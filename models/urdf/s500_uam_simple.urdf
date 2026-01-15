@@ -1,0 +1,487 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="s500_uam">
+  <link name="base_link">
+    <inertial>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <mass
+        value="1.772" />
+      <inertia
+        ixx="0.0165"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="0.0186"
+        iyz="0.0"
+        izz="0.0250" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/base_link.dae" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/base_link.dae" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rotor_1">
+    <inertial>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <mass
+        value="0.01" />
+      <inertia
+        ixx="9.75e-07"
+        ixy="0"
+        ixz="0"
+        iyy="5.2e-05"
+        iyz="0"
+        izz="5.2e-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/iris_prop_ccw.dae" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/iris_prop_ccw.dae" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rotor_joint_1" type="fixed">
+    <origin
+      xyz="0.171 0.171 0.07"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="rotor_1" />
+    <axis
+      xyz="0 1 0" />
+  </joint>
+  <link name="rotor_2">
+    <inertial>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <mass
+        value="0.01" />
+      <inertia
+        ixx="9.75e-07"
+        ixy="0"
+        ixz="0"
+        iyy="5.2e-05"
+        iyz="0"
+        izz="5.2e-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/iris_prop_ccw.dae" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/iris_prop_ccw.dae" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rotor_joint_2" type="fixed">
+    <origin
+      xyz="-0.171 0.171 0.07"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="rotor_2" />
+    <axis
+      xyz="0 1 0" />
+  </joint>
+  <link name="rotor_3">
+    <inertial>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <mass
+        value="0.01" />
+      <inertia
+        ixx="9.75e-07"
+        ixy="0"
+        ixz="0"
+        iyy="5.2e-05"
+        iyz="0"
+        izz="5.2e-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/iris_prop_cw.dae" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/iris_prop_cw.dae" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rotor_joint_3" type="fixed">
+    <origin
+      xyz="-0.171 -0.171 0.07"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="rotor_3" />
+    <axis
+      xyz="0 1 0" />
+  </joint>
+  <link name="rotor_4">
+    <inertial>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <mass
+        value="0.01" />
+      <inertia
+        ixx="9.75e-07"
+        ixy="0"
+        ixz="0"
+        iyy="5.2e-05"
+        iyz="0"
+        izz="5.2e-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/iris_prop_cw.dae" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/iris_prop_cw.dae" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rotor_joint_4" type="fixed">
+    <origin
+      xyz="0.1701 -0.1701 0.07"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="rotor_4" />
+    <axis
+      xyz="0 1 0" />
+  </joint>
+
+  <link name="link_1">
+    <inertial>
+      <origin
+        xyz="-0 -0.000196 -0.076809"
+        rpy="0 0 0" />
+      <mass
+        value="0.095" />
+      <inertia
+        ixx="5.8e-04"
+        ixy="0"
+        ixz="0"
+        iyy="5.1e-04"
+        iyz="0"
+        izz="1.8e-04" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/link_1.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/link_1.STL" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="joint_1" type="revolute">
+    <origin
+      xyz="0.0007 0 -0.07275"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="link_1" />
+    <axis xyz="0 1 0" />
+    <limit effort="2" lower="-2" upper="2" velocity="10"/>
+    <!-- <dynamics damping="0.1" friction="0.1"/> -->
+  </joint>
+
+  <link name="link_2">
+    <inertial>
+      <origin
+        xyz="0.000575 0.000247 -0.072261"
+        rpy="0 0 0" />
+      <mass
+        value="0.082" />
+      <inertia
+        ixx="4.3e-04"
+        ixy="0"
+        ixz="0"
+        iyy="4.1e-04"
+        iyz="0"
+        izz="2.6e-04" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/link_2.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/link_2.STL" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="joint_2" type="revolute">
+    <origin
+      xyz="0 0 -0.09925"
+      rpy="0 0 0" />
+    <parent
+      link="link_1" />
+    <child
+      link="link_2" />
+    <axis xyz="0 1 0" />
+    <limit effort="2" lower="-2" upper="2" velocity="10"/>
+    <!-- <dynamics damping="0.1" friction="0.1"/> -->
+  </joint>
+
+  <link name="link_3">
+    <inertial>
+      <origin
+        xyz="0.025274 0.000991 -0.041284"
+        rpy="0 0 0" />
+      <mass
+        value="0.012" />
+      <inertia
+        ixx="1.0e-05"
+        ixy="0"
+        ixz="0"
+        iyy="1.0e-05"
+        iyz="0"
+        izz="2.0e-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/link_3.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.92157 0.92157 0.92157 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/link_3.STL" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="joint_3" type="fixed">
+    <origin
+      xyz="-0.011 0 -0.08225"
+      rpy="0 0.23432 3.1416" />
+    <parent
+      link="link_2" />
+    <child
+      link="link_3" />
+    <axis
+      xyz="0 1 0" />
+    <limit
+      lower="-1.57"
+      upper="0"
+      effort="10"
+      velocity="1" />
+  </joint>
+
+  <link name="link_4">
+    <inertial>
+      <origin
+        xyz="0.024422 -0.000991 -0.039818"
+        rpy="0 0 0" />
+      <mass
+        value="0.012" />
+      <inertia
+        ixx="1.0e-05"
+        ixy="0"
+        ixz="0"
+        iyy="1.0e-05"
+        iyz="0"
+        izz="2.0e-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/link_4.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.92157 0.92157 0.92157 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://example-robot-data/robots/s500_description/s500_uam/meshes/link_4.STL" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="joint_4" type="fixed">
+    <origin
+      xyz="0.011 0 -0.08225"
+      rpy="0 0.26237 0" />
+    <parent
+      link="link_2" />
+    <child
+      link="link_4" />
+    <axis
+      xyz="0 1 0" />
+    <limit
+      lower="0"
+      upper="1.57"
+      effort="10"
+      velocity="1" />
+  </joint>
+
+  <link name="gripper_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="0.001" />
+      <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
+    </inertial>
+    <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+            <box size="0.01 0.01 0.01" /> 
+        </geometry>
+        <material name="">
+            <color rgba="1 0 0 0.5" /> 
+        </material>
+    </visual>
+
+  </link>
+
+  <joint name="gripper_joint" type="fixed">
+    <origin xyz="0 0 -0.14" rpy="0 0 0" />  
+    <parent link="link_2" />
+    <child link="gripper_link" />
+  </joint>
+
+</robot>
