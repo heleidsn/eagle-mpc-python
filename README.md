@@ -18,9 +18,11 @@ This project implements trajectory planning for the S500 quadrotor using the Cro
 ## 🛠️ Requirements
 
 ### Python Version
+
 - Python 3.7+
 
 ### Main Dependencies
+
 - `crocoddyl`: Optimal control library
 - `pinocchio`: Robotics dynamics library
 - `numpy`: Numerical computing
@@ -30,17 +32,65 @@ This project implements trajectory planning for the S500 quadrotor using the Cro
 
 ### Installation
 
+#### Linux/macOS (Recommended)
+
 ```bash
 # Using conda environment (recommended)
-conda create -n eagle_mpc python=3.9
+conda create -n eagle_mpc python=3.10
 conda activate eagle_mpc
 
 # Install crocoddyl and pinocchio
-conda install -c conda-forge crocoddyl pinocchio
-
+conda install pinocchio -c conda-forge
+conda install crocoddyl -c conda-forge
 # Install other dependencies
 pip install numpy matplotlib pyyaml
 ```
+
+#### Windows
+
+**Note**: `crocoddyl` may not be directly installable via conda or pip on Windows, as conda-forge may not have pre-compiled packages for Windows platform.
+
+**Option 1: Use WSL (Windows Subsystem for Linux) (Recommended)**
+
+Follow the Linux installation steps in WSL:
+
+```bash
+# In WSL
+conda create -n eagle_mpc python=3.10
+conda activate eagle_mpc
+conda install pinocchio -c conda-forge
+conda install crocoddyl -c conda-forge
+pip install numpy matplotlib pyyaml
+```
+
+**Option 2: Build from Source**
+
+If you need to use it directly on Windows, you need to build `crocoddyl` from source:
+
+1. Install required tools:
+   - CMake (>= 3.10)
+   - Visual Studio or MinGW-w64
+   - Git
+
+2. Clone and build crocoddyl:
+```bash
+git clone https://github.com/loco-3d/crocoddyl.git
+cd crocoddyl
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --config Release
+cmake --install . --prefix <install_path>
+```
+
+3. Set Python path:
+```bash
+# Add crocoddyl Python bindings path to PYTHONPATH
+set PYTHONPATH=%PYTHONPATH%;<install_path>\lib\python3.10\site-packages
+```
+
+**Option 3: Use Docker**
+
+Use a Docker container that includes crocoddyl to run the project.
 
 ## 📁 Project Structure
 
@@ -106,6 +156,7 @@ python scripts/example_s500_trajectory.py
 ```
 
 This script provides two predefined trajectories:
+
 1. **Square Trajectory**: Square flight pattern at specified altitude
 2. **Figure-Eight Trajectory**: Classic figure-eight flight pattern
 
@@ -157,13 +208,14 @@ Main methods:
 After optimization, the following files are generated:
 
 1. **Visualization Plots** (`*.png`): Complete plots of all states and controls
+
    - Position, velocity, angular velocity trajectories
    - Orientation quaternion
    - Control inputs (thruster thrusts)
    - 3D trajectory plot
    - Cost convergence curve
-
 2. **Data Files** (`*.npz`): Trajectory data in NumPy format
+
    - `states`: State trajectory
    - `controls`: Control input trajectory
    - `cost`: Final cost
@@ -174,6 +226,7 @@ After optimization, the following files are generated:
 ### S500 Configuration File (`config/yaml/multicopter/s500.yaml`)
 
 Contains key quadrotor parameters:
+
 - Number of thrusters
 - Thrust coefficient (cf)
 - Moment coefficient (cm)
@@ -183,6 +236,7 @@ Contains key quadrotor parameters:
 ### URDF Model (`models/urdf/s500_simple.urdf`)
 
 Contains robot physical parameters:
+
 - Mass
 - Inertia matrix
 - Geometric structure
@@ -224,9 +278,11 @@ if converged:
 ### Common Issues
 
 1. **Import Errors**: Ensure crocoddyl and pinocchio are properly installed
+   - **Windows Users**: If you encounter `ModuleNotFoundError: No module named 'crocoddyl'`, please refer to the Windows installation instructions above. Using WSL is recommended.
 2. **Path Errors**: Check that configuration and URDF file paths are correct
 3. **Convergence Issues**: Try increasing iteration count or adjusting weight parameters
 4. **Thrust Constraints**: If trajectory is unreasonable, check if thrust constraints are too tight
+5. **Conda Installation Failed (Windows)**: `crocoddyl` may not support Windows platform on conda-forge. Please use WSL or build from source.
 
 ## 📚 References
 
