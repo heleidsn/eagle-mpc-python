@@ -113,10 +113,11 @@ class S500TrajectoryPlanner:
             cf = platform['cf']
             cm = platform['cm']
             rotors = platform['$rotors']
+            min_thrust = platform['min_thrust']
+            max_thrust = platform['max_thrust']
             
-            # Build tau_f matrix (thrust to force/moment mapping matrix)
-            # tau_f shape: (6, n_rotors) - mapping from n_rotors thrust inputs to 6 force/moment outputs
-            tau_f = np.zeros((6, n_rotors))
+            # Create thruster list for new crocoddyl API
+            thruster_list = []
             
             print("Rotor configuration:")
             for i, rotor in enumerate(rotors):
@@ -125,22 +126,27 @@ class S500TrajectoryPlanner:
                 
                 print(f"  Rotor{i+1}: position={pos}, spin_direction={'CCW' if spin_dir < 0 else 'CW'}")
                 
-                # Force mapping (all rotors generate upward thrust)
-                tau_f[0, i] = 0.0      # x-direction force
-                tau_f[1, i] = 0.0      # y-direction force  
-                tau_f[2, i] = 1.0      # z-direction thrust (upward positive)
+                # Create SE3 pose for thruster (position from root joint, orientation upward)
+                # Translation: rotor position
+                # Rotation: identity (thrusters point upward in z-direction)
+                M = pin.SE3(np.eye(3), pos)
                 
-                # Moment mapping (using rotor position to calculate moment arm)
-                tau_f[3, i] = pos[1]   # moment about x-axis (roll) = y * Fz
-                tau_f[4, i] = -pos[0]  # moment about y-axis (pitch) = -x * Fz
-                tau_f[5, i] = spin_dir * cm / cf  # moment about z-axis (yaw) = reaction moment coefficient ratio
+                # Torque coefficient per thrust (cm/cf ratio)
+                ctorque = abs(spin_dir) * cm / cf
+                
+                # Thruster type: CCW or CW
+                thruster_type = crocoddyl.ThrusterType.CCW if spin_dir < 0 else crocoddyl.ThrusterType.CW
+                
+                # Create thruster object
+                thruster = crocoddyl.Thruster(M, ctorque, thruster_type, min_thrust, max_thrust)
+                thruster_list.append(thruster)
             
-            # Create multicopter actuation model
-            self.actuation = crocoddyl.ActuationModelMultiCopterBase(self.state, tau_f)
+            # Create multicopter actuation model using new API
+            self.actuation = crocoddyl.ActuationModelFloatingBaseThrusters(self.state, thruster_list)
             
             print(f"✓ Successfully created actuation model")
             print(f"  - Control input dimension: {self.actuation.nu}")
-            print(f"  - tau_f matrix shape: {tau_f.shape}")
+            print(f"  - Number of thrusters: {len(thruster_list)}")
             
         except Exception as e:
             print(f"✗ Failed to create actuation model: {e}")
@@ -722,7 +728,9 @@ def main():
             if args.save_dir:
                 save_dir = args.save_dir
             else:
-                save_dir = os.path.join(planner.package_path, 'results', 's500_trajectory_optimization')
+                # Use project root directory
+                project_root = Path(__file__).parent.parent
+                save_dir = str(project_root / 'results' / 's500_trajectory_optimization')
             os.makedirs(save_dir, exist_ok=True)
             
             # Plot results
