@@ -3,16 +3,17 @@
 """
 TVC Rocket Trajectory Optimization using Crocoddyl
 
-运行方式：
+Usage:
     python -u tvc_traj_opt.py
     
-注意：使用 -u 参数（无缓冲输出）可以实时看到求解过程的迭代信息
+Note: Use -u flag (unbuffered output) to see real-time iteration information during solving
 """
 
 import numpy as np
 import sys
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.gridspec import GridSpec
 import crocoddyl
 
 # -------- quaternion utils --------
@@ -102,12 +103,12 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
         self.w = {
             "p": 1.0, "v": 0.2, "R": 0.5, "w": 0.1,
             "u": 1e-3, "du": 1e-2,
-            "terminal_scale": 0.0  # 终端可用单独模型放大
+            "terminal_scale": 0.0  # Terminal can use separate model for scaling
         }
         if weights is not None:
             self.w.update(weights)
 
-        # bounds: dict
+        # bounds: dict (control constraints)
         self.b = {
             "th_p": (-0.4, 0.4),
             "th_r": (-0.4, 0.4),
@@ -117,6 +118,28 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
         }
         if bounds is not None:
             self.b.update(bounds)
+        
+        # state_bounds: dict (state constraints)
+        self.state_b = {
+            "v_horizontal_max": 20.0,  # Maximum horizontal velocity magnitude (m/s)
+            "v_vertical_max": 20.0,    # Maximum vertical velocity magnitude (m/s)
+            "roll_max": np.radians(45.0),   # Maximum roll angle (rad)
+            "pitch_max": np.radians(45.0),  # Maximum pitch angle (rad)
+            "yaw_max": np.radians(180.0),   # Maximum yaw angle (rad)
+            "w_max": 2.0,            # Maximum angular velocity magnitude (rad/s)
+            "k_state_bound": 200.0   # State constraint penalty coefficient
+        }
+        # Allow state bounds to be passed via bounds dict with "state_" prefix
+        if bounds is not None:
+            for key, value in bounds.items():
+                if key.startswith("state_"):
+                    state_key = key[6:]  # Remove "state_" prefix
+                    if state_key in self.state_b:
+                        self.state_b[state_key] = value
+                    # Backward compatibility: convert old v_max to both horizontal and vertical
+                    if state_key == "v_max":
+                        self.state_b["v_horizontal_max"] = value
+                        self.state_b["v_vertical_max"] = value
 
         self.unone = np.zeros(self.nu)
 
@@ -168,14 +191,20 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
         if val < lb: return k*(lb - val)**2
         if val > ub: return k*(val - ub)**2
         return 0.0
+    
+    def _quat_to_euler(self, q):
+        """Convert quaternion to Euler angles (ZYX order)"""
+        w, x, y, z = q[0], q[1], q[2], q[3]
+        roll = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
+        pitch = np.arcsin(np.clip(2*(w*y - z*x), -1.0, 1.0))
+        yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+        return np.array([roll, pitch, yaw])
 
-    def calc(self, data, x, u=None):
-        if u is None:
-            u = self.unone
-
-        data.xnext = self._step(x, u)
-
-        # ----- running cost -----
+    def _compute_cost(self, x, u):
+        """
+        Compute cost (helper method for numerical differentiation)
+        Does not modify data object, only returns cost value
+        """
         p = x[0:3]; v = x[3:6]; q = x[6:10]; w = x[10:13]
         u_prev = x[13:17]
         du = u - u_prev
@@ -187,7 +216,6 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
 
         e_p = p - p_g
         e_v = v - v_g
-        # attitude error: q_e = q_g * inv(q)
         q_e = quat_mul(q_g, quat_conj(q))
         e_R = so3_log_from_quat(q_e)
         e_w = w - w_g
@@ -198,25 +226,55 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
         cost += self.w["R"] * e_R.dot(e_R)
         cost += self.w["w"] * e_w.dot(e_w)
 
-        # control regularization
         e_u = u - self.u_ref
         cost += self.w["u"]  * e_u.dot(e_u)
         cost += self.w["du"] * du.dot(du)
 
-        # soft bounds
+        # Control constraints
         kB = self.b["k_bound"]
         th_p, th_r, T, tau_yaw = u
         cost += self._bound_pen(th_p, *self.b["th_p"], kB)
         cost += self._bound_pen(th_r, *self.b["th_r"], kB)
         cost += self._bound_pen(T,    *self.b["T"],    kB)
         cost += self._bound_pen(tau_yaw, *self.b["tau_yaw"], kB)
+        
+        # State constraints
+        kSB = self.state_b["k_state_bound"]
+        # Velocity constraints (horizontal and vertical)
+        v_horizontal = np.sqrt(v[0]**2 + v[1]**2)  # Horizontal velocity magnitude
+        v_vertical = abs(v[2])  # Vertical velocity magnitude
+        cost += self._bound_pen(v_horizontal, 0.0, self.state_b["v_horizontal_max"], kSB)
+        cost += self._bound_pen(v_vertical, 0.0, self.state_b["v_vertical_max"], kSB)
+        # Euler angle constraints
+        euler = self._quat_to_euler(q)
+        cost += self._bound_pen(abs(euler[0]), 0.0, self.state_b["roll_max"], kSB)  # Roll
+        cost += self._bound_pen(abs(euler[1]), 0.0, self.state_b["pitch_max"], kSB)  # Pitch
+        cost += self._bound_pen(abs(euler[2]), 0.0, self.state_b["yaw_max"], kSB)    # Yaw
+        # Angular velocity magnitude constraint
+        w_mag = np.linalg.norm(w)
+        cost += self._bound_pen(w_mag, 0.0, self.state_b["w_max"], kSB)
+        
+        return cost
 
-        data.cost = cost
+    def calc(self, data, x, u=None):
+        if u is None:
+            u = self.unone
+
+        data.xnext = self._step(x, u)
+        data.cost = self._compute_cost(x, u)
 
     def calcDiff(self, data, x, u=None):
         """
-        计算雅可比矩阵（解析导数）
-        这是关键方法，提供解析雅可比可以避免数值微分，大幅提升速度
+        Compute Jacobian matrices (optimized numerical differentiation)
+        
+        Performance optimizations:
+        1. Reuse data object to avoid repeated creation
+        2. Optimize numerical differentiation computation flow
+        3. Reduce unnecessary memory allocation
+        
+        Note: This is a numerical differentiation implementation, slower than analytical Jacobian,
+        but more efficient than previous implementation. Can be further optimized to analytical
+        Jacobian for best performance in the future.
         """
         if u is None:
             u = self.unone
@@ -224,66 +282,75 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
         dt = self.dt
         nx, nu = self.state.nx, self.nu
         
-        # 先调用 calc 计算下一步状态和代价
+        # First call calc to compute next state and cost
         self.calc(data, x, u)
         
-        # 使用数值微分计算雅可比（作为临时方案）
-        # 注意：完整的解析雅可比需要手动推导，这里先用数值微分
-        # 但至少不需要 ActionModelNumDiff 包装了
+        # Use numerical differentiation to compute Jacobians
+        # Optimization: use smaller perturbation step size, but be careful with numerical precision
         eps = 1e-6
+        eps_inv = 1.0 / eps
         
-        # Fx: 动力学对状态的雅可比 (nx x nx)
+        # Pre-allocate memory
         Fx = np.zeros((nx, nx))
-        x_pert = x.copy()
-        for i in range(nx):
-            x_pert[i] += eps
-            x_next_pert = self._step(x_pert, u)
-            Fx[:, i] = (x_next_pert - data.xnext) / eps
-            x_pert[i] = x[i]
-        
-        # Fu: 动力学对控制的雅可比 (nx x nu)
         Fu = np.zeros((nx, nu))
-        u_pert = u.copy()
-        for i in range(nu):
-            u_pert[i] += eps
-            x_next_pert = self._step(x, u_pert)
-            Fu[:, i] = (x_next_pert - data.xnext) / eps
-            u_pert[i] = u[i]
-        
-        # Lx: 代价对状态的梯度 (nx,)
         Lx = np.zeros(nx)
-        x_pert = x.copy()
-        cost_base = data.cost
-        for i in range(nx):
-            x_pert[i] += eps
-            data_pert = self.createData()
-            self.calc(data_pert, x_pert, u)
-            Lx[i] = (data_pert.cost - cost_base) / eps
-            x_pert[i] = x[i]
-        
-        # Lu: 代价对控制的梯度 (nu,)
         Lu = np.zeros(nu)
-        u_pert = u.copy()
-        for i in range(nu):
-            u_pert[i] += eps
-            data_pert = self.createData()
-            self.calc(data_pert, x, u_pert)
-            Lu[i] = (data_pert.cost - cost_base) / eps
-            u_pert[i] = u[i]
         
-        # Lxx: 代价对状态的 Hessian (nx x nx) - 简化为零矩阵
+        # Cache base values
+        x_next_base = data.xnext.copy()
+        cost_base = data.cost
+        
+        # Optimization: reuse temporary variables to reduce memory allocation
+        x_pert = x.copy()
+        u_pert = u.copy()
+        
+        # Fx: dynamics Jacobian w.r.t. state (nx x nx)
+        # Optimization: directly modify x_pert to avoid repeated copying
+        for i in range(nx):
+            x_pert[i] = x[i] + eps
+            x_next_pert = self._step(x_pert, u)
+            Fx[:, i] = (x_next_pert - x_next_base) * eps_inv
+            x_pert[i] = x[i]  # Restore original value
+        
+        # Fu: dynamics Jacobian w.r.t. control (nx x nu)
+        for i in range(nu):
+            u_pert[i] = u[i] + eps
+            x_next_pert = self._step(x, u_pert)
+            Fu[:, i] = (x_next_pert - x_next_base) * eps_inv
+            u_pert[i] = u[i]  # Restore original value
+        
+        # Lx: cost gradient w.r.t. state (nx,)
+        # Optimization: use helper method to directly compute cost, avoid modifying data object
+        for i in range(nx):
+            x_pert[i] = x[i] + eps
+            cost_pert = self._compute_cost(x_pert, u)
+            Lx[i] = (cost_pert - cost_base) * eps_inv
+            x_pert[i] = x[i]  # Restore original value
+        
+        # Lu: cost gradient w.r.t. control (nu,)
+        for i in range(nu):
+            u_pert[i] = u[i] + eps
+            cost_pert = self._compute_cost(x, u_pert)
+            Lu[i] = (cost_pert - cost_base) * eps_inv
+            u_pert[i] = u[i]  # Restore original value
+        
+        # Lxx: cost Hessian w.r.t. state (nx x nx) - simplified to zero matrix
+        # Note: for quadratic cost, analytical Hessian can be computed, but simplified here
         Lxx = np.zeros((nx, nx))
         
-        # Luu: 代价对控制的 Hessian (nu x nu) - 简化
+        # Luu: cost Hessian w.r.t. control (nu x nu)
+        # Optimization: directly compute analytical Hessian for control regularization term
         Luu = np.zeros((nu, nu))
-        # 控制正则化项的 Hessian
+        # Analytical Hessian for control regularization term
         Luu += 2 * self.w["u"] * np.eye(nu)
         Luu += 2 * self.w["du"] * np.eye(nu)
+        # Note: Hessian for boundary penalty term needs to be computed based on whether inside boundary
+        # Simplified here, only includes regularization term
         
-        # Lxu: 代价对状态和控制的混合 Hessian (nx x nu)
+        # Lxu: cost mixed Hessian w.r.t. state and control (nx x nu)
         Lxu = np.zeros((nx, nu))
         
-        # 存储到 data
+        # Store to data
         data.Fx = Fx
         data.Fu = Fu
         data.Lx = Lx
@@ -300,27 +367,27 @@ class TVCRocketActionModel(crocoddyl.ActionModelAbstract):
 
 # -------- Custom Callback for Progress Display --------
 class ProgressCallback(crocoddyl.CallbackAbstract):
-    """自定义回调类，用于显示求解进度"""
+    """Custom callback class for displaying solving progress"""
     def __init__(self):
         crocoddyl.CallbackAbstract.__init__(self)
         self.iter_count = 0
         
     def __call__(self, solver):
         self.iter_count += 1
-        # 使用 \r 实现同一行更新，\033[K 清除到行尾
-        print(f"\r迭代 {self.iter_count}: 成本 = {solver.cost:.6e}, 停止条件 = {solver.stop:.6e}", end='', flush=True)
+        # Use \r to update same line, \033[K to clear to end of line
+        print(f"\rIteration {self.iter_count}: Cost = {solver.cost:.6e}, Stop Condition = {solver.stop:.6e}", end='', flush=True)
         sys.stdout.flush()
 
 
 # -------- build + solve --------
 def solve_once(dt=0.02, N=100, max_iter=100):
     """
-    求解轨迹优化问题
+    Solve trajectory optimization problem
     
-    参数:
-        dt: 时间步长 (默认 0.02s)
-        N: 时间步数 (默认 100，减少可加快速度但降低精度)
-        max_iter: 最大迭代次数 (默认 100)
+    Parameters:
+        dt: Time step (default 0.02s)
+        N: Number of time steps (default 100, reducing can speed up but lower accuracy)
+        max_iter: Maximum number of iterations (default 100)
     """
 
     m = 0.6
@@ -347,7 +414,7 @@ def solve_once(dt=0.02, N=100, max_iter=100):
                                            "th_p": (-0.35, 0.35),
                                            "th_r": (-0.35, 0.35),
                                            "tau_yaw": (-1.0, 1.0)})
-    # terminal model：把终端误差放大
+    # Terminal model: amplify terminal error
     terminal = TVCRocketActionModel(dt, m, I, r_thrust,
                                     tvc_order="pitch_roll",
                                     x_goal=xg, u_ref=uref,
@@ -355,99 +422,100 @@ def solve_once(dt=0.02, N=100, max_iter=100):
                                              "u": 0.0, "du": 0.0},
                                     bounds=running.b)
 
-    # 直接使用模型（已实现 calcDiff 方法）
-    # 注意：calcDiff 中目前使用数值微分，但避免了 ActionModelNumDiff 的额外开销
-    # 未来可以实现完整的解析雅可比以进一步提升速度
+    # Directly use model (calcDiff method already implemented)
+    # Note: calcDiff currently uses numerical differentiation, but avoids overhead of ActionModelNumDiff
+    # Can implement full analytical Jacobian in the future for further speedup
     problem = crocoddyl.ShootingProblem(x0, [running]*N, terminal)
     solver  = crocoddyl.SolverFDDP(problem)
     
-    # 优化求解器参数以提高速度
-    solver.th_stop = 1e-4  # 放宽停止条件（默认 1e-6）
-    solver.reg_min = 1e-9  # 最小正则化
-    solver.reg_max = 1e6   # 最大正则化
+    # Optimize solver parameters for speed
+    solver.th_stop = 1e-4  # Relax stop condition (default 1e-6)
+    solver.reg_min = 1e-9  # Minimum regularization
+    solver.reg_max = 1e6   # Maximum regularization
 
-    # 添加回调以显示求解过程
-    # 使用 CallbackLogger 记录数据，CallbackVerbose 显示进度
-    # 注意：如果看不到实时输出，请使用 python -u 运行脚本（无缓冲输出模式）
+    # Add callbacks to display solving process
+    # Use CallbackLogger to record data, CallbackVerbose to display progress
+    # Note: If real-time output is not visible, use python -u to run script (unbuffered output mode)
     logger = crocoddyl.CallbackLogger()
     callbacks = [
-        crocoddyl.CallbackVerbose(),  # 显示详细迭代信息
-        logger  # 记录数据用于后续分析
+        crocoddyl.CallbackVerbose(),  # Display detailed iteration information
+        logger  # Record data for subsequent analysis
     ]
     solver.setCallbacks(callbacks)
 
-    # initial guess
+    # Initial guess
     xs_init = [x0.copy() for _ in range(N+1)]
     us_init = [uref.copy() for _ in range(N)]
 
-    print("开始求解轨迹优化问题...", flush=True)
-    print(f"  - 时间步数: {N}", flush=True)
-    print(f"  - 时间步长: {dt} s", flush=True)
-    print(f"  - 总时长: {N*dt:.2f} s", flush=True)
-    print(f"  - 最大迭代次数: {max_iter}", flush=True)
-    print("  - 提示：如果看不到迭代进度，请使用 'python -u' 运行脚本", flush=True)
-    print("", flush=True)  # 空行
+    print("Starting trajectory optimization problem...", flush=True)
+    print(f"  - Number of time steps: {N}", flush=True)
+    print(f"  - Time step: {dt} s", flush=True)
+    print(f"  - Total duration: {N*dt:.2f} s", flush=True)
+    print(f"  - Maximum iterations: {max_iter}", flush=True)
+    print("  - Tip: If iteration progress is not visible, use 'python -u' to run script", flush=True)
+    print("", flush=True)  # Empty line
     
     import time
     start_time = time.time()
     
-    # 调用 solve
-    # CallbackVerbose 应该会在每次迭代时打印信息
-    # 如果看不到输出，可能是输出缓冲问题，使用 python -u 可以解决
+    # Call solve
+    # CallbackVerbose should print information at each iteration
+    # If output is not visible, may be output buffering issue, using python -u can solve it
     solver.solve(xs_init, us_init, max_iter, False)
     
     solve_time = time.time() - start_time
     
-    print("", flush=True)  # 空行
-    print(f"求解完成!", flush=True)
-    print(f"  - 求解时间: {solve_time:.2f} 秒", flush=True)
-    print(f"  - 最终成本: {solver.cost:.6e}", flush=True)
-    print(f"  - 迭代次数: {solver.iter}", flush=True)
-    print(f"  - 停止条件: {solver.stop:.6e}", flush=True)
+    print("", flush=True)  # Empty line
+    print(f"Solving completed!", flush=True)
+    print(f"  - Solving time: {solve_time:.2f} seconds", flush=True)
+    print(f"  - Final cost: {solver.cost:.6e}", flush=True)
+    print(f"  - Iterations: {solver.iter}", flush=True)
+    print(f"  - Stop condition: {solver.stop:.6e}", flush=True)
     
-    # 如果有记录的数据，显示收敛曲线信息
+    # If recorded data exists, display convergence curve information
     if len(logger.costs) > 0:
-        print(f"  - 成本变化: {logger.costs[0]:.6e} -> {logger.costs[-1]:.6e}", flush=True)
-        print(f"  - 平均每次迭代时间: {solve_time/solver.iter:.3f} 秒", flush=True)
+        print(f"  - Cost change: {logger.costs[0]:.6e} -> {logger.costs[-1]:.6e}", flush=True)
+        print(f"  - Average time per iteration: {solve_time/solver.iter:.3f} seconds", flush=True)
 
     return solver.xs, solver.us, logger
 
 # xs, us = solve_once()
 
-def plot_trajectory(xs, us, dt, logger=None, x_goal=None):
+def plot_trajectory(xs, us, dt, logger=None, x_goal=None, waypoints=None):
     """
-    绘制轨迹优化结果
+    Plot trajectory optimization results - all states, controls and cost on one page
     
-    参数:
-        xs: 状态轨迹列表
-        us: 控制输入列表
-        dt: 时间步长
-        logger: 回调记录器（可选，用于绘制收敛曲线）
-        x_goal: 目标状态（可选）
+    Args:
+        xs: State trajectory list
+        us: Control input list
+        dt: Time step
+        logger: Callback logger (optional, for plotting convergence curve)
+        x_goal: Target state (optional)
+        waypoints: List of waypoint positions (optional, for plotting waypoints)
     """
-    # 转换为 numpy 数组
+    # Convert to numpy arrays
     xs_array = np.array(xs)
     us_array = np.array(us)
     
-    # 时间轴
+    # Time axis
     time_states = np.arange(len(xs)) * dt
     time_controls = np.arange(len(us)) * dt
     
-    # 提取状态
+    # Extract states
     positions = xs_array[:, 0:3]      # p(3)
     velocities = xs_array[:, 3:6]     # v(3)
     quaternions = xs_array[:, 6:10]    # q(4)
     angular_velocities = xs_array[:, 10:13]  # w(3)
     
-    # 提取控制输入
+    # Extract control inputs
     th_p = us_array[:, 0]  # pitch angle
     th_r = us_array[:, 1]  # roll angle
     T = us_array[:, 2]     # thrust
     tau_yaw = us_array[:, 3]  # yaw torque
     
-    # 将四元数转换为欧拉角（用于显示）
+    # Convert quaternion to Euler angles (for display)
     def quat_to_euler(q):
-        """四元数转欧拉角 (ZYX顺序)"""
+        """Convert quaternion to Euler angles (ZYX order)"""
         w, x, y, z = q[0], q[1], q[2], q[3]
         roll = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
         pitch = np.arcsin(2*(w*y - z*x))
@@ -456,175 +524,279 @@ def plot_trajectory(xs, us, dt, logger=None, x_goal=None):
     
     euler_angles = np.array([quat_to_euler(q) for q in quaternions])
     
-    # 创建图形
-    fig = plt.figure(figsize=(20, 14))
-    fig.suptitle('TVC Rocket Trajectory Optimization Results', fontsize=16, fontweight='bold')
+    # Create figure - use GridSpec for flexible layout, all content on one page
+    # Layout: 4 rows x 4 columns, 16 subplot positions
+    fig = plt.figure(figsize=(24, 16))
+    gs = GridSpec(4, 4, figure=fig, hspace=0.35, wspace=0.3)
+    fig.suptitle('TVC Rocket Trajectory Optimization - Complete States, Controls and Cost', 
+                 fontsize=18, fontweight='bold', y=0.995)
     
-    # 1. 3D 位置轨迹
-    ax1 = fig.add_subplot(3, 4, 1, projection='3d')
-    ax1.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2, label='轨迹')
+    # First row: 3D trajectory and convergence curve
+    # 1. 3D position trajectory (occupies 2 positions)
+    ax1 = fig.add_subplot(gs[0, 0:2], projection='3d')
+    ax1.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2, label='Trajectory')
     ax1.scatter(positions[0, 0], positions[0, 1], positions[0, 2], 
-                color='green', s=100, marker='o', label='起点')
+                color='green', s=100, marker='o', label='Start')
     ax1.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
-                color='red', s=100, marker='*', label='终点')
-    if x_goal is not None:
+                color='red', s=100, marker='*', label='End')
+    
+    # Collect all points for unified scaling
+    all_x = positions[:, 0].tolist()
+    all_y = positions[:, 1].tolist()
+    all_z = positions[:, 2].tolist()
+    
+    if waypoints is not None and len(waypoints) > 0:
+        # Plot waypoints with smaller markers and numbered labels
+        for i, wp in enumerate(waypoints):
+            if len(wp) >= 3:
+                # Use smaller, clearer marker (triangle up)
+                ax1.scatter(wp[0], wp[1], wp[2], 
+                           color='orange', s=50, marker='^', 
+                           edgecolors='darkorange', linewidths=1.5, 
+                           label=f'WP {i+1}', zorder=5, alpha=0.8)
+                # Add text label with waypoint number
+                ax1.text(wp[0], wp[1], wp[2], f' {i+1}', 
+                        fontsize=9, color='darkorange', 
+                        fontweight='bold', zorder=6)
+                all_x.append(wp[0])
+                all_y.append(wp[1])
+                all_z.append(wp[2])
+    elif x_goal is not None:
         ax1.scatter(x_goal[0], x_goal[1], x_goal[2], 
-                   color='orange', s=100, marker='x', label='目标', linewidths=3)
-    ax1.set_xlabel('X (m)')
-    ax1.set_ylabel('Y (m)')
-    ax1.set_zlabel('Z (m)')
-    ax1.set_title('3D Position Trajectory')
-    ax1.legend()
+                   color='orange', s=100, marker='x', label='Target', linewidths=3)
+        all_x.append(x_goal[0])
+        all_y.append(x_goal[1])
+        all_z.append(x_goal[2])
+    
+    # Calculate unified scale for all axes
+    x_range = max(all_x) - min(all_x) if len(all_x) > 0 else 1.0
+    y_range = max(all_y) - min(all_y) if len(all_y) > 0 else 1.0
+    z_range = max(all_z) - min(all_z) if len(all_z) > 0 else 1.0
+    
+    # Use the maximum range for all axes to ensure equal scaling
+    max_range = max(x_range, y_range, z_range)
+    if max_range == 0:
+        max_range = 1.0
+    
+    x_center = (max(all_x) + min(all_x)) / 2 if len(all_x) > 0 else 0.0
+    y_center = (max(all_y) + min(all_y)) / 2 if len(all_y) > 0 else 0.0
+    z_center = (max(all_z) + min(all_z)) / 2 if len(all_z) > 0 else 0.0
+    
+    # Set equal limits for all axes
+    half_range = max_range / 2.0
+    ax1.set_xlim([x_center - half_range, x_center + half_range])
+    ax1.set_ylim([y_center - half_range, y_center + half_range])
+    ax1.set_zlim([z_center - half_range, z_center + half_range])
+    
+    ax1.set_xlabel('X (m)', fontsize=10)
+    ax1.set_ylabel('Y (m)', fontsize=10)
+    ax1.set_zlabel('Z (m)', fontsize=10)
+    ax1.set_title('3D Position Trajectory', fontsize=11, fontweight='bold')
+    ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.3)
     
-    # 2. 位置 vs 时间
-    ax2 = plt.subplot(3, 4, 2)
+    # 2. Cost convergence curve (occupies 2 positions)
+    ax_cost = fig.add_subplot(gs[0, 2:4])
+    if logger is not None and len(logger.costs) > 0:
+        iterations = np.arange(len(logger.costs))
+        ax_cost.semilogy(iterations, logger.costs, 'b-', linewidth=2.5, label='Cost', marker='o', markersize=3)
+        ax_cost.set_xlabel('Iteration', fontsize=10)
+        ax_cost.set_ylabel('Cost (log scale)', fontsize=10)
+        ax_cost.set_title('Optimization Cost Convergence', fontsize=11, fontweight='bold')
+        ax_cost.legend(fontsize=9)
+        ax_cost.grid(True, alpha=0.3)
+        # Add final cost text
+        final_cost = logger.costs[-1]
+        ax_cost.text(0.02, 0.98, f'Final Cost: {final_cost:.4e}', 
+                    transform=ax_cost.transAxes, fontsize=9,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    else:
+        ax_cost.text(0.5, 0.5, 'No convergence data', 
+                    ha='center', va='center', transform=ax_cost.transAxes, fontsize=12)
+        ax_cost.set_title('Cost Convergence', fontsize=11, fontweight='bold')
+    
+    # Second row: position states
+    # 3. Position vs time
+    ax2 = fig.add_subplot(gs[1, 0])
     ax2.plot(time_states, positions[:, 0], 'r-', label='x', linewidth=2)
     ax2.plot(time_states, positions[:, 1], 'g-', label='y', linewidth=2)
     ax2.plot(time_states, positions[:, 2], 'b-', label='z', linewidth=2)
     if x_goal is not None:
-        ax2.axhline(y=x_goal[0], color='r', linestyle='--', alpha=0.5, label='目标 x')
-        ax2.axhline(y=x_goal[1], color='g', linestyle='--', alpha=0.5, label='目标 y')
-        ax2.axhline(y=x_goal[2], color='b', linestyle='--', alpha=0.5, label='目标 z')
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Position (m)')
-    ax2.set_title('Position vs Time')
-    ax2.legend()
+        ax2.axhline(y=x_goal[0], color='r', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax2.axhline(y=x_goal[1], color='g', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax2.axhline(y=x_goal[2], color='b', linestyle='--', alpha=0.5, linewidth=1.5)
+    ax2.set_xlabel('Time (s)', fontsize=9)
+    ax2.set_ylabel('Position (m)', fontsize=9)
+    ax2.set_title('Position', fontsize=10, fontweight='bold')
+    ax2.legend(fontsize=8, loc='best')
     ax2.grid(True, alpha=0.3)
     
-    # 3. 速度
-    ax3 = plt.subplot(3, 4, 3)
+    # 4. Velocity
+    ax3 = fig.add_subplot(gs[1, 1])
     ax3.plot(time_states, velocities[:, 0], 'r-', label='vx', linewidth=2)
     ax3.plot(time_states, velocities[:, 1], 'g-', label='vy', linewidth=2)
     ax3.plot(time_states, velocities[:, 2], 'b-', label='vz', linewidth=2)
     if x_goal is not None and len(x_goal) > 3:
-        ax3.axhline(y=x_goal[3], color='r', linestyle='--', alpha=0.5)
-        ax3.axhline(y=x_goal[4], color='g', linestyle='--', alpha=0.5)
-        ax3.axhline(y=x_goal[5], color='b', linestyle='--', alpha=0.5)
-    ax3.set_xlabel('Time (s)')
-    ax3.set_ylabel('Velocity (m/s)')
-    ax3.set_title('Linear Velocity')
-    ax3.legend()
+        ax3.axhline(y=x_goal[3], color='r', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax3.axhline(y=x_goal[4], color='g', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax3.axhline(y=x_goal[5], color='b', linestyle='--', alpha=0.5, linewidth=1.5)
+    ax3.set_xlabel('Time (s)', fontsize=9)
+    ax3.set_ylabel('Velocity (m/s)', fontsize=9)
+    ax3.set_title('Linear Velocity', fontsize=10, fontweight='bold')
+    ax3.legend(fontsize=8, loc='best')
     ax3.grid(True, alpha=0.3)
     
-    # 4. 角速度
-    ax4 = plt.subplot(3, 4, 4)
+    # 5. Angular velocity
+    ax4 = fig.add_subplot(gs[1, 2])
     ax4.plot(time_states, angular_velocities[:, 0], 'r-', label='ωx', linewidth=2)
     ax4.plot(time_states, angular_velocities[:, 1], 'g-', label='ωy', linewidth=2)
     ax4.plot(time_states, angular_velocities[:, 2], 'b-', label='ωz', linewidth=2)
     if x_goal is not None and len(x_goal) > 10:
-        ax4.axhline(y=x_goal[10], color='r', linestyle='--', alpha=0.5)
-        ax4.axhline(y=x_goal[11], color='g', linestyle='--', alpha=0.5)
-        ax4.axhline(y=x_goal[12], color='b', linestyle='--', alpha=0.5)
-    ax4.set_xlabel('Time (s)')
-    ax4.set_ylabel('Angular Velocity (rad/s)')
-    ax4.set_title('Angular Velocity')
-    ax4.legend()
+        ax4.axhline(y=x_goal[10], color='r', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax4.axhline(y=x_goal[11], color='g', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax4.axhline(y=x_goal[12], color='b', linestyle='--', alpha=0.5, linewidth=1.5)
+    ax4.set_xlabel('Time (s)', fontsize=9)
+    ax4.set_ylabel('Angular Vel (rad/s)', fontsize=9)
+    ax4.set_title('Angular Velocity', fontsize=10, fontweight='bold')
+    ax4.legend(fontsize=8, loc='best')
     ax4.grid(True, alpha=0.3)
     
-    # 5. 欧拉角
-    ax5 = plt.subplot(3, 4, 5)
+    # 6. Euler angles
+    ax5 = fig.add_subplot(gs[1, 3])
     ax5.plot(time_states, np.degrees(euler_angles[:, 0]), 'r-', label='Roll', linewidth=2)
     ax5.plot(time_states, np.degrees(euler_angles[:, 1]), 'g-', label='Pitch', linewidth=2)
     ax5.plot(time_states, np.degrees(euler_angles[:, 2]), 'b-', label='Yaw', linewidth=2)
-    ax5.set_xlabel('Time (s)')
-    ax5.set_ylabel('Euler Angles (deg)')
-    ax5.set_title('Attitude (Euler Angles)')
-    ax5.legend()
+    ax5.set_xlabel('Time (s)', fontsize=9)
+    ax5.set_ylabel('Euler Angles (deg)', fontsize=9)
+    ax5.set_title('Attitude (Euler)', fontsize=10, fontweight='bold')
+    ax5.legend(fontsize=8, loc='best')
     ax5.grid(True, alpha=0.3)
     
-    # 6. TVC 角度 - Pitch
-    ax6 = plt.subplot(3, 4, 6)
-    ax6.plot(time_controls, np.degrees(th_p), 'b-', linewidth=2, label='θ_pitch')
-    ax6.set_xlabel('Time (s)')
-    ax6.set_ylabel('Angle (deg)')
-    ax6.set_title('TVC Pitch Angle')
-    ax6.legend()
+    # Third row: control inputs
+    # 7. TVC Pitch angle
+    ax6 = fig.add_subplot(gs[2, 0])
+    ax6.plot(time_controls, np.degrees(th_p), 'b-', linewidth=2, label='θ_pitch', marker='o', markersize=2)
+    ax6.set_xlabel('Time (s)', fontsize=9)
+    ax6.set_ylabel('Angle (deg)', fontsize=9)
+    ax6.set_title('TVC Pitch Angle', fontsize=10, fontweight='bold')
+    ax6.legend(fontsize=8)
     ax6.grid(True, alpha=0.3)
     
-    # 7. TVC 角度 - Roll
-    ax7 = plt.subplot(3, 4, 7)
-    ax7.plot(time_controls, np.degrees(th_r), 'r-', linewidth=2, label='θ_roll')
-    ax7.set_xlabel('Time (s)')
-    ax7.set_ylabel('Angle (deg)')
-    ax7.set_title('TVC Roll Angle')
-    ax7.legend()
+    # 8. TVC Roll angle
+    ax7 = fig.add_subplot(gs[2, 1])
+    ax7.plot(time_controls, np.degrees(th_r), 'r-', linewidth=2, label='θ_roll', marker='o', markersize=2)
+    ax7.set_xlabel('Time (s)', fontsize=9)
+    ax7.set_ylabel('Angle (deg)', fontsize=9)
+    ax7.set_title('TVC Roll Angle', fontsize=10, fontweight='bold')
+    ax7.legend(fontsize=8)
     ax7.grid(True, alpha=0.3)
     
-    # 8. 推力
-    ax8 = plt.subplot(3, 4, 8)
-    ax8.plot(time_controls, T, 'g-', linewidth=2, label='Thrust')
-    ax8.set_xlabel('Time (s)')
-    ax8.set_ylabel('Thrust (N)')
-    ax8.set_title('Thrust')
-    ax8.legend()
+    # 9. Thrust
+    ax8 = fig.add_subplot(gs[2, 2])
+    ax8.plot(time_controls, T, 'g-', linewidth=2, label='Thrust', marker='o', markersize=2)
+    ax8.set_xlabel('Time (s)', fontsize=9)
+    ax8.set_ylabel('Thrust (N)', fontsize=9)
+    ax8.set_title('Thrust', fontsize=10, fontweight='bold')
+    ax8.legend(fontsize=8)
     ax8.grid(True, alpha=0.3)
     
-    # 9. Yaw 扭矩
-    ax9 = plt.subplot(3, 4, 9)
-    ax9.plot(time_controls, tau_yaw, 'm-', linewidth=2, label='τ_yaw')
-    ax9.set_xlabel('Time (s)')
-    ax9.set_ylabel('Torque (N·m)')
-    ax9.set_title('Yaw Torque')
-    ax9.legend()
+    # 10. Yaw torque
+    ax9 = fig.add_subplot(gs[2, 3])
+    ax9.plot(time_controls, tau_yaw, 'm-', linewidth=2, label='τ_yaw', marker='o', markersize=2)
+    ax9.set_xlabel('Time (s)', fontsize=9)
+    ax9.set_ylabel('Torque (N·m)', fontsize=9)
+    ax9.set_title('Yaw Torque', fontsize=10, fontweight='bold')
+    ax9.legend(fontsize=8)
     ax9.grid(True, alpha=0.3)
     
-    # 10. 高度 vs 水平距离
-    ax10 = plt.subplot(3, 4, 10)
+    # Fourth row: auxiliary information
+    # 11. Altitude vs horizontal distance
+    ax10 = fig.add_subplot(gs[3, 0])
     ax10.plot(np.sqrt(positions[:, 0]**2 + positions[:, 1]**2), positions[:, 2], 
-              'b-', linewidth=2, label='轨迹')
-    ax10.scatter(0, positions[0, 2], color='green', s=100, marker='o', label='起点')
+              'b-', linewidth=2, label='Trajectory')
+    ax10.scatter(0, positions[0, 2], color='green', s=80, marker='o', label='Start', zorder=5)
     ax10.scatter(np.sqrt(positions[-1, 0]**2 + positions[-1, 1]**2), positions[-1, 2],
-                color='red', s=100, marker='*', label='终点')
-    if x_goal is not None:
+                color='red', s=80, marker='*', label='End', zorder=5)
+    if waypoints is not None and len(waypoints) > 0:
+        # Plot waypoints
+        for i, wp in enumerate(waypoints):
+            if len(wp) >= 3:
+                h_dist = np.sqrt(wp[0]**2 + wp[1]**2)
+                ax10.scatter(h_dist, wp[2], color='orange', s=100, marker='s', 
+                           label=f'WP {i+1}', linewidths=2, zorder=5)
+    elif x_goal is not None:
         ax10.scatter(np.sqrt(x_goal[0]**2 + x_goal[1]**2), x_goal[2],
-                    color='orange', s=100, marker='x', label='目标', linewidths=3)
-    ax10.set_xlabel('Horizontal Distance (m)')
-    ax10.set_ylabel('Altitude (m)')
-    ax10.set_title('Altitude vs Horizontal Distance')
-    ax10.legend()
+                    color='orange', s=80, marker='x', label='Target', linewidths=2, zorder=5)
+    ax10.set_xlabel('Horizontal Distance (m)', fontsize=9)
+    ax10.set_ylabel('Altitude (m)', fontsize=9)
+    ax10.set_title('Altitude vs Horizontal', fontsize=10, fontweight='bold')
+    ax10.legend(fontsize=8)
     ax10.grid(True, alpha=0.3)
     
-    # 11. 速度大小
-    ax11 = plt.subplot(3, 4, 11)
+    # 12. Speed magnitude
+    ax11 = fig.add_subplot(gs[3, 1])
     speed = np.linalg.norm(velocities, axis=1)
     ax11.plot(time_states, speed, 'purple', linewidth=2, label='Speed')
-    ax11.set_xlabel('Time (s)')
-    ax11.set_ylabel('Speed (m/s)')
-    ax11.set_title('Speed Magnitude')
-    ax11.legend()
+    ax11.set_xlabel('Time (s)', fontsize=9)
+    ax11.set_ylabel('Speed (m/s)', fontsize=9)
+    ax11.set_title('Speed Magnitude', fontsize=10, fontweight='bold')
+    ax11.legend(fontsize=8)
     ax11.grid(True, alpha=0.3)
     
-    # 12. 收敛曲线（如果有 logger）
-    ax12 = plt.subplot(3, 4, 12)
-    if logger is not None and len(logger.costs) > 0:
-        iterations = np.arange(len(logger.costs))
-        ax12.semilogy(iterations, logger.costs, 'b-', linewidth=2, label='Cost')
-        ax12.set_xlabel('Iteration')
-        ax12.set_ylabel('Cost (log scale)')
-        ax12.set_title('Convergence')
-        ax12.legend()
-        ax12.grid(True, alpha=0.3)
-    else:
-        ax12.text(0.5, 0.5, 'No convergence data', 
-                 ha='center', va='center', transform=ax12.transAxes)
-        ax12.set_title('Convergence')
+    # 13. Control inputs summary (all controls in one plot)
+    ax12 = fig.add_subplot(gs[3, 2])
+    ax12_twin = ax12.twinx()
+    ax12.plot(time_controls, np.degrees(th_p), 'b-', linewidth=2, label='θ_pitch (deg)', alpha=0.7)
+    ax12.plot(time_controls, np.degrees(th_r), 'r-', linewidth=2, label='θ_roll (deg)', alpha=0.7)
+    ax12_twin.plot(time_controls, T, 'g-', linewidth=2, label='Thrust (N)', alpha=0.7)
+    ax12_twin.plot(time_controls, tau_yaw, 'm-', linewidth=2, label='τ_yaw (N·m)', alpha=0.7)
+    ax12.set_xlabel('Time (s)', fontsize=9)
+    ax12.set_ylabel('TVC Angles (deg)', fontsize=9, color='black')
+    ax12_twin.set_ylabel('Thrust & Torque', fontsize=9, color='black')
+    ax12.set_title('All Controls', fontsize=10, fontweight='bold')
+    ax12.tick_params(axis='y', labelcolor='black')
+    ax12_twin.tick_params(axis='y', labelcolor='black')
+    # Merge legends
+    lines1, labels1 = ax12.get_legend_handles_labels()
+    lines2, labels2 = ax12_twin.get_legend_handles_labels()
+    ax12.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc='best')
+    ax12.grid(True, alpha=0.3)
     
-    plt.tight_layout()
+    # 14. State summary (position and velocity in one plot)
+    ax13 = fig.add_subplot(gs[3, 3])
+    ax13_twin = ax13.twinx()
+    ax13.plot(time_states, positions[:, 2], 'b-', linewidth=2, label='z (m)', alpha=0.7)
+    ax13_twin.plot(time_states, velocities[:, 2], 'r-', linewidth=2, label='vz (m/s)', alpha=0.7)
+    if x_goal is not None:
+        ax13.axhline(y=x_goal[2], color='b', linestyle='--', alpha=0.5, linewidth=1.5)
+        if len(x_goal) > 5:
+            ax13_twin.axhline(y=x_goal[5], color='r', linestyle='--', alpha=0.5, linewidth=1.5)
+    ax13.set_xlabel('Time (s)', fontsize=9)
+    ax13.set_ylabel('Altitude (m)', fontsize=9, color='b')
+    ax13_twin.set_ylabel('Vertical Vel (m/s)', fontsize=9, color='r')
+    ax13.set_title('Position & Velocity', fontsize=10, fontweight='bold')
+    ax13.tick_params(axis='y', labelcolor='b')
+    ax13_twin.tick_params(axis='y', labelcolor='r')
+    lines1, labels1 = ax13.get_legend_handles_labels()
+    lines2, labels2 = ax13_twin.get_legend_handles_labels()
+    ax13.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc='best')
+    ax13.grid(True, alpha=0.3)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
     return fig
 
 if __name__ == "__main__":
-    # 可以调整参数来平衡速度和精度
-    # N 越小速度越快，但轨迹精度可能降低
-    # 建议从 N=50 开始测试，然后根据需要增加
+    # Can adjust parameters to balance speed and accuracy
+    # Smaller N is faster, but trajectory accuracy may decrease
+    # Recommend starting with N=50 for testing, then increase as needed
     xs, us, logger = solve_once(dt=0.02, N=100, max_iter=100)
     print("\n" + "="*50)
     print("Solved. N =", len(us))
     print("x0 =", xs[0])
     print("xN =", xs[-1])
     
-    # 绘制结果
-    print("\n正在绘制轨迹图...")
-    x_goal = np.array([0., 0., 10.])  # 目标位置
+    # Plot results
+    print("\nPlotting trajectory...")
+    x_goal = np.array([0., 0., 10.])  # Target position
     fig = plot_trajectory(xs, us, dt=0.02, logger=logger, x_goal=x_goal)
     plt.show()
