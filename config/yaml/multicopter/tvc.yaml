@@ -1,0 +1,37 @@
+platform:
+    # TVC (Thrust Vector Control) Rocket Configuration
+    # Extracted from SDF model: models/tvc/model.sdf
+    
+    # Thrust parameters (from motor plugin)
+    motorConstant: 0.0000048449  # Motor constant from SDF
+    maxRotVelocity: 1400  # Maximum rotor velocity (rad/s)
+    minRotVelocity: 100   # Minimum rotor velocity (rad/s)
+    
+    # Thrust coefficient (estimated from motor constant)
+    # Thrust = motorConstant * omega^2
+    # At max velocity: max_thrust = motorConstant * maxRotVelocity^2
+    cf: 0.0000048449  # Thrust coefficient (same as motorConstant)
+    cm: 0.1  # Moment constant (from SDF plugin)
+    
+    # Thrust limits (calculated from motor parameters)
+    max_thrust: 9.5  # N (estimated: motorConstant * maxRotVelocity^2)
+    min_thrust: 0.05  # N (estimated: motorConstant * minRotVelocity^2)
+    
+    # Base link name
+    base_link_name: "base_link"
+    
+    # Number of thrusters (TVC has one main thruster with vector control)
+    n_rotors: 1
+    
+    # Thruster configuration
+    # TVC has one thruster at the bottom, position relative to base_link
+    # From SDF: motor_housing is at z=0.1675 relative to base_link (which is at z=0.7725)
+    # So thruster is at z = 0.1675 - 0.7725 = -0.605 relative to base_link center
+    $rotors:
+        - translation: [0, 0, -0.605]  # Position relative to base_link center
+          orientation: [0, 0, 0, 1]  # x, y, z, w (quaternion)
+          spin_direction: [1]  # Direction (not critical for single thruster)
+    
+    # Servo limits (from SDF joint limits)
+    servo_roll_limit: 1.0   # rad (from SDF: -1 to 1)
+    servo_pitch_limit: 1.0  # rad (from SDF: -1 to 1)

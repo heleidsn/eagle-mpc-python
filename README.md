@@ -43,7 +43,7 @@ conda activate eagle_mpc
 conda install pinocchio -c conda-forge
 conda install crocoddyl -c conda-forge
 # Install other dependencies
-pip install numpy matplotlib pyyaml
+pip install numpy matplotlib pyyaml pyqt5
 ```
 
 #### Windows
