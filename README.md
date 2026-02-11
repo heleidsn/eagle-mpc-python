@@ -1,19 +1,20 @@
-# Eagle MPC Python - S500 Quadrotor Trajectory Planning
+# Eagle MPC Python - S500 Quadrotor & UAM Trajectory Planning
 
-S500 quadrotor trajectory optimization project using Crocoddyl and Pinocchio.
+S500 quadrotor and S500 UAM (UAV with Arm) trajectory optimization project using Crocoddyl and Pinocchio.
 
 ## 📋 Project Overview
 
-This project implements trajectory planning for the S500 quadrotor using the Crocoddyl optimal control library and Pinocchio robotics dynamics library. It supports generating optimized trajectories by defining waypoints and includes comprehensive visualization capabilities.
+This project implements trajectory planning for the S500 quadrotor and S500 UAM (UAV with Arm) using the Crocoddyl optimal control library and Pinocchio robotics dynamics library. It supports generating optimized trajectories by defining waypoints and includes comprehensive visualization and a GUI interface.
 
 ## ✨ Key Features
 
-- **Trajectory Optimization**: Uses Crocoddyl's DDP algorithm for trajectory optimization
-- **Multicopter Model**: Supports complete dynamics model for S500 quadrotor
-- **Waypoint Planning**: Supports custom waypoint sequences for trajectory planning
-- **Thrust Constraints**: Automatically applies thrust upper and lower bounds for thrusters
-- **Visualization**: Complete state trajectory and control input visualization
-- **Multiple Trajectory Types**: Supports square trajectories, figure-eight trajectories, and other predefined trajectories
+- **Trajectory Optimization**: Crocoddyl DDP algorithm for trajectory optimization
+- **S500 Quadrotor**: Full S500 quadrotor dynamics model
+- **S500 UAM**: Quadrotor + 2-DOF arm with end-effector grasp constraints
+- **Task Types**: Point-to-Point (start→target), Grasp (start→grasp point→target)
+- **Thrust Constraints**: Automatic thrust upper and lower bounds
+- **Visualization**: State trajectories, control inputs, 3D trajectory, cost convergence
+- **GUI**: PyQt5 graphical interface with parameter tuning, save/load, interactive plots
 
 ## 🛠️ Requirements
 
@@ -42,7 +43,7 @@ conda activate eagle_mpc
 # Install crocoddyl and pinocchio
 conda install pinocchio -c conda-forge
 conda install crocoddyl -c conda-forge
-# Install other dependencies
+# Other dependencies (PyQt5 required for GUI)
 pip install numpy matplotlib pyyaml pyqt5
 ```
 
@@ -99,127 +100,136 @@ eagle-mpc-python/
 ├── config/
 │   └── yaml/
 │       ├── multicopter/
-│       │   └── s500.yaml          # S500 quadrotor configuration
-│       ├── mpc/                   # MPC configuration files
-│       └── trajectories/          # Trajectory configuration files
+│       │   └── s500.yaml              # S500 quadrotor configuration
+│       ├── mpc/                       # MPC configuration
+│       └── trajectories/             # Trajectory params (s500_uam_trajectory_params.json)
 ├── models/
 │   ├── urdf/
-│   │   └── s500_simple.urdf      # S500 URDF model
-│   └── sdf/                      # SDF model files
+│   │   ├── s500_simple.urdf           # S500 quadrotor URDF
+│   │   └── s500_uam_simple.urdf       # S500 UAM (quadrotor + arm) URDF
+│   └── sdf/                          # SDF models
 ├── scripts/
-│   ├── s500_trajectory_planner.py    # Main trajectory planning class
-│   ├── example_s500_trajectory.py    # Usage examples
-│   └── crocoddyl_quad_trajectory_opt.py  # Crocoddyl examples
-└── results/                      # Optimization results output directory
+│   ├── s500_trajectory_planner.py     # S500 quadrotor trajectory planner
+│   ├── example_s500_trajectory.py     # S500 examples
+│   ├── s500_uam_trajectory_planner.py # S500 UAM trajectory planner
+│   ├── s500_uam_trajectory_gui.py     # S500 UAM GUI
+│   ├── example_s500_uam_trajectory.py # S500 UAM examples
+│   └── crocoddyl_quad_trajectory_opt.py
+└── results/                          # Optimization results output
 ```
 
 ## 🚀 Quick Start
 
-### 1. Basic Usage
+### 1. S500 UAM GUI (Recommended)
 
-Use the `S500TrajectoryPlanner` class for trajectory planning:
-
-```python
-from s500_trajectory_planner import S500TrajectoryPlanner
-import numpy as np
-
-# Create planner
-planner = S500TrajectoryPlanner()
-
-# Define waypoints
-waypoints = [
-    np.array([0.0, 0.0, 0.0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]),  # Start point
-    np.array([0.0, 0.0, 1.0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]),  # Ascend
-    np.array([2.0, 0.0, 1.0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]),  # Forward
-]
-
-# Define duration for each segment
-durations = [2.0, 3.0]
-
-# Create optimization problem
-planner.create_trajectory_problem(waypoints, durations, dt=0.01)
-
-# Solve
-converged = planner.solve_trajectory(max_iter=100)
-
-# Visualize
-if converged:
-    planner.plot_trajectory()
+```bash
+python scripts/s500_uam_trajectory_gui.py
 ```
 
-### 2. Run Example Scripts
+- **Task types**: Point-to-Point (start→target), Grasp (start→grasp point→target)
+- **Waypoints**: Row 1 — Start x,y,z, Start j1,j2 (°); Row 2 — Target x,y,z, Target j1,j2 (°); Row 3 — Duration
+- **Cost parameters**: State weight, Control weight, EE position weight
+- **Visualization**: Trajectory tab (main plot), 3D Trajectory tab (3D plot)
+- **Params save/load**: Fixed path `config/yaml/trajectories/s500_uam_trajectory_params.json`
 
-#### Interactive Trajectory Planning Example
+### 2. S500 UAM Command-Line Example
+
+```bash
+python scripts/example_s500_uam_trajectory.py
+```
+
+Supports `grasp`, `catch`, and `simple` trajectory types.
+
+### 3. S500 Quadrotor Example
 
 ```bash
 python scripts/example_s500_trajectory.py
 ```
 
-This script provides two predefined trajectories:
+Provides Square, Figure-Eight, and other predefined trajectories.
 
-1. **Square Trajectory**: Square flight pattern at specified altitude
-2. **Figure-Eight Trajectory**: Classic figure-eight flight pattern
+### 4. S500 Quadrotor Basic Usage
 
-#### Command Line Arguments
+```python
+from s500_trajectory_planner import S500TrajectoryPlanner
+import numpy as np
+
+planner = S500TrajectoryPlanner()
+waypoints = [
+    np.array([0.0, 0.0, 0.0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
+    np.array([0.0, 0.0, 1.0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
+    np.array([2.0, 0.0, 1.0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
+]
+durations = [2.0, 3.0]
+planner.create_trajectory_problem(waypoints, durations, dt=0.01)
+converged = planner.solve_trajectory(max_iter=100)
+if converged:
+    planner.plot_trajectory()
+```
+
+### 5. S500 UAM Command-Line Arguments
 
 ```bash
-python scripts/s500_trajectory_planner.py \
-    --s500-yaml config/yaml/multicopter/s500.yaml \
-    --urdf models/urdf/s500_simple.urdf \
-    --max-iter 100 \
-    --dt 0.01 \
-    --save-dir results/my_trajectory
+python scripts/s500_uam_trajectory_planner.py --simple --max-iter 150 --dt 0.02
 ```
 
 ## 📊 State Vector Format
 
-The state vector is 13-dimensional with the following format:
+### S500 Quadrotor (13-D)
 
 ```python
 state = [
     x, y, z,              # Position (m)
-    qx, qy, qz, qw,      # Quaternion orientation
-    vx, vy, vz,          # Linear velocity (m/s)
-    wx, wy, wz           # Angular velocity (rad/s)
+    qx, qy, qz, qw,       # Quaternion orientation
+    vx, vy, vz,           # Linear velocity (m/s)
+    wx, wy, wz            # Angular velocity (rad/s)
 ]
 ```
 
+### S500 UAM (17-D)
+
+```python
+state = [
+    x, y, z,              # Base position (m)
+    qx, qy, qz, qw,       # Base quaternion orientation
+    j1, j2,               # Arm joint angles (rad)
+    vx, vy, vz,           # Base linear velocity (m/s)
+    wx, wy, wz,           # Base angular velocity (rad/s)
+    j1_dot, j2_dot        # Arm joint angular velocity (rad/s)
+]
+```
+
+Control: `[thrust_1..4, torque_j1, torque_j2]` (4 thrusters + 2 joint torques)
+
 ## 🎯 Features
 
-### S500TrajectoryPlanner Class
+### S500TrajectoryPlanner (Quadrotor)
 
-Main methods:
-
-- `__init__(s500_yaml_path, urdf_path)`: Initialize planner
 - `create_trajectory_problem(waypoints, durations, dt, ...)`: Create trajectory optimization problem
-- `solve_trajectory(max_iter, verbose)`: Solve trajectory optimization
-- `plot_trajectory(save_path, show_waypoints)`: Plot trajectory results
+- `solve_trajectory(max_iter, verbose)`: Solve optimization
+- `plot_trajectory(save_path, show_waypoints)`: Plot results
 - `save_trajectory(save_path)`: Save trajectory data
+
+### S500UAMTrajectoryPlanner (Quadrotor + Arm)
+
+- `create_trajectory_problem_simple(start_state, target_state, duration, ...)`: Simple mode (start→target)
+- `create_trajectory_problem(start_state, grasp_position, target_state, durations, ...)`: Grasp mode (start→grasp→target)
+- `get_plot_figure()`, `get_3d_plot_figure()`: Main and 3D figures for GUI embedding
 
 ### Key Parameters
 
-- `waypoint_multiplier`: Waypoint weight enhancement multiplier (default 1000.0)
-- `use_thrust_constraints`: Enable thrust constraints (default True)
-- `dt`: Time step (default 0.01s)
-- `max_iter`: Maximum iterations (default 100)
+- `waypoint_multiplier`: Waypoint weight multiplier (default 1000.0)
+- `state_weight`, `control_weight`: State/control cost weights
+- `grasp_ee_weight`: End-effector position weight in Grasp mode
+- `dt`: Time step (default 0.02s)
 
 ## 📈 Output Results
 
-After optimization, the following files are generated:
+After optimization:
 
-1. **Visualization Plots** (`*.png`): Complete plots of all states and controls
-
-   - Position, velocity, angular velocity trajectories
-   - Orientation quaternion
-   - Control inputs (thruster thrusts)
-   - 3D trajectory plot
-   - Cost convergence curve
-2. **Data Files** (`*.npz`): Trajectory data in NumPy format
-
-   - `states`: State trajectory
-   - `controls`: Control input trajectory
-   - `cost`: Final cost
-   - `iterations`: Number of iterations
+1. **Main plot**: Base position, Base orientation (Euler), Joint angles (°), velocities, Base control, Arm control, Cost convergence
+2. **3D plot**: Base and EE trajectories with equal axis scaling
+3. **Data file** (`*.npz`): states, controls, ee_positions, cost, iterations
 
 ## 🔧 Configuration
 
@@ -243,34 +253,20 @@ Contains robot physical parameters:
 
 ## 📝 Example Code
 
-### Create Custom Trajectory
+### S500 UAM Simple Trajectory
 
 ```python
-from s500_trajectory_planner import S500TrajectoryPlanner
-import numpy as np
+from s500_uam_trajectory_planner import S500UAMTrajectoryPlanner, make_uam_state
 
-planner = S500TrajectoryPlanner()
+planner = S500UAMTrajectoryPlanner()
+start = make_uam_state(0, 0, 1.0, j1=-1.2, j2=-0.6)   # x,y,z, joint angles (rad)
+target = make_uam_state(1.0, 0.5, 2.0, j1=-0.8, j2=-0.3)
 
-# Define waypoints
-waypoints = []
-durations = []
-
-# Start point
-start = np.zeros(13)
-start[6] = 1.0  # qw = 1
-waypoints.append(start)
-
-# Add more waypoints...
-# waypoints.append(...)
-# durations.append(...)
-
-# Create and solve
-planner.create_trajectory_problem(waypoints, durations, dt=0.01)
-converged = planner.solve_trajectory(max_iter=100)
-
-if converged:
-    planner.plot_trajectory()
-    planner.save_trajectory('my_trajectory.npz')
+planner.create_trajectory_problem_simple(
+    start_state=start, target_state=target, duration=5.0, dt=0.02
+)
+converged = planner.solve_trajectory(max_iter=200)
+planner.plot_trajectory(save_path='results/uam_traj.png')
 ```
 
 ## 🐛 Troubleshooting
@@ -296,10 +292,21 @@ Lei He
 
 ## 📅 Changelog
 
+- **2026-02-11**: S500 UAM support
+  - S500 UAM trajectory planning (quadrotor + 2-DOF arm)
+  - PyQt5 GUI: task selection, waypoints, cost parameters, tabbed plots (Trajectory + 3D)
+  - Point-to-Point and Grasp task modes
+  - Waypoint layout: Start/Target (x,y,z, j1,j2 in degrees), Duration
+  - Fixed parameter save/load path
 - **2026-01-15**: Initial version
   - Basic trajectory planning functionality
   - Adapted to new Crocoddyl API (ActuationModelFloatingBaseThrusters)
   - Added comprehensive visualization features
+
+## TODO
+
+- Add grasp support
+- Add constrains support
 
 ## 📄 License
 
