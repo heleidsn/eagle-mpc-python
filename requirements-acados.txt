@@ -1,0 +1,15 @@
+# Optional: for s500_uam_acados_trajectory.py
+# acados must be built from source: https://docs.acados.org/installation/
+# pip install -e <acados_root>/interfaces/acados_template
+
+# Core (already in main deps)
+numpy>=1.15
+pyyaml
+matplotlib
+
+# For acados model (dynamics from URDF)
+pinocchio  # conda install pinocchio -c conda-forge
+casadi     # conda install casadi -c conda-forge
+
+# Alternative: urdf2casadi for FK (optional, not required)
+# pip install urdf2casadi

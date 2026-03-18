@@ -111,8 +111,10 @@ eagle-mpc-python/
 ├── scripts/
 │   ├── s500_trajectory_planner.py     # S500 quadrotor trajectory planner
 │   ├── example_s500_trajectory.py     # S500 examples
-│   ├── s500_uam_trajectory_planner.py # S500 UAM trajectory planner
+│   ├── s500_uam_trajectory_planner.py # S500 UAM trajectory planner (crocoddyl)
 │   ├── s500_uam_trajectory_gui.py     # S500 UAM GUI
+│   ├── s500_uam_acados_trajectory.py  # S500 UAM acados (state constraints)
+│   ├── s500_uam_acados_model.py       # Dynamics from URDF (Pinocchio+CasADi)
 │   ├── example_s500_uam_trajectory.py # S500 UAM examples
 │   └── crocoddyl_quad_trajectory_opt.py
 └── results/                          # Optimization results output
@@ -172,6 +174,16 @@ if converged:
 ```bash
 python scripts/s500_uam_trajectory_planner.py --simple --max-iter 150 --dt 0.02
 ```
+
+### 6. S500 UAM with acados (State Constraints)
+
+acados handles state constraints (joint limits, velocity bounds) natively:
+
+```bash
+python scripts/s500_uam_acados_trajectory.py --simple --duration 5 --N 50 --save results/uam_acados.png
+```
+
+**Requirements**: acados (build from source), pinocchio, casadi. Dynamics are derived from URDF via Pinocchio+CasADi (no hand-written dynamics). See [acados installation](https://docs.acados.org/installation/).
 
 ## 📊 State Vector Format
 

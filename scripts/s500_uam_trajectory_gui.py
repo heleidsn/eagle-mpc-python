@@ -247,9 +247,10 @@ class S500UAMTrajectoryGUI(QMainWindow):
         Row 3: Duration
         """
         self.wp_inputs = {}
-        # Row 1: Start x, y, z, Start j1, j2 (key 必须与 get_params 中的 get_float 一致)
+        # Row 1: Start x, y, z, Start yaw (°), Start j1, j2 (key 必须与 get_params 中的 get_float 一致)
         row1 = [
             ("Start x", "0", "start_x"), ("Start y", "0", "start_y"), ("Start z", "1.0", "start_z"),
+            ("Start yaw (°)", "0", "start_yaw"),
             ("Start j1 (°)", "-68.8", "start_j1"), ("Start j2 (°)", "-34.4", "start_j2")
         ]
         for col, (label, def_val, key) in enumerate(row1):
@@ -258,9 +259,10 @@ class S500UAMTrajectoryGUI(QMainWindow):
             le.setText(def_val)
             self.waypoint_layout.addWidget(le, 0, col * 2 + 1)
             self.wp_inputs[key] = le
-        # Row 2: Target x, y, z, Target j1, j2
+        # Row 2: Target x, y, z, Target yaw (°), Target j1, j2
         row2 = [
             ("Target x", "1.0", "target_x"), ("Target y", "0.5", "target_y"), ("Target z", "1.2", "target_z"),
+            ("Target yaw (°)", "45", "target_yaw"),
             ("Target j1 (°)", "-45.8", "target_j1"), ("Target j2 (°)", "-17.2", "target_j2")
         ]
         for col, (label, def_val, key) in enumerate(row2):
@@ -306,11 +308,13 @@ class S500UAMTrajectoryGUI(QMainWindow):
             "start_x": self.get_float("start_x", 0),
             "start_y": self.get_float("start_y", 0),
             "start_z": self.get_float("start_z", 1),
+            "start_yaw": self.get_float("start_yaw", 0),
             "start_j1": self.get_float("start_j1", -68.8),
             "start_j2": self.get_float("start_j2", -34.4),
             "target_x": self.get_float("target_x", 1),
             "target_y": self.get_float("target_y", 0.5),
             "target_z": self.get_float("target_z", 1.2),
+            "target_yaw": self.get_float("target_yaw", 45),
             "target_j1": self.get_float("target_j1", -45.8),
             "target_j2": self.get_float("target_j2", -17.2),
             "grasp_x": self.get_float("grasp_x", 0.5),
@@ -330,8 +334,8 @@ class S500UAMTrajectoryGUI(QMainWindow):
     def set_params_from_dict(self, d):
         """Load params from dict into GUI."""
         self.task_combo.setCurrentIndex(d.get("task_type", 0))
-        for key in ["start_x", "start_y", "start_z", "start_j1", "start_j2",
-                    "target_x", "target_y", "target_z", "target_j1", "target_j2",
+        for key in ["start_x", "start_y", "start_z", "start_yaw", "start_j1", "start_j2",
+                    "target_x", "target_y", "target_z", "target_yaw", "target_j1", "target_j2",
                     "grasp_x", "grasp_y", "grasp_z",
                     "duration", "duration_to_grasp", "duration_to_target"]:
             if key in d and key in self.wp_inputs:
@@ -358,11 +362,13 @@ class S500UAMTrajectoryGUI(QMainWindow):
         params = {
             "start_state": make_uam_state(
                 self.get_float("start_x", 0), self.get_float("start_y", 0), self.get_float("start_z", 1),
-                self.get_float("start_j1", -68.8) * deg2rad, self.get_float("start_j2", -34.4) * deg2rad
+                self.get_float("start_j1", -68.8) * deg2rad, self.get_float("start_j2", -34.4) * deg2rad,
+                self.get_float("start_yaw", 0) * deg2rad
             ),
             "target_state": make_uam_state(
                 self.get_float("target_x", 1), self.get_float("target_y", 0.5), self.get_float("target_z", 1.2),
-                self.get_float("target_j1", -45.8) * deg2rad, self.get_float("target_j2", -17.2) * deg2rad
+                self.get_float("target_j1", -45.8) * deg2rad, self.get_float("target_j2", -17.2) * deg2rad,
+                self.get_float("target_yaw", 45) * deg2rad
             ),
             "grasp_position": np.array([
                 self.get_float("grasp_x", 0.5), self.get_float("grasp_y", 0), self.get_float("grasp_z", 0.7)

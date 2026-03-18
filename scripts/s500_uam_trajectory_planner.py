@@ -686,11 +686,15 @@ class S500UAMTrajectoryPlanner:
         print(f"✓ Data saved: {save_path}")
 
 
-def make_uam_state(x, y, z, j1=0, j2=0):
-    """Full state: [x,y,z, qx,qy,qz,qw, j1,j2, vx,vy,vz, wx,wy,wz, j1_dot,j2_dot]"""
+def make_uam_state(x, y, z, j1=0, j2=0, yaw=0):
+    """Full state: [x,y,z, qx,qy,qz,qw, j1,j2, vx,vy,vz, wx,wy,wz, j1_dot,j2_dot].
+    yaw: rotation around world z-axis (rad). For yaw-only: q = [0, 0, sin(yaw/2), cos(yaw/2)]."""
     s = np.zeros(17)
     s[0], s[1], s[2] = x, y, z
-    s[6] = 1.0  # qw
+    half = yaw / 2
+    s[3], s[4] = 0.0, 0.0
+    s[5] = np.sin(half)
+    s[6] = np.cos(half)
     s[7], s[8] = j1, j2
     return s
 

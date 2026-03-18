@@ -36,6 +36,9 @@ ENV/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# acados generated code
+c_generated_code/
+
 # Results and outputs
 results/*.png
 results/*.npz
@@ -53,3 +56,4 @@ Thumbs.db
 *.bak
 
 results/
+s500_uam_ocp.json
