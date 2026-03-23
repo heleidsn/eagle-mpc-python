@@ -40,7 +40,7 @@ except ImportError as e:
     MODEL_AVAILABLE = False
     _model_err = e
 
-from s500_uam_trajectory_planner import make_uam_state
+from s500_uam_trajectory_planner import make_uam_state, compute_ee_kinematics_along_trajectory
 
 
 def _quat_to_euler_zyx(quat):
@@ -87,9 +87,16 @@ def create_simple_ocp(
     target_state: np.ndarray,
     duration: float = 5.0,
     dt: float = 0.02,
+    state_weight: float = 1.0,
+    control_weight: float = 1e-5,
+    waypoint_multiplier: float = 1000.0,
+    is_waypoint: bool = False,
+    max_iter: int = 200,
 ) -> "AcadosOcpSolver":
     """Create acados OCP for start -> target trajectory.
     N is computed from duration and dt: N = max(1, int(duration / dt)).
+    state_weight, control_weight, waypoint_multiplier: from GUI, same semantics as Crocoddyl.
+    is_waypoint: if True, scale terminal cost by waypoint_multiplier (for segment ends).
     """
     if not ACADOS_AVAILABLE:
         raise ImportError("acados_template not installed. See https://docs.acados.org/installation/")
@@ -108,7 +115,7 @@ def create_simple_ocp(
 
     ocp.dims.N = N
     ocp.solver_options.tf = duration
-    ocp.solver_options.nlp_solver_max_iter = 200
+    ocp.solver_options.nlp_solver_max_iter = max_iter
     if hasattr(ocp.solver_options, 'N_horizon'):
         ocp.solver_options.N_horizon = N
 
@@ -127,20 +134,23 @@ def create_simple_ocp(
     yref = np.concatenate([_state_to_cost_ref(target_state), np.zeros(nu)])
     yref_e = _state_to_cost_ref(target_state)
 
-    # Weights: pos(100), yaw(50), roll/pitch(10), jq(50), v_lin(1), omega(1), j_dot(10), u
-    w_pos = 100.0
-    w_yaw = 50.0
-    w_rp = 10.0
-    w_jq = 50.0
-    w_v = 1.0
-    w_omega = 1.0
-    w_jdot = 10.0
+    # Base weight ratios (same relative importance); scaled by state_weight from GUI
+    w_pos = 100.0 * state_weight
+    w_yaw = 50.0 * state_weight
+    w_rp = 10.0 * state_weight
+    w_jq = 50.0 * state_weight
+    w_v = 1.0 * state_weight
+    w_omega = 1.0 * state_weight
+    w_jdot = 10.0 * state_weight
     W_state = np.diag([
         w_pos, w_pos, w_pos, w_yaw, w_rp, w_rp,
         w_jq, w_jq,
         w_v, w_v, w_v, w_omega, w_omega, w_omega, w_jdot, w_jdot
     ])
-    R = np.diag([1e-5] * 4 + [1e-3] * 2)
+    # Control: R = control_weight * [1,1,1,1, 100,100] to keep thrust:torque ratio
+    r_thrust = control_weight
+    r_torque = control_weight * 100.0
+    R = np.diag([r_thrust] * 4 + [r_torque] * 2)
     ocp.cost.cost_type = 'NONLINEAR_LS'
     ocp.model.cost_y_expr = cost_y
     ocp.cost.yref = yref
@@ -149,7 +159,9 @@ def create_simple_ocp(
     ocp.cost.cost_type_e = 'NONLINEAR_LS'
     ocp.cost.yref_e = yref_e
     ocp.model.cost_y_expr_e = cost_y_e
-    ocp.cost.W_e = W_state
+    # Terminal weight: scale by waypoint_multiplier when segment end is a waypoint
+    terminal_scale = waypoint_multiplier if is_waypoint else 1.0
+    ocp.cost.W_e = W_state * terminal_scale
 
     # Control constraints
     cfg = load_s500_config()
@@ -209,16 +221,28 @@ def run_simple_trajectory(
     target_state: np.ndarray = None,
     duration: float = 5.0,
     dt: float = 0.02,
+    state_weight: float = 1.0,
+    control_weight: float = 1e-5,
+    waypoint_multiplier: float = 1000.0,
+    max_iter: int = 200,
 ):
     """Run simple start->target trajectory optimization.
     N = duration / dt (auto-computed).
+    state_weight, control_weight, waypoint_multiplier: from GUI.
     """
     if start_state is None:
         start_state = make_uam_state(0, 0, 1.0, j1=-1.2, j2=-0.6, yaw=0)
     if target_state is None:
         target_state = make_uam_state(1.0, 0.5, 1.2, j1=-0.8, j2=-0.3, yaw=np.pi / 4)
 
-    solver = create_simple_ocp(start_state, target_state, duration, dt)
+    solver = create_simple_ocp(
+        start_state, target_state, duration, dt,
+        state_weight=state_weight,
+        control_weight=control_weight,
+        waypoint_multiplier=waypoint_multiplier,
+        is_waypoint=True,
+        max_iter=max_iter,
+    )
     t0 = time.perf_counter()
     status = solver.solve()
     t_wall = time.perf_counter() - t0
@@ -236,7 +260,7 @@ def run_simple_trajectory(
 
     if status != 0:
         print(f"acados solver returned status {status}")
-        return None, None, None, None
+        return None, None, None, None, None
 
     N = max(1, int(round(duration / dt)))
     nx = len(start_state)
@@ -250,7 +274,326 @@ def run_simple_trajectory(
 
     dt_actual = duration / N
     time_arr = np.linspace(0, duration, N + 1)
-    return simX, simU, time_arr, dt_actual
+    stats = {
+        "n_iter": max(n_iter, 0),
+        "total_s": float(t_wall),
+        "avg_ms_per_iter": float(t_per_iter),
+    }
+    return simX, simU, time_arr, dt_actual, stats
+
+
+def run_multiwaypoint_trajectory(
+    waypoints: list,
+    durations: list,
+    dt: float = 0.02,
+    state_weight: float = 1.0,
+    control_weight: float = 1e-5,
+    waypoint_multiplier: float = 1000.0,
+    max_iter: int = 200,
+):
+    """Run trajectory optimization through multiple waypoints (segment by segment).
+    waypoints: list of 17-dim states
+    durations: list of segment durations (len = len(waypoints) - 1)
+    Returns: (simX, simU, time_arr, dt_actual) or (None, None, None, None) on failure.
+    """
+    if len(waypoints) != len(durations) + 1:
+        raise ValueError("len(waypoints) must equal len(durations) + 1")
+    all_X = []
+    all_U = []
+    all_stats = []
+    x0 = waypoints[0]
+    for i in range(len(durations)):
+        x_target = waypoints[i + 1]
+        result = run_simple_trajectory(
+            x0, x_target, duration=durations[i], dt=dt,
+            state_weight=state_weight,
+            control_weight=control_weight,
+            waypoint_multiplier=waypoint_multiplier,
+            max_iter=max_iter,
+        )
+        if result[0] is None:
+            return None, None, None, None, None
+        simX, simU, time_arr, dt_actual, seg_stats = result
+        if seg_stats:
+            all_stats.append(seg_stats)
+        if i == 0:
+            all_X.append(simX)
+            all_U.append(simU)
+        else:
+            all_X.append(simX[1:])
+            all_U.append(simU)
+        x0 = simX[-1]
+    simX = np.vstack(all_X)
+    simU = np.vstack(all_U)
+    t_total = sum(durations)
+    time_arr = np.linspace(0, t_total, len(simX))
+    n_tot = sum(s["n_iter"] for s in all_stats) if all_stats else 0
+    t_tot = sum(s.get("total_s", 0) for s in all_stats) if all_stats else 0
+    merged_stats = {
+        "n_iter": n_tot,
+        "total_s": t_tot,
+        "avg_ms_per_iter": (t_tot / n_tot * 1000) if n_tot > 0 else 0.0,
+    }
+    return simX, simU, time_arr, dt_actual, merged_stats
+
+
+def _plot_pin_model_for_acados_fig():
+    """Lazy-load Pinocchio model for EE kinematics in plots."""
+    import pinocchio as pin
+    urdf = Path(__file__).parent.parent / "models" / "urdf" / "s500_uam_simple.urdf"
+    model = pin.buildModelFromUrdf(str(urdf), pin.JointModelFreeFlyer())
+    data = model.createData()
+    fid = model.getFrameId("gripper_link")
+    return model, data, fid
+
+
+def plot_acados_into_figure(simX, simU, time_arr, fig, title: str = "S500 UAM Trajectory (acados)", waypoint_times=None,
+                            timing_info=None):
+    """Plot acados trajectory into existing figure (4x4 layout, aligned with Crocoddyl)."""
+    if simX is None or fig is None:
+        return None
+    import matplotlib.pyplot as plt
+    dt = time_arr[1] - time_arr[0] if len(time_arr) > 1 else 0.02
+    time_states = time_arr
+    time_controls = np.linspace(0, time_arr[-1] - dt, len(simU)) if len(simU) == len(time_arr) - 1 else time_arr[:-1]
+    if len(time_controls) != len(simU):
+        time_controls = np.linspace(time_arr[0], time_arr[-1] - dt, len(simU))
+    waypoint_indices = [int(t / dt) for t in (waypoint_times or [])] if waypoint_times else []
+
+    def _quat_to_euler_row(quat):
+        qx, qy, qz, qw = quat[0], quat[1], quat[2], quat[3]
+        roll = np.arctan2(2 * (qw * qx + qy * qz), 1 - 2 * (qx**2 + qy**2))
+        pitch = np.arcsin(np.clip(2 * (qw * qy - qz * qx), -1, 1))
+        yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy**2 + qz**2))
+        return roll, pitch, yaw
+    euler = np.array([_quat_to_euler_row(simX[i, 3:7]) for i in range(len(simX))])
+
+    ee_pos = ee_v = ee_rpy = ee_w = None
+    try:
+        pm, pdata, pfid = _plot_pin_model_for_acados_fig()
+        ee_pos, ee_v, ee_rpy, ee_w = compute_ee_kinematics_along_trajectory(simX, pm, pdata, pfid)
+    except Exception:
+        ee_pos = np.zeros((len(simX), 3))
+        ee_v = ee_rpy = ee_w = ee_pos
+
+    def add_wp_lines(ax):
+        for idx in waypoint_indices:
+            if idx < len(time_states):
+                ax.axvline(x=time_states[idx], color='orange', linestyle='--', alpha=0.5)
+
+    positions = simX[:, :3]
+    fig.clear()
+    gs = fig.add_gridspec(4, 4, hspace=0.42, wspace=0.32, left=0.05, right=0.98, top=0.93, bottom=0.05)
+    tinfo = {'fontsize': 9, 'labelpad': 2}
+
+    # Row 0: Base
+    ax00 = fig.add_subplot(gs[0, 0])
+    ax00.plot(time_states, simX[:, 0], 'r-', label='x')
+    ax00.plot(time_states, simX[:, 1], 'g-', label='y')
+    ax00.plot(time_states, simX[:, 2], 'b-', label='z')
+    add_wp_lines(ax00)
+    ax00.set_xlabel('Time (s)', **tinfo)
+    ax00.set_ylabel('Position (m)', **tinfo)
+    ax00.set_title('Base Position', fontsize=9)
+    ax00.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax01 = fig.add_subplot(gs[0, 1])
+    ax01.plot(time_states, simX[:, 9], 'r-', label='vx')
+    ax01.plot(time_states, simX[:, 10], 'g-', label='vy')
+    ax01.plot(time_states, simX[:, 11], 'b-', label='vz')
+    add_wp_lines(ax01)
+    ax01.set_xlabel('Time (s)', **tinfo)
+    ax01.set_ylabel('Velocity (m/s)', **tinfo)
+    ax01.set_title('Base Linear Velocity', fontsize=9)
+    ax01.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax02 = fig.add_subplot(gs[0, 2])
+    ax02.plot(time_states, np.degrees(euler[:, 0]), 'r-', label='roll')
+    ax02.plot(time_states, np.degrees(euler[:, 1]), 'g-', label='pitch')
+    ax02.plot(time_states, np.degrees(euler[:, 2]), 'b-', label='yaw')
+    add_wp_lines(ax02)
+    ax02.set_xlabel('Time (s)', **tinfo)
+    ax02.set_ylabel('Angle (°)', **tinfo)
+    ax02.set_title('Base Orientation (Euler)', fontsize=9)
+    ax02.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax03 = fig.add_subplot(gs[0, 3])
+    ax03.plot(time_states, simX[:, 12], 'r-', label='ωx')
+    ax03.plot(time_states, simX[:, 13], 'g-', label='ωy')
+    ax03.plot(time_states, simX[:, 14], 'b-', label='ωz')
+    add_wp_lines(ax03)
+    ax03.set_xlabel('Time (s)', **tinfo)
+    ax03.set_ylabel('Angular vel (rad/s)', **tinfo)
+    ax03.set_title('Base Angular Velocity', fontsize=9)
+    ax03.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    # Row 1: EE
+    ax10 = fig.add_subplot(gs[1, 0])
+    ax10.plot(time_states, ee_pos[:, 0], 'r-', label='x')
+    ax10.plot(time_states, ee_pos[:, 1], 'g-', label='y')
+    ax10.plot(time_states, ee_pos[:, 2], 'b-', label='z')
+    add_wp_lines(ax10)
+    ax10.set_xlabel('Time (s)', **tinfo)
+    ax10.set_ylabel('Position (m)', **tinfo)
+    ax10.set_title('EE Position', fontsize=9)
+    ax10.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax11 = fig.add_subplot(gs[1, 1])
+    ax11.plot(time_states, ee_v[:, 0], 'r-', label='vx')
+    ax11.plot(time_states, ee_v[:, 1], 'g-', label='vy')
+    ax11.plot(time_states, ee_v[:, 2], 'b-', label='vz')
+    add_wp_lines(ax11)
+    ax11.set_xlabel('Time (s)', **tinfo)
+    ax11.set_ylabel('Velocity (m/s)', **tinfo)
+    ax11.set_title('EE Linear Velocity', fontsize=9)
+    ax11.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax12 = fig.add_subplot(gs[1, 2])
+    ax12.plot(time_states, np.degrees(ee_rpy[:, 0]), 'r-', label='roll')
+    ax12.plot(time_states, np.degrees(ee_rpy[:, 1]), 'g-', label='pitch')
+    ax12.plot(time_states, np.degrees(ee_rpy[:, 2]), 'b-', label='yaw')
+    add_wp_lines(ax12)
+    ax12.set_xlabel('Time (s)', **tinfo)
+    ax12.set_ylabel('Angle (°)', **tinfo)
+    ax12.set_title('EE Orientation (RPY)', fontsize=9)
+    ax12.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax13 = fig.add_subplot(gs[1, 3])
+    ax13.plot(time_states, ee_w[:, 0], 'r-', label='ωx')
+    ax13.plot(time_states, ee_w[:, 1], 'g-', label='ωy')
+    ax13.plot(time_states, ee_w[:, 2], 'b-', label='ωz')
+    add_wp_lines(ax13)
+    ax13.set_xlabel('Time (s)', **tinfo)
+    ax13.set_ylabel('Angular vel (rad/s)', **tinfo)
+    ax13.set_title('EE Angular Velocity', fontsize=9)
+    ax13.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    # Row 2: Arm & controls
+    ax20 = fig.add_subplot(gs[2, 0])
+    ax20.plot(time_states, np.degrees(simX[:, 7]), 'r-', label='j1')
+    ax20.plot(time_states, np.degrees(simX[:, 8]), 'g-', label='j2')
+    add_wp_lines(ax20)
+    ax20.set_xlabel('Time (s)', **tinfo)
+    ax20.set_ylabel('Angle (°)', **tinfo)
+    ax20.set_title('Arm Joint Angles', fontsize=9)
+    ax20.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax21 = fig.add_subplot(gs[2, 1])
+    ax21.plot(time_states, simX[:, 15], 'r-', label='j1_dot')
+    ax21.plot(time_states, simX[:, 16], 'g-', label='j2_dot')
+    add_wp_lines(ax21)
+    ax21.set_xlabel('Time (s)', **tinfo)
+    ax21.set_ylabel('Angular vel (rad/s)', **tinfo)
+    ax21.set_title('Arm Joint Angular Velocity', fontsize=9)
+    ax21.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    colors = ['r', 'g', 'b', 'orange']
+    ax22 = fig.add_subplot(gs[2, 2])
+    for i in range(min(4, simU.shape[1])):
+        ax22.plot(time_controls, simU[:, i], color=colors[i], label=f'T{i+1}')
+    ax22.set_xlabel('Time (s)', **tinfo)
+    ax22.set_ylabel('Thrust (N)', **tinfo)
+    ax22.set_title('Base Control (Thrusters)', fontsize=9)
+    ax22.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax23 = fig.add_subplot(gs[2, 3])
+    if simU.shape[1] >= 6:
+        ax23.plot(time_controls, simU[:, 4], 'r-', label='τ1')
+        ax23.plot(time_controls, simU[:, 5], 'g-', label='τ2')
+    ax23.set_xlabel('Time (s)', **tinfo)
+    ax23.set_ylabel('Torque (N·m)', **tinfo)
+    ax23.set_title('Arm Control (Joint Torques)', fontsize=9)
+    ax23.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    # Row 3
+    ax30 = fig.add_subplot(gs[3, 0])
+    ax30.plot(positions[:, 0], positions[:, 1], 'b-', linewidth=1.5, label='Base')
+    ax30.plot(ee_pos[:, 0], ee_pos[:, 1], 'm--', linewidth=1.2, label='EE')
+    ax30.plot(positions[0, 0], positions[0, 1], 'go', markersize=6, label='Start')
+    ax30.plot(positions[-1, 0], positions[-1, 1], 'rs', markersize=6, label='End')
+    ax30.set_xlabel('X (m)', **tinfo)
+    ax30.set_ylabel('Y (m)', **tinfo)
+    ax30.set_title('Horizontal trajectory (XY)', fontsize=9)
+    ax30.axis('equal')
+    ax30.grid(True, alpha=0.3)
+    ax30.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax31 = fig.add_subplot(gs[3, 1])
+    ax31.plot(positions[:, 0], positions[:, 2], 'b-', linewidth=1.5, label='Base')
+    ax31.plot(ee_pos[:, 0], ee_pos[:, 2], 'm--', linewidth=1.2, label='EE')
+    ax31.plot(positions[0, 0], positions[0, 2], 'go', markersize=6, label='Start')
+    ax31.plot(positions[-1, 0], positions[-1, 2], 'rs', markersize=6, label='End')
+    ax31.set_xlabel('X (m)', **tinfo)
+    ax31.set_ylabel('Z (m)', **tinfo)
+    ax31.set_title('Vertical profile (XZ)', fontsize=9)
+    ax31.grid(True, alpha=0.3)
+    ax31.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+    ax32 = fig.add_subplot(gs[3, 2])
+    ax32.text(0.5, 0.5, 'Acados: cost in solver log', ha='center', va='center', transform=ax32.transAxes)
+    ax32.set_xlabel('Iteration', **tinfo)
+    ax32.set_ylabel('Cost', **tinfo)
+    ax32.set_title('Cost convergence', fontsize=9)
+    ax32.grid(True, alpha=0.3)
+
+    ax33 = fig.add_subplot(gs[3, 3])
+    ti = timing_info or {}
+    if ti.get('n_iter', 0) and ti.get('n_iter', 0) > 0:
+        n_it = int(ti['n_iter'])
+        avg_ms = float(ti.get('avg_ms_per_iter', 0))
+        iters = np.arange(1, n_it + 1)
+        ax33.plot(iters, np.full(n_it, avg_ms), 'g-', linewidth=2, label=f'Avg {avg_ms:.2f} ms/iter')
+        ax33.fill_between(iters, 0, np.full(n_it, avg_ms), alpha=0.15, color='g')
+        ax33.set_xlabel('Iteration', **tinfo)
+        ax33.set_ylabel('Time per iter (ms)', **tinfo)
+        ax33.set_title('Solver time / iteration', fontsize=9)
+        ax33.legend(loc='upper right', fontsize=7)
+        ax33.grid(True, alpha=0.3)
+    else:
+        ax33.text(0.5, 0.5, 'Timing N/A', ha='center', va='center', transform=ax33.transAxes)
+        ax33.set_title('Solver time / iteration', fontsize=9)
+
+    fig.suptitle(title, fontsize=12, y=0.98)
+    all_axes = fig.get_axes()
+    for ax in all_axes:
+        ax.tick_params(axis='both', labelsize=8)
+    return fig
+
+
+def plot_acados_3d_into_figure(simX, fig, waypoint_positions=None):
+    """Plot acados 3D trajectory into existing figure."""
+    if simX is None or fig is None:
+        return None
+    positions = simX[:, :3]
+    fig.clear()
+    ax = fig.add_subplot(111, projection='3d')
+    fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
+    ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2, label='Base')
+    ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], color='g', s=100, label='Start')
+    ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], color='r', s=100, label='End')
+    if waypoint_positions:
+        for wp in waypoint_positions:
+            ax.scatter(wp[0], wp[1], wp[2], color='orange', s=150, marker='*')
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title('3D Trajectory (acados)')
+    ax.legend(loc='upper right', fontsize=8)
+    all_pts = positions.copy()
+    if waypoint_positions:
+        all_pts = np.vstack([all_pts, np.array(waypoint_positions)])
+    x_min, x_max = all_pts[:, 0].min(), all_pts[:, 0].max()
+    y_min, y_max = all_pts[:, 1].min(), all_pts[:, 1].max()
+    z_min, z_max = all_pts[:, 2].min(), all_pts[:, 2].max()
+    max_range = max(x_max - x_min, y_max - y_min, z_max - z_min) * 0.5
+    if max_range < 0.1:
+        max_range = 0.5
+    x_mid, y_mid, z_mid = (x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2
+    ax.set_xlim(x_mid - max_range, x_mid + max_range)
+    ax.set_ylim(y_mid - max_range, y_mid + max_range)
+    ax.set_zlim(z_mid - max_range, z_mid + max_range)
+    ax.set_box_aspect([1, 1, 1])
+    return fig
 
 
 def plot_results(simX, simU, time_arr, save_path: str = None):
@@ -390,7 +733,7 @@ def main():
     print(f"Duration: {args.duration}s, dt: {args.dt}s, N: {N}")
     print()
 
-    simX, simU, time_arr, dt = run_simple_trajectory(
+    simX, simU, time_arr, dt, _stats = run_simple_trajectory(
         start, target, args.duration, args.dt
     )
 

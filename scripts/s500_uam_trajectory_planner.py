@@ -28,6 +28,34 @@ from typing import Dict, List, Tuple, Optional
 import argparse
 
 
+def compute_ee_kinematics_along_trajectory(
+    states: np.ndarray,
+    robot_model,
+    data,
+    ee_frame_id: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """EE frame in world: position, linear velocity, RPY (rad), angular velocity (world)."""
+    n = len(states)
+    nq = robot_model.nq
+    ee_pos = np.zeros((n, 3))
+    ee_v = np.zeros((n, 3))
+    ee_rpy = np.zeros((n, 3))
+    ee_w = np.zeros((n, 3))
+    rf = pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+    for i, x in enumerate(states):
+        q = np.asarray(x[:nq], dtype=float).flatten()
+        v = np.asarray(x[nq:], dtype=float).flatten()
+        pin.forwardKinematics(robot_model, data, q, v)
+        pin.updateFramePlacements(robot_model, data)
+        oMf = data.oMf[ee_frame_id]
+        ee_pos[i] = oMf.translation
+        ee_rpy[i] = pin.rpy.matrixToRpy(oMf.rotation)
+        vel = pin.getFrameVelocity(robot_model, data, ee_frame_id, rf)
+        ee_v[i] = np.array(vel.linear).flatten()
+        ee_w[i] = np.array(vel.angular).flatten()
+    return ee_pos, ee_v, ee_rpy, ee_w
+
+
 class S500UAMTrajectoryPlanner:
     """S500 UAM (UAV with Arm) Trajectory Planner"""
 
@@ -414,6 +442,91 @@ class S500UAMTrajectoryPlanner:
         self.problem = crocoddyl.ShootingProblem(x0, running_models, terminal_model)
         print(f"✓ Created simple trajectory problem: {len(running_models)} nodes, {duration:.2f}s total")
 
+    def create_trajectory_problem_waypoints(self,
+                                          waypoints: List[np.ndarray],
+                                          durations: List[float],
+                                          dt: float = 0.02,
+                                          waypoint_multiplier: float = 1000.0,
+                                          state_weight: float = 1.0,
+                                          control_weight: float = 1e-5,
+                                          use_thrust_constraints: bool = True) -> None:
+        """
+        Create trajectory optimization problem with multiple waypoints.
+        waypoints: list of full states [x,y,z,qx,qy,qz,qw,j1,j2,vx,vy,vz,wx,wy,wz,j1_dot,j2_dot]
+        durations: duration of each segment (len = len(waypoints) - 1)
+        """
+        if len(waypoints) != len(durations) + 1:
+            raise ValueError("Number of waypoints should be one more than number of durations")
+        self.dt = dt
+        x0 = np.array(waypoints[0], dtype=float).copy()
+        if len(x0) != self.robot_model.nq + self.robot_model.nv:
+            raise ValueError(f"waypoint must have {self.robot_model.nq + self.robot_model.nv} elements")
+
+        self._waypoint_times = [0.0]
+        self._waypoint_positions = [waypoints[0][:3]]
+        self._waypoint_labels = ["Start"] + [f"WP{i+1}" for i in range(len(waypoints) - 2)] + ["Target"]
+
+        running_models = []
+        current_time = 0.0
+
+        for i, duration in enumerate(durations):
+            target_state = waypoints[i + 1]
+            current_time += duration
+            self._waypoint_times.append(current_time)
+            self._waypoint_positions.append(target_state[:3])
+
+            n_steps = max(1, int(duration / dt))
+            waypoint_cost = self.create_cost_model(
+                target_state=target_state,
+                state_weight=state_weight,
+                control_weight=control_weight,
+                is_waypoint=True,
+                waypoint_multiplier=waypoint_multiplier
+            )
+            waypoint_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
+                self.state, self.actuation, waypoint_cost
+            )
+            waypoint_int = crocoddyl.IntegratedActionModelEuler(waypoint_diff, dt)
+            running_models.append(waypoint_int)
+
+            normal_cost = self.create_cost_model(
+                target_state=target_state,
+                state_weight=state_weight,
+                control_weight=control_weight
+            )
+            normal_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
+                self.state, self.actuation, normal_cost
+            )
+            normal_int = crocoddyl.IntegratedActionModelEuler(normal_diff, dt)
+            for _ in range(n_steps - 1):
+                running_models.append(normal_int)
+
+        if use_thrust_constraints:
+            platform = self.s500_config['platform']
+            u_lb = np.array([platform['min_thrust']] * 4 + [-2.0] * 2)
+            u_ub = np.array([platform['max_thrust']] * 4 + [2.0] * 2)
+            for m in running_models:
+                m.u_lb = u_lb
+                m.u_ub = u_ub
+
+        terminal_target = waypoints[-1]
+        terminal_cost = self.create_cost_model(
+            target_state=terminal_target,
+            state_weight=10.0 * state_weight,
+            control_weight=control_weight,
+            is_terminal=True,
+            is_waypoint=True,
+            waypoint_multiplier=waypoint_multiplier
+        )
+        terminal_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
+            self.state, self.actuation, terminal_cost
+        )
+        terminal_model = crocoddyl.IntegratedActionModelEuler(terminal_diff, 0.0)
+
+        self.problem = crocoddyl.ShootingProblem(x0, running_models, terminal_model)
+        total_time = sum(durations)
+        print(f"✓ Created waypoint trajectory: {len(waypoints)} waypoints, {len(running_models)} nodes, {total_time:.2f}s total")
+
     def solve_trajectory(self, max_iter: int = 150, verbose: bool = True) -> bool:
         """Solve trajectory optimization"""
         if self.problem is None:
@@ -471,16 +584,27 @@ class S500UAMTrajectoryPlanner:
         yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
         return np.column_stack([roll, pitch, yaw])
 
-    def _build_plot_figure(self, title: str = "S500 UAM Trajectory", show_waypoints: bool = True, fig=None):
-        """Build main plot figure (no 3D). Row0: base pos, euler, joint angles. Row1: velocities. Row2: controls, cost."""
-        if self.solver is None:
+    def _build_plot_figure(self, title: str = "S500 UAM Trajectory", show_waypoints: bool = True,
+                           fig=None, timing_info: Optional[dict] = None):
+        """4x4 grid: base / EE kinematics, arm & controls, trajectories & solver stats."""
+        cache = getattr(self, '_plot_cache', None)
+        if cache:
+            states = np.array(cache['xs'])
+            controls = np.array(cache['us'])
+            dt = cache.get('dt', 0.02)
+            waypoint_times = cache.get('waypoint_times', [])
+            waypoint_indices = [int(t / dt) for t in waypoint_times] if show_waypoints and waypoint_times else []
+            cost_logger = cache.get('cost_logger')
+        elif self.solver is not None:
+            states = np.array(self.solver.xs)
+            controls = np.array(self.solver.us)
+            dt = self.dt or 0.02
+            waypoint_indices = self._identify_waypoint_indices() if show_waypoints else []
+            cost_logger = getattr(self, '_cost_logger', None)
+        else:
             return None
-        states = np.array(self.solver.xs)
-        controls = np.array(self.solver.us)
-        dt = self.dt or 0.02
         time_states = np.arange(len(states)) * dt
         time_controls = np.arange(len(controls)) * dt
-        waypoint_indices = self._identify_waypoint_indices() if show_waypoints else []
 
         nq, nv = self.robot_model.nq, self.robot_model.nv
         positions = states[:, :3]
@@ -491,6 +615,10 @@ class S500UAMTrajectoryPlanner:
         angular_vel = states[:, nq + 3:nq + 6]
         arm_vel = states[:, nq + 6:nq + 8] if nv >= 8 else np.zeros((len(states), 2))
 
+        ee_pos, ee_v, ee_rpy, ee_w = compute_ee_kinematics_along_trajectory(
+            states, self.robot_model, self.robot_data, self.ee_frame_id
+        )
+
         def add_waypoint_lines(ax):
             if show_waypoints and waypoint_indices:
                 for idx in waypoint_indices:
@@ -498,115 +626,205 @@ class S500UAMTrajectoryPlanner:
                         ax.axvline(x=time_states[idx], color='orange', linestyle='--', alpha=0.5)
 
         if fig is None:
-            fig = plt.figure(figsize=(14, 10))
+            fig = plt.figure(figsize=(20, 16))
         else:
             fig.clear()
         fig.suptitle(title, fontsize=12, y=0.98)
-        # 使用 margins 占满画布，避免重叠
-        gs = fig.add_gridspec(3, 3, hspace=0.45, wspace=0.35,
-                              left=0.06, right=0.98, top=0.92, bottom=0.06)
-
-        # Row 0: Base position, Base orientation (Euler), Joint angles (degrees)
-        ax0 = fig.add_subplot(gs[0, 0])
-        ax0.plot(time_states, positions[:, 0], 'r-', label='x')
-        ax0.plot(time_states, positions[:, 1], 'g-', label='y')
-        ax0.plot(time_states, positions[:, 2], 'b-', label='z')
-        add_waypoint_lines(ax0)
+        gs = fig.add_gridspec(4, 4, hspace=0.42, wspace=0.32,
+                              left=0.05, right=0.98, top=0.93, bottom=0.05)
         tinfo = {'fontsize': 9, 'labelpad': 2}
-        ax0.set_xlabel('Time (s)', **tinfo)
-        ax0.set_ylabel('Position (m)', **tinfo)
-        ax0.set_title('Base Position', fontsize=9)
-        ax0.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-        ax1 = fig.add_subplot(gs[0, 1])
-        ax1.plot(time_states, np.degrees(euler[:, 0]), 'r-', label='roll')
-        ax1.plot(time_states, np.degrees(euler[:, 1]), 'g-', label='pitch')
-        ax1.plot(time_states, np.degrees(euler[:, 2]), 'b-', label='yaw')
-        add_waypoint_lines(ax1)
-        ax1.set_xlabel('Time (s)', **tinfo)
-        ax1.set_ylabel('Angle (°)', **tinfo)
-        ax1.set_title('Base Orientation (Euler)', fontsize=9)
-        ax1.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        # Row 0: Base — position, linear vel, orientation, angular vel
+        ax00 = fig.add_subplot(gs[0, 0])
+        ax00.plot(time_states, positions[:, 0], 'r-', label='x')
+        ax00.plot(time_states, positions[:, 1], 'g-', label='y')
+        ax00.plot(time_states, positions[:, 2], 'b-', label='z')
+        add_waypoint_lines(ax00)
+        ax00.set_xlabel('Time (s)', **tinfo)
+        ax00.set_ylabel('Position (m)', **tinfo)
+        ax00.set_title('Base Position', fontsize=9)
+        ax00.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-        ax2 = fig.add_subplot(gs[0, 2])
-        ax2.plot(time_states, arm_angles_deg[:, 0], 'r-', label='j1')
-        ax2.plot(time_states, arm_angles_deg[:, 1], 'g-', label='j2')
-        add_waypoint_lines(ax2)
-        ax2.set_xlabel('Time (s)', **tinfo)
-        ax2.set_ylabel('Angle (°)', **tinfo)
-        ax2.set_title('Arm Joint Angles', fontsize=9)
-        ax2.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax01 = fig.add_subplot(gs[0, 1])
+        ax01.plot(time_states, velocities[:, 0], 'r-', label='vx')
+        ax01.plot(time_states, velocities[:, 1], 'g-', label='vy')
+        ax01.plot(time_states, velocities[:, 2], 'b-', label='vz')
+        add_waypoint_lines(ax01)
+        ax01.set_xlabel('Time (s)', **tinfo)
+        ax01.set_ylabel('Velocity (m/s)', **tinfo)
+        ax01.set_title('Base Linear Velocity', fontsize=9)
+        ax01.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-        # Row 1: Base velocity, Base angular velocity, Arm angular velocity
-        ax3 = fig.add_subplot(gs[1, 0])
-        ax3.plot(time_states, velocities[:, 0], 'r-', label='vx')
-        ax3.plot(time_states, velocities[:, 1], 'g-', label='vy')
-        ax3.plot(time_states, velocities[:, 2], 'b-', label='vz')
-        add_waypoint_lines(ax3)
-        ax3.set_xlabel('Time (s)', **tinfo)
-        ax3.set_ylabel('Velocity (m/s)', **tinfo)
-        ax3.set_title('Base Linear Velocity', fontsize=9)
-        ax3.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax02 = fig.add_subplot(gs[0, 2])
+        ax02.plot(time_states, np.degrees(euler[:, 0]), 'r-', label='roll')
+        ax02.plot(time_states, np.degrees(euler[:, 1]), 'g-', label='pitch')
+        ax02.plot(time_states, np.degrees(euler[:, 2]), 'b-', label='yaw')
+        add_waypoint_lines(ax02)
+        ax02.set_xlabel('Time (s)', **tinfo)
+        ax02.set_ylabel('Angle (°)', **tinfo)
+        ax02.set_title('Base Orientation (Euler)', fontsize=9)
+        ax02.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-        ax4 = fig.add_subplot(gs[1, 1])
-        ax4.plot(time_states, angular_vel[:, 0], 'r-', label='ωx')
-        ax4.plot(time_states, angular_vel[:, 1], 'g-', label='ωy')
-        ax4.plot(time_states, angular_vel[:, 2], 'b-', label='ωz')
-        add_waypoint_lines(ax4)
-        ax4.set_xlabel('Time (s)', **tinfo)
-        ax4.set_ylabel('Angular vel (rad/s)', **tinfo)
-        ax4.set_title('Base Angular Velocity', fontsize=9)
-        ax4.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax03 = fig.add_subplot(gs[0, 3])
+        ax03.plot(time_states, angular_vel[:, 0], 'r-', label='ωx')
+        ax03.plot(time_states, angular_vel[:, 1], 'g-', label='ωy')
+        ax03.plot(time_states, angular_vel[:, 2], 'b-', label='ωz')
+        add_waypoint_lines(ax03)
+        ax03.set_xlabel('Time (s)', **tinfo)
+        ax03.set_ylabel('Angular vel (rad/s)', **tinfo)
+        ax03.set_title('Base Angular Velocity', fontsize=9)
+        ax03.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-        ax5 = fig.add_subplot(gs[1, 2])
-        ax5.plot(time_states, arm_vel[:, 0], 'r-', label='j1_dot')
-        ax5.plot(time_states, arm_vel[:, 1], 'g-', label='j2_dot')
-        add_waypoint_lines(ax5)
-        ax5.set_xlabel('Time (s)', **tinfo)
-        ax5.set_ylabel('Angular vel (rad/s)', **tinfo)
-        ax5.set_title('Arm Joint Angular Velocity', fontsize=9)
-        ax5.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        # Row 1: EE — position, linear vel, orientation (RPY), angular vel
+        ax10 = fig.add_subplot(gs[1, 0])
+        ax10.plot(time_states, ee_pos[:, 0], 'r-', label='x')
+        ax10.plot(time_states, ee_pos[:, 1], 'g-', label='y')
+        ax10.plot(time_states, ee_pos[:, 2], 'b-', label='z')
+        add_waypoint_lines(ax10)
+        ax10.set_xlabel('Time (s)', **tinfo)
+        ax10.set_ylabel('Position (m)', **tinfo)
+        ax10.set_title('EE Position', fontsize=9)
+        ax10.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-        # Row 2: Base control, Arm control, Cost convergence
-        ax6 = fig.add_subplot(gs[2, 0])
+        ax11 = fig.add_subplot(gs[1, 1])
+        ax11.plot(time_states, ee_v[:, 0], 'r-', label='vx')
+        ax11.plot(time_states, ee_v[:, 1], 'g-', label='vy')
+        ax11.plot(time_states, ee_v[:, 2], 'b-', label='vz')
+        add_waypoint_lines(ax11)
+        ax11.set_xlabel('Time (s)', **tinfo)
+        ax11.set_ylabel('Velocity (m/s)', **tinfo)
+        ax11.set_title('EE Linear Velocity', fontsize=9)
+        ax11.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+        ax12 = fig.add_subplot(gs[1, 2])
+        ax12.plot(time_states, np.degrees(ee_rpy[:, 0]), 'r-', label='roll')
+        ax12.plot(time_states, np.degrees(ee_rpy[:, 1]), 'g-', label='pitch')
+        ax12.plot(time_states, np.degrees(ee_rpy[:, 2]), 'b-', label='yaw')
+        add_waypoint_lines(ax12)
+        ax12.set_xlabel('Time (s)', **tinfo)
+        ax12.set_ylabel('Angle (°)', **tinfo)
+        ax12.set_title('EE Orientation (RPY)', fontsize=9)
+        ax12.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+        ax13 = fig.add_subplot(gs[1, 3])
+        ax13.plot(time_states, ee_w[:, 0], 'r-', label='ωx')
+        ax13.plot(time_states, ee_w[:, 1], 'g-', label='ωy')
+        ax13.plot(time_states, ee_w[:, 2], 'b-', label='ωz')
+        add_waypoint_lines(ax13)
+        ax13.set_xlabel('Time (s)', **tinfo)
+        ax13.set_ylabel('Angular vel (rad/s)', **tinfo)
+        ax13.set_title('EE Angular Velocity', fontsize=9)
+        ax13.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+        # Row 2: Arm joints, arm joint rates, base control, arm control
+        ax20 = fig.add_subplot(gs[2, 0])
+        ax20.plot(time_states, arm_angles_deg[:, 0], 'r-', label='j1')
+        ax20.plot(time_states, arm_angles_deg[:, 1], 'g-', label='j2')
+        add_waypoint_lines(ax20)
+        ax20.set_xlabel('Time (s)', **tinfo)
+        ax20.set_ylabel('Angle (°)', **tinfo)
+        ax20.set_title('Arm Joint Angles', fontsize=9)
+        ax20.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+        ax21 = fig.add_subplot(gs[2, 1])
+        ax21.plot(time_states, arm_vel[:, 0], 'r-', label='j1_dot')
+        ax21.plot(time_states, arm_vel[:, 1], 'g-', label='j2_dot')
+        add_waypoint_lines(ax21)
+        ax21.set_xlabel('Time (s)', **tinfo)
+        ax21.set_ylabel('Angular vel (rad/s)', **tinfo)
+        ax21.set_title('Arm Joint Angular Velocity', fontsize=9)
+        ax21.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
         colors = ['r', 'g', 'b', 'orange']
+        ax22 = fig.add_subplot(gs[2, 2])
         for i in range(min(4, controls.shape[1])):
-            ax6.plot(time_controls, controls[:, i], color=colors[i], label=f'Thrust{i+1}')
-        ax6.set_xlabel('Time (s)', **tinfo)
-        ax6.set_ylabel('Thrust (N)', **tinfo)
-        ax6.set_title('Base Control (Thrusters)', fontsize=9)
-        ax6.legend(loc='upper right', fontsize=7, framealpha=0.9)
+            ax22.plot(time_controls, controls[:, i], color=colors[i], label=f'T{i+1}')
+        ax22.set_xlabel('Time (s)', **tinfo)
+        ax22.set_ylabel('Thrust (N)', **tinfo)
+        ax22.set_title('Base Control (Thrusters)', fontsize=9)
+        ax22.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-        ax7 = fig.add_subplot(gs[2, 1])
+        ax23 = fig.add_subplot(gs[2, 3])
         if controls.shape[1] >= 6:
-            ax7.plot(time_controls, controls[:, 4], 'r-', label='τ1')
-            ax7.plot(time_controls, controls[:, 5], 'g-', label='τ2')
-        ax7.set_xlabel('Time (s)', **tinfo)
-        ax7.set_ylabel('Torque (N·m)', **tinfo)
-        ax7.set_title('Arm Control (Joint Torques)', fontsize=9)
-        ax7.legend(loc='upper right', fontsize=7, framealpha=0.9)
+            ax23.plot(time_controls, controls[:, 4], 'r-', label='τ1')
+            ax23.plot(time_controls, controls[:, 5], 'g-', label='τ2')
+        ax23.set_xlabel('Time (s)', **tinfo)
+        ax23.set_ylabel('Torque (N·m)', **tinfo)
+        ax23.set_title('Arm Control (Joint Torques)', fontsize=9)
+        ax23.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-        ax8 = fig.add_subplot(gs[2, 2])
-        if hasattr(self, '_cost_logger') and hasattr(self._cost_logger, 'costs') and len(self._cost_logger.costs) > 0:
-            ax8.semilogy(self._cost_logger.costs, 'b-', linewidth=2)
+        # Row 3: Horizontal (XY), Vertical (XZ), Cost, Time per iteration
+        ax30 = fig.add_subplot(gs[3, 0])
+        ax30.plot(positions[:, 0], positions[:, 1], 'b-', linewidth=1.5, label='Base')
+        ax30.plot(ee_pos[:, 0], ee_pos[:, 1], 'm--', linewidth=1.2, label='EE')
+        ax30.plot(positions[0, 0], positions[0, 1], 'go', markersize=6, label='Start')
+        ax30.plot(positions[-1, 0], positions[-1, 1], 'rs', markersize=6, label='End')
+        ax30.set_xlabel('X (m)', **tinfo)
+        ax30.set_ylabel('Y (m)', **tinfo)
+        ax30.set_title('Horizontal trajectory (XY)', fontsize=9)
+        ax30.axis('equal')
+        ax30.grid(True, alpha=0.3)
+        ax30.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+        ax31 = fig.add_subplot(gs[3, 1])
+        ax31.plot(positions[:, 0], positions[:, 2], 'b-', linewidth=1.5, label='Base')
+        ax31.plot(ee_pos[:, 0], ee_pos[:, 2], 'm--', linewidth=1.2, label='EE')
+        ax31.plot(positions[0, 0], positions[0, 2], 'go', markersize=6, label='Start')
+        ax31.plot(positions[-1, 0], positions[-1, 2], 'rs', markersize=6, label='End')
+        ax31.set_xlabel('X (m)', **tinfo)
+        ax31.set_ylabel('Z (m)', **tinfo)
+        ax31.set_title('Vertical profile (XZ)', fontsize=9)
+        ax31.grid(True, alpha=0.3)
+        ax31.legend(loc='upper right', fontsize=7, framealpha=0.9)
+
+        ax32 = fig.add_subplot(gs[3, 2])
+        if cost_logger is not None and hasattr(cost_logger, 'costs') and len(cost_logger.costs) > 0:
+            ax32.semilogy(cost_logger.costs, 'b-', linewidth=2)
         else:
-            ax8.text(0.5, 0.5, 'No cost data', ha='center', va='center', transform=ax8.transAxes)
-        ax8.set_xlabel('Iteration', **tinfo)
-        ax8.set_ylabel('Cost', **tinfo)
-        ax8.set_title('Cost Convergence', fontsize=9)
-        ax8.grid(True, alpha=0.3)
+            ax32.text(0.5, 0.5, 'No cost data', ha='center', va='center', transform=ax32.transAxes)
+        ax32.set_xlabel('Iteration', **tinfo)
+        ax32.set_ylabel('Cost', **tinfo)
+        ax32.set_title('Cost convergence', fontsize=9)
+        ax32.grid(True, alpha=0.3)
 
-        for ax in [ax0, ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8]:
+        ax33 = fig.add_subplot(gs[3, 3])
+        if timing_info and timing_info.get('n_iter', 0) and timing_info.get('n_iter', 0) > 0:
+            n_it = int(timing_info['n_iter'])
+            avg_ms = float(timing_info.get('avg_ms_per_iter', 0))
+            iters = np.arange(1, n_it + 1)
+            ax33.plot(iters, np.full(n_it, avg_ms), 'g-', linewidth=2, label=f'Avg {avg_ms:.2f} ms/iter')
+            ax33.fill_between(iters, 0, np.full(n_it, avg_ms), alpha=0.15, color='g')
+            ax33.set_xlabel('Iteration', **tinfo)
+            ax33.set_ylabel('Time per iter (ms)', **tinfo)
+            ax33.set_title('Solver time / iteration', fontsize=9)
+            ax33.legend(loc='upper right', fontsize=7)
+            ax33.grid(True, alpha=0.3)
+        else:
+            ax33.text(0.5, 0.5, 'Timing N/A', ha='center', va='center', transform=ax33.transAxes)
+            ax33.set_title('Solver time / iteration', fontsize=9)
+
+        all_axes = [ax00, ax01, ax02, ax03, ax10, ax11, ax12, ax13, ax20, ax21, ax22, ax23, ax30, ax31, ax32, ax33]
+        for ax in all_axes:
             ax.tick_params(axis='both', labelsize=8)
         return fig
 
     def _build_3d_plot_figure(self, fig=None):
         """Build 3D trajectory figure only."""
-        if self.solver is None:
+        cache = getattr(self, '_plot_cache', None)
+        if cache:
+            states = np.array(cache['xs'])
+            positions = states[:, :3]
+            ee_positions = cache.get('ee_positions')
+            if ee_positions is None:
+                ee_positions = positions
+            waypoint_positions = cache.get('waypoint_positions', [])
+        elif self.solver is not None:
+            states = np.array(self.solver.xs)
+            positions = states[:, :3]
+            ee_positions = self.get_ee_positions()
+            waypoint_positions = getattr(self, '_waypoint_positions', [])
+        else:
             return None
-        states = np.array(self.solver.xs)
-        positions = states[:, :3]
-        ee_positions = self.get_ee_positions()
         if fig is None:
             fig = plt.figure(figsize=(10, 8))
         else:
@@ -614,21 +832,24 @@ class S500UAMTrajectoryPlanner:
         ax = fig.add_subplot(111, projection='3d')
         fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
         ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2, label='Base')
-        ax.plot(ee_positions[:, 0], ee_positions[:, 1], ee_positions[:, 2], 'm--', linewidth=1.5, label='EE')
+        ee_arr = np.array(ee_positions)
+        if len(ee_arr.shape) == 2 and ee_arr.shape[0] == len(positions):
+            ax.plot(ee_arr[:, 0], ee_arr[:, 1], ee_arr[:, 2], 'm--', linewidth=1.5, label='EE')
         ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], color='g', s=100, label='Start')
         ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], color='r', s=100, label='End')
-        if hasattr(self, '_waypoint_positions'):
-            for wp in self._waypoint_positions:
-                ax.scatter(wp[0], wp[1], wp[2], color='orange', s=150, marker='*')
+        for wp in waypoint_positions:
+            ax.scatter(wp[0], wp[1], wp[2], color='orange', s=150, marker='*')
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
         ax.set_title('3D Trajectory')
         ax.legend(loc='upper right', fontsize=8)
         # 三轴使用相同尺度
-        all_pts = np.vstack([positions, ee_positions])
-        if hasattr(self, '_waypoint_positions') and len(self._waypoint_positions) > 0:
-            all_pts = np.vstack([all_pts, np.array(self._waypoint_positions)])
+        all_pts = positions.copy()
+        if len(np.array(ee_positions).shape) == 2:
+            all_pts = np.vstack([all_pts, np.array(ee_positions)])
+        if len(waypoint_positions) > 0:
+            all_pts = np.vstack([all_pts, np.array(waypoint_positions)])
         x_min, x_max = all_pts[:, 0].min(), all_pts[:, 0].max()
         y_min, y_max = all_pts[:, 1].min(), all_pts[:, 1].max()
         z_min, z_max = all_pts[:, 2].min(), all_pts[:, 2].max()
@@ -661,9 +882,11 @@ class S500UAMTrajectoryPlanner:
         if fig_main or fig_3d:
             plt.show()
 
-    def get_plot_figure(self, title: str = "S500 UAM Trajectory", show_waypoints: bool = True, fig=None):
+    def get_plot_figure(self, title: str = "S500 UAM Trajectory", show_waypoints: bool = True, fig=None,
+                        timing_info: Optional[dict] = None):
         """Return main plot figure. If fig provided, plot into it for interactivity."""
-        return self._build_plot_figure(title=title, show_waypoints=show_waypoints, fig=fig)
+        return self._build_plot_figure(title=title, show_waypoints=show_waypoints, fig=fig,
+                                       timing_info=timing_info)
 
     def get_3d_plot_figure(self, fig=None):
         """Return 3D trajectory figure. If fig provided, plot into it for interactivity."""
