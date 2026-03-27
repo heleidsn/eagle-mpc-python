@@ -459,17 +459,17 @@
     <visual>
         <origin xyz="0 0 0" rpy="0 0 0" />
         <geometry>
-            <!-- 使用一个小的box或sphere作为可视化 -->
-            <box size="0.01 0.01 0.01" />  <!-- 或者使用 <sphere radius="0.005" /> -->
+            <!-- Use a small box or sphere for visualization -->
+            <box size="0.01 0.01 0.01" />  <!-- or use <sphere radius="0.005" /> -->
         </geometry>
         <material name="">
-            <color rgba="1 0 0 0.5" />  <!-- 红色，半透明 -->
+            <color rgba="1 0 0 0.5" />  <!-- red, semi-transparent -->
         </material>
     </visual>
-    <!-- 不需要collision和inertial属性，因为这是虚拟link -->
+    <!-- No collision or inertial attributes are needed because this is a dummy link -->
   </link>
   <joint name="gripper_joint" type="fixed">
-    <origin xyz="0 0 -0.14" rpy="0 0 0" />  <!-- 调整xyz和rpy以匹配爪子位置 -->
+    <origin xyz="0 0 -0.14" rpy="0 0 0" />  <!-- Adjust xyz and rpy to match the gripper position -->
     <parent link="link_2" />
     <child link="gripper_link" />
   </joint>
