@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "plan_mode_index": 1,
+  "method_index": 0,
+  "track_mode_index": 1,
+  "control_mode_track_index": 0,
+  "wp_rows": [
+    [
+      -1.5,
+      0.0,
+      1.5,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      3.0
+    ],
+    [
+      1.5,
+      0.0,
+      1.5,
+      0.0,
+      0.0,
+      0.0,
+      6.0
+    ]
+  ],
+  "ee_wp_rows": [
+    [
+      -1.5,
+      0.0,
+      1.5,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      2.0
+    ],
+    [
+      1.5,
+      0.0,
+      1.5,
+      0.0,
+      4.0
+    ],
+    [
+      3.0,
+      0.0,
+      1.5,
+      0.0,
+      6.0
+    ]
+  ],
+  "dt_plan": 0.02,
+  "max_iter_plan": 200,
+  "state_w": 1.0,
+  "ctrl_w": 0.0,
+  "wp_mult": 1000.0,
+  "dt_ee_sample": 0.02,
+  "T_sim": 8.0,
+  "sim_dt": 0.001,
+  "control_dt": 0.01,
+  "dt_mpc": 0.05,
+  "N_mpc": 35,
+  "w_ee": 20.0,
+  "w_ee_yaw": 10.0,
+  "mpc_max_iter": 20,
+  "mpc_log_iv": 0,
+  "tau_thrust_track": 0.06,
+  "tau_theta_track": 0.05,
+  "croc_horizon": 40,
+  "croc_mpc_iter": 60,
+  "w_state_track": 10.0,
+  "w_state_reg": 0.1,
+  "w_control": 0.001,
+  "w_terminal_track": 100.0,
+  "croc_use_actuator_first_order": true,
+  "croc_ee_use_thrust_constraints": true,
+  "plan_croc_use_actuator_first_order": true,
+  "plan_tau_motor": 0.06,
+  "plan_tau_joint": 0.05
+}

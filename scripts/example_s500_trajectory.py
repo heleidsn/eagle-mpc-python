@@ -55,35 +55,35 @@ def create_square_trajectory():
     wp6 = start.copy()
     waypoints.append(wp6)
     
-    # 每段的持续时间
-    durations = [2.0, 4.0, 4.0, 4.0, 4.0, 2.0]  # 总共20秒
+    # Duration of each segment
+    durations = [2.0, 4.0, 4.0, 4.0, 4.0, 2.0]  # Total 20 seconds
     
     return waypoints, durations
 
 
 def create_figure_eight_trajectory():
-    """创建figure-eight轨迹"""
+    """Create a figure-eight trajectory."""
     waypoints = []
     
-    # 起始点
+    # Start point
     start = np.zeros(13)
     start[6] = 1.0
     waypoints.append(start)
     
-    # 上升
+    # Ascend
     wp1 = start.copy()
     wp1[2] = 1.5
     waypoints.append(wp1)
     
-    # figure-eight参数
+    # Figure-eight parameters
     center_height = 1.5
     radius = 2.0
-    n_points = 8  # figure-eight的点数
+    n_points = 8  # number of points in the figure-eight
     
     for i in range(n_points):
         t = 2 * np.pi * i / n_points
         
-        # figure-eight参数方程
+        # Figure-eight parameterization equations
         x = radius * np.sin(t)
         y = radius * np.sin(2 * t) / 2  # figure-eight
         z = center_height
@@ -95,7 +95,7 @@ def create_figure_eight_trajectory():
         wp[6] = 1.0
         waypoints.append(wp)
     
-    # 回到中心并Landing
+    # Return to center and landing
     wp_center = np.zeros(13)
     wp_center[2] = center_height
     wp_center[6] = 1.0
@@ -104,8 +104,8 @@ def create_figure_eight_trajectory():
     # Landing
     waypoints.append(start)
     
-    # 持续时间
-    durations = [2.0] + [2.0] * n_points + [2.0, 2.0]  # 总共24秒
+    # Duration
+    durations = [2.0] + [2.0] * n_points + [2.0, 2.0]  # Total 24 seconds
     
     return waypoints, durations
 

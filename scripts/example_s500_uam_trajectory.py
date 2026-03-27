@@ -90,8 +90,10 @@ def main():
             print(f"  Start:  pos={start_state[:3]}, arm=[{start_state[7]:.2f}, {start_state[8]:.2f}]")
             print(f"  Target: pos={target_state[:3]}, arm=[{target_state[7]:.2f}, {target_state[8]:.2f}]")
             print(f"  Duration: {duration} s")
-            planner.create_trajectory_problem_simple(
-                start_state, target_state, duration, dt=0.02
+            planner.create_trajectory_problem_waypoints(
+                waypoints=[start_state, target_state],
+                durations=[duration],
+                dt=0.02,
             )
 
         print("\nOptimizing...")

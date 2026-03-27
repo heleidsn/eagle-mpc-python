@@ -18,6 +18,7 @@ Date: 2026-02-11
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import yaml
 import os
 import time
@@ -88,6 +89,9 @@ class S500UAMTrajectoryPlanner:
         self.dt = None
         self.ee_frame_id = None
         self._cost_logger = None
+        self._use_actuator_first_order = False
+        self._tau_cmd = None
+        self._plot_cache = None
 
         self.load_s500_config()
         self.load_pinocchio_model()
@@ -158,12 +162,15 @@ class S500UAMTrajectoryPlanner:
                          ee_position_weight: float = 0,
                          is_terminal: bool = False,
                          is_waypoint: bool = False,
-                         waypoint_multiplier: float = 10000.0) -> crocoddyl.CostModelSum:
+                         waypoint_multiplier: float = 10.0,
+                         include_state_reg: bool = True) -> crocoddyl.CostModelSum:
         """
         Create cost model
 
         Args:
-            target_state: Target full state [x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz,j1,j2,j1_dot,j2_dot]
+            target_state: Reference full state for state_reg (q then v). Ignored for state_reg if
+                include_state_reg is False; still used as fallback when include_state_reg is True
+                and target_state is None (internal default pose).
             grasp_position: Target end-effector position [x,y,z] (world frame)
             control_weight: Control regularization weight
             state_weight: State tracking weight
@@ -171,11 +178,12 @@ class S500UAMTrajectoryPlanner:
             is_terminal: Terminal cost
             is_waypoint: Waypoint cost (enhanced weight)
             waypoint_multiplier: Weight multiplier for waypoints
+            include_state_reg: If False, omit full-state tracking (e.g. grasp approach segment where
+                only EE position is specified, not a desired pose at grasp).
         """
         control_dim = self.actuation.nu
         cost_model = crocoddyl.CostModelSum(self.state, control_dim)
 
-        # Default target state (full state: q then v)
         nq, nv = self.robot_model.nq, self.robot_model.nv
         if target_state is None:
             target_state = np.zeros(nq + nv)
@@ -190,12 +198,13 @@ class S500UAMTrajectoryPlanner:
             effective_control_weight *= waypoint_multiplier
             effective_ee_weight *= waypoint_multiplier
 
-        # State cost
-        state_activation = crocoddyl.ActivationModelQuad(self.state.ndx)
-        state_residual = crocoddyl.ResidualModelState(self.state, target_state, control_dim)
-        cost_model.addCost("state_reg",
-                          crocoddyl.CostModelResidual(self.state, state_activation, state_residual),
-                          effective_state_weight)
+        # State cost (optional: off for segments with only task-space targets, e.g. EE at grasp)
+        if include_state_reg and effective_state_weight > 0:
+            state_activation = crocoddyl.ActivationModelQuad(self.state.ndx)
+            state_residual = crocoddyl.ResidualModelState(self.state, target_state, control_dim)
+            cost_model.addCost("state_reg",
+                              crocoddyl.CostModelResidual(self.state, state_activation, state_residual),
+                              effective_state_weight)
 
         # End-effector position cost (grasp point)
         if grasp_position is not None and ee_position_weight > 0:
@@ -219,17 +228,19 @@ class S500UAMTrajectoryPlanner:
 
         return cost_model
 
-    def create_trajectory_problem(self,
+    def create_trajectory_problem_grasp(self,
                                  start_state: np.ndarray,
                                  grasp_position: np.ndarray,
                                  target_state: np.ndarray,
                                  durations: List[float],
                                  dt: float = 0.02,
-                                 grasp_ee_weight: float = 5000.0,
-                                 waypoint_multiplier: float = 1000.0,
+                                 grasp_ee_weight: float = 500.0,
+                                 waypoint_multiplier: float = 500.0,
                                  state_weight: float = 1.0,
-                                 control_weight: float = 1e-5,
-                                 use_thrust_constraints: bool = True) -> None:
+                                 control_weight: float = 1.0,
+                                 use_thrust_constraints: bool = True,
+                                 use_actuator_first_order: bool = False,
+                                 tau_cmd: Optional[np.ndarray] = None) -> None:
         """
         Create trajectory optimization problem: start -> grasp -> target
 
@@ -242,11 +253,17 @@ class S500UAMTrajectoryPlanner:
             grasp_ee_weight: Weight for EE position at grasp waypoint
             waypoint_multiplier: Waypoint weight multiplier
             use_thrust_constraints: Apply thrust limits
+
+        Per-segment first-step costs (including grasp EE) use waypoint_multiplier × N_segment;
+        terminal state cost uses an extra factor N_total (sum of both segments' node counts).
         """
         if len(durations) != 2:
             raise ValueError("durations must have 2 elements: [to_grasp, to_target]")
 
         self.dt = dt
+        self._use_actuator_first_order = bool(use_actuator_first_order)
+        self._tau_cmd = None if tau_cmd is None else np.asarray(tau_cmd, dtype=float).reshape(-1)
+        self._plot_cache = None
 
         # Initial state: full state (q,v) for ShootingProblem
         x0 = np.array(start_state, dtype=float).copy()
@@ -256,16 +273,19 @@ class S500UAMTrajectoryPlanner:
         self._waypoint_times = [0.0]
         self._waypoint_positions = [start_state[:3]]
         self._waypoint_labels = ["Start"]
+        self._waypoint_ee_positions = [self.get_ee_position_from_state(start_state)]
 
         running_models = []
 
         # Segment 1: Start -> Grasp
         n_steps_1 = max(1, int(durations[0] / dt))
+        scale_seg1 = float(max(1, n_steps_1))
         self._waypoint_times.append(durations[0])
         self._waypoint_positions.append(grasp_position)
         self._waypoint_labels.append("Grasp")
+        self._waypoint_ee_positions.append(np.asarray(grasp_position, dtype=float).reshape(-1)[:3])
 
-        # Grasp waypoint cost: reach EE position + state
+        # Grasp waypoint: only EE pose is specified at grasp (no full target state there)
         grasp_cost = self.create_cost_model(
             target_state=target_state,
             grasp_position=grasp_position,
@@ -273,7 +293,8 @@ class S500UAMTrajectoryPlanner:
             state_weight=state_weight,
             control_weight=control_weight,
             is_waypoint=True,
-            waypoint_multiplier=waypoint_multiplier
+            waypoint_multiplier=waypoint_multiplier * scale_seg1,
+            include_state_reg=False,
         )
         grasp_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
             self.state, self.actuation, grasp_cost
@@ -286,7 +307,8 @@ class S500UAMTrajectoryPlanner:
             grasp_position=grasp_position,
             ee_position_weight=grasp_ee_weight * 0.1,
             state_weight=state_weight,
-            control_weight=control_weight
+            control_weight=control_weight,
+            include_state_reg=False,
         )
         normal_diff_1 = crocoddyl.DifferentialActionModelFreeFwdDynamics(
             self.state, self.actuation, normal_cost_1
@@ -298,16 +320,20 @@ class S500UAMTrajectoryPlanner:
 
         # Segment 2: Grasp -> Target
         n_steps_2 = max(1, int(durations[1] / dt))
+        n_total = n_steps_1 + n_steps_2
+        terminal_scale = float(max(1, n_total))
+        scale_seg2 = float(max(1, n_steps_2))
         self._waypoint_times.append(durations[0] + durations[1])
         self._waypoint_positions.append(target_state[:3])
         self._waypoint_labels.append("Target")
+        self._waypoint_ee_positions.append(self.get_ee_position_from_state(target_state))
 
         target_waypoint_cost = self.create_cost_model(
             target_state=target_state,
             state_weight=state_weight,
             control_weight=control_weight,
             is_waypoint=True,
-            waypoint_multiplier=waypoint_multiplier
+            waypoint_multiplier=waypoint_multiplier * scale_seg2
         )
         target_waypoint_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
             self.state, self.actuation, target_waypoint_cost
@@ -340,7 +366,7 @@ class S500UAMTrajectoryPlanner:
         # Terminal model
         terminal_cost = self.create_cost_model(
             target_state=target_state,
-            state_weight=10.0 * state_weight,
+            state_weight=10.0 * state_weight * terminal_scale,
             control_weight=control_weight,
             is_terminal=True,
             is_waypoint=True,
@@ -353,135 +379,70 @@ class S500UAMTrajectoryPlanner:
 
         self.problem = crocoddyl.ShootingProblem(x0, running_models, terminal_model)
         total_time = sum(durations)
-        print(f"✓ Created trajectory problem: {len(running_models)} nodes, {total_time:.2f}s total")
+        print(f"✓ Created grasp trajectory: {len(running_models)} nodes, terminal scale N={n_total:.0f}, {total_time:.2f}s total")
 
-    def create_trajectory_problem_simple(self,
-                                        start_state: np.ndarray,
-                                        target_state: np.ndarray,
-                                        duration: float,
-                                        dt: float = 0.02,
-                                        waypoint_multiplier: float = 1000.0,
-                                        state_weight: float = 1.0,
-                                        control_weight: float = 1e-5,
-                                        use_thrust_constraints: bool = True) -> None:
-        """
-        Create trajectory optimization problem: start -> target (no grasp point)
-
-        Simpler case for better convergence when only initial and target states are needed.
-
-        Args:
-            start_state: Initial state [x,y,z,qx,qy,qz,qw,j1,j2,vx,vy,vz,wx,wy,wz,j1_dot,j2_dot]
-            target_state: Final target state
-            duration: Total trajectory duration (seconds)
-            dt: Time step
-            waypoint_multiplier: Waypoint weight multiplier
-            use_thrust_constraints: Apply thrust limits
-        """
-        self.dt = dt
-
-        x0 = np.array(start_state, dtype=float).copy()
-        if len(x0) != self.robot_model.nq + self.robot_model.nv:
-            raise ValueError(f"start_state must have {self.robot_model.nq + self.robot_model.nv} elements (q+v), got {len(x0)}")
-
-        self._waypoint_times = [0.0, duration]
-        self._waypoint_positions = [start_state[:3], target_state[:3]]
-        self._waypoint_labels = ["Start", "Target"]
-
-        n_steps = max(1, int(duration / dt))
-        running_models = []
-
-        # First step: waypoint with enhanced weight
-        waypoint_cost = self.create_cost_model(
-            target_state=target_state,
-            grasp_position=None,
-            state_weight=state_weight,
-            control_weight=control_weight,
-            is_waypoint=True,
-            waypoint_multiplier=waypoint_multiplier
-        )
-        waypoint_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
-            self.state, self.actuation, waypoint_cost
-        )
-        waypoint_int = crocoddyl.IntegratedActionModelEuler(waypoint_diff, dt)
-        running_models.append(waypoint_int)
-
-        # Remaining steps
-        normal_cost = self.create_cost_model(
-            target_state=target_state,
-            state_weight=state_weight,
-            control_weight=control_weight
-        )
-        normal_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
-            self.state, self.actuation, normal_cost
-        )
-        normal_int = crocoddyl.IntegratedActionModelEuler(normal_diff, dt)
-        for _ in range(n_steps - 1):
-            running_models.append(normal_int)
-
-        if use_thrust_constraints:
-            platform = self.s500_config['platform']
-            u_lb = np.array([platform['min_thrust']] * 4 + [-2.0] * 2)
-            u_ub = np.array([platform['max_thrust']] * 4 + [2.0] * 2)
-            for m in running_models:
-                m.u_lb = u_lb
-                m.u_ub = u_ub
-
-        terminal_cost = self.create_cost_model(
-            target_state=target_state,
-            state_weight=10.0 * state_weight,
-            control_weight=control_weight,
-            is_terminal=True,
-            is_waypoint=True,
-            waypoint_multiplier=waypoint_multiplier
-        )
-        terminal_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
-            self.state, self.actuation, terminal_cost
-        )
-        terminal_model = crocoddyl.IntegratedActionModelEuler(terminal_diff, 0.0)
-
-        self.problem = crocoddyl.ShootingProblem(x0, running_models, terminal_model)
-        print(f"✓ Created simple trajectory problem: {len(running_models)} nodes, {duration:.2f}s total")
+    create_trajectory_problem = create_trajectory_problem_grasp
 
     def create_trajectory_problem_waypoints(self,
                                           waypoints: List[np.ndarray],
                                           durations: List[float],
                                           dt: float = 0.02,
-                                          waypoint_multiplier: float = 1000.0,
+                                          waypoint_multiplier: float = 5000.0,
                                           state_weight: float = 1.0,
                                           control_weight: float = 1e-5,
-                                          use_thrust_constraints: bool = True) -> None:
+                                          use_thrust_constraints: bool = True,
+                                          use_actuator_first_order: bool = False,
+                                          tau_cmd: Optional[np.ndarray] = None) -> None:
         """
         Create trajectory optimization problem with multiple waypoints.
         waypoints: list of full states [x,y,z,qx,qy,qz,qw,j1,j2,vx,vy,vz,wx,wy,wz,j1_dot,j2_dot]
         durations: duration of each segment (len = len(waypoints) - 1)
+
+        Waypoint multiplier is applied only to the *boundary knot* corresponding to each
+        intermediate waypoint state. Concretely, we apply the boosted (is_waypoint) cost on
+        the first running model of each segment, whose evaluated state equals the segment's
+        start waypoint (i.e., the previous segment's end). The final target state is enforced
+        by the terminal cost only, avoiding double weighting against the same state.
+        Terminal state cost is scaled by total node count N_total for running vs terminal balance.
         """
         if len(waypoints) != len(durations) + 1:
             raise ValueError("Number of waypoints should be one more than number of durations")
         self.dt = dt
+        self._use_actuator_first_order = bool(use_actuator_first_order)
+        self._tau_cmd = None if tau_cmd is None else np.asarray(tau_cmd, dtype=float).reshape(-1)
+        self._plot_cache = None
         x0 = np.array(waypoints[0], dtype=float).copy()
         if len(x0) != self.robot_model.nq + self.robot_model.nv:
             raise ValueError(f"waypoint must have {self.robot_model.nq + self.robot_model.nv} elements")
 
+        segment_n_steps = [max(1, int(d / dt)) for d in durations]
+        n_total = int(sum(segment_n_steps))
+        terminal_scale = float(max(1, n_total))
+
         self._waypoint_times = [0.0]
         self._waypoint_positions = [waypoints[0][:3]]
         self._waypoint_labels = ["Start"] + [f"WP{i+1}" for i in range(len(waypoints) - 2)] + ["Target"]
+        self._waypoint_ee_positions = [self.get_ee_position_from_state(wp) for wp in waypoints]
 
         running_models = []
         current_time = 0.0
 
         for i, duration in enumerate(durations):
+            start_state = waypoints[i]
             target_state = waypoints[i + 1]
             current_time += duration
             self._waypoint_times.append(current_time)
             self._waypoint_positions.append(target_state[:3])
 
-            n_steps = max(1, int(duration / dt))
+            n_steps = segment_n_steps[i]
+            # First running model evaluates the current knot state, which at segment start
+            # equals the corresponding waypoint_i state. So apply the waypoint multiplier here.
             waypoint_cost = self.create_cost_model(
-                target_state=target_state,
+                target_state=start_state,
                 state_weight=state_weight,
                 control_weight=control_weight,
                 is_waypoint=True,
-                waypoint_multiplier=waypoint_multiplier
+                waypoint_multiplier=waypoint_multiplier,
             )
             waypoint_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
                 self.state, self.actuation, waypoint_cost
@@ -489,10 +450,11 @@ class S500UAMTrajectoryPlanner:
             waypoint_int = crocoddyl.IntegratedActionModelEuler(waypoint_diff, dt)
             running_models.append(waypoint_int)
 
+            # Remaining running models track the segment target (end waypoint) with normal weights.
             normal_cost = self.create_cost_model(
                 target_state=target_state,
                 state_weight=state_weight,
-                control_weight=control_weight
+                control_weight=control_weight,
             )
             normal_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
                 self.state, self.actuation, normal_cost
@@ -512,7 +474,7 @@ class S500UAMTrajectoryPlanner:
         terminal_target = waypoints[-1]
         terminal_cost = self.create_cost_model(
             target_state=terminal_target,
-            state_weight=10.0 * state_weight,
+            state_weight=waypoint_multiplier * state_weight,
             control_weight=control_weight,
             is_terminal=True,
             is_waypoint=True,
@@ -525,14 +487,14 @@ class S500UAMTrajectoryPlanner:
 
         self.problem = crocoddyl.ShootingProblem(x0, running_models, terminal_model)
         total_time = sum(durations)
-        print(f"✓ Created waypoint trajectory: {len(waypoints)} waypoints, {len(running_models)} nodes, {total_time:.2f}s total")
+        print(f"✓ Created waypoint trajectory: {len(waypoints)} waypoints, {len(running_models)} nodes, terminal scale N={n_total:.0f}, {total_time:.2f}s total")
 
     def solve_trajectory(self, max_iter: int = 150, verbose: bool = True) -> bool:
         """Solve trajectory optimization"""
         if self.problem is None:
             raise RuntimeError("Create trajectory problem first")
 
-        self.solver = crocoddyl.SolverBoxDDP(self.problem)
+        self.solver = crocoddyl.SolverBoxFDDP(self.problem)
         self.solver.convergence_init = 1e-12
         self.solver.convergence_stop = 1e-12
 
@@ -547,7 +509,87 @@ class S500UAMTrajectoryPlanner:
         converged = self.solver.solve([], [], max_iter)
         elapsed = (time.time() - start_time) * 1000
         print(f"✓ Done: {elapsed:.1f} ms, converged={converged}, cost={self.solver.cost:.6f}")
+        self._refresh_plot_cache()
         return converged
+
+    def _effective_tau_cmd(self) -> np.ndarray:
+        nu = int(self.actuation.nu)
+        default_tau = np.array([0.06, 0.06, 0.06, 0.06, 0.05, 0.05], dtype=float)
+        if self._tau_cmd is None:
+            tau = default_tau
+        else:
+            tau = np.asarray(self._tau_cmd, dtype=float).reshape(-1)
+        if tau.size != nu:
+            if tau.size < nu:
+                pad = np.full(nu - tau.size, float(tau[-1] if tau.size > 0 else 0.05), dtype=float)
+                tau = np.concatenate([tau, pad])
+            else:
+                tau = tau[:nu]
+        return np.maximum(tau, 1e-4)
+
+    def _rollout_with_actuator_first_order(self, xs_cmd: List[np.ndarray], us_cmd: List[np.ndarray]) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        if self.dt is None:
+            return xs_cmd, us_cmd
+        if not us_cmd:
+            return xs_cmd, us_cmd
+        nu = int(self.actuation.nu)
+        tau = self._effective_tau_cmd()
+
+        x = np.asarray(xs_cmd[0], dtype=float).flatten().copy()
+        u_act = np.asarray(us_cmd[0], dtype=float).flatten().copy()
+        if u_act.size != nu:
+            u_act = np.zeros(nu, dtype=float)
+
+        zero_cost = crocoddyl.CostModelSum(self.state, nu)
+        diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, zero_cost)
+        int_model = crocoddyl.IntegratedActionModelEuler(diff, float(self.dt))
+        data = int_model.createData()
+
+        xs_roll = [x.copy()]
+        us_act = []
+        alpha = float(self.dt) / tau
+        alpha = np.clip(alpha, 0.0, 1.0)
+        for k in range(len(us_cmd)):
+            u_cmd = np.asarray(us_cmd[k], dtype=float).flatten()
+            if u_cmd.size != nu:
+                u_cmd = np.zeros(nu, dtype=float)
+            u_act = u_act + alpha * (u_cmd - u_act)
+            us_act.append(u_act.copy())
+            int_model.calc(data, x, u_act)
+            x = np.asarray(data.xnext, dtype=float).flatten().copy()
+            xs_roll.append(x.copy())
+        return xs_roll, us_act
+
+    def _refresh_plot_cache(self) -> None:
+        if self.solver is None:
+            self._plot_cache = None
+            return
+        xs_cmd = [np.asarray(x, dtype=float).copy() for x in self.solver.xs]
+        us_cmd = [np.asarray(u, dtype=float).copy() for u in self.solver.us]
+        if self._use_actuator_first_order:
+            xs_plot, us_plot = self._rollout_with_actuator_first_order(xs_cmd, us_cmd)
+        else:
+            xs_plot, us_plot = xs_cmd, us_cmd
+        try:
+            ee_positions = []
+            for x in xs_plot:
+                ee_positions.append(self.get_ee_position_from_state(x))
+            ee_positions = np.asarray(ee_positions, dtype=float)
+        except Exception:
+            ee_positions = np.zeros((len(xs_plot), 3), dtype=float)
+        self._plot_cache = {
+            "xs": xs_plot,
+            "us": us_plot,
+            "dt": self.dt or 0.02,
+            "waypoint_times": list(getattr(self, "_waypoint_times", [])),
+            "waypoint_positions": [np.asarray(p, dtype=float).copy() for p in getattr(self, "_waypoint_positions", [])],
+            "waypoint_labels": list(getattr(self, "_waypoint_labels", [])),
+            "waypoint_ee_positions": [np.asarray(p, dtype=float).copy() for p in getattr(self, "_waypoint_ee_positions", [])],
+            "cost_logger": getattr(self, "_cost_logger", None),
+            "ee_positions": ee_positions,
+            "use_actuator_first_order": bool(self._use_actuator_first_order),
+            "tau_cmd": self._effective_tau_cmd().copy(),
+        }
 
     def get_trajectory(self) -> Tuple[List[np.ndarray], List[np.ndarray]]:
         """Get optimized states and controls"""
@@ -569,6 +611,18 @@ class S500UAMTrajectoryPlanner:
             pos = self.robot_data.oMf[self.ee_frame_id].translation.copy()
             ee_positions.append(pos)
         return np.array(ee_positions)
+
+    def get_ee_position_from_state(self, state: np.ndarray) -> np.ndarray:
+        """Compute EE position for a single full state vector (q,v)."""
+        x = np.asarray(state, dtype=float).reshape(-1)
+        nq, nv = self.robot_model.nq, self.robot_model.nv
+        if x.size != nq + nv:
+            raise ValueError(f"state must have {nq + nv} elements (q+v), got {x.size}")
+        q = x[:nq]
+        v = x[nq:]
+        pin.forwardKinematics(self.robot_model, self.robot_data, q, v)
+        pin.updateFramePlacements(self.robot_model, self.robot_data)
+        return self.robot_data.oMf[self.ee_frame_id].translation.copy()
 
     def _identify_waypoint_indices(self) -> List[int]:
         if not hasattr(self, '_waypoint_times') or self.dt is None:
@@ -594,12 +648,18 @@ class S500UAMTrajectoryPlanner:
             dt = cache.get('dt', 0.02)
             waypoint_times = cache.get('waypoint_times', [])
             waypoint_indices = [int(t / dt) for t in waypoint_times] if show_waypoints and waypoint_times else []
+            waypoint_positions = cache.get('waypoint_positions', []) or []
+            waypoint_labels = cache.get('waypoint_labels', []) or []
+            waypoint_ee_positions = cache.get('waypoint_ee_positions', []) or []
             cost_logger = cache.get('cost_logger')
         elif self.solver is not None:
             states = np.array(self.solver.xs)
             controls = np.array(self.solver.us)
             dt = self.dt or 0.02
             waypoint_indices = self._identify_waypoint_indices() if show_waypoints else []
+            waypoint_positions = getattr(self, '_waypoint_positions', []) or []
+            waypoint_labels = getattr(self, '_waypoint_labels', []) or []
+            waypoint_ee_positions = getattr(self, '_waypoint_ee_positions', []) or []
             cost_logger = getattr(self, '_cost_logger', None)
         else:
             return None
@@ -619,11 +679,46 @@ class S500UAMTrajectoryPlanner:
             states, self.robot_model, self.robot_data, self.ee_frame_id
         )
 
-        def add_waypoint_lines(ax):
-            if show_waypoints and waypoint_indices:
-                for idx in waypoint_indices:
-                    if idx < len(time_states):
-                        ax.axvline(x=time_states[idx], color='orange', linestyle='--', alpha=0.5)
+        def add_waypoint_lines(
+            ax,
+            show_text: bool = False,
+            include_target_vec: bool = False,
+            target_vecs: Optional[List[np.ndarray]] = None,
+        ):
+            """
+            Add vertical dashed lines at waypoint times.
+            Optionally add a compact label for each waypoint on top of the subplot.
+            """
+            if not (show_waypoints and waypoint_indices):
+                return
+
+            # Labels can get cluttered quickly; only show when reasonably small.
+            show_text = bool(show_text) and (len(waypoint_indices) <= 8)
+            y_top = ax.get_ylim()[1] if show_text else None
+            if target_vecs is None:
+                target_vecs = waypoint_positions
+
+            for k, idx in enumerate(waypoint_indices):
+                if idx >= len(time_states):
+                    continue
+                x = time_states[idx]
+                ax.axvline(
+                    x=x, color='darkorange', linestyle='--',
+                    alpha=0.7, linewidth=1.0, zorder=1,
+                )
+                if show_text and k < len(waypoint_labels) and y_top is not None:
+                    label = str(waypoint_labels[k])
+                    if include_target_vec and k < len(target_vecs):
+                        tgt = np.asarray(target_vecs[k], dtype=float).reshape(-1)
+                        if tgt.size >= 3:
+                            label = f"{label} tgt=[{tgt[0]:.2f},{tgt[1]:.2f},{tgt[2]:.2f}]"
+                    ax.text(
+                        x, y_top, label,
+                        rotation=90, va='top', ha='right',
+                        fontsize=7, color='darkorange',
+                        bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', pad=1.0),
+                        zorder=3,
+                    )
 
         if fig is None:
             fig = plt.figure(figsize=(20, 16))
@@ -639,11 +734,31 @@ class S500UAMTrajectoryPlanner:
         ax00.plot(time_states, positions[:, 0], 'r-', label='x')
         ax00.plot(time_states, positions[:, 1], 'g-', label='y')
         ax00.plot(time_states, positions[:, 2], 'b-', label='z')
-        add_waypoint_lines(ax00)
+        add_waypoint_lines(ax00, show_text=True, include_target_vec=True)
+        if show_waypoints and waypoint_indices:
+            # Mark the *expected* base position at each waypoint boundary time.
+            for k, idx in enumerate(waypoint_indices):
+                if idx >= len(time_states):
+                    continue
+                if k >= len(waypoint_positions):
+                    continue
+                tgt = np.asarray(waypoint_positions[k], dtype=float).reshape(-1)
+                if tgt.size < 3:
+                    continue
+                ax00.scatter(time_states[idx], tgt[0], color='r', s=28, marker='o',
+                             zorder=4, edgecolors='k', linewidths=0.3)
+                ax00.scatter(time_states[idx], tgt[1], color='g', s=28, marker='o',
+                             zorder=4, edgecolors='k', linewidths=0.3)
+                ax00.scatter(time_states[idx], tgt[2], color='b', s=28, marker='o',
+                             zorder=4, edgecolors='k', linewidths=0.3)
         ax00.set_xlabel('Time (s)', **tinfo)
         ax00.set_ylabel('Position (m)', **tinfo)
         ax00.set_title('Base Position', fontsize=9)
-        ax00.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        h0, l0 = ax00.get_legend_handles_labels()
+        if show_waypoints and waypoint_indices:
+            h0.append(Line2D([0], [0], color='darkorange', linestyle='--', alpha=0.7, linewidth=1.0))
+            l0.append('Waypoint')
+        ax00.legend(h0, l0, loc='upper right', fontsize=7, framealpha=0.9)
 
         ax01 = fig.add_subplot(gs[0, 1])
         ax01.plot(time_states, velocities[:, 0], 'r-', label='vx')
@@ -680,10 +795,32 @@ class S500UAMTrajectoryPlanner:
         ax10.plot(time_states, ee_pos[:, 0], 'r-', label='x')
         ax10.plot(time_states, ee_pos[:, 1], 'g-', label='y')
         ax10.plot(time_states, ee_pos[:, 2], 'b-', label='z')
-        add_waypoint_lines(ax10)
+        add_waypoint_lines(ax10, show_text=True, include_target_vec=True, target_vecs=waypoint_ee_positions)
         ax10.set_xlabel('Time (s)', **tinfo)
         ax10.set_ylabel('Position (m)', **tinfo)
         ax10.set_title('EE Position', fontsize=9)
+        if show_waypoints and waypoint_indices:
+            # Mark the *expected* EE position at each waypoint boundary time.
+            for k, idx in enumerate(waypoint_indices):
+                if idx >= len(time_states):
+                    continue
+                if k >= len(waypoint_ee_positions):
+                    continue
+                tgt = np.asarray(waypoint_ee_positions[k], dtype=float).reshape(-1)
+                if tgt.size < 3:
+                    continue
+                ax10.scatter(
+                    time_states[idx], tgt[0], color='r', s=22, marker='o',
+                    zorder=4, edgecolors='k', linewidths=0.3
+                )
+                ax10.scatter(
+                    time_states[idx], tgt[1], color='g', s=22, marker='o',
+                    zorder=4, edgecolors='k', linewidths=0.3
+                )
+                ax10.scatter(
+                    time_states[idx], tgt[2], color='b', s=22, marker='o',
+                    zorder=4, edgecolors='k', linewidths=0.3
+                )
         ax10.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
         ax11 = fig.add_subplot(gs[1, 1])
@@ -739,6 +876,7 @@ class S500UAMTrajectoryPlanner:
         ax22 = fig.add_subplot(gs[2, 2])
         for i in range(min(4, controls.shape[1])):
             ax22.plot(time_controls, controls[:, i], color=colors[i], label=f'T{i+1}')
+        add_waypoint_lines(ax22)
         ax22.set_xlabel('Time (s)', **tinfo)
         ax22.set_ylabel('Thrust (N)', **tinfo)
         ax22.set_title('Base Control (Thrusters)', fontsize=9)
@@ -748,6 +886,7 @@ class S500UAMTrajectoryPlanner:
         if controls.shape[1] >= 6:
             ax23.plot(time_controls, controls[:, 4], 'r-', label='τ1')
             ax23.plot(time_controls, controls[:, 5], 'g-', label='τ2')
+        add_waypoint_lines(ax23)
         ax23.set_xlabel('Time (s)', **tinfo)
         ax23.set_ylabel('Torque (N·m)', **tinfo)
         ax23.set_title('Arm Control (Joint Torques)', fontsize=9)
@@ -757,8 +896,32 @@ class S500UAMTrajectoryPlanner:
         ax30 = fig.add_subplot(gs[3, 0])
         ax30.plot(positions[:, 0], positions[:, 1], 'b-', linewidth=1.5, label='Base')
         ax30.plot(ee_pos[:, 0], ee_pos[:, 1], 'm--', linewidth=1.2, label='EE')
-        ax30.plot(positions[0, 0], positions[0, 1], 'go', markersize=6, label='Start')
-        ax30.plot(positions[-1, 0], positions[-1, 1], 'rs', markersize=6, label='End')
+        if show_waypoints and len(waypoint_positions) > 0:
+            wps = np.asarray(waypoint_positions, dtype=float).reshape(-1, 3)
+            nwp = wps.shape[0]
+            wl = (
+                list(waypoint_labels)
+                if waypoint_labels and len(waypoint_labels) == nwp
+                else [f"P{i}" for i in range(nwp)]
+            )
+            for k in range(nwp):
+                if k == 0:
+                    mk, sz, cl = 'o', 64, 'tab:green'
+                elif k == nwp - 1:
+                    mk, sz, cl = 's', 64, 'tab:red'
+                else:
+                    mk, sz, cl = '*', 110, 'darkorange'
+                ax30.scatter(
+                    wps[k, 0], wps[k, 1], c=cl, s=sz, marker=mk, zorder=6,
+                    edgecolors='black', linewidths=0.6,
+                )
+                ax30.annotate(
+                    wl[k], (wps[k, 0], wps[k, 1]), xytext=(4, 4),
+                    textcoords='offset points', fontsize=7, zorder=7,
+                )
+        else:
+            ax30.plot(positions[0, 0], positions[0, 1], 'go', markersize=6, label='Start')
+            ax30.plot(positions[-1, 0], positions[-1, 1], 'rs', markersize=6, label='End')
         ax30.set_xlabel('X (m)', **tinfo)
         ax30.set_ylabel('Y (m)', **tinfo)
         ax30.set_title('Horizontal trajectory (XY)', fontsize=9)
@@ -769,8 +932,32 @@ class S500UAMTrajectoryPlanner:
         ax31 = fig.add_subplot(gs[3, 1])
         ax31.plot(positions[:, 0], positions[:, 2], 'b-', linewidth=1.5, label='Base')
         ax31.plot(ee_pos[:, 0], ee_pos[:, 2], 'm--', linewidth=1.2, label='EE')
-        ax31.plot(positions[0, 0], positions[0, 2], 'go', markersize=6, label='Start')
-        ax31.plot(positions[-1, 0], positions[-1, 2], 'rs', markersize=6, label='End')
+        if show_waypoints and len(waypoint_positions) > 0:
+            wps = np.asarray(waypoint_positions, dtype=float).reshape(-1, 3)
+            nwp = wps.shape[0]
+            wl = (
+                list(waypoint_labels)
+                if waypoint_labels and len(waypoint_labels) == nwp
+                else [f"P{i}" for i in range(nwp)]
+            )
+            for k in range(nwp):
+                if k == 0:
+                    mk, sz, cl = 'o', 64, 'tab:green'
+                elif k == nwp - 1:
+                    mk, sz, cl = 's', 64, 'tab:red'
+                else:
+                    mk, sz, cl = '*', 110, 'darkorange'
+                ax31.scatter(
+                    wps[k, 0], wps[k, 2], c=cl, s=sz, marker=mk, zorder=6,
+                    edgecolors='black', linewidths=0.6,
+                )
+                ax31.annotate(
+                    wl[k], (wps[k, 0], wps[k, 2]), xytext=(4, 4),
+                    textcoords='offset points', fontsize=7, zorder=7,
+                )
+        else:
+            ax31.plot(positions[0, 0], positions[0, 2], 'go', markersize=6, label='Start')
+            ax31.plot(positions[-1, 0], positions[-1, 2], 'rs', markersize=6, label='End')
         ax31.set_xlabel('X (m)', **tinfo)
         ax31.set_ylabel('Z (m)', **tinfo)
         ax31.set_title('Vertical profile (XZ)', fontsize=9)
@@ -817,12 +1004,14 @@ class S500UAMTrajectoryPlanner:
             ee_positions = cache.get('ee_positions')
             if ee_positions is None:
                 ee_positions = positions
-            waypoint_positions = cache.get('waypoint_positions', [])
+            waypoint_positions = cache.get('waypoint_positions', []) or []
+            waypoint_labels = cache.get('waypoint_labels', []) or []
         elif self.solver is not None:
             states = np.array(self.solver.xs)
             positions = states[:, :3]
             ee_positions = self.get_ee_positions()
-            waypoint_positions = getattr(self, '_waypoint_positions', [])
+            waypoint_positions = getattr(self, '_waypoint_positions', []) or []
+            waypoint_labels = getattr(self, '_waypoint_labels', []) or []
         else:
             return None
         if fig is None:
@@ -835,16 +1024,36 @@ class S500UAMTrajectoryPlanner:
         ee_arr = np.array(ee_positions)
         if len(ee_arr.shape) == 2 and ee_arr.shape[0] == len(positions):
             ax.plot(ee_arr[:, 0], ee_arr[:, 1], ee_arr[:, 2], 'm--', linewidth=1.5, label='EE')
-        ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], color='g', s=100, label='Start')
-        ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], color='r', s=100, label='End')
-        for wp in waypoint_positions:
-            ax.scatter(wp[0], wp[1], wp[2], color='orange', s=150, marker='*')
+        if len(waypoint_positions) > 0:
+            wps = np.asarray(waypoint_positions, dtype=float).reshape(-1, 3)
+            nwp = wps.shape[0]
+            wl = (
+                list(waypoint_labels)
+                if waypoint_labels and len(waypoint_labels) == nwp
+                else [f"P{i}" for i in range(nwp)]
+            )
+            for k in range(nwp):
+                wp = wps[k]
+                if k == 0:
+                    mk, sz, cl = 'o', 90, 'tab:green'
+                elif k == nwp - 1:
+                    mk, sz, cl = 's', 90, 'tab:red'
+                else:
+                    mk, sz, cl = '*', 130, 'darkorange'
+                ax.scatter(
+                    wp[0], wp[1], wp[2], color=cl, s=sz, marker=mk, edgecolors='k',
+                    linewidths=0.5, zorder=5,
+                )
+                ax.text(float(wp[0]), float(wp[1]), float(wp[2]), f"  {wl[k]}", fontsize=8, zorder=6)
+        else:
+            ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], color='g', s=100, label='Start')
+            ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], color='r', s=100, label='End')
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
         ax.set_title('3D Trajectory')
         ax.legend(loc='upper right', fontsize=8)
-        # 三轴使用相同尺度
+        # Use the same scale for all three axes.
         all_pts = positions.copy()
         if len(np.array(ee_positions).shape) == 2:
             all_pts = np.vstack([all_pts, np.array(ee_positions)])
@@ -924,35 +1133,50 @@ def make_uam_state(x, y, z, j1=0, j2=0, yaw=0):
 
 def create_uam_grasp_waypoints() -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[float]]:
     """Create waypoints for UAM grasp trajectory: start -> grasp -> target"""
-    start_state = make_uam_state(0, 0, 1.0, j1=-1.2, j2=-0.6)
-    grasp_position = np.array([0.5, 0.0, 0.7])
-    target_state = make_uam_state(1.0, 0.5, 1.2, j1=-0.8, j2=-0.3)
-    durations = [3.0, 3.0]
+    start_state = make_uam_state(-1.5, 0, 1.5, j1=0.0, j2=0.0)
+    grasp_position = np.array([0.0, 0.0, 0.5])
+    target_state = make_uam_state(1.5, 0.0, 1.5, j1=0.0, j2=0.0)
+    durations = [5.0, 5.0]
     return start_state, grasp_position, target_state, durations
 
 
-def create_uam_simple_waypoints() -> Tuple[np.ndarray, np.ndarray, float]:
-    """Create waypoints for simple trajectory: start -> target only"""
-    start_state = make_uam_state(0, 0, 1.0, j1=-1.2, j2=-0.6)
-    target_state = make_uam_state(1.0, 0.5, 2.0, j1=-0.8, j2=-0.3)
-    duration = 5.0
-    return start_state, target_state, duration
+def create_uam_simple_waypoints() -> Tuple[List[np.ndarray], List[float]]:
+    """Default multi-waypoint demo (no grasp): full states and one duration per segment."""
+    waypoints = [
+        make_uam_state(-1.5, 0.0, 1.5, j1=0.0, j2=0.0),
+        make_uam_state(0.0, 0.0, 1.2, j1=0.0, j2=0.0),
+        make_uam_state(1.5, 0.0, 1.5, j1=0.0, j2=0.0),
+        # make_uam_state(4.5, 1.5, 3.0, j1=1.0, j2=0.8),
+    ]
+    # durations = [2.0, 2.0, 2.0]
+    durations = [5.0, 5.0]
+    return waypoints, durations
 
 
 def main():
     parser = argparse.ArgumentParser(description='S500 UAM Trajectory Planning')
     parser.add_argument('--s500-yaml', type=str, help='S500 config YAML')
     parser.add_argument('--urdf', type=str, help='S500 UAM URDF')
-    parser.add_argument('--simple', action='store_true', help='Simple mode: start -> target only (no grasp point)')
-    parser.add_argument('--max-iter', type=int, default=150)
-    parser.add_argument('--dt', type=float, default=0.02)
+    parser.add_argument(
+        '--simple',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Waypoint mode: built-in multi-waypoint demo (no grasp); use --no-simple for grasp trajectory (default: on)',
+    )
+    parser.add_argument('--max-iter', type=int, default=100)
+    parser.add_argument('--dt', type=float, default=0.01)
     parser.add_argument('--save-dir', type=str, help='Results directory')
-    parser.add_argument('--no-thrust-constraints', action='store_true')
+    parser.add_argument(
+        '--thrust-constraints',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Enable rotor thrust limits in optimization (default: on); pass --no-thrust-constraints to disable',
+    )
     args = parser.parse_args()
 
     print("=" * 70)
     if args.simple:
-        print("S500 UAM Trajectory Planning (Simple: Start → Target)")
+        print("S500 UAM Trajectory Planning (Multi-waypoint demo)")
     else:
         print("S500 UAM Trajectory Planning (Start → Grasp → Target)")
     print("=" * 70)
@@ -960,14 +1184,21 @@ def main():
     planner = S500UAMTrajectoryPlanner(s500_yaml_path=args.s500_yaml, urdf_path=args.urdf)
 
     if args.simple:
-        start_state, target_state, duration = create_uam_simple_waypoints()
-        print(f"\nWaypoints:")
-        print(f"  Start:  {start_state[:3]}, arm=[{start_state[7]:.2f}, {start_state[8]:.2f}]")
-        print(f"  Target: {target_state[:3]}, arm=[{target_state[7]:.2f}, {target_state[8]:.2f}]")
-        print(f"  Duration: {duration} s")
-        planner.create_trajectory_problem_simple(
-            start_state, target_state, duration,
-            dt=args.dt, use_thrust_constraints=not args.no_thrust_constraints
+        waypoints, durations = create_uam_simple_waypoints()
+        print(f"\nWaypoints ({len(waypoints)} points, {len(durations)} segments):")
+        labels = (
+            ["Start"]
+            + [f"WP{i}" for i in range(1, len(waypoints) - 1)]
+            + ["Target"]
+        )
+        for lab, w in zip(labels, waypoints):
+            print(f"  {lab:8s} {w[:3]}, arm=[{w[7]:.2f}, {w[8]:.2f}]")
+        print(f"  Durations: {durations} s (total {sum(durations):.2f} s)")
+        planner.create_trajectory_problem_waypoints(
+            waypoints=waypoints,
+            durations=durations,
+            dt=args.dt,
+            use_thrust_constraints=args.thrust_constraints,
         )
         save_name = 's500_uam_simple_trajectory'
     else:
@@ -977,9 +1208,9 @@ def main():
         print(f"  Grasp EE:  {grasp_position}")
         print(f"  Target:    {target_state[:3]}, arm=[{target_state[7]:.2f}, {target_state[8]:.2f}]")
         print(f"  Durations: {durations} s")
-        planner.create_trajectory_problem(
+        planner.create_trajectory_problem_grasp(
             start_state, grasp_position, target_state, durations,
-            dt=args.dt, use_thrust_constraints=not args.no_thrust_constraints
+            dt=args.dt, use_thrust_constraints=args.thrust_constraints
         )
         save_name = 's500_uam_grasp_trajectory'
 

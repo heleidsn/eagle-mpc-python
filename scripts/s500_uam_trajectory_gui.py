@@ -3,7 +3,7 @@
 S500 UAM Trajectory Planning GUI
 
 A graphical interface for S500 UAM trajectory optimization:
-- Supports Crocoddyl and Acados optimization methods
+- Supports Crocoddyl and Acados (direct thrust/torque, or ω+T+θ with cascaded 1st-order dynamics)
 - Waypoint add/remove/update (like tvc_traj_opt_gui)
 - Task selection: Point-to-point or Grasp
 - Cost parameter tuning
@@ -52,16 +52,22 @@ try:
     from s500_uam_acados_trajectory import (
         run_simple_trajectory,
         run_multiwaypoint_trajectory,
+        run_simple_trajectory_cascade,
+        run_multiwaypoint_trajectory_cascade,
         plot_acados_into_figure,
         plot_acados_3d_into_figure,
         ACADOS_AVAILABLE,
+        CASCADE_TRAJ_AVAILABLE,
     )
 except (ImportError, Exception):
     run_simple_trajectory = None
     run_multiwaypoint_trajectory = None
+    run_simple_trajectory_cascade = None
+    run_multiwaypoint_trajectory_cascade = None
     plot_acados_into_figure = None
     plot_acados_3d_into_figure = None
     ACADOS_AVAILABLE = False
+    CASCADE_TRAJ_AVAILABLE = False
 
 # Fixed path for saving/loading parameters
 DEFAULT_PARAMS_PATH = Path(__file__).parent.parent / "config" / "yaml" / "trajectories" / "s500_uam_trajectory_params.json"
@@ -85,14 +91,14 @@ class OptimizationWorker(QThread):
 
     def __init__(self, method, params):
         super().__init__()
-        self.method = method  # "crocoddyl" or "acados"
+        self.method = method  # "crocoddyl" | "acados" | "acados_cascade"
         self.params = params
 
     def run(self):
         try:
             if self.method == "crocoddyl":
                 self._run_crocoddyl()
-            else:
+            elif self.method in ("acados", "acados_cascade"):
                 self._run_acados()
         except Exception as e:
             import traceback
@@ -117,6 +123,8 @@ class OptimizationWorker(QThread):
                 waypoint_multiplier=self.params.get("waypoint_multiplier", 1000),
                 state_weight=self.params.get("state_weight", 1.0),
                 control_weight=self.params.get("control_weight", 1e-5),
+                use_actuator_first_order=self.params.get("use_actuator_first_order", False),
+                tau_cmd=self.params.get("tau_cmd"),
             )
         else:
             waypoints = self.params.get("waypoints", [])
@@ -128,25 +136,16 @@ class OptimizationWorker(QThread):
             if any(s is None for s in states):
                 self.finished.emit(False, "make_uam_state not available.", None)
                 return
-            if len(waypoints) == 2:
-                planner.create_trajectory_problem_simple(
-                    start_state=states[0],
-                    target_state=states[1],
-                    duration=durations[0],
-                    dt=self.params["dt"],
-                    waypoint_multiplier=self.params.get("waypoint_multiplier", 1000),
-                    state_weight=self.params.get("state_weight", 1.0),
-                    control_weight=self.params.get("control_weight", 1e-5),
-                )
-            else:
-                planner.create_trajectory_problem_waypoints(
-                    waypoints=states,
-                    durations=durations,
-                    dt=self.params["dt"],
-                    waypoint_multiplier=self.params.get("waypoint_multiplier", 1000),
-                    state_weight=self.params.get("state_weight", 1.0),
-                    control_weight=self.params.get("control_weight", 1e-5),
-                )
+            planner.create_trajectory_problem_waypoints(
+                waypoints=states,
+                durations=durations,
+                dt=self.params["dt"],
+                waypoint_multiplier=self.params.get("waypoint_multiplier", 1000),
+                state_weight=self.params.get("state_weight", 1.0),
+                control_weight=self.params.get("control_weight", 1e-5),
+                use_actuator_first_order=self.params.get("use_actuator_first_order", False),
+                tau_cmd=self.params.get("tau_cmd"),
+            )
         import time as _time
         t0 = _time.perf_counter()
         converged = planner.solve_trajectory(max_iter=self.params.get("max_iter", 200), verbose=False)
@@ -157,12 +156,18 @@ class OptimizationWorker(QThread):
             "total_s": elapsed,
             "avg_ms_per_iter": (elapsed * 1000.0 / n_iter) if n_iter > 0 else 0.0,
         }
-        self.finished.emit(converged, "", {"planner": planner, "method": "crocoddyl", "timing": timing})
+        self.finished.emit(
+            converged,
+            "",
+            {
+                "planner": planner,
+                "method": "crocoddyl",
+                "timing": timing,
+                "_plot_cache": getattr(planner, "_plot_cache", None),
+            },
+        )
 
     def _run_acados(self):
-        if not ACADOS_AVAILABLE or run_simple_trajectory is None:
-            self.finished.emit(False, "Acados not available. Install acados_template and build acados.", None)
-            return
         waypoints = self.params.get("waypoints", [])
         durations = self.params.get("durations", [])
         if len(waypoints) < 2:
@@ -178,30 +183,64 @@ class OptimizationWorker(QThread):
             "waypoint_multiplier": self.params.get("waypoint_multiplier", 1000),
             "max_iter": self.params.get("max_iter", 200),
         }
-        if len(waypoints) == 2:
-            simX, simU, time_arr, _, timing = run_simple_trajectory(
-                states[0], states[1],
-                duration=durations[0],
-                dt=self.params["dt"],
-                **kw,
-            )
+        if self.method == "acados_cascade":
+            if not ACADOS_AVAILABLE or not CASCADE_TRAJ_AVAILABLE or run_simple_trajectory_cascade is None:
+                self.finished.emit(
+                    False,
+                    "Acados cascade model not available (need acados, pinocchio, casadi).",
+                    None,
+                )
+                return
+            tc = self.params.get("tau_cmd")
+            if tc is not None:
+                kw["tau_cmd"] = np.asarray(tc, dtype=float).reshape(6)
+            ta = self.params.get("tau_act")
+            if ta is not None:
+                kw["tau_act"] = np.asarray(ta, dtype=float).reshape(6)
+            if len(waypoints) == 2:
+                simX, simU, time_arr, _, timing = run_simple_trajectory_cascade(
+                    states[0], states[1],
+                    duration=durations[0],
+                    dt=self.params["dt"],
+                    **kw,
+                )
+            else:
+                simX, simU, time_arr, _, timing = run_multiwaypoint_trajectory_cascade(
+                    states, durations, dt=self.params["dt"], **kw
+                )
+            method_tag = "acados_cascade"
+            control_layout = "high_level"
         else:
-            simX, simU, time_arr, _, timing = run_multiwaypoint_trajectory(
-                states, durations, dt=self.params["dt"], **kw
-            )
+            if not ACADOS_AVAILABLE or run_simple_trajectory is None:
+                self.finished.emit(False, "Acados not available. Install acados_template and build acados.", None)
+                return
+            if len(waypoints) == 2:
+                simX, simU, time_arr, _, timing = run_simple_trajectory(
+                    states[0], states[1],
+                    duration=durations[0],
+                    dt=self.params["dt"],
+                    **kw,
+                )
+            else:
+                simX, simU, time_arr, _, timing = run_multiwaypoint_trajectory(
+                    states, durations, dt=self.params["dt"], **kw
+                )
+            method_tag = "acados"
+            control_layout = "direct"
         if simX is None:
             self.finished.emit(False, "Acados optimization failed.", None)
             return
         wp_positions = [[w[0], w[1], w[2]] for w in waypoints]
         wp_times = [w[6] for w in waypoints]
         self.finished.emit(True, "", {
-            "method": "acados",
+            "method": method_tag,
             "simX": simX,
             "simU": simU,
             "time_arr": time_arr,
             "waypoint_positions": wp_positions,
             "waypoint_times": wp_times,
             "timing": timing or {},
+            "control_layout": control_layout,
         })
 
 
@@ -234,13 +273,20 @@ class S500UAMTrajectoryGUI(QMainWindow):
         method_group = QGroupBox("Optimization Method")
         method_layout = QHBoxLayout()
         self.method_combo = QComboBox()
+        self._method_ids = []
         items = []
         if CROCODDYL_AVAILABLE:
             items.append("Crocoddyl (BoxDDP)")
+            self._method_ids.append("crocoddyl")
         if ACADOS_AVAILABLE:
-            items.append("Acados")
+            items.append("Acados (thrusters + τ)")
+            self._method_ids.append("acados")
+            if CASCADE_TRAJ_AVAILABLE:
+                items.append("Acados (ω,T,θ + 1st-order)")
+                self._method_ids.append("acados_cascade")
         if not items:
             items.append("(No solver available)")
+            self._method_ids.append("none")
         self.method_combo.addItems(items)
         self._solver_available = CROCODDYL_AVAILABLE or ACADOS_AVAILABLE
         self.method_combo.setCurrentIndex(0)
@@ -248,6 +294,42 @@ class S500UAMTrajectoryGUI(QMainWindow):
         method_layout.addWidget(self.method_combo)
         method_group.setLayout(method_layout)
         left_layout.addWidget(method_group)
+
+        self.cascade_tau_group = QGroupBox(
+            "Cascade: first-order time constant τ (s) for high-level commands — used only by the ω, T, θ methods; ωx/ωy correspond to the roll/pitch angular-rate channels"
+        )
+        ct_layout = QGridLayout()
+        self.tau_omega_xy = QDoubleSpinBox()
+        self.tau_omega_xy.setRange(0.001, 2.0)
+        self.tau_omega_xy.setDecimals(3)
+        self.tau_omega_xy.setSingleStep(0.005)
+        self.tau_omega_xy.setValue(0.03)
+        self.tau_omega_yaw = QDoubleSpinBox()
+        self.tau_omega_yaw.setRange(0.001, 2.0)
+        self.tau_omega_yaw.setDecimals(3)
+        self.tau_omega_yaw.setSingleStep(0.005)
+        self.tau_omega_yaw.setValue(0.08)
+        self.tau_thrust = QDoubleSpinBox()
+        self.tau_thrust.setRange(0.001, 2.0)
+        self.tau_thrust.setDecimals(3)
+        self.tau_thrust.setSingleStep(0.005)
+        self.tau_thrust.setValue(0.06)
+        self.tau_theta = QDoubleSpinBox()
+        self.tau_theta.setRange(0.001, 2.0)
+        self.tau_theta.setDecimals(3)
+        self.tau_theta.setSingleStep(0.005)
+        self.tau_theta.setValue(0.05)
+        ct_layout.addWidget(QLabel("τ ωx,ωy (fast):"), 0, 0)
+        ct_layout.addWidget(self.tau_omega_xy, 0, 1)
+        ct_layout.addWidget(QLabel("τ ωz (yaw):"), 1, 0)
+        ct_layout.addWidget(self.tau_omega_yaw, 1, 1)
+        ct_layout.addWidget(QLabel("τ total thrust:"), 2, 0)
+        ct_layout.addWidget(self.tau_thrust, 2, 1)
+        ct_layout.addWidget(QLabel("τ joint angles θ1,θ2:"), 3, 0)
+        ct_layout.addWidget(self.tau_theta, 3, 1)
+        self.cascade_tau_group.setLayout(ct_layout)
+        self.cascade_tau_group.setVisible(CASCADE_TRAJ_AVAILABLE)
+        left_layout.addWidget(self.cascade_tau_group)
 
         # Task selection (for backward compat, can hide if using waypoints)
         task_group = QGroupBox("Task Type")
@@ -366,7 +448,7 @@ class S500UAMTrajectoryGUI(QMainWindow):
         cost_layout.addWidget(self.state_weight, 0, 1)
         cost_layout.addWidget(QLabel("Control weight:"), 1, 0)
         self.control_weight = QDoubleSpinBox()
-        self.control_weight.setRange(1e-8, 1.0)
+        self.control_weight.setRange(1e-8, 50.0)
         self.control_weight.setValue(1e-5)
         self.control_weight.setDecimals(1)
         cost_layout.addWidget(self.control_weight, 1, 1)
@@ -576,6 +658,10 @@ class S500UAMTrajectoryGUI(QMainWindow):
             "control_weight": self.control_weight.value(),
             "waypoint_multiplier": self.waypoint_mult.value(),
             "grasp_ee_weight": self.ee_weight.value(),
+            "tau_omega_xy": self.tau_omega_xy.value(),
+            "tau_omega_yaw": self.tau_omega_yaw.value(),
+            "tau_thrust": self.tau_thrust.value(),
+            "tau_theta": self.tau_theta.value(),
         }
         for k, le in self.grasp_inputs.items():
             try:
@@ -586,7 +672,10 @@ class S500UAMTrajectoryGUI(QMainWindow):
 
     def set_params_from_dict(self, d):
         self.task_combo.setCurrentIndex(d.get("task_type", 0))
-        self.method_combo.setCurrentIndex(d.get("method", 0))
+        mi = int(d.get("method", 0))
+        mc = self.method_combo.count()
+        if mc > 0:
+            self.method_combo.setCurrentIndex(max(0, min(mi, mc - 1)))
         if "waypoints" in d:
             self.waypoints = [list(w) for w in d["waypoints"]]
             self.update_waypoint_list()
@@ -605,6 +694,14 @@ class S500UAMTrajectoryGUI(QMainWindow):
         for k, le in self.grasp_inputs.items():
             if k in d:
                 le.setText(str(d[k]))
+        if "tau_omega_xy" in d:
+            self.tau_omega_xy.setValue(float(d["tau_omega_xy"]))
+        if "tau_omega_yaw" in d:
+            self.tau_omega_yaw.setValue(float(d["tau_omega_yaw"]))
+        if "tau_thrust" in d:
+            self.tau_thrust.setValue(float(d["tau_thrust"]))
+        if "tau_theta" in d:
+            self.tau_theta.setValue(float(d["tau_theta"]))
         self.grasp_group.setVisible(d.get("task_type", 0) == 2)
 
     def init_planner(self):
@@ -639,8 +736,17 @@ class S500UAMTrajectoryGUI(QMainWindow):
             self.log("ERROR: Need at least 2 waypoints")
             QMessageBox.warning(self, "Error", "Need at least 2 waypoints")
             return
-        method = "crocoddyl" if self.method_combo.currentIndex() == 0 else "acados"
-        if method == "acados" and not ACADOS_AVAILABLE:
+        mid = self.method_combo.currentIndex()
+        method = self._method_ids[mid] if 0 <= mid < len(self._method_ids) else "none"
+        if method == "none":
+            self.log("ERROR: No solver available")
+            QMessageBox.warning(self, "Error", "No solver available")
+            return
+        if method == "acados_cascade" and not CASCADE_TRAJ_AVAILABLE:
+            self.log("ERROR: Acados cascade model not available")
+            QMessageBox.warning(self, "Error", "Acados cascade model not available")
+            return
+        if method in ("acados", "acados_cascade") and not ACADOS_AVAILABLE:
             self.log("ERROR: Acados not available")
             QMessageBox.warning(self, "Error", "Acados not available")
             return
@@ -648,6 +754,14 @@ class S500UAMTrajectoryGUI(QMainWindow):
             self.log("ERROR: Crocoddyl planner not initialized")
             QMessageBox.warning(self, "Error", "Planner not initialized")
             return
+        tau_cmd = np.array([
+            self.tau_omega_xy.value(),
+            self.tau_omega_xy.value(),
+            self.tau_omega_yaw.value(),
+            self.tau_thrust.value(),
+            self.tau_theta.value(),
+            self.tau_theta.value(),
+        ], dtype=float)
         params = {
             "waypoints": wps,
             "durations": durations,
@@ -657,6 +771,8 @@ class S500UAMTrajectoryGUI(QMainWindow):
             "control_weight": self.control_weight.value(),
             "waypoint_multiplier": self.waypoint_mult.value(),
             "planner": self.planner,
+            "tau_cmd": tau_cmd,
+            "use_actuator_first_order": bool(method == "crocoddyl"),
         }
         self.run_btn.setEnabled(False)
         self.log(f"Running {method} optimization ({len(wps)} waypoints)...")
@@ -712,18 +828,20 @@ class S500UAMTrajectoryGUI(QMainWindow):
         if result_data is None:
             return
         timing = result_data.get("timing")
-        if result_data.get("method") == "acados":
+        if result_data.get("method") in ("acados", "acados_cascade"):
             simX = result_data["simX"]
             simU = result_data["simU"]
             time_arr = result_data["time_arr"]
             wp_times = result_data.get("waypoint_times", [])
             wp_pos = result_data.get("waypoint_positions", [])
+            ac_tag = "Acados cascade" if result_data.get("method") == "acados_cascade" else "Acados"
             if plot_acados_into_figure:
                 plot_acados_into_figure(
                     simX, simU, time_arr, fig_main,
-                    title=f"Acados{title_suffix}",
+                    title=f"{ac_tag}{title_suffix}",
                     waypoint_times=wp_times,
                     timing_info=timing,
+                    control_layout=result_data.get("control_layout", "direct"),
                 )
             if plot_acados_3d_into_figure:
                 plot_acados_3d_into_figure(simX, fig_3d, waypoint_positions=wp_pos)
@@ -760,7 +878,9 @@ class S500UAMTrajectoryGUI(QMainWindow):
                             "us": [u.copy() for u in planner.solver.us],
                             "dt": planner.dt or 0.02,
                             "waypoint_times": list(getattr(planner, "_waypoint_times", [])),
-                            "waypoint_positions": list(getattr(planner, "_waypoint_positions", [])),
+                            "waypoint_positions": [np.asarray(p, dtype=float).copy() for p in getattr(planner, "_waypoint_positions", [])],
+                            "waypoint_labels": list(getattr(planner, "_waypoint_labels", [])),
+                            "waypoint_ee_positions": [np.asarray(p, dtype=float).copy() for p in getattr(planner, "_waypoint_ee_positions", [])],
                             "cost_logger": getattr(planner, "_cost_logger", None),
                             "ee_positions": planner.get_ee_positions(),
                         },
@@ -781,18 +901,20 @@ class S500UAMTrajectoryGUI(QMainWindow):
         status = "Converged" if converged else "Not converged"
         self.log(f"Optimization finished: {status}")
         timing = result_data.get("timing") if result_data else None
-        if result_data and result_data.get("method") == "acados":
+        if result_data and result_data.get("method") in ("acados", "acados_cascade"):
             simX = result_data["simX"]
             simU = result_data["simU"]
             time_arr = result_data["time_arr"]
             wp_times = result_data.get("waypoint_times", [])
             wp_pos = result_data.get("waypoint_positions", [])
+            ac_title = "Acados cascade" if result_data.get("method") == "acados_cascade" else "Acados"
             plot_acados_into_figure(
                 simX, simU, time_arr,
                 self.plot_canvas.figure,
-                title=f"S500 UAM Trajectory ({status}) [Acados]",
+                title=f"S500 UAM Trajectory ({status}) [{ac_title}]",
                 waypoint_times=wp_times,
                 timing_info=timing,
+                control_layout=result_data.get("control_layout", "direct"),
             )
             plot_acados_3d_into_figure(simX, self.plot_canvas_3d.figure, waypoint_positions=wp_pos)
         else:
@@ -826,7 +948,7 @@ class S500UAMTrajectoryGUI(QMainWindow):
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save Trajectory Data", "", "NPZ (*.npz);;All (*)")
         if path:
-            if self.last_result.get("method") == "acados":
+            if self.last_result.get("method") in ("acados", "acados_cascade"):
                 np.savez(path,
                         states=self.last_result["simX"],
                         controls=self.last_result["simU"],

@@ -40,6 +40,18 @@ except ImportError as e:
     MODEL_AVAILABLE = False
     _model_err = e
 
+try:
+    from s500_uam_acados_cascade_actuator_model import (
+        build_acados_model_cascade_actuator,
+        pack_initial_state_cascade,
+    )
+
+    CASCADE_TRAJ_AVAILABLE = True
+except ImportError:
+    CASCADE_TRAJ_AVAILABLE = False
+    build_acados_model_cascade_actuator = None
+    pack_initial_state_cascade = None
+
 from s500_uam_trajectory_planner import make_uam_state, compute_ee_kinematics_along_trajectory
 
 
@@ -80,6 +92,11 @@ STATE_LIMITS = {
     "j_angle_max": 2.0,     # rad, max joint angle (from URDF)
     "j_vel_max": 10.0,      # rad/s, max joint angular velocity (from URDF)
 }
+
+# Control input semantics (consistent with the 6 columns of simU; plotting and CLI switch using the same naming)
+# direct: simU = [T1..T4, τ_arm1, τ_arm2]; cascade: [ωx, ωy, ωz, T_tot, θ1_cmd, θ2_cmd]
+CONTROL_INPUT_DIRECT = "direct"
+CONTROL_INPUT_CASCADE = "cascade"
 
 
 def create_simple_ocp(
@@ -216,6 +233,272 @@ def create_simple_ocp(
     return solver
 
 
+def _x0_cascade(start_state: np.ndarray, pin_model) -> np.ndarray:
+    """Convert a 17-dim robot initial state to 29-dim; if already 29-dim, return as-is (for multi-segment stitching)."""
+    x = np.asarray(start_state, dtype=float).flatten()
+    if x.size == 29:
+        return x
+    if x.size == 17:
+        if pack_initial_state_cascade is None:
+            raise RuntimeError("pack_initial_state_cascade not available")
+        return pack_initial_state_cascade(x, pin_model)
+    raise ValueError(f"cascade start_state must be 17 or 29, got {x.size}")
+
+
+def _normalize_quaternion_np(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=float).reshape(4)
+    n = float(np.linalg.norm(q))
+    if n < 1e-12:
+        return np.array([0.0, 0.0, 0.0, 1.0])
+    return q / n
+
+
+def _interp_robot_state_17(alpha: float, x_start: np.ndarray, x_end: np.ndarray) -> np.ndarray:
+    """Linear interpolation of pose/joints/velocity; quaternion via normalized nlerp. Used to keep the initial guess within box constraints (constant rollouts can overspeed)."""
+    a = float(np.clip(alpha, 0.0, 1.0))
+    xs = np.asarray(x_start, dtype=float).reshape(17)
+    xe = np.asarray(x_end, dtype=float).reshape(17)
+    out = (1.0 - a) * xs + a * xe
+    out[3:7] = _normalize_quaternion_np(out[3:7])
+    return out
+
+
+def _robot_state_17_from_waypoint(wp: np.ndarray) -> np.ndarray:
+    w = np.asarray(wp, dtype=float).flatten()
+    if w.size == 17:
+        return w.copy()
+    if w.size == 29:
+        return w[:17].copy()
+    raise ValueError(f"waypoint state must be 17 or 29, got {w.size}")
+
+
+def _warm_start_cascade_trajectory_solver(
+    solver,
+    pin_model,
+    start_state: np.ndarray,
+    target_state: np.ndarray,
+    N: int,
+    min_thrust: float,
+    max_thrust: float,
+):
+    """Interpolate 17-dim onboard states from start to target and pack them into 29-dim; u matches the filtered state z.
+
+    Avoid the default all-zero initial guess; relative to a constant nominal dynamics rollout, propagate forward so that interpolation keeps velocities etc. near STATE_LIMITS, which helps the first-step QP.
+    """
+    if pack_initial_state_cascade is None:
+        return
+    x0 = _x0_cascade(start_state, pin_model)
+    s17 = x0[:17]
+    e17 = _robot_state_17_from_waypoint(target_state)
+    z_sl = slice(17, 23)
+    for i in range(N + 1):
+        if i == 0:
+            xi = x0
+        else:
+            s = float(i) / float(N)
+            x17 = _interp_robot_state_17(s, s17, e17)
+            xi = pack_initial_state_cascade(
+                x17, pin_model, min_thrust=min_thrust, max_thrust=max_thrust
+            )
+        solver.set(i, "x", xi)
+    for i in range(N):
+        xgi = np.asarray(solver.get(i, "x"), dtype=float).flatten()
+        solver.set(i, "u", xgi[z_sl])
+
+
+def create_simple_ocp_cascade_actuator(
+    start_state: np.ndarray,
+    target_state: np.ndarray,
+    duration: float = 5.0,
+    dt: float = 0.02,
+    state_weight: float = 1.0,
+    control_weight: float = 1e-5,
+    waypoint_multiplier: float = 1000.0,
+    is_waypoint: bool = False,
+    max_iter: int = 200,
+    tau_cmd: np.ndarray | None = None,
+    tau_act: np.ndarray | None = None,
+) -> "AcadosOcpSolver":
+    """
+    Same cost and constraint structure as create_simple_ocp; the dynamics are "first-order filtering per high-level ω, T, θ channel + first-order lag for the thrust/torque layer".
+    State dimension is 29; control remains 6 (optimization variable is u_cmd).
+    """
+    if not ACADOS_AVAILABLE:
+        raise ImportError("acados_template not installed. See https://docs.acados.org/installation/")
+    if not CASCADE_TRAJ_AVAILABLE:
+        raise ImportError("Cascade actuator model not available (pinocchio/casadi/acados).")
+
+    import casadi as ca
+
+    N = max(1, int(round(duration / dt)))
+
+    ocp = AcadosOcp()
+    acados_model, pin_model, nq, nv, nu, _meta = build_acados_model_cascade_actuator(
+        tau_cmd=tau_cmd, tau_act=tau_act
+    )
+    ocp.model = acados_model
+
+    nx = int(acados_model.x.rows())
+    ocp.dims.N = N
+    ocp.solver_options.tf = duration
+    ocp.solver_options.nlp_solver_max_iter = max_iter
+    if hasattr(ocp.solver_options, "N_horizon"):
+        ocp.solver_options.N_horizon = N
+
+    x = ocp.model.x
+    quat = x[3:7]
+    roll, pitch, yaw = _quat_to_euler_zyx(quat)
+    cost_y = ca.vertcat(
+        x[0:3], yaw, roll, pitch, x[7:9], x[9:17], ocp.model.u
+    )
+    cost_y_e = ca.vertcat(
+        x[0:3], yaw, roll, pitch, x[7:9], x[9:17]
+    )
+
+    yref = np.concatenate([_state_to_cost_ref(target_state), np.zeros(nu)])
+    yref_e = _state_to_cost_ref(target_state)
+
+    w_pos = 100.0 * state_weight
+    w_yaw = 50.0 * state_weight
+    w_rp = 10.0 * state_weight
+    w_jq = 50.0 * state_weight
+    w_v = 1.0 * state_weight
+    w_omega = 1.0 * state_weight
+    w_jdot = 10.0 * state_weight
+    W_state = np.diag([
+        w_pos, w_pos, w_pos, w_yaw, w_rp, w_rp,
+        w_jq, w_jq,
+        w_v, w_v, w_v, w_omega, w_omega, w_omega, w_jdot, w_jdot
+    ])
+    r_omega = control_weight
+    r_T = control_weight
+    r_theta = control_weight * 50.0
+    R = np.diag([r_omega, r_omega, r_omega, r_T, r_theta, r_theta])
+    ocp.cost.cost_type = "NONLINEAR_LS"
+    ocp.model.cost_y_expr = cost_y
+    ocp.cost.yref = yref
+    ocp.cost.W = np.diag(np.concatenate([np.diag(W_state), np.diag(R)]))
+
+    ocp.cost.cost_type_e = "NONLINEAR_LS"
+    ocp.cost.yref_e = yref_e
+    ocp.model.cost_y_expr_e = cost_y_e
+    terminal_scale = waypoint_multiplier if is_waypoint else 1.0
+    ocp.cost.W_e = W_state * terminal_scale
+
+    cfg = load_s500_config()
+    platform = cfg["platform"]
+    min_thrust = platform["min_thrust"]
+    max_thrust = platform["max_thrust"]
+    v_max = STATE_LIMITS["v_max"]
+    om_max = STATE_LIMITS["omega_max"]
+    j_max = STATE_LIMITS["j_angle_max"]
+    jv_max = STATE_LIMITS["j_vel_max"]
+
+    ocp.constraints.lbu = np.array([-om_max, -om_max, -om_max, 4 * min_thrust, -j_max, -j_max])
+    ocp.constraints.ubu = np.array([om_max, om_max, om_max, 4 * max_thrust, j_max, j_max])
+    ocp.constraints.idxbu = np.arange(nu)
+
+    idx_robot = np.array([7, 8, 9, 10, 11, 12, 13, 14, 15, 16], dtype=int)
+    idx_z = np.array([17, 18, 19, 20, 21, 22], dtype=int)
+    idx_uact = np.array([23, 24, 25, 26, 27, 28], dtype=int)
+    ocp.constraints.idxbx = np.concatenate([idx_robot, idx_z, idx_uact])
+    ocp.constraints.lbx = np.concatenate([
+        np.array([-j_max, -j_max, -v_max, -v_max, -v_max, -om_max, -om_max, -om_max, -jv_max, -jv_max]),
+        np.array([-om_max, -om_max, -om_max, 4 * min_thrust, -j_max, -j_max]),
+        np.array([min_thrust, min_thrust, min_thrust, min_thrust, -2.0, -2.0]),
+    ])
+    ocp.constraints.ubx = np.concatenate([
+        np.array([j_max, j_max, v_max, v_max, v_max, om_max, om_max, om_max, jv_max, jv_max]),
+        np.array([om_max, om_max, om_max, 4 * max_thrust, j_max, j_max]),
+        np.array([max_thrust, max_thrust, max_thrust, max_thrust, 2.0, 2.0]),
+    ])
+
+    ocp.constraints.x0 = _x0_cascade(start_state, pin_model)
+
+    ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
+    ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
+    ocp.solver_options.integrator_type = "ERK"
+    ocp.solver_options.nlp_solver_type = "SQP"
+    ocp.solver_options.print_level = 0
+    if hasattr(ocp.solver_options, "qp_solver_iter_max"):
+        ocp.solver_options.qp_solver_iter_max = max(80, max_iter * 2)
+    if hasattr(ocp.solver_options, "nlp_solver_tol_stat"):
+        ocp.solver_options.nlp_solver_tol_stat = 1e-2
+    if hasattr(ocp.solver_options, "nlp_solver_tol_eq"):
+        ocp.solver_options.nlp_solver_tol_eq = 1e-2
+    dt_shoot = duration / N
+    if hasattr(ocp.solver_options, "sim_method_num_steps"):
+        # With large-step shooting, use enough sub-steps; otherwise the mismatch between the discretized dynamics and a rough initial guess can make the first-step QP ill-conditioned.
+        ocp.solver_options.sim_method_num_steps = int(max(5, min(40, np.ceil(dt_shoot / 0.01))))
+
+    script_dir = Path(__file__).parent
+    code_export_dir = script_dir.parent / "c_generated_code" / "s500_uam_cascade_traj"
+    json_path = code_export_dir / "s500_uam_cascade_traj_ocp.json"
+    ocp.code_gen_opts.code_export_directory = str(code_export_dir)
+    ocp.code_gen_opts.json_file = str(json_path)
+
+    solver = AcadosOcpSolver(
+        ocp, json_file=str(json_path), build=False, generate=False,
+        verbose=False, check_reuse_possible=True,
+    )
+    _warm_start_cascade_trajectory_solver(
+        solver, pin_model, start_state, target_state, N, min_thrust, max_thrust
+    )
+    return solver
+
+
+def _solve_ocp_with_live_log(solver, max_iter: int, label: str = "cascade"):
+    """Run SQP step-by-step and print per-step residuals/step lengths in the terminal for debugging; on failure, fall back to a single solve + print_level.
+
+    Returns:
+        (status, n_sqp_steps): n_sqp_steps is the actual number of SQP steps executed (step-by-step mode); otherwise None.
+    """
+    use_step_loop = False
+    try:
+        solver.options_set("nlp_solver_max_iter", 1)
+        solver.options_set("print_level", 0)
+        try:
+            solver.options_set("qp_print_level", 0)
+        except Exception:
+            pass
+        use_step_loop = True
+    except Exception:
+        use_step_loop = False
+
+    if not use_step_loop:
+        try:
+            solver.options_set("print_level", 1)
+        except Exception:
+            pass
+        print(f"[{label}] single solve (step loop unavailable), using print_level if set.", flush=True)
+        st = solver.solve()
+        return st, None
+
+    last = 2
+    for it in range(max_iter):
+        last = solver.solve()
+        stats = None
+        try:
+            stats = solver.get_stats("statistics")
+        except Exception:
+            stats = None
+        extra = ""
+        if stats is not None:
+            st = np.asarray(stats, dtype=float)
+            if st.size > 0:
+                row = st if st.ndim == 1 else st[-1]
+                ncol = min(12, int(row.shape[0]))
+                extra = " " + " ".join(f"{float(row[j]):.2e}" for j in range(ncol))
+        print(f"[{label}] SQP {it + 1}/{max_iter}  status={last}{extra}", flush=True)
+        if last == 0:
+            return 0, it + 1
+        if last not in (0, 2):
+            print(f"[{label}] solver exit status {last}", flush=True)
+            return last, it + 1
+    print(f"[{label}] reached max_iter={max_iter} (last status={last})", flush=True)
+    return last, max_iter
+
+
 def run_simple_trajectory(
     start_state: np.ndarray = None,
     target_state: np.ndarray = None,
@@ -337,6 +620,150 @@ def run_multiwaypoint_trajectory(
     return simX, simU, time_arr, dt_actual, merged_stats
 
 
+def run_simple_trajectory_cascade(
+    start_state: np.ndarray = None,
+    target_state: np.ndarray = None,
+    duration: float = 5.0,
+    dt: float = 0.02,
+    state_weight: float = 1.0,
+    control_weight: float = 1e-5,
+    waypoint_multiplier: float = 1000.0,
+    max_iter: int = 200,
+    tau_cmd: np.ndarray | None = None,
+    tau_act: np.ndarray | None = None,
+    debug_opt: bool = False,
+    debug_label: str | None = None,
+):
+    """start/target are 17-dim robot states; returns simX as (N+1)x29 and simU as N×6 (high-level u_cmd).
+
+    debug_opt: when True, print SQP residuals and other statistics step-by-step in the terminal (requires acados to support options_set for step-by-step iteration).
+    debug_label: log prefix; for multi-waypoint runs, it can be set by the caller to be the segment index.
+    """
+    if start_state is None:
+        start_state = make_uam_state(0, 0, 1.0, j1=-1.2, j2=-0.6, yaw=0)
+    if target_state is None:
+        target_state = make_uam_state(1.0, 0.5, 1.2, j1=-0.8, j2=-0.3, yaw=np.pi / 4)
+
+    solver = create_simple_ocp_cascade_actuator(
+        start_state, target_state, duration, dt,
+        state_weight=state_weight,
+        control_weight=control_weight,
+        waypoint_multiplier=waypoint_multiplier,
+        is_waypoint=True,
+        max_iter=max_iter,
+        tau_cmd=tau_cmd,
+        tau_act=tau_act,
+    )
+    try:
+        solver.options_set("levenberg_marquardt", 1e-2)
+    except Exception:
+        pass
+    label = debug_label if debug_label else "cascade"
+    t0 = time.perf_counter()
+    n_sqp_logged = None
+    if debug_opt:
+        print(f"[{label}] start optimization  N={max(1, int(round(duration / dt)))}  max_iter={max_iter}", flush=True)
+        status, n_sqp_logged = _solve_ocp_with_live_log(solver, max_iter, label=label)
+    else:
+        status = solver.solve()
+    t_wall = time.perf_counter() - t0
+
+    t_cpu = solver.get_stats("time_tot")
+    if n_sqp_logged is not None:
+        n_iter = int(n_sqp_logged)
+    else:
+        n_iter = solver.get_stats("nlp_iter")
+        if n_iter is None:
+            n_iter = solver.get_stats("sqp_iter")
+        if n_iter is None:
+            n_iter = solver.get_stats("ddp_iter")
+        n_iter = int(n_iter) if n_iter is not None else -1
+    t_per_iter = (t_cpu / n_iter * 1000) if n_iter > 0 else 0
+    print(f"Optimization (cascade): {n_iter} iterations, {t_cpu:.4f}s CPU, {t_wall:.4f}s wall, {t_per_iter:.2f} ms/iter avg")
+
+    if status not in [0, 2]:
+        print(f"acados solver returned status {status}")
+        return None, None, None, None, None
+
+    N = max(1, int(round(duration / dt)))
+    nx = int(solver.get(0, "x").shape[0])
+    nu = int(solver.get(0, "u").shape[0])
+    simX = np.zeros((N + 1, nx))
+    simU = np.zeros((N, nu))
+    for i in range(N):
+        simX[i, :] = solver.get(i, "x")
+        simU[i, :] = solver.get(i, "u")
+    simX[N, :] = solver.get(N, "x")
+
+    dt_actual = duration / N
+    time_arr = np.linspace(0, duration, N + 1)
+    stats = {
+        "n_iter": max(n_iter, 0),
+        "total_s": float(t_wall),
+        "avg_ms_per_iter": float(t_per_iter),
+    }
+    return simX, simU, time_arr, dt_actual, stats
+
+
+def run_multiwaypoint_trajectory_cascade(
+    waypoints: list,
+    durations: list,
+    dt: float = 0.02,
+    state_weight: float = 1.0,
+    control_weight: float = 1e-5,
+    waypoint_multiplier: float = 1000.0,
+    max_iter: int = 200,
+    tau_cmd: np.ndarray | None = None,
+    tau_act: np.ndarray | None = None,
+    debug_opt: bool = False,
+):
+    """Multi-waypoint cascade optimization; segment-to-segment stitching uses the full 29-dim terminal state."""
+    if len(waypoints) != len(durations) + 1:
+        raise ValueError("len(waypoints) must equal len(durations) + 1")
+    all_X = []
+    all_U = []
+    all_stats = []
+    x0 = waypoints[0]
+    for i in range(len(durations)):
+        x_target = waypoints[i + 1]
+        seg_label = f"cascade seg {i + 1}/{len(durations)}"
+        result = run_simple_trajectory_cascade(
+            x0, x_target, duration=durations[i], dt=dt,
+            state_weight=state_weight,
+            control_weight=control_weight,
+            waypoint_multiplier=waypoint_multiplier,
+            max_iter=max_iter,
+            tau_cmd=tau_cmd,
+            tau_act=tau_act,
+            debug_opt=debug_opt,
+            debug_label=seg_label,
+        )
+        if result[0] is None:
+            return None, None, None, None, None
+        simX, simU, time_arr, dt_actual, seg_stats = result
+        if seg_stats:
+            all_stats.append(seg_stats)
+        if i == 0:
+            all_X.append(simX)
+            all_U.append(simU)
+        else:
+            all_X.append(simX[1:])
+            all_U.append(simU)
+        x0 = simX[-1]
+    simX = np.vstack(all_X)
+    simU = np.vstack(all_U)
+    t_total = sum(durations)
+    time_arr = np.linspace(0, t_total, len(simX))
+    n_tot = sum(s["n_iter"] for s in all_stats) if all_stats else 0
+    t_tot = sum(s.get("total_s", 0) for s in all_stats) if all_stats else 0
+    merged_stats = {
+        "n_iter": n_tot,
+        "total_s": t_tot,
+        "avg_ms_per_iter": (t_tot / n_tot * 1000) if n_tot > 0 else 0.0,
+    }
+    return simX, simU, time_arr, dt_actual, merged_stats
+
+
 def _plot_pin_model_for_acados_fig():
     """Lazy-load Pinocchio model for EE kinematics in plots."""
     import pinocchio as pin
@@ -348,8 +775,13 @@ def _plot_pin_model_for_acados_fig():
 
 
 def plot_acados_into_figure(simX, simU, time_arr, fig, title: str = "S500 UAM Trajectory (acados)", waypoint_times=None,
-                            timing_info=None):
-    """Plot acados trajectory into existing figure (4x4 layout, aligned with Crocoddyl)."""
+                            timing_info=None, control_layout: str = "direct"):
+    """Plot acados trajectory into existing figure (4x4 layout, aligned with Crocoddyl).
+
+    control_layout:
+      - ``direct``: simU = [T1..T4, τ1, τ2] (default)
+      - ``high_level``: simU = [ωx, ωy, ωz, T_tot, θ1, θ2] (cascade / high-level command)
+    """
     if simX is None or fig is None:
         return None
     import matplotlib.pyplot as plt
@@ -487,23 +919,38 @@ def plot_acados_into_figure(simX, simU, time_arr, fig, title: str = "S500 UAM Tr
     ax21.set_title('Arm Joint Angular Velocity', fontsize=9)
     ax21.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-    colors = ['r', 'g', 'b', 'orange']
     ax22 = fig.add_subplot(gs[2, 2])
-    for i in range(min(4, simU.shape[1])):
-        ax22.plot(time_controls, simU[:, i], color=colors[i], label=f'T{i+1}')
-    ax22.set_xlabel('Time (s)', **tinfo)
-    ax22.set_ylabel('Thrust (N)', **tinfo)
-    ax22.set_title('Base Control (Thrusters)', fontsize=9)
-    ax22.legend(loc='upper right', fontsize=7, framealpha=0.9)
-
     ax23 = fig.add_subplot(gs[2, 3])
-    if simU.shape[1] >= 6:
-        ax23.plot(time_controls, simU[:, 4], 'r-', label='τ1')
-        ax23.plot(time_controls, simU[:, 5], 'g-', label='τ2')
-    ax23.set_xlabel('Time (s)', **tinfo)
-    ax23.set_ylabel('Torque (N·m)', **tinfo)
-    ax23.set_title('Arm Control (Joint Torques)', fontsize=9)
-    ax23.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    if control_layout == "high_level" and simU.shape[1] >= 6:
+        ax22.plot(time_controls, simU[:, 0], 'r-', label='ωx')
+        ax22.plot(time_controls, simU[:, 1], 'g-', label='ωy')
+        ax22.plot(time_controls, simU[:, 2], 'b-', label='ωz')
+        ax22.set_ylabel('Ang. rate cmd (rad/s)', **tinfo)
+        ax22.set_title('High-level ω cmd', fontsize=9)
+        ax22.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax22.set_xlabel('Time (s)', **tinfo)
+        ax23.plot(time_controls, simU[:, 3], 'k-', label='T_tot')
+        ax23.plot(time_controls, simU[:, 4], 'r--', label='θ1 cmd')
+        ax23.plot(time_controls, simU[:, 5], 'g--', label='θ2 cmd')
+        ax23.set_xlabel('Time (s)', **tinfo)
+        ax23.set_ylabel('T (N) / θ (rad)', **tinfo)
+        ax23.set_title('High-level T & θ cmd', fontsize=9)
+        ax23.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    else:
+        colors = ['r', 'g', 'b', 'orange']
+        for i in range(min(4, simU.shape[1])):
+            ax22.plot(time_controls, simU[:, i], color=colors[i], label=f'T{i+1}')
+        ax22.set_xlabel('Time (s)', **tinfo)
+        ax22.set_ylabel('Thrust (N)', **tinfo)
+        ax22.set_title('Base Control (Thrusters)', fontsize=9)
+        ax22.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        if simU.shape[1] >= 6:
+            ax23.plot(time_controls, simU[:, 4], 'r-', label='τ1')
+            ax23.plot(time_controls, simU[:, 5], 'g-', label='τ2')
+        ax23.set_xlabel('Time (s)', **tinfo)
+        ax23.set_ylabel('Torque (N·m)', **tinfo)
+        ax23.set_title('Arm Control (Joint Torques)', fontsize=9)
+        ax23.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
     # Row 3
     ax30 = fig.add_subplot(gs[3, 0])
@@ -596,13 +1043,26 @@ def plot_acados_3d_into_figure(simX, fig, waypoint_positions=None):
     return fig
 
 
-def plot_results(simX, simU, time_arr, save_path: str = None):
-    """Plot trajectory results with state limits shown."""
+def plot_results(
+    simX,
+    simU,
+    time_arr,
+    save_path: str = None,
+    control_input: str = CONTROL_INPUT_DIRECT,
+):
+    """Plot trajectory results with state limits shown.
+
+    control_input:
+      - ``CONTROL_INPUT_DIRECT`` / ``"direct"``: simU is quadrotor thrust + arm joint torques.
+      - ``CONTROL_INPUT_CASCADE`` / ``"cascade"``: simU is body angular rates, total thrust, and joint angle commands (rad).
+    """
     if simX is None:
         return
     lim = STATE_LIMITS
+    use_high_level = control_input == CONTROL_INPUT_CASCADE
     fig, axes = plt.subplots(3, 3, figsize=(14, 10))
-    fig.suptitle("S500 UAM Trajectory (acados)")
+    _ctrl_tag = "cascade cmd" if use_high_level else "direct thrust/torque"
+    fig.suptitle(f"S500 UAM Trajectory (acados) — {_ctrl_tag}")
 
     # Row 0: position, orientation (euler), joint angles
     ax = axes[0, 0]
@@ -663,20 +1123,38 @@ def plot_results(simX, simU, time_arr, save_path: str = None):
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Row 2: controls
+    # Row 2: controls (branch by control-input semantics)
     t_u = time_arr[:-1]
     ax = axes[2, 0]
-    for i in range(4):
-        ax.plot(t_u, simU[:, i], label=f'T{i+1}')
-    ax.set_ylabel('Thrust (N)')
-    ax.legend()
+    if use_high_level and simU.shape[1] >= 6:
+        ax.plot(t_u, simU[:, 0], 'r-', label='ωx cmd')
+        ax.plot(t_u, simU[:, 1], 'g-', label='ωy cmd')
+        ax.plot(t_u, simU[:, 2], 'b-', label='ωz cmd')
+        ax.axhline(lim["omega_max"], color='gray', linestyle='--', alpha=0.7, label=f'±{lim["omega_max"]} rad/s')
+        ax.axhline(-lim["omega_max"], color='gray', linestyle='--', alpha=0.7)
+        ax.set_ylabel('Body rate cmd (rad/s)')
+    else:
+        for i in range(min(4, simU.shape[1])):
+            ax.plot(t_u, simU[:, i], label=f'T{i+1}')
+        ax.set_ylabel('Thrust (N)')
+    ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
 
     ax = axes[2, 1]
-    ax.plot(t_u, simU[:, 4], 'r-', label='τ1')
-    ax.plot(t_u, simU[:, 5], 'g-', label='τ2')
-    ax.set_ylabel('Torque (N·m)')
-    ax.legend()
+    if use_high_level and simU.shape[1] >= 6:
+        ax.plot(t_u, simU[:, 3], 'k-', label='T_tot cmd')
+        ax.plot(t_u, np.degrees(simU[:, 4]), 'r--', label='θ1 cmd')
+        ax.plot(t_u, np.degrees(simU[:, 5]), 'g--', label='θ2 cmd')
+        j_deg = np.degrees(lim["j_angle_max"])
+        ax.axhline(j_deg, color='gray', linestyle='--', alpha=0.7)
+        ax.axhline(-j_deg, color='gray', linestyle='--', alpha=0.7)
+        ax.set_ylabel('T_tot (N) / joint cmd (°)')
+    else:
+        if simU.shape[1] >= 6:
+            ax.plot(t_u, simU[:, 4], 'r-', label='τ1')
+            ax.plot(t_u, simU[:, 5], 'g-', label='τ2')
+        ax.set_ylabel('Torque (N·m)')
+    ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
 
     ax = axes[2, 2]
@@ -711,6 +1189,21 @@ def main():
     parser.add_argument('--duration', type=float, default=5.0, help='Trajectory duration (s)')
     parser.add_argument('--dt', type=float, default=0.1, help='Time step (s), N = duration/dt')
     parser.add_argument('--save', type=str, help='Save plot path')
+    parser.add_argument(
+        '--control',
+        type=str,
+        choices=(CONTROL_INPUT_DIRECT, CONTROL_INPUT_CASCADE),
+        default=CONTROL_INPUT_CASCADE,
+        help=(
+            f'Control parameterization: "{CONTROL_INPUT_DIRECT}" = [T1..T4,τ1,τ2] (default); '
+            f'"{CONTROL_INPUT_CASCADE}" = [ωx,ωy,ωz,T_tot,θ1,θ2] (needs cascade model).'
+        ),
+    )
+    parser.add_argument(
+        '--debug-opt',
+        action='store_true',
+        help='Print per-iteration SQP stats while solving cascade trajectory (for debugging)',
+    )
     args = parser.parse_args()
 
     if not ACADOS_AVAILABLE:
@@ -726,23 +1219,43 @@ def main():
     print("=" * 50)
 
     start = make_uam_state(0, 0, 0.0, j1=-1.2, j2=-0.6, yaw=0)
-    target = make_uam_state(1.0, 0, 0.5, j1=-0.8, j2=-0.3, yaw=np.deg2rad(45))
+    target = make_uam_state(1.0, 0, 0.5, j1=-0.8, j2=-0.3, yaw=np.deg2rad(0))
     N = max(1, int(round(args.duration / args.dt)))
     print(f"Start:  pos={start[:3]}, arm=[{np.degrees(start[7]):.0f}, {np.degrees(start[8]):.0f}]°")
     print(f"Target: pos={target[:3]}, arm=[{np.degrees(target[7]):.0f}, {np.degrees(target[8]):.0f}]°")
     print(f"Duration: {args.duration}s, dt: {args.dt}s, N: {N}")
+    print(f"Control input mode: {args.control}")
     print()
 
-    simX, simU, time_arr, dt, _stats = run_simple_trajectory(
-        start, target, args.duration, args.dt
-    )
+    if args.control == CONTROL_INPUT_CASCADE:
+        if not CASCADE_TRAJ_AVAILABLE:
+            print("ERROR: cascade control requires pinocchio/casadi and s500_uam_acados_cascade_actuator_model.")
+            return 1
+        simX, simU, time_arr, dt, _stats = run_simple_trajectory_cascade(
+            start,
+            target,
+            args.duration,
+            args.dt,
+            debug_opt=args.debug_opt,
+        )
+        plot_ctrl = CONTROL_INPUT_CASCADE
+    else:
+        simX, simU, time_arr, dt, _stats = run_simple_trajectory(
+            start, target, args.duration, args.dt
+        )
+        plot_ctrl = CONTROL_INPUT_DIRECT
 
     if simX is not None:
         print("Optimization converged.")
-        plot_results(simX, simU, time_arr, args.save)
+        plot_results(simX, simU, time_arr, args.save, control_input=plot_ctrl)
         if args.save:
-            np.savez(args.save.replace('.png', '.npz') if args.save.endswith('.png') else args.save + '.npz',
-                     states=simX, controls=simU, time=time_arr)
+            np.savez(
+                args.save.replace('.png', '.npz') if args.save.endswith('.png') else args.save + '.npz',
+                states=simX,
+                controls=simU,
+                time=time_arr,
+                control_input=np.array(args.control),
+            )
     else:
         print("Optimization failed.")
         return 1

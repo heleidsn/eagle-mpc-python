@@ -191,9 +191,9 @@ class S500TrajectoryPlanner:
             original_control_weight = effective_control_weight
             effective_state_weight = float(effective_state_weight * waypoint_multiplier)
             effective_control_weight = float(effective_control_weight * waypoint_multiplier)
-            print(f"🎯 Waypoint权重增强:")
-            print(f"   State权重: {original_state_weight} -> {effective_state_weight} (倍数: {waypoint_multiplier})")
-            print(f"   Control权重: {original_control_weight} -> {effective_control_weight} (倍数: {waypoint_multiplier})")
+            print(f"🎯 Waypoint weight enhancement:")
+            print(f"   State weight: {original_state_weight} -> {effective_state_weight} (multiplier: {waypoint_multiplier})")
+            print(f"   Control weight: {original_control_weight} -> {effective_control_weight} (multiplier: {waypoint_multiplier})")
         
         # State cost
         state_activation = crocoddyl.ActivationModelQuad(self.state.ndx)

@@ -1,0 +1,52 @@
+{
+  "track": "eight",
+  "snap_rows": [
+    [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.55,
+      0.35,
+      0.95,
+      14.3,
+      2.5
+    ],
+    [
+      0.85,
+      -0.15,
+      1.05,
+      -22.9,
+      5.0
+    ],
+    [
+      1.0,
+      0.2,
+      0.9,
+      8.6,
+      8.0
+    ]
+  ],
+  "eight_center": [
+    0.55,
+    0.05,
+    0.92
+  ],
+  "eight_a": 0.22,
+  "eight_period": 6.0,
+  "control_mode": "direct",
+  "dt_mpc": 0.1,
+  "N_mpc": 20,
+  "sim_dt": 0.001,
+  "control_dt": 0.01,
+  "T_sim": 8.0,
+  "w_ee": 400.0,
+  "w_ee_yaw": 200.0,
+  "mpc_max_iter": 20,
+  "mpc_log_interval": 0,
+  "traj_combo_index": 1,
+  "control_combo_index": 0
+}

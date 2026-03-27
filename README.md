@@ -224,7 +224,7 @@ Control: `[thrust_1..4, torque_j1, torque_j2]` (4 thrusters + 2 joint torques)
 
 ### S500UAMTrajectoryPlanner (Quadrotor + Arm)
 
-- `create_trajectory_problem_simple(start_state, target_state, duration, ...)`: Simple mode (start→target)
+- `create_trajectory_problem_waypoints(waypoints, durations, dt, ...)`: Multi-segment trajectory (two points: `waypoints=[start, target]`, `durations=[T]`)
 - `create_trajectory_problem(start_state, grasp_position, target_state, durations, ...)`: Grasp mode (start→grasp→target)
 - `get_plot_figure()`, `get_3d_plot_figure()`: Main and 3D figures for GUI embedding
 
@@ -274,8 +274,8 @@ planner = S500UAMTrajectoryPlanner()
 start = make_uam_state(0, 0, 1.0, j1=-1.2, j2=-0.6)   # x,y,z, joint angles (rad)
 target = make_uam_state(1.0, 0.5, 2.0, j1=-0.8, j2=-0.3)
 
-planner.create_trajectory_problem_simple(
-    start_state=start, target_state=target, duration=5.0, dt=0.02
+planner.create_trajectory_problem_waypoints(
+    waypoints=[start, target], durations=[5.0], dt=0.02
 )
 converged = planner.solve_trajectory(max_iter=200)
 planner.plot_trajectory(save_path='results/uam_traj.png')
