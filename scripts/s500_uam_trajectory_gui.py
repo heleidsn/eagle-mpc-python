@@ -73,15 +73,31 @@ except (ImportError, Exception):
 DEFAULT_PARAMS_PATH = Path(__file__).parent.parent / "config" / "yaml" / "trajectories" / "s500_uam_trajectory_params.json"
 
 
+def mixed_wp_row_kind(cell0) -> str:
+    """Parse full-state waypoint Type cell.
+
+    Returns:
+        ``base`` — x,y,z = base origin (m); A,B,C = j1°, j2°, base yaw°.
+        ``ee_pose`` — x,y,z = EE position (world); A,B,C = roll°, pitch°, yaw° (ZYX, Pinocchio).
+        ``ee_pos`` — x,y,z = EE position (world); A,B,C = j1°, j2°, yaw° seeds for alignment.
+    """
+    s = str(cell0).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+    if s.startswith("eep") or s in ("eepos", "eeposition"):
+        return "ee_pos"
+    if s.startswith("e"):
+        return "ee_pose"
+    return "base"
+
+
 def wp_to_state(wp):
-    """Convert waypoint [x,y,z,yaw_deg,j1_deg,j2_deg,time] to 17-dim state."""
+    """Convert waypoint [x,y,z,j1_deg,j2_deg,yaw_deg,time] to 17-dim state."""
     if make_uam_state is None:
         return None
     deg2rad = np.pi / 180.0
     return make_uam_state(
         wp[0], wp[1], wp[2],
-        j1=wp[4] * deg2rad, j2=wp[5] * deg2rad,
-        yaw=wp[3] * deg2rad
+        j1=wp[3] * deg2rad, j2=wp[4] * deg2rad,
+        yaw=wp[5] * deg2rad,
     )
 
 
@@ -127,25 +143,103 @@ class OptimizationWorker(QThread):
                 tau_cmd=self.params.get("tau_cmd"),
             )
         else:
-            waypoints = self.params.get("waypoints", [])
-            durations = self.params.get("durations", [])
-            if len(waypoints) < 2:
-                self.finished.emit(False, "Need at least 2 waypoints.", None)
-                return
-            states = [wp_to_state(wp) for wp in waypoints]
-            if any(s is None for s in states):
-                self.finished.emit(False, "make_uam_state not available.", None)
-                return
-            planner.create_trajectory_problem_waypoints(
-                waypoints=states,
-                durations=durations,
-                dt=self.params["dt"],
-                waypoint_multiplier=self.params.get("waypoint_multiplier", 1000),
-                state_weight=self.params.get("state_weight", 1.0),
-                control_weight=self.params.get("control_weight", 1e-5),
-                use_actuator_first_order=self.params.get("use_actuator_first_order", False),
-                tau_cmd=self.params.get("tau_cmd"),
-            )
+            mixed_rows = self.params.get("mixed_wp_rows")
+            if mixed_rows is not None and len(mixed_rows) >= 2 and make_uam_state is not None:
+                import pinocchio as pin
+
+                deg2rad = np.pi / 180.0
+                sorted_rows = sorted(mixed_rows, key=lambda r: float(r[7]))
+                modes: list[str] = []
+                resolved: list = []
+                ee_targets: list = []
+                ee_pose_rpy_world: list = []
+                durs = []
+                for row in sorted_rows:
+                    rk = mixed_wp_row_kind(row[0])
+                    x, y, z, a, b, c, t = (float(row[i]) for i in range(1, 8))
+                    if rk == "base":
+                        modes.append("base")
+                        st = wp_to_state([x, y, z, a, b, c, t])
+                        if st is None:
+                            self.finished.emit(False, "make_uam_state not available.", None)
+                            return
+                        resolved.append(st)
+                        ee_targets.append(None)
+                        ee_pose_rpy_world.append(None)
+                    elif rk == "ee_pos":
+                        modes.append("ee_pos")
+                        st0 = make_uam_state(
+                            0.0, 0.0, 1.0, j1=a * deg2rad, j2=b * deg2rad, yaw=c * deg2rad
+                        )
+                        st = planner.align_state_ee_to_world_point(
+                            st0, np.array([x, y, z], dtype=float)
+                        )
+                        resolved.append(st)
+                        ee_targets.append(np.array([x, y, z], dtype=float))
+                        ee_pose_rpy_world.append(None)
+                    else:
+                        modes.append("ee_pose")
+                        st0 = np.zeros(17)
+                        st0[2] = 1.0
+                        rpy = np.array([a, b, c], dtype=float) * deg2rad
+                        R = pin.rpy.rpyToMatrix(
+                            float(rpy[0]), float(rpy[1]), float(rpy[2])
+                        )
+                        quat = pin.Quaternion(R)
+                        st0[3], st0[4], st0[5], st0[6] = quat.x, quat.y, quat.z, quat.w
+                        st = planner.align_state_ee_to_world_point(
+                            st0, np.array([x, y, z], dtype=float)
+                        )
+                        resolved.append(st)
+                        ee_targets.append(np.array([x, y, z], dtype=float))
+                        ee_pose_rpy_world.append(rpy.copy())
+                for i in range(len(sorted_rows) - 1):
+                    d = float(sorted_rows[i + 1][7]) - float(sorted_rows[i][7])
+                    durs.append(d if d > 1e-6 else 1.0)
+                planner.create_trajectory_problem_mixed_waypoints(
+                    modes=modes,
+                    resolved_states=resolved,
+                    ee_targets=ee_targets,
+                    durations=durs,
+                    dt=self.params["dt"],
+                    waypoint_multiplier=self.params.get("waypoint_multiplier", 1000),
+                    state_weight=self.params.get("state_weight", 1.0),
+                    control_weight=self.params.get("control_weight", 1e-5),
+                    ee_knot_weight=self.params.get("ee_knot_weight", 5000.0),
+                    ee_knot_state_reg_weight=self.params.get("ee_knot_state_reg_weight", 0.0),
+                    ee_pose_rpy_world=ee_pose_rpy_world,
+                    ee_knot_rotation_weight=float(
+                        self.params.get("ee_knot_rotation_weight", 0.0)
+                    ),
+                    ee_knot_velocity_weight=float(
+                        self.params.get("ee_knot_velocity_weight", 200.0)
+                    ),
+                    ee_knot_velocity_pitch_weight=float(
+                        self.params.get("ee_knot_velocity_pitch_weight", 0.0)
+                    ),
+                    use_actuator_first_order=self.params.get("use_actuator_first_order", False),
+                    tau_cmd=self.params.get("tau_cmd"),
+                )
+            else:
+                waypoints = self.params.get("waypoints", [])
+                durations = self.params.get("durations", [])
+                if len(waypoints) < 2:
+                    self.finished.emit(False, "Need at least 2 waypoints.", None)
+                    return
+                states = [wp_to_state(wp) for wp in waypoints]
+                if any(s is None for s in states):
+                    self.finished.emit(False, "make_uam_state not available.", None)
+                    return
+                planner.create_trajectory_problem_waypoints(
+                    waypoints=states,
+                    durations=durations,
+                    dt=self.params["dt"],
+                    waypoint_multiplier=self.params.get("waypoint_multiplier", 1000),
+                    state_weight=self.params.get("state_weight", 1.0),
+                    control_weight=self.params.get("control_weight", 1e-5),
+                    use_actuator_first_order=self.params.get("use_actuator_first_order", False),
+                    tau_cmd=self.params.get("tau_cmd"),
+                )
         import time as _time
         t0 = _time.perf_counter()
         converged = planner.solve_trajectory(max_iter=self.params.get("max_iter", 200), verbose=False)
@@ -393,12 +487,12 @@ class S500UAMTrajectoryGUI(QMainWindow):
         wp_edit_layout.addWidget(self.wp_y, 0, 3)
         wp_edit_layout.addWidget(QLabel("Z (m):"), 1, 0)
         wp_edit_layout.addWidget(self.wp_z, 1, 1)
-        wp_edit_layout.addWidget(QLabel("Yaw (°):"), 1, 2)
-        wp_edit_layout.addWidget(self.wp_yaw, 1, 3)
-        wp_edit_layout.addWidget(QLabel("J1 (°):"), 2, 0)
-        wp_edit_layout.addWidget(self.wp_j1, 2, 1)
-        wp_edit_layout.addWidget(QLabel("J2 (°):"), 2, 2)
-        wp_edit_layout.addWidget(self.wp_j2, 2, 3)
+        wp_edit_layout.addWidget(QLabel("J1 (°):"), 1, 2)
+        wp_edit_layout.addWidget(self.wp_j1, 1, 3)
+        wp_edit_layout.addWidget(QLabel("J2 (°):"), 2, 0)
+        wp_edit_layout.addWidget(self.wp_j2, 2, 1)
+        wp_edit_layout.addWidget(QLabel("Yaw (°):"), 2, 2)
+        wp_edit_layout.addWidget(self.wp_yaw, 2, 3)
         wp_edit_layout.addWidget(QLabel("Arrival Time (s):"), 3, 0)
         wp_edit_layout.addWidget(self.wp_time, 3, 1)
         self.update_wp_btn = QPushButton("Update Selected")
@@ -409,10 +503,10 @@ class S500UAMTrajectoryGUI(QMainWindow):
         self.waypoint_group.setLayout(wp_layout)
         left_layout.addWidget(self.waypoint_group)
 
-        # Default waypoints: [x, y, z, yaw_deg, j1_deg, j2_deg, arrival_time]
+        # Default waypoints: [x, y, z, j1_deg, j2_deg, yaw_deg, arrival_time]
         self.waypoints = [
-            [0.0, 0.0, 1.0, 0.0, -68.8, -34.4, 0.0],
-            [1.0, 0.5, 1.2, 45.0, -45.8, -17.2, 5.0],
+            [0.0, 0.0, 1.0, -68.8, -34.4, 0.0, 0.0],
+            [1.0, 0.5, 1.2, -45.8, -17.2, 45.0, 5.0],
         ]
         self.update_waypoint_list()
 
@@ -578,14 +672,21 @@ class S500UAMTrajectoryGUI(QMainWindow):
                 wp = list(wp) + [0.0] * (7 - len(wp))
             label = "Start" if i == 0 else f"WP {i}"
             t = wp[6] if len(wp) > 6 else 0
-            item_text = f"{label}: [{wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f}] yaw={wp[3]:.0f}° j=[{wp[4]:.0f},{wp[5]:.0f}]° @ t={t:.2f}s"
+            item_text = (
+                f"{label}: [{wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f}] "
+                f"j=[{wp[3]:.0f},{wp[4]:.0f}]° yaw={wp[5]:.0f}° @ t={t:.2f}s"
+            )
             self.waypoint_list.addItem(QListWidgetItem(item_text))
 
     def add_waypoint(self):
         new_wp = [
-            self.wp_x.value(), self.wp_y.value(), self.wp_z.value(),
-            self.wp_yaw.value(), self.wp_j1.value(), self.wp_j2.value(),
-            self.wp_time.value()
+            self.wp_x.value(),
+            self.wp_y.value(),
+            self.wp_z.value(),
+            self.wp_j1.value(),
+            self.wp_j2.value(),
+            self.wp_yaw.value(),
+            self.wp_time.value(),
         ]
         self.waypoints.append(new_wp)
         self.update_waypoint_list()
@@ -608,9 +709,13 @@ class S500UAMTrajectoryGUI(QMainWindow):
         if row < 0 or row >= len(self.waypoints):
             return
         self.waypoints[row] = [
-            self.wp_x.value(), self.wp_y.value(), self.wp_z.value(),
-            self.wp_yaw.value(), self.wp_j1.value(), self.wp_j2.value(),
-            self.wp_time.value()
+            self.wp_x.value(),
+            self.wp_y.value(),
+            self.wp_z.value(),
+            self.wp_j1.value(),
+            self.wp_j2.value(),
+            self.wp_yaw.value(),
+            self.wp_time.value(),
         ]
         self.update_waypoint_list()
         self.waypoint_list.setCurrentRow(row)
@@ -624,9 +729,9 @@ class S500UAMTrajectoryGUI(QMainWindow):
             self.wp_x.setValue(wp[0])
             self.wp_y.setValue(wp[1])
             self.wp_z.setValue(wp[2])
-            self.wp_yaw.setValue(wp[3] if len(wp) > 3 else 0)
-            self.wp_j1.setValue(wp[4] if len(wp) > 4 else 0)
-            self.wp_j2.setValue(wp[5] if len(wp) > 5 else 0)
+            self.wp_j1.setValue(wp[3] if len(wp) > 3 else 0)
+            self.wp_j2.setValue(wp[4] if len(wp) > 4 else 0)
+            self.wp_yaw.setValue(wp[5] if len(wp) > 5 else 0)
             self.wp_time.setValue(wp[6] if len(wp) > 6 else 0)
 
     def get_waypoints_and_durations(self):
@@ -651,6 +756,7 @@ class S500UAMTrajectoryGUI(QMainWindow):
         d = {
             "task_type": self.task_combo.currentIndex(),
             "method": self.method_combo.currentIndex(),
+            "traj_gui_wp_version": 2,
             "waypoints": [list(w) for w in self.waypoints],
             "dt": self.dt_spin.value(),
             "max_iter": self.max_iter.value(),
@@ -677,7 +783,13 @@ class S500UAMTrajectoryGUI(QMainWindow):
         if mc > 0:
             self.method_combo.setCurrentIndex(max(0, min(mi, mc - 1)))
         if "waypoints" in d:
-            self.waypoints = [list(w) for w in d["waypoints"]]
+            wps = [list(w) for w in d["waypoints"]]
+            if int(d.get("traj_gui_wp_version", 1)) < 2:
+                for w in wps:
+                    if len(w) >= 6:
+                        yaw, j1, j2 = float(w[3]), float(w[4]), float(w[5])
+                        w[3], w[4], w[5] = j1, j2, yaw
+            self.waypoints = wps
             self.update_waypoint_list()
         if "dt" in d:
             self.dt_spin.setValue(d["dt"])

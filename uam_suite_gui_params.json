@@ -1,11 +1,12 @@
 {
   "version": 1,
-  "plan_mode_index": 1,
+  "plan_mode_index": 0,
   "method_index": 0,
-  "track_mode_index": 1,
+  "track_mode_index": 2,
   "control_mode_track_index": 0,
   "wp_rows": [
     [
+      "Base",
       -1.5,
       0.0,
       1.5,
@@ -15,22 +16,24 @@
       0.0
     ],
     [
+      "EE",
       0.0,
       0.0,
-      1.0,
+      0.8,
       0.0,
       0.0,
       0.0,
-      3.0
+      2.0
     ],
     [
+      "Base",
       1.5,
       0.0,
       1.5,
       0.0,
       0.0,
       0.0,
-      6.0
+      4.0
     ]
   ],
   "ee_wp_rows": [
@@ -66,20 +69,42 @@
   "dt_plan": 0.02,
   "max_iter_plan": 200,
   "state_w": 1.0,
-  "ctrl_w": 0.0,
-  "wp_mult": 1000.0,
+  "ctrl_w": 0.9,
+  "wp_mult": 5000.0,
+  "ee_knot_w": 5000.0,
+  "ee_knot_state_reg_w": 0.0,
+  "ee_knot_rot_w": 1000.0,
+  "ee_knot_vel_w": 200.0,
+  "ee_knot_vel_pitch_w": 0.0,
   "dt_ee_sample": 0.02,
-  "T_sim": 8.0,
+  "ee_plan_type_index": 0,
+  "ee_eight_center": [
+    0.55,
+    0.05,
+    0.92
+  ],
+  "ee_eight_a": 0.22,
+  "ee_eight_period": 6.0,
+  "ee_eight_tdur": 8.0,
+  "T_sim": 6.0,
   "sim_dt": 0.001,
   "control_dt": 0.01,
   "dt_mpc": 0.05,
-  "N_mpc": 35,
+  "N_mpc": 40,
   "w_ee": 20.0,
   "w_ee_yaw": 10.0,
+  "croc_ee_w_pos": 50.0,
+  "croc_ee_w_rot_rp": 1.0,
+  "croc_ee_w_rot_yaw": 10.0,
+  "croc_ee_w_vel_lin": 1.0,
+  "croc_ee_w_vel_ang_rp": 1.0,
+  "croc_ee_w_vel_ang_yaw": 1.0,
+  "croc_ee_w_u": 1.0,
+  "croc_ee_w_terminal": 3.0,
   "mpc_max_iter": 20,
   "mpc_log_iv": 0,
-  "tau_thrust_track": 0.06,
-  "tau_theta_track": 0.05,
+  "tau_thrust_track": 0.1,
+  "tau_theta_track": 0.1,
   "croc_horizon": 40,
   "croc_mpc_iter": 60,
   "w_state_track": 10.0,
@@ -88,7 +113,7 @@
   "w_terminal_track": 100.0,
   "croc_use_actuator_first_order": true,
   "croc_ee_use_thrust_constraints": true,
-  "plan_croc_use_actuator_first_order": true,
+  "plan_croc_use_actuator_first_order": false,
   "plan_tau_motor": 0.06,
   "plan_tau_joint": 0.05
 }

@@ -2,8 +2,11 @@
 """
 S500 UAM — Crocoddyl EE pose tracking (MPC)
 
-EE-centric tracking uses a pose residual on the EE frame:
-  - translation + rotation (SE3) via ``ResidualModelFramePlacement``
+EE-centric tracking uses separate costs on the EE frame:
+  - position: ``ResidualModelFrameTranslation``
+  - orientation: ``ResidualModelFramePlacement`` with translation block zeroed in activation
+  - spatial velocity: ``ResidualModelFrameVelocity`` (LOCAL_WORLD_ALIGNED)
+  - optional full-state residual vs a plan reference ``x_ref(t)``
   - rolling-horizon MPC solved by ``crocoddyl.SolverBoxFDDP``
 
 Control (direct mode):
@@ -15,14 +18,21 @@ Reference provided as:
   - yaw_ref: (N,) ZYX yaw angle in rad
 
 For rotation target we assume roll/pitch = 0 and yaw = yaw_ref.
+
+Optional **sim-only payload**: when enabled, closed-loop integration uses a **copy** of the
+Pinocchio model and adds a **solid-sphere** payload (CoM at gripper joint origin,
+``Ixx=Iyy=Izz = 2/5·m·r²``) on the EE link at ``t_grasp``; MPC keeps the original model.
+
+MPC problem construction (costs, shooting along EE reference) lives in
+``s500_uam_crocoddyl_state_tracking_mpc`` (``UAMEEPoseTrackingCrocoddylMPC``); this module
+keeps closed-loop simulation, CLI, and plotting.
 """
 
 from __future__ import annotations
 
 import argparse
 import time
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import List, Optional
 
 import numpy as np
 import pinocchio as pin
@@ -34,287 +44,19 @@ from s500_uam_trajectory_planner import (
     compute_ee_kinematics_along_trajectory,
     make_uam_state,
 )
-
-
-def _interp_ref_pose(
-    tq: float,
-    t_ref: np.ndarray,
-    p_ref: np.ndarray,
-    yaw_ref: np.ndarray,
-) -> Tuple[np.ndarray, float]:
-    """Linear interpolation for position and yaw (yaw is unwrapped first)."""
-    t_ref = np.asarray(t_ref, dtype=float).flatten()
-    p_ref = np.asarray(p_ref, dtype=float)
-    yaw_ref = np.asarray(yaw_ref, dtype=float).flatten()
-
-    if len(t_ref) < 2:
-        raise ValueError("t_ref must have at least 2 points")
-    if p_ref.shape != (len(t_ref), 3):
-        raise ValueError(f"p_ref must have shape (len(t_ref),3); got {p_ref.shape}")
-    if len(yaw_ref) != len(t_ref):
-        raise ValueError("yaw_ref length mismatch with t_ref")
-
-    tq = float(np.clip(tq, t_ref[0], t_ref[-1]))
-    px = float(np.interp(tq, t_ref, p_ref[:, 0]))
-    py = float(np.interp(tq, t_ref, p_ref[:, 1]))
-    pz = float(np.interp(tq, t_ref, p_ref[:, 2]))
-
-    yaw_u = np.unwrap(yaw_ref)
-    yaw = float(np.interp(tq, t_ref, yaw_u))
-
-    return np.array([px, py, pz], dtype=float), yaw
-
-
-def _yaw_to_rotation_matrix(yaw: float, roll: float = 0.0, pitch: float = 0.0) -> np.ndarray:
-    """Construct a target rotation from roll/pitch/yaw (world ZYX yaw)."""
-    return pin.rpy.rpyToMatrix(roll, pitch, yaw)
-
-
-@dataclass
-class EETrackingWeights:
-    w_pos: float = 10.0
-    w_rot_rp: float = 1.0   # roll/pitch rotation weights (small vs yaw)
-    w_rot_yaw: float = 1.0
-    w_vel_lin: float = 1.0
-    w_vel_ang_rp: float = 1.0  # angular velocity x/y
-    w_vel_ang_yaw: float = 1.0  # angular velocity z (yaw rate)
-    w_u: float = 0
-    w_terminal_scale: float = 3.0
-    w_state_reg: float = 0.0  # optional; default off
-
-
-class UAMEEPoseTrackingCrocoddylMPC:
-    def __init__(
-        self,
-        *,
-        s500_yaml_path: Optional[str] = None,
-        urdf_path: Optional[str] = None,
-        dt_mpc: float = 0.05,
-        horizon: int = 25,
-        u_weights: EETrackingWeights = EETrackingWeights(),
-        use_thrust_constraints: bool = True,
-    ):
-        self.dt_mpc = float(dt_mpc)
-        self.horizon = int(horizon)
-        self.w = u_weights
-        self.use_thrust_constraints = bool(use_thrust_constraints)
-
-        self._planner = S500UAMTrajectoryPlanner(
-            s500_yaml_path=s500_yaml_path,
-            urdf_path=urdf_path,
-        )
-        self.state = self._planner.state
-        self.actuation = self._planner.actuation
-        self.robot_model = self._planner.robot_model
-        self.robot_data = self._planner.robot_data
-        self.ee_frame_id = self._planner.ee_frame_id
-
-        self.nu = self.actuation.nu
-        self.nq = self.robot_model.nq
-        self.nv = self.robot_model.nv
-
-        mass = float(self.robot_model.inertias[1].mass)
-        hover_thrust = mass * 9.81 / 4.0
-        self._u_ref = np.array([hover_thrust] * 4 + [0.0] * (self.nu - 4), dtype=float)
-
-        if use_thrust_constraints:
-            p = self._planner.s500_config["platform"]
-            self._u_lb = np.array([p["min_thrust"]] * 4 + [-2.0] * 2, dtype=float)
-            self._u_ub = np.array([p["max_thrust"]] * 4 + [2.0] * 2, dtype=float)
-        else:
-            self._u_lb = -1e6 * np.ones(self.nu, dtype=float)
-            self._u_ub = 1e6 * np.ones(self.nu, dtype=float)
-
-    def _make_running_cost(
-        self,
-        p_des: np.ndarray,
-        yaw_des: float,
-        v_lin_des: np.ndarray,
-        w_ang_des: np.ndarray,
-    ) -> crocoddyl.CostModelSum:
-        nu = self.nu
-        c = crocoddyl.CostModelSum(self.state, nu)
-
-        R_des = _yaw_to_rotation_matrix(yaw_des)
-        T_des = pin.SE3(R_des, np.asarray(p_des, dtype=float).reshape(3))
-
-        # ResidualModelFramePlacement residual dimension is 6 (t + rot).
-        pose_act = crocoddyl.ActivationModelWeightedQuad(
-            np.array(
-                [
-                    self.w.w_pos,
-                    self.w.w_pos,
-                    self.w.w_pos,
-                    self.w.w_rot_rp,
-                    self.w.w_rot_rp,
-                    self.w.w_rot_yaw,
-                ],
-                dtype=float,
-            )
-        )
-        ee_res = crocoddyl.ResidualModelFramePlacement(self.state, self.ee_frame_id, T_des, nu)
-        c.addCost(
-            "ee_pose",
-            crocoddyl.CostModelResidual(self.state, pose_act, ee_res),
-            1.0,
-        )
-
-        # EE velocity tracking
-        # Desired motion is (linear velocity; angular velocity) in world-aligned coordinates.
-        if (
-            self.w.w_vel_lin > 0
-            or self.w.w_vel_ang_rp > 0
-            or self.w.w_vel_ang_yaw > 0
-        ):
-            rf = pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
-            vel_act = crocoddyl.ActivationModelWeightedQuad(
-                np.array(
-                    [
-                        self.w.w_vel_lin,
-                        self.w.w_vel_lin,
-                        self.w.w_vel_lin,
-                        self.w.w_vel_ang_rp,
-                        self.w.w_vel_ang_rp,
-                        self.w.w_vel_ang_yaw,
-                    ],
-                    dtype=float,
-                )
-            )
-            v_lin_des = np.asarray(v_lin_des, dtype=float).reshape(3)
-            w_ang_des = np.asarray(w_ang_des, dtype=float).reshape(3)
-            vel_motion_ref = pin.Motion(v_lin_des, w_ang_des)
-
-            vel_res = None
-            # Some crocoddyl builds may provide a Tpl variant; fall back if not.
-            if hasattr(crocoddyl, "ResidualModelFrameVelocityTpl"):
-                try:
-                    vel_res = crocoddyl.ResidualModelFrameVelocityTpl(
-                        self.state, self.ee_frame_id, vel_motion_ref, rf, nu
-                    )
-                except Exception:
-                    vel_res = None
-            if vel_res is None:
-                vel_res = crocoddyl.ResidualModelFrameVelocity(
-                    self.state, self.ee_frame_id, vel_motion_ref, rf, nu
-                )
-
-            c.addCost(
-                "ee_vel",
-                crocoddyl.CostModelResidual(self.state, vel_act, vel_res),
-                1.0,
-            )
-
-        # Control regularization around nominal hover command.
-        if self.w.w_u > 0:
-            u_act = crocoddyl.ActivationModelQuad(nu)
-            u_res = crocoddyl.ResidualModelControl(self.state, self._u_ref.copy())
-            c.addCost(
-                "u_reg",
-                crocoddyl.CostModelResidual(self.state, u_act, u_res),
-                self.w.w_u,
-            )
-
-        # Optional state regularization (off by default).
-        if self.w.w_state_reg > 0:
-            x_nom = np.zeros(self.nq + self.nv, dtype=float)
-            x_nom[2] = 1.0
-            x_nom[6] = 1.0
-            x_act_weights = np.ones(int(self.state.ndx), dtype=float)
-            # Ignore velocity part: residual ordered as [q_diff, v_diff] in tangent.
-            if self.nv > 0 and self.state.ndx >= self.nv:
-                x_act_weights[-self.nv:] = 0.0
-            x_act = crocoddyl.ActivationModelWeightedQuad(x_act_weights)
-            x_res = crocoddyl.ResidualModelState(self.state, x_nom, nu)
-            c.addCost(
-                "x_reg",
-                crocoddyl.CostModelResidual(self.state, x_act, x_res),
-                self.w.w_state_reg,
-            )
-
-        return c
-
-    def _make_terminal_cost(
-        self,
-        p_des: np.ndarray,
-        yaw_des: float,
-        v_lin_des: np.ndarray,
-        w_ang_des: np.ndarray,
-    ) -> crocoddyl.CostModelSum:
-        # Reuse the same residuals; terminal scaling is handled by global weight multipliers
-        # in practice (kept simple here).
-        return self._make_running_cost(p_des, yaw_des, v_lin_des, w_ang_des)
-
-    def _make_integrated_running(
-        self,
-        p_des: np.ndarray,
-        yaw_des: float,
-        v_lin_des: np.ndarray,
-        w_ang_des: np.ndarray,
-    ) -> crocoddyl.IntegratedActionModelEuler:
-        cost = self._make_running_cost(p_des, yaw_des, v_lin_des, w_ang_des)
-        diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, cost)
-        inte = crocoddyl.IntegratedActionModelEuler(diff, self.dt_mpc)
-        inte.u_lb = self._u_lb.copy()
-        inte.u_ub = self._u_ub.copy()
-        return inte
-
-    def _make_integrated_terminal(
-        self,
-        p_des: np.ndarray,
-        yaw_des: float,
-        v_lin_des: np.ndarray,
-        w_ang_des: np.ndarray,
-    ) -> crocoddyl.IntegratedActionModelEuler:
-        # Terminal: same residual, larger weight.
-        cost = self._make_running_cost(p_des, yaw_des, v_lin_des, w_ang_des)
-        diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, cost)
-        terminal = crocoddyl.IntegratedActionModelEuler(diff, 0.0)
-        return terminal
-
-    def build_shooting_problem_along_ref(
-        self,
-        x0: np.ndarray,
-        t_start: float,
-        t_ref: np.ndarray,
-        p_ref: np.ndarray,
-        yaw_ref: np.ndarray,
-        dp_ref: np.ndarray,
-        dyaw_ref: np.ndarray,
-    ) -> crocoddyl.ShootingProblem:
-        x0 = np.asarray(x0, dtype=float).flatten()
-
-        running: List[crocoddyl.IntegratedActionModelEuler] = []
-        for k in range(self.horizon):
-            tk = float(t_start + k * self.dt_mpc)
-            p_des_k, yaw_des_k = _interp_ref_pose(tk, t_ref, p_ref, yaw_ref)
-            v_lin_k = np.array(
-                [
-                    np.interp(tk, t_ref, dp_ref[:, 0]),
-                    np.interp(tk, t_ref, dp_ref[:, 1]),
-                    np.interp(tk, t_ref, dp_ref[:, 2]),
-                ],
-                dtype=float,
-            )
-            yaw_rate_k = float(np.interp(tk, t_ref, dyaw_ref))
-            w_ang_k = np.array([0.0, 0.0, yaw_rate_k], dtype=float)
-            running.append(
-                self._make_integrated_running(p_des_k, yaw_des_k, v_lin_k, w_ang_k)
-            )
-
-        tN = float(t_start + self.horizon * self.dt_mpc)
-        p_des_N, yaw_des_N = _interp_ref_pose(tN, t_ref, p_ref, yaw_ref)
-        v_lin_N = np.array(
-            [
-                np.interp(tN, t_ref, dp_ref[:, 0]),
-                np.interp(tN, t_ref, dp_ref[:, 1]),
-                np.interp(tN, t_ref, dp_ref[:, 2]),
-            ],
-            dtype=float,
-        )
-        yaw_rate_N = float(np.interp(tN, t_ref, dyaw_ref))
-        w_ang_N = np.array([0.0, 0.0, yaw_rate_N], dtype=float)
-        terminal = self._make_integrated_terminal(p_des_N, yaw_des_N, v_lin_N, w_ang_N)
-        return crocoddyl.ShootingProblem(x0, running, terminal)
+from s500_uam_closed_loop_plant import (
+    CrocoddylEulerPlant,
+    PayloadSchedulePlant,
+    mpc_inner_stride,
+)
+from s500_uam_crocoddyl_state_tracking_mpc import (
+    EETrackingWeights,
+    UAMEEPoseTrackingCrocoddylMPC,
+    _apply_first_order_actuator,
+    interp_ref_pose,
+    solid_sphere_principal_inertias,
+    _apply_payload_inertia_on_plant_model,
+)
 
 
 def run_closed_loop_ee_pose_tracking(
@@ -331,6 +73,15 @@ def run_closed_loop_ee_pose_tracking(
     use_thrust_constraints: bool,
     weights: EETrackingWeights = EETrackingWeights(),
     verbose: bool = True,
+    use_actuator_first_order: bool = False,
+    tau_thrust: float = 0.06,
+    tau_theta: float = 0.05,
+    t_plan: Optional[np.ndarray] = None,
+    x_plan: Optional[np.ndarray] = None,
+    sim_payload_enable: bool = False,
+    sim_payload_t_grasp: float = 1.0,
+    sim_payload_mass: float = 0.2,
+    sim_payload_sphere_radius: float = 0.02,
 ) -> dict:
     mpc = UAMEEPoseTrackingCrocoddylMPC(
         dt_mpc=dt_mpc,
@@ -338,6 +89,7 @@ def run_closed_loop_ee_pose_tracking(
         u_weights=weights,
         use_thrust_constraints=use_thrust_constraints,
     )
+    # MPC uses ideal u; optional first-order lag only on the simulation plant (same as full-state tracker).
 
     # Precompute reference velocities for EE tracking.
     t_ref = np.asarray(t_ref, dtype=float).flatten()
@@ -353,15 +105,54 @@ def run_closed_loop_ee_pose_tracking(
     dp_ref = np.gradient(p_ref, t_ref, axis=0)
     dyaw_ref = np.gradient(yaw_ref_u, t_ref)
 
-    # Zero-cost placeholder for forward integration (dynamics only).
-    cost0 = crocoddyl.CostModelSum(mpc.state, mpc.nu)
-    diff0 = crocoddyl.DifferentialActionModelFreeFwdDynamics(mpc.state, mpc.actuation, cost0)
+    sim_dt = float(sim_dt)
+    t_grasp = max(0.0, float(sim_payload_t_grasp))
+    m_pay = float(sim_payload_mass)
+    r_sph = max(1e-6, float(sim_payload_sphere_radius))
+    use_sim_plant_payload = bool(sim_payload_enable) and m_pay > 1e-9
+    ixx_p, iyy_p, izz_p = solid_sphere_principal_inertias(m_pay, r_sph)
+    com_pl = np.zeros(3, dtype=float)
+
+    # Forward dynamics for closed-loop plant: separate Pinocchio copy if sim-only payload is enabled
+    # (MPC shooting problem keeps using mpc.robot_model).
+    if use_sim_plant_payload:
+        sim_model = pin.Model(mpc.robot_model)
+        sim_state, sim_actuation = mpc._planner.thruster_actuation_for_model(sim_model)
+        cost0 = crocoddyl.CostModelSum(sim_state, mpc.nu)
+        diff0 = crocoddyl.DifferentialActionModelFreeFwdDynamics(
+            sim_state, sim_actuation, cost0
+        )
+    else:
+        sim_model = None
+        cost0 = crocoddyl.CostModelSum(mpc.state, mpc.nu)
+        diff0 = crocoddyl.DifferentialActionModelFreeFwdDynamics(
+            mpc.state, mpc.actuation, cost0
+        )
     sim_int = crocoddyl.IntegratedActionModelEuler(diff0, float(sim_dt))
     sim_data = sim_int.createData()
+    base_plant = CrocoddylEulerPlant(sim_int, sim_data)
+    if use_sim_plant_payload:
 
-    sim_dt = float(sim_dt)
+        def _apply_payload_once() -> None:
+            assert sim_model is not None
+            _apply_payload_inertia_on_plant_model(
+                sim_model,
+                mpc.ee_frame_id,
+                m_pay,
+                com_pl,
+                ixx_p,
+                iyy_p,
+                izz_p,
+            )
+
+        plant: CrocoddylEulerPlant | PayloadSchedulePlant = PayloadSchedulePlant(
+            base_plant, t_grasp, _apply_payload_once
+        )
+    else:
+        plant = base_plant
+
     control_dt = float(control_dt)
-    n_inner = max(1, int(round(control_dt / sim_dt)))
+    n_inner = mpc_inner_stride(control_dt, sim_dt)
 
     T_sim = float(t_ref[-1] - t_ref[0])
     n_total = max(1, int(np.ceil(T_sim / sim_dt)))
@@ -372,6 +163,7 @@ def run_closed_loop_ee_pose_tracking(
     ts: List[float] = []
 
     u_cmd_hold = mpc._u_ref.copy()
+    u_act = u_cmd_hold.copy()
     xs_guess: Optional[List[np.ndarray]] = None
     us_guess: Optional[List[np.ndarray]] = None
 
@@ -379,7 +171,7 @@ def run_closed_loop_ee_pose_tracking(
         t = step * sim_dt
         ts.append(t)
         xs.append(x.copy())
-        us.append(u_cmd_hold.copy())
+        plant.on_pre_step(t, step)
 
         # Update MPC every control_dt.
         if step % n_inner == 0:
@@ -392,6 +184,8 @@ def run_closed_loop_ee_pose_tracking(
                 yaw_ref_u,
                 dp_ref,
                 dyaw_ref,
+                t_plan=t_plan,
+                x_plan=x_plan,
             )
             solver = crocoddyl.SolverBoxFDDP(prob)
             solver.convergence_init = 1e-9
@@ -421,10 +215,21 @@ def run_closed_loop_ee_pose_tracking(
             xs_guess[0] = x.copy()
             us_guess = [solver.us[i + 1].copy() for i in range(horizon - 1)] + [solver.us[-1].copy()]
 
-        # Forward integrate one sim step.
+        if use_actuator_first_order:
+            u_act = _apply_first_order_actuator(
+                u_act,
+                u_cmd_hold,
+                tau_thrust=tau_thrust,
+                tau_theta=tau_theta,
+                dt=sim_dt,
+            )
+        else:
+            u_act = u_cmd_hold.copy()
+
+        us.append(u_act.copy())
+
         if step < n_total - 1:
-            sim_int.calc(sim_data, x, u_cmd_hold)
-            x = np.array(sim_data.xnext, dtype=float).flatten().copy()
+            x = plant.step(x, u_act)
 
     xs_arr = np.asarray(xs, dtype=float)
     ee_pos, _, ee_rpy, _ = compute_ee_kinematics_along_trajectory(
@@ -434,10 +239,10 @@ def run_closed_loop_ee_pose_tracking(
 
     # Reference aligned with our ts (t_ref starts at 0 in CLI generation below).
     ref_p = np.stack(
-        [_interp_ref_pose(t, t_ref, p_ref, yaw_ref_u)[0] for t in ts], axis=0
+        [interp_ref_pose(t, t_ref, p_ref, yaw_ref_u)[0] for t in ts], axis=0
     )
     ref_yaw = np.array(
-        [_interp_ref_pose(t, t_ref, p_ref, yaw_ref_u)[1] for t in ts], dtype=float
+        [interp_ref_pose(t, t_ref, p_ref, yaw_ref_u)[1] for t in ts], dtype=float
     )
 
     return {
@@ -449,6 +254,9 @@ def run_closed_loop_ee_pose_tracking(
         "p_ref": ref_p,
         "yaw_ref": ref_yaw,
         "mpc": mpc,
+        "sim_plant_payload_applied": bool(
+            isinstance(plant, PayloadSchedulePlant) and plant.schedule_applied
+        ),
     }
 
 
@@ -500,6 +308,8 @@ def main():
     parser.add_argument("--w_vel_ang_yaw", type=float, default=1.0)
     parser.add_argument("--w_u", type=float, default=0.1)
     parser.add_argument("--w_state_reg", type=float, default=0.0)
+    parser.add_argument("--w_state_track", type=float, default=0.0)
+    parser.add_argument("--w_terminal_scale", type=float, default=3.0)
 
     parser.add_argument("--no_verbose", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
@@ -546,8 +356,9 @@ def main():
         w_vel_ang_rp=float(args.w_vel_ang_rp),
         w_vel_ang_yaw=float(args.w_vel_ang_yaw),
         w_u=float(args.w_u),
-        w_terminal_scale=3.0,
+        w_terminal_scale=float(args.w_terminal_scale),
         w_state_reg=float(args.w_state_reg),
+        w_state_track=float(args.w_state_track),
     )
 
     out = run_closed_loop_ee_pose_tracking(

@@ -94,6 +94,8 @@ except ImportError:
     plot_acados_3d_into_figure = None  # type: ignore
     PLOT_ACADOS_GUI_STYLE = False
 
+from s500_uam_closed_loop_plant import CasadiRK4Plant, rk4_step
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 EE_FRAME_NAME = "gripper_link"
@@ -452,10 +454,10 @@ def create_ee_tracking_mpc_solver(
     c_psi, s_psi = _casadi_ee_heading_cs_expr(acados_model, pin_model, frame_id)
     if w_ue is None:
         if control_mode == "direct":
-            w_ue = np.array([1.0, 1.0, 1.0, 1.0, 50.0, 50.0], dtype=float)
+            w_ue = np.array([1.0, 1.0, 1.0, 1.0, 5000.0, 5000.0], dtype=float)
         else:
             # ω(3), T_total, θ(2)
-            w_ue = np.array([0.5, 0.5, 0.5, 5.0e-4, 50.0, 50.0], dtype=float)
+            w_ue = np.array([0.5, 0.5, 0.5, 5.0e-4, 5000.0, 5000.0], dtype=float)
     cost_y = ca.vertcat(ee_p, c_psi, s_psi, acados_model.u)
     ny = int(cost_y.shape[0])
     W = np.zeros((ny, ny))
@@ -577,16 +579,6 @@ def create_ee_tracking_mpc_solver(
 def _make_f_expl_fun(acados_model):
     """Numpy-callable explicit dynamics xdot = f(x,u)."""
     return ca.Function("f", [acados_model.x, acados_model.u], [acados_model.f_expl_expr])
-
-
-def rk4_step(f_fun, x: np.ndarray, u: np.ndarray, dt: float) -> np.ndarray:
-    x = np.asarray(x, dtype=float).flatten()
-    u = np.asarray(u, dtype=float).flatten()
-    k1 = np.array(f_fun(x, u)).flatten()
-    k2 = np.array(f_fun(x + 0.5 * dt * k1, u)).flatten()
-    k3 = np.array(f_fun(x + 0.5 * dt * k2, u)).flatten()
-    k4 = np.array(f_fun(x + dt * k3, u)).flatten()
-    return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
 
 
 def rollout_nominal_trajectory(
@@ -765,6 +757,7 @@ def run_closed_loop(
     from s500_uam_acados_actuator_layer import nominal_command_hover
 
     f_fun = _make_f_expl_fun(acados_model)
+    plant = CasadiRK4Plant(f_fun, sim_dt, nu)
 
     n_robot = nq + nv
     nx = n_robot + (6 if control_mode == "actuator_first_order" else 0)
@@ -846,6 +839,7 @@ def run_closed_loop(
 
     for k in range(n_steps):
         t_k = k * sim_dt
+        plant.on_pre_step(t_k, k)
         do_mpc = k % mpc_stride == 0
 
         if do_mpc:
@@ -908,7 +902,7 @@ def run_closed_loop(
             solve_idx += 1
 
         u_log[k] = u_apply
-        x = rk4_step(f_fun, x, u_apply, sim_dt)
+        x = plant.step(x, u_apply)
 
         t_log[k + 1] = t_k + sim_dt
         x_log[k + 1] = x
@@ -982,7 +976,8 @@ def _mpc_timing_info_for_acados_plot(res: dict) -> dict:
     if nit.size == 0:
         return {"n_iter": 0, "avg_ms_per_iter": 0.0, "total_s": 0.0}
     valid = nit > 0
-    per_ms = np.where(valid, cpu / nit * 1000.0, np.nan)
+    per_ms = np.full_like(cpu, np.nan, dtype=float)
+    np.divide(cpu * 1000.0, nit, out=per_ms, where=valid)
     return {
         "n_iter": int(np.sum(nit)) if np.any(nit > 0) else 0,
         "avg_ms_per_iter": float(np.nanmean(per_ms)) if np.any(valid) else 0.0,
@@ -1104,11 +1099,32 @@ def plot_minimum_snap_reference(
     plt.show()
 
 
+def _valid_plan_wp_xyz(M) -> np.ndarray:
+    if M is None:
+        return np.zeros((0, 3))
+    A = np.asarray(M, dtype=float)
+    if A.size == 0 or A.ndim != 2 or A.shape[1] < 3:
+        return np.zeros((0, 3))
+    v = np.isfinite(A[:, 0]) & np.isfinite(A[:, 1]) & np.isfinite(A[:, 2])
+    return A[v, :3]
+
+
+def _plot_wp_vlines(ax, plan_waypoint_times):
+    if plan_waypoint_times is None:
+        return
+    tw = np.asarray(plan_waypoint_times, dtype=float).flatten()
+    for tv in tw:
+        ax.axvline(float(tv), color="gray", ls=":", lw=0.75, alpha=0.65, zorder=1)
+
+
 def _plot_tracking_dashboard(
     fig: plt.Figure,
     res: dict,
     simX: np.ndarray,
     plan_waypoints_xyz: np.ndarray | None = None,
+    plan_waypoint_times: np.ndarray | None = None,
+    plan_waypoints_base_xyz: np.ndarray | None = None,
+    plan_waypoints_ee_xyz: np.ndarray | None = None,
 ):
     """EE tracking quality + base/reference/error + MPC solve statistics (complements GUI information)."""
     t = res["t"]
@@ -1133,7 +1149,14 @@ def _plot_tracking_dashboard(
     ax3.plot(pref[:, 0], pref[:, 1], pref[:, 2], "k--", lw=1.0, alpha=0.7, label="p_ref")
     ax3.scatter(base[0, 0], base[0, 1], base[0, 2], c="g", s=60, label="Start")
     ax3.scatter(base[-1, 0], base[-1, 1], base[-1, 2], c="r", s=60, label="End")
-    if plan_waypoints_xyz is not None:
+    Bwp = _valid_plan_wp_xyz(plan_waypoints_base_xyz)
+    Ewp = _valid_plan_wp_xyz(plan_waypoints_ee_xyz)
+    if Bwp.shape[0] or Ewp.shape[0]:
+        if Bwp.shape[0]:
+            ax3.scatter(Bwp[:, 0], Bwp[:, 1], Bwp[:, 2], c="tab:blue", s=100, marker="s", label="plan Base WP", zorder=5)
+        if Ewp.shape[0]:
+            ax3.scatter(Ewp[:, 0], Ewp[:, 1], Ewp[:, 2], c="darkorange", s=120, marker="*", label="plan EE WP", zorder=6)
+    elif plan_waypoints_xyz is not None:
         W = np.asarray(plan_waypoints_xyz, dtype=float)
         W = W[:, :3] if W.shape[1] > 3 else W.reshape(-1, 3)
         ax3.scatter(W[:, 0], W[:, 1], W[:, 2], c="orange", s=120, marker="*", label="plan WPs")
@@ -1142,13 +1165,38 @@ def _plot_tracking_dashboard(
     ax3.set_zlabel("Z [m]", **tinfo)
     ax3.set_title("3D: base / EE / p_ref", fontsize=10)
     ax3.legend(loc="upper left", fontsize=6, framealpha=0.9)
-    _pts = np.vstack([base, ee, pref])
-    br = float(np.ptp(_pts, axis=0).max())
-    mid = _pts.mean(axis=0)
-    r = max(br * 0.55, 0.25)
-    ax3.set_xlim(mid[0] - r, mid[0] + r)
-    ax3.set_ylim(mid[1] - r, mid[1] + r)
-    ax3.set_zlim(mid[2] - r, mid[2] + r)
+    _pts = np.vstack(
+        [
+            np.asarray(base[:, :3], dtype=float),
+            np.asarray(ee[:, :3], dtype=float),
+            np.asarray(pref[:, :3], dtype=float),
+        ]
+    )
+    _ok = np.isfinite(_pts).all(axis=1)
+    _pts = _pts[_ok]
+    if _pts.shape[0] == 0:
+        mid = np.array([0.0, 0.0, 1.0], dtype=float)
+        r = 0.5
+        ax3.text2D(
+            0.05,
+            0.02,
+            "NaN/Inf in trajectories — axis limits defaulted",
+            transform=ax3.transAxes,
+            fontsize=7,
+            color="crimson",
+        )
+    else:
+        br = float(np.ptp(_pts, axis=0).max())
+        mid = _pts.mean(axis=0)
+        if not np.isfinite(br) or br < 0:
+            br = 0.0
+        r = max(br * 0.55, 0.25)
+        if not np.all(np.isfinite(mid)) or not np.isfinite(r) or r <= 0:
+            mid = np.array([0.0, 0.0, 1.0], dtype=float)
+            r = 0.5
+    ax3.set_xlim(float(mid[0] - r), float(mid[0] + r))
+    ax3.set_ylim(float(mid[1] - r), float(mid[1] + r))
+    ax3.set_zlim(float(mid[2] - r), float(mid[2] + r))
     try:
         ax3.set_box_aspect([1, 1, 1])
     except Exception:
@@ -1160,6 +1208,10 @@ def _plot_tracking_dashboard(
     ax_xy.plot(base[:, 0], base[:, 1], "b-", lw=1.0, alpha=0.6, label="Base (xy)")
     ax_xy.plot(base[0, 0], base[0, 1], "go", ms=5, label="Start")
     ax_xy.plot(base[-1, 0], base[-1, 1], "rs", ms=5, label="End")
+    if Bwp.shape[0]:
+        ax_xy.scatter(Bwp[:, 0], Bwp[:, 1], c="tab:blue", s=55, marker="s", zorder=5, label="plan Base WP")
+    if Ewp.shape[0]:
+        ax_xy.scatter(Ewp[:, 0], Ewp[:, 1], c="darkorange", s=65, marker="*", zorder=6, label="plan EE WP")
     ax_xy.set_aspect("equal", adjustable="box")
     ax_xy.set_xlabel("X [m]", **tinfo)
     ax_xy.set_ylabel("Y [m]", **tinfo)
@@ -1171,6 +1223,10 @@ def _plot_tracking_dashboard(
     ax_xz.plot(pref[:, 0], pref[:, 2], "k--", lw=1.2, alpha=0.8, label="p_ref (xz)")
     ax_xz.plot(ee[:, 0], ee[:, 2], "m-", lw=1.2, label="EE (xz)")
     ax_xz.plot(base[:, 0], base[:, 2], "b-", lw=1.0, alpha=0.6, label="Base (xz)")
+    if Bwp.shape[0]:
+        ax_xz.scatter(Bwp[:, 0], Bwp[:, 2], c="tab:blue", s=55, marker="s", zorder=5, label="plan Base WP")
+    if Ewp.shape[0]:
+        ax_xz.scatter(Ewp[:, 0], Ewp[:, 2], c="darkorange", s=65, marker="*", zorder=6, label="plan EE WP")
     ax_xz.set_xlabel("X [m]", **tinfo)
     ax_xz.set_ylabel("Z [m]", **tinfo)
     ax_xz.set_title("Vertical profile (XZ)", fontsize=10)
@@ -1180,6 +1236,7 @@ def _plot_tracking_dashboard(
     ax_e = fig.add_subplot(gs[1, 0])
     ax_e.fill_between(t, 0.0, res["err"], color="red", alpha=0.2)
     ax_e.plot(t, res["err"], "r-", lw=1.2, label=r"$\|e\|$")
+    _plot_wp_vlines(ax_e, plan_waypoint_times)
     ax_e.set_xlabel("t [s]", **tinfo)
     ax_e.set_ylabel("m", **tinfo)
     ax_e.set_title("EE position error norm", fontsize=10)
@@ -1190,6 +1247,7 @@ def _plot_tracking_dashboard(
     for j, c in enumerate("rgb"):
         ax_ec.plot(t, err_vec[:, j], color=c, lw=1.0, label=f"e_{'xyz'[j]}")
     ax_ec.axhline(0.0, color="gray", ls=":", lw=0.8)
+    _plot_wp_vlines(ax_ec, plan_waypoint_times)
     ax_ec.set_xlabel("t [s]", **tinfo)
     ax_ec.set_ylabel("m", **tinfo)
     ax_ec.set_title("EE error components (EE − p_ref)", fontsize=10)
@@ -1207,6 +1265,7 @@ def _plot_tracking_dashboard(
     ax_pos.set_title("EE vs p_ref (xyz)", fontsize=10)
     ax_pos.legend(loc="best", fontsize=6, ncol=2)
     ax_pos.grid(True, alpha=0.3)
+    _plot_wp_vlines(ax_pos, plan_waypoint_times)
 
     ax_w = fig.add_subplot(gs[2, 0])
     if wall.size:
@@ -1256,6 +1315,7 @@ def _plot_tracking_dashboard(
     ax_y.set_title("EE yaw tracking (ZYX, world)", fontsize=10)
     ax_y.legend(loc="upper left", fontsize=7)
     ax_y.grid(True, alpha=0.3)
+    _plot_wp_vlines(ax_y, plan_waypoint_times)
 
     for ax in fig.get_axes():
         ax.tick_params(axis="both", labelsize=8)
@@ -1269,6 +1329,14 @@ def render_ee_tracking_results_to_figures(
     control_mode: str = "direct",
     plan_waypoints_xyz: np.ndarray | None = None,
     states_title: str | None = None,
+    plan_waypoint_times: np.ndarray | None = None,
+    plan_waypoints_base_xyz: np.ndarray | None = None,
+    plan_waypoints_ee_xyz: np.ndarray | None = None,
+    traj_solver_meta: dict | None = None,
+    ref_time_states: np.ndarray | None = None,
+    ref_states: np.ndarray | None = None,
+    ref_time_controls: np.ndarray | None = None,
+    ref_controls: np.ndarray | None = None,
 ) -> None:
     """
     Render closed-loop results into an existing ``matplotlib.figure.Figure`` (embedded in Qt, etc.); do not call ``plt.show()``.
@@ -1291,22 +1359,55 @@ def render_ee_tracking_results_to_figures(
             t,
             fig_states,
             title=title,
-            waypoint_times=None,
+            waypoint_times=plan_waypoint_times,
             timing_info=ti,
             control_layout=clayout,
+            waypoint_positions_base=plan_waypoints_base_xyz,
+            waypoint_positions_ee=plan_waypoints_ee_xyz,
+            traj_solver_meta=traj_solver_meta,
+            ref_time_states=ref_time_states,
+            ref_states=ref_states,
+            ref_time_controls=ref_time_controls,
+            ref_controls=ref_controls,
         )
 
     if fig_3d is not None and PLOT_ACADOS_GUI_STYLE and plot_acados_3d_into_figure is not None:
         wp_list = None
-        if plan_waypoints_xyz is not None:
+        wp_ee_list = None
+        Bp = _valid_plan_wp_xyz(plan_waypoints_base_xyz)
+        Ep = _valid_plan_wp_xyz(plan_waypoints_ee_xyz)
+        if Bp.shape[0]:
+            wp_list = [Bp[i].copy() for i in range(len(Bp))]
+        elif plan_waypoints_xyz is not None:
             W = np.asarray(plan_waypoints_xyz, dtype=float)
             W = W[:, :3] if W.shape[1] > 3 else W.reshape(-1, 3)
             wp_list = [W[i].copy() for i in range(len(W))]
-        plot_acados_3d_into_figure(simX, fig_3d, waypoint_positions=wp_list)
-        fig_3d.suptitle("Base 3D path (acados style) + plan waypoints", fontsize=11, y=0.98)
+        if Ep.shape[0]:
+            wp_ee_list = [Ep[i].copy() for i in range(len(Ep))]
+        plot_acados_3d_into_figure(
+            simX,
+            fig_3d,
+            waypoint_positions=wp_list,
+            waypoint_positions_ee=wp_ee_list,
+            ref_states=ref_states,
+        )
+        if traj_solver_meta and traj_solver_meta.get("backend") == "crocoddyl":
+            fig_3d.suptitle("Base 3D path (planned, Crocoddyl) + waypoints", fontsize=11, y=0.98)
+        elif traj_solver_meta and traj_solver_meta.get("backend") == "acados_traj":
+            fig_3d.suptitle("Base 3D path (planned, Acados) + waypoints", fontsize=11, y=0.98)
+        else:
+            fig_3d.suptitle("Base 3D path (acados style) + plan waypoints", fontsize=11, y=0.98)
 
     assert isinstance(fig_dashboard, matplotlib.figure.Figure)
-    _plot_tracking_dashboard(fig_dashboard, res, simX, plan_waypoints_xyz=plan_waypoints_xyz)
+    _plot_tracking_dashboard(
+        fig_dashboard,
+        res,
+        simX,
+        plan_waypoints_xyz=plan_waypoints_xyz,
+        plan_waypoint_times=plan_waypoint_times,
+        plan_waypoints_base_xyz=plan_waypoints_base_xyz,
+        plan_waypoints_ee_xyz=plan_waypoints_ee_xyz,
+    )
 
 
 def plot_results(

@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import tempfile
@@ -87,11 +88,49 @@ def _snap_default_rows() -> list[list[float]]:
     ]
 
 
-def _full_wp_default_rows() -> list[list[float]]:
+def _full_wp_default_rows() -> list[list]:
+    """[Type, x, y, z, j1/roll°, j2/pitch°, yaw°, t[s]]. Base/EEp: j1,j2,yaw. EE: roll,pitch,yaw."""
     return [
-        [0.0, 0.0, 1.0, 0.0, -68.8, -34.4, 0.0],
-        [1.0, 0.5, 1.2, 45.0, -45.8, -17.2, 5.0],
+        ["Base", 0.0, 0.0, 1.0, -68.8, -34.4, 0.0, 0.0],
+        ["Base", 1.0, 0.5, 1.2, -45.8, -17.2, 45.0, 5.0],
     ]
+
+
+def _normalize_wp_type_for_combo(cell0: str) -> str:
+    """Map saved/free-text type to combo label: Base | EE | EEp."""
+    try:
+        from s500_uam_trajectory_gui import mixed_wp_row_kind
+
+        k = mixed_wp_row_kind(cell0)
+    except Exception:
+        s = str(cell0).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+        if s.startswith("eep") or s in ("eepos", "eeposition"):
+            k = "ee_pos"
+        elif s.startswith("e"):
+            k = "ee_pose"
+        else:
+            k = "base"
+    if k == "base":
+        return "Base"
+    if k == "ee_pos":
+        return "EEp"
+    return "EE"
+
+
+def _migrate_mixed_wp_rows_v1_to_v2(rows: list) -> list:
+    """v1: Base/EEp columns are yaw,j1,j2; v2: j1,j2,yaw. EE rows remain roll,pitch,yaw."""
+    out: list = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 8:
+            out.append(list(row) if isinstance(row, (list, tuple)) else row)
+            continue
+        r = list(row)
+        kind = _normalize_wp_type_for_combo(r[0])
+        if kind in ("Base", "EEp"):
+            yaw, j1, j2 = float(r[4]), float(r[5]), float(r[6])
+            r[4], r[5], r[6] = j1, j2, yaw
+        out.append(r)
+    return out
 
 
 def build_ee_ref_from_full_state(
@@ -225,9 +264,13 @@ class TrackCrocAlongPlanWorker(QThread):
                 w_terminal_track=p.get("w_terminal_track", 100.0),
                 mpc_max_iter=p.get("mpc_max_iter", 60),
                 use_thrust_constraints=p.get("use_thrust_constraints", True),
-                use_actuator_first_order=p.get("use_actuator_first_order", True),
+                use_actuator_first_order=p.get("use_actuator_first_order", False),
                 tau_thrust=p.get("tau_thrust", 0.06),
                 tau_theta=p.get("tau_theta", 0.05),
+                sim_payload_enable=p.get("sim_payload_enable", False),
+                sim_payload_t_grasp=p.get("sim_payload_t_grasp", 1.0),
+                sim_payload_mass=p.get("sim_payload_mass", 0.2),
+                sim_payload_sphere_radius=p.get("sim_payload_sphere_r", 0.02),
                 s500_yaml_path=p.get("s500_yaml_path"),
                 urdf_path=p.get("urdf_path"),
                 verbose=False,
@@ -293,8 +336,20 @@ class TrackEeCrocWorker(QThread):
 
             p = self.params
             weights = EETrackingWeights(
-                w_pos=p.get("w_ee", 400.0),
-                w_rot_yaw=p.get("w_ee_yaw", 200.0),
+                w_pos=float(
+                    p.get("croc_ee_w_pos", p.get("w_ee", 400.0))
+                ),
+                w_rot_rp=float(p.get("croc_ee_w_rot_rp", 1.0)),
+                w_rot_yaw=float(
+                    p.get("croc_ee_w_rot_yaw", p.get("w_ee_yaw", 200.0))
+                ),
+                w_vel_lin=float(p.get("croc_ee_w_vel_lin", 1.0)),
+                w_vel_ang_rp=float(p.get("croc_ee_w_vel_ang_rp", 1.0)),
+                w_vel_ang_yaw=float(p.get("croc_ee_w_vel_ang_yaw", 1.0)),
+                w_u=float(p.get("croc_ee_w_u", 0.0)),
+                w_terminal_scale=float(p.get("croc_ee_w_terminal", 3.0)),
+                w_state_reg=float(p.get("w_state_reg", 0.0)),
+                w_state_track=float(p.get("w_state_track", 0.0)),
             )
             out = run_closed_loop_ee_pose_tracking(
                 x0=p["x0"],
@@ -309,6 +364,15 @@ class TrackEeCrocWorker(QThread):
                 use_thrust_constraints=bool(p.get("use_thrust_constraints", True)),
                 weights=weights,
                 verbose=False,
+                use_actuator_first_order=bool(p.get("use_actuator_first_order", False)),
+                tau_thrust=float(p.get("tau_thrust", 0.06)),
+                tau_theta=float(p.get("tau_theta", 0.05)),
+                t_plan=p.get("t_plan"),
+                x_plan=p.get("x_plan"),
+                sim_payload_enable=bool(p.get("sim_payload_enable", False)),
+                sim_payload_t_grasp=float(p.get("sim_payload_t_grasp", 1.0)),
+                sim_payload_mass=float(p.get("sim_payload_mass", 0.2)),
+                sim_payload_sphere_radius=float(p.get("sim_payload_sphere_r", 0.02)),
             )
 
             t = np.asarray(out["t"], dtype=float).flatten()
@@ -482,6 +546,7 @@ class UamSuiteGUI(QMainWindow):
         self._meshcat_worker = None
         self._last_track_res: dict | None = None
         self._params_path: Path = DEFAULT_PARAMS_PATH
+        self._last_plan_sorted_wp_rows: list | None = None
 
         try:
             from s500_uam_trajectory_gui import (
@@ -489,20 +554,26 @@ class UamSuiteGUI(QMainWindow):
                 CASCADE_TRAJ_AVAILABLE,
                 CROCODDYL_AVAILABLE,
                 OptimizationWorker,
+                mixed_wp_row_kind,
                 wp_to_state,
             )
+            from s500_uam_trajectory_planner import make_uam_state
 
             self._ACADOS_AVAILABLE = ACADOS_AVAILABLE
             self._CASCADE_TRAJ_AVAILABLE = CASCADE_TRAJ_AVAILABLE
             self._CROCODDYL_AVAILABLE = CROCODDYL_AVAILABLE
             self.OptimizationWorker = OptimizationWorker
             self._wp_to_state = wp_to_state
+            self._mixed_wp_row_kind = mixed_wp_row_kind
+            self._make_uam_state = make_uam_state
         except Exception as e:
             self._ACADOS_AVAILABLE = False
             self._CASCADE_TRAJ_AVAILABLE = False
             self._CROCODDYL_AVAILABLE = False
             self.OptimizationWorker = None
             self._wp_to_state = None
+            self._mixed_wp_row_kind = None
+            self._make_uam_state = None
             self._import_err = e
         else:
             self._import_err = None
@@ -588,6 +659,7 @@ class UamSuiteGUI(QMainWindow):
 
         self.plan_mode_combo = QComboBox()
         self.plan_mode_combo.addItems(["Full state (default)", "EE only (Minimum snap)"])
+        self.plan_mode_combo.setCurrentIndex(0)
         self.plan_mode_combo.currentIndexChanged.connect(self._on_plan_mode)
         plan_layout.addWidget(QLabel("Planning type"))
         plan_layout.addWidget(self.plan_mode_combo)
@@ -618,18 +690,27 @@ class UamSuiteGUI(QMainWindow):
         method_row.addWidget(self.method_combo)
         g_full.addLayout(method_row)
 
-        g_full.addWidget(QLabel("Waypoints [x,y,z m | yaw° | j1° | j2° | arrival time s]"))
-        self.wp_table = QTableWidget(2, 7)
+        self._wp_type_help_label = QLabel(
+            "Columns j1/roll, j2/pitch, yaw: for Base and EEp they mean j1 deg, j2 deg, base yaw deg; "
+            "for EE they mean roll deg, pitch deg, yaw deg (ZYX). "
+            "EEp constrains only end-effector position; the three angles are alignment seeds."
+        )
+        self._wp_type_help_label.setWordWrap(True)
+        g_full.addWidget(self._wp_type_help_label)
+        self.wp_table = QTableWidget(2, 8)
         self.wp_table.setHorizontalHeaderLabels(
-            ["x", "y", "z", "yaw°", "j1°", "j2°", "t [s]"]
+            ["Type", "x", "y", "z", "j1/roll°", "j2/pitch°", "yaw°", "t [s]"]
         )
         wp_header = self.wp_table.horizontalHeader()
-        wp_header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        wp_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for col in range(1, 8):
+            wp_header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         wp_header.setStretchLastSection(False)
         wp_header.setMinimumSectionSize(56)
         for r, row in enumerate(_full_wp_default_rows()):
-            for c, val in enumerate(row):
-                self.wp_table.setItem(r, c, QTableWidgetItem(f"{val:g}"))
+            self.wp_table.setCellWidget(r, 0, self._make_wp_type_combo(str(row[0])))
+            for c, val in enumerate(row[1:], start=1):
+                self.wp_table.setItem(r, c, QTableWidgetItem(f"{float(val):g}"))
         g_full.addWidget(self.wp_table)
         wp_btn = QHBoxLayout()
         add_r = QPushButton("Add row")
@@ -651,13 +732,13 @@ class UamSuiteGUI(QMainWindow):
         self.state_w.setRange(1e-4, 1e4)
         self.state_w.setValue(1.0)
         self.ctrl_w = QDoubleSpinBox()
-        self.ctrl_w.setRange(1e-8, 1.0)
+        self.ctrl_w.setRange(1e-3, 100.0)
         self.ctrl_w.setValue(1e-5)
         self.wp_mult = QDoubleSpinBox()
         self.wp_mult.setRange(1, 1e6)
         self.wp_mult.setValue(1000.0)
         self.plan_croc_use_actuator_first_order = QCheckBox("Enable")
-        self.plan_croc_use_actuator_first_order.setChecked(True)
+        self.plan_croc_use_actuator_first_order.setChecked(False)
         self.plan_tau_motor = QDoubleSpinBox()
         self.plan_tau_motor.setRange(0.001, 2.0)
         self.plan_tau_motor.setDecimals(3)
@@ -684,6 +765,36 @@ class UamSuiteGUI(QMainWindow):
         cost_g.addWidget(self.plan_tau_motor, 3, 1)
         cost_g.addWidget(QLabel("tau joint torque [s]"), 3, 2)
         cost_g.addWidget(self.plan_tau_joint, 3, 3)
+        self.ee_knot_w = QDoubleSpinBox()
+        self.ee_knot_w.setRange(1.0, 1e6)
+        self.ee_knot_w.setDecimals(1)
+        self.ee_knot_w.setValue(5000.0)
+        self.ee_knot_state_reg_w = QDoubleSpinBox()
+        self.ee_knot_state_reg_w.setRange(0.0, 1e4)
+        self.ee_knot_state_reg_w.setDecimals(4)
+        self.ee_knot_state_reg_w.setValue(0.0)
+        cost_g.addWidget(QLabel("EE knot w"), 4, 0)
+        cost_g.addWidget(self.ee_knot_w, 4, 1)
+        cost_g.addWidget(QLabel("EE knot state_reg w (0=off)"), 4, 2)
+        cost_g.addWidget(self.ee_knot_state_reg_w, 4, 3)
+        self.ee_knot_rot_w = QDoubleSpinBox()
+        self.ee_knot_rot_w.setRange(0.0, 1e6)
+        self.ee_knot_rot_w.setDecimals(1)
+        self.ee_knot_rot_w.setValue(1000.0)
+        cost_g.addWidget(QLabel("EE knot rot w (0=position only)"), 5, 0)
+        cost_g.addWidget(self.ee_knot_rot_w, 5, 1)
+        self.ee_knot_vel_w = QDoubleSpinBox()
+        self.ee_knot_vel_w.setRange(0.0, 1e6)
+        self.ee_knot_vel_w.setDecimals(1)
+        self.ee_knot_vel_w.setValue(200.0)
+        cost_g.addWidget(QLabel("EE knot vel w (EE only, ref=0)"), 5, 2)
+        cost_g.addWidget(self.ee_knot_vel_w, 5, 3)
+        self.ee_knot_vel_pitch_w = QDoubleSpinBox()
+        self.ee_knot_vel_pitch_w.setRange(0.0, 1e6)
+        self.ee_knot_vel_pitch_w.setDecimals(1)
+        self.ee_knot_vel_pitch_w.setValue(0.0)
+        cost_g.addWidget(QLabel("EE vel pitch ωy w (0=off)"), 6, 0)
+        cost_g.addWidget(self.ee_knot_vel_pitch_w, 6, 1)
         wg = QGroupBox("Full-state optimization parameters")
         wg.setLayout(cost_g)
         g_full.addWidget(wg)
@@ -808,6 +919,35 @@ class UamSuiteGUI(QMainWindow):
         self.w_ee_yaw = QDoubleSpinBox()
         self.w_ee_yaw.setRange(0.0, 2000.0)
         self.w_ee_yaw.setValue(200.0)
+
+        # Crocoddyl EE pose tracking: per-term cost weights (Tracking mode index 2).
+        self.croc_ee_w_pos = QDoubleSpinBox()
+        self.croc_ee_w_pos.setRange(0.0, 5000.0)
+        self.croc_ee_w_pos.setValue(400.0)
+        self.croc_ee_w_rot_rp = QDoubleSpinBox()
+        self.croc_ee_w_rot_rp.setRange(0.0, 2000.0)
+        self.croc_ee_w_rot_rp.setValue(1.0)
+        self.croc_ee_w_rot_yaw = QDoubleSpinBox()
+        self.croc_ee_w_rot_yaw.setRange(0.0, 2000.0)
+        self.croc_ee_w_rot_yaw.setValue(200.0)
+        self.croc_ee_w_vel_lin = QDoubleSpinBox()
+        self.croc_ee_w_vel_lin.setRange(0.0, 5000.0)
+        self.croc_ee_w_vel_lin.setValue(1.0)
+        self.croc_ee_w_vel_ang_rp = QDoubleSpinBox()
+        self.croc_ee_w_vel_ang_rp.setRange(0.0, 5000.0)
+        self.croc_ee_w_vel_ang_rp.setValue(1.0)
+        self.croc_ee_w_vel_ang_yaw = QDoubleSpinBox()
+        self.croc_ee_w_vel_ang_yaw.setRange(0.0, 5000.0)
+        self.croc_ee_w_vel_ang_yaw.setValue(1.0)
+        self.croc_ee_w_u = QDoubleSpinBox()
+        self.croc_ee_w_u.setRange(0.0, 100.0)
+        self.croc_ee_w_u.setDecimals(6)
+        self.croc_ee_w_u.setValue(0.0)
+        self.croc_ee_w_terminal = QDoubleSpinBox()
+        self.croc_ee_w_terminal.setRange(0.0, 100.0)
+        self.croc_ee_w_terminal.setDecimals(3)
+        self.croc_ee_w_terminal.setValue(3.0)
+
         self.mpc_max_iter = QSpinBox()
         self.mpc_max_iter.setRange(1, 200)
         self.mpc_max_iter.setValue(20)
@@ -817,16 +957,15 @@ class UamSuiteGUI(QMainWindow):
         self.control_mode_track = QComboBox()
         self.control_mode_track.addItems(["direct (thrust + τ)", "actuator_first_order (ω, T, θ)"])
 
-        # Crocoddyl full-state tracking: optional first-order actuator response (different τ for thrust vs joint torques)
-        # Note: Acados' actuator_first_order already includes a first-order actuator model; the τ below is only used for the Crocoddyl branch.
+        # τ for Crocoddyl closed-loop plant lag (full-state + EE-pose modes when "Plant u first-order lag" is on).
         self.tau_thrust_track = QDoubleSpinBox()
-        self.tau_thrust_track.setRange(0.001, 2.0)
+        self.tau_thrust_track.setRange(0.0, 2.0)
         self.tau_thrust_track.setDecimals(3)
         self.tau_thrust_track.setSingleStep(0.005)
         self.tau_thrust_track.setValue(0.06)
 
         self.tau_theta_track = QDoubleSpinBox()
-        self.tau_theta_track.setRange(0.001, 2.0)
+        self.tau_theta_track.setRange(0.0, 2.0)
         self.tau_theta_track.setDecimals(3)
         self.tau_theta_track.setSingleStep(0.005)
         self.tau_theta_track.setValue(0.05)
@@ -850,12 +989,52 @@ class UamSuiteGUI(QMainWindow):
         self.w_terminal_track = QDoubleSpinBox()
         self.w_terminal_track.setRange(0.0, 1e6)
         self.w_terminal_track.setValue(100.0)
-        self.croc_use_actuator_first_order = QCheckBox("enable")
-        self.croc_use_actuator_first_order.setChecked(True)
+        self.croc_use_actuator_first_order = QCheckBox("Enable")
+        self.croc_use_actuator_first_order.setChecked(False)
+        self.croc_use_actuator_first_order.toggled.connect(self._refresh_track_sim_actuator_taus_enabled)
         self.croc_ee_use_thrust_constraints = QCheckBox("enable")
         self.croc_ee_use_thrust_constraints.setChecked(True)
 
-        # Common simulation parameters (algorithm-independent)
+        # Sim-only payload (Croc EE): checkbox + one row (t_grasp, mass, sphere r → I=⅖mr², CoM at origin).
+        self.sim_payload_enable = QCheckBox("Enable (MPC nominal model unchanged)")
+        self.sim_payload_enable.setChecked(False)
+        self.sim_payload_t_grasp = QDoubleSpinBox()
+        self.sim_payload_t_grasp.setRange(0.0, 500.0)
+        self.sim_payload_t_grasp.setDecimals(3)
+        self.sim_payload_t_grasp.setSingleStep(0.1)
+        self.sim_payload_t_grasp.setValue(1.0)
+        self.sim_payload_mass = QDoubleSpinBox()
+        self.sim_payload_mass.setRange(0.0, 50.0)
+        self.sim_payload_mass.setDecimals(4)
+        self.sim_payload_mass.setSingleStep(0.01)
+        self.sim_payload_mass.setValue(0.2)
+        self.sim_payload_row = QWidget()
+        _spr = QHBoxLayout(self.sim_payload_row)
+        _spr.setContentsMargins(0, 0, 0, 0)
+        _spr.addWidget(QLabel("t_grasp [s]"))
+        _spr.addWidget(self.sim_payload_t_grasp)
+        _spr.addWidget(QLabel("mass [kg]"))
+        _spr.addWidget(self.sim_payload_mass)
+        self.sim_payload_inertia_lbl = QLabel("")
+        self.sim_payload_inertia_lbl.setStyleSheet("color: palette(mid);")
+        _spr.addWidget(self.sim_payload_inertia_lbl)
+        _spr.addStretch(1)
+
+        self.sim_payload_mass.valueChanged.connect(self._refresh_sim_payload_inertia_hint)
+        self.sim_payload_enable.toggled.connect(self._on_sim_payload_enable_toggled)
+        self._refresh_sim_payload_inertia_hint()
+
+        # Closed-loop simulator (time stepping, plant dynamics extras). Independent of MPC cost / horizon.
+        self._track_sim_actuator_hint = QLabel(
+            "Note: \"Croc actuator 1st-order\" in the planning panel only affects the trajectory optimization model. "
+            "The option here only affects the closed-loop integration plant (Crocoddyl full-state / EE-pose modes): "
+            "MPC still solves with ideal u, while simulation can apply a first-order lag to u. "
+            "In Acados mode, actuator_first_order under \"Control mode\" belongs to the NMPC model and is independent "
+            "from the plant lag option below."
+        )
+        self._track_sim_actuator_hint.setWordWrap(True)
+        self._track_sim_actuator_hint.setStyleSheet("color: palette(mid);")
+
         sim_g = QGridLayout()
         sim_g.addWidget(QLabel("T_sim [s]"), 0, 0)
         sim_g.addWidget(self.T_sim, 0, 1)
@@ -863,9 +1042,21 @@ class UamSuiteGUI(QMainWindow):
         sim_g.addWidget(self.sim_dt, 1, 1)
         sim_g.addWidget(QLabel("control_dt"), 2, 0)
         sim_g.addWidget(self.control_dt, 2, 1)
-        sg = QGroupBox("Simulation parameters")
+        sim_g.addWidget(self._track_sim_actuator_hint, 3, 0, 1, 2)
+        sim_g.addWidget(QLabel("Plant: u first-order lag"), 4, 0)
+        sim_g.addWidget(self.croc_use_actuator_first_order, 4, 1)
+        sim_g.addWidget(QLabel("τ_thrust [s]"), 5, 0)
+        sim_g.addWidget(self.tau_thrust_track, 5, 1)
+        sim_g.addWidget(QLabel("τ_θ [s]"), 6, 0)
+        sim_g.addWidget(self.tau_theta_track, 6, 1)
+        self._sim_payload_label = QLabel("Plant: simulation-only payload")
+        sim_g.addWidget(self._sim_payload_label, 7, 0)
+        sim_g.addWidget(self.sim_payload_enable, 7, 1)
+        sim_g.addWidget(self.sim_payload_row, 8, 0, 1, 2)
+        sg = QGroupBox("Simulation parameters (closed-loop simulator; decoupled from MPC weights/horizon above)")
         sg.setLayout(sim_g)
         tk.addWidget(sg)
+        self._refresh_sim_plant_controls_state()
 
         tk.addWidget(QLabel("Tracking method"))
         tk.addWidget(self.track_mode_combo)
@@ -877,20 +1068,25 @@ class UamSuiteGUI(QMainWindow):
             [
                 ("dt_mpc", self.dt_mpc),
                 ("N (horizon)", self.N_mpc),
-                ("w_ee", self.w_ee),
-                ("w_ee_yaw", self.w_ee_yaw),
+                ("w_ee (Acados)", self.w_ee),
+                ("w_ee_yaw (Acados)", self.w_ee_yaw),
+                ("Croc EE w_pos", self.croc_ee_w_pos),
+                ("Croc EE w_rot_rp", self.croc_ee_w_rot_rp),
+                ("Croc EE w_rot_yaw", self.croc_ee_w_rot_yaw),
+                ("Croc EE w_vel_lin", self.croc_ee_w_vel_lin),
+                ("Croc EE w_vel_ang_rp", self.croc_ee_w_vel_ang_rp),
+                ("Croc EE w_vel_ang_yaw", self.croc_ee_w_vel_ang_yaw),
+                ("Croc EE w_u (ctrl reg)", self.croc_ee_w_u),
+                ("Croc EE terminal scale", self.croc_ee_w_terminal),
                 ("mpc max_iter", self.mpc_max_iter),
                 ("mpc log ivl", self.mpc_log_iv),
                 ("Control mode", self.control_mode_track),
                 ("Croc horizon steps", self.croc_horizon),
                 ("Croc MPC max_iter", self.croc_mpc_iter),
-                ("tau_thrust_track [s]", self.tau_thrust_track),
-                ("tau_theta_track [s]", self.tau_theta_track),
                 ("w_state_track", self.w_state_track),
                 ("w_state_reg", self.w_state_reg),
                 ("w_control", self.w_control),
                 ("w_terminal_track", self.w_terminal_track),
-                ("use actuator 1st-order", self.croc_use_actuator_first_order),
                 ("use thrust constraints", self.croc_ee_use_thrust_constraints),
             ]
         ):
@@ -962,6 +1158,27 @@ class UamSuiteGUI(QMainWindow):
     def log(self, msg: str) -> None:
         self.log_text.append(msg)
         self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+
+    @staticmethod
+    def _mixed_rows_to_plot_xyz(
+        sorted_rows: list,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[None, None, None]:
+        """From GUI mixed waypoint rows to (times, base_xyz with NaN for EE rows, ee_xyz with NaN for Base rows)."""
+        if not sorted_rows:
+            return None, None, None
+        tw = np.array([float(r[7]) for r in sorted_rows], dtype=float)
+        base: list[list[float]] = []
+        ee: list[list[float]] = []
+        for r in sorted_rows:
+            is_ee = str(r[0]).strip().lower().startswith("e")
+            x, y, z = float(r[1]), float(r[2]), float(r[3])
+            if is_ee:
+                base.append([float("nan"), float("nan"), float("nan")])
+                ee.append([x, y, z])
+            else:
+                base.append([x, y, z])
+                ee.append([float("nan"), float("nan"), float("nan")])
+        return tw, np.array(base, dtype=float), np.array(ee, dtype=float)
 
     def _redraw_combined_views(self, res: dict | None = None) -> None:
         # Planning preview uses the same rendering framework as EE tracking GUI.
@@ -1045,9 +1262,50 @@ class UamSuiteGUI(QMainWindow):
             "mpc_solve": {"nlp_iter": [], "cpu_s": [], "wall_s": [], "status": []},
         }
 
-        wp_xyz = None
+        tw_rel = None
+        base_wp = None
+        ee_wp = None
+        rows = pb.get("plan_mixed_wp_rows")
+        if rows:
+            tw, bx, ex = self._mixed_rows_to_plot_xyz(rows)
+            if tw is not None:
+                t0 = float(t.flatten()[0])
+                tw_rel = tw - t0
+                base_wp, ee_wp = bx, ex
+
         fs = self.fig_states if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_into_figure else None
         f3 = self.fig_3d_track if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_3d_into_figure else None
+
+        traj_meta = None
+        fr = getattr(self, "_full_plan_result", None)
+        if fr and pb.get("kind") == "full_croc":
+            pl = fr.get("planner")
+            costs: list[float] = []
+            if pl is not None:
+                cl = getattr(pl, "_cost_logger", None)
+                if cl is not None and hasattr(cl, "costs") and cl.costs is not None:
+                    costs = [float(c) for c in cl.costs]
+            tim = fr.get("timing") or {}
+            traj_meta = {
+                "backend": "crocoddyl",
+                "costs": costs,
+                "timing": {
+                    "n_iter": int(tim.get("n_iter", 0)),
+                    "avg_ms_per_iter": float(tim.get("avg_ms_per_iter", 0)),
+                    "total_s": float(tim.get("total_s", 0)),
+                },
+            }
+        elif fr and pb.get("kind") == "full_acados":
+            tim = fr.get("timing") or {}
+            traj_meta = {
+                "backend": "acados_traj",
+                "costs": None,
+                "timing": {
+                    "n_iter": int(tim.get("n_iter", 0)),
+                    "avg_ms_per_iter": float(tim.get("avg_ms_per_iter", 0)),
+                    "total_s": float(tim.get("total_s", 0)),
+                },
+            }
 
         # Render into the same 3 figures as the tracking GUI.
         em.render_ee_tracking_results_to_figures(
@@ -1056,8 +1314,12 @@ class UamSuiteGUI(QMainWindow):
             f3,
             self.fig_traj_dash,
             control_mode="direct",
-            plan_waypoints_xyz=wp_xyz,
+            plan_waypoints_xyz=None,
+            plan_waypoint_times=tw_rel,
+            plan_waypoints_base_xyz=base_wp,
+            plan_waypoints_ee_xyz=ee_wp,
             states_title="Planned reference",
+            traj_solver_meta=traj_meta,
         )
         self.cv_states.draw()
         self.cv_3d_track.draw()
@@ -1401,13 +1663,10 @@ class UamSuiteGUI(QMainWindow):
                 {
                     self.croc_horizon,
                     self.croc_mpc_iter,
-                    self.tau_thrust_track,
-                    self.tau_theta_track,
                     self.w_state_track,
                     self.w_state_reg,
                     self.w_control,
                     self.w_terminal_track,
-                    self.croc_use_actuator_first_order,
                 }
             )
         elif idx == 1:
@@ -1425,8 +1684,16 @@ class UamSuiteGUI(QMainWindow):
             visible_widgets.update(
                 {
                     self.N_mpc,
-                    self.w_ee,
-                    self.w_ee_yaw,
+                    self.croc_ee_w_pos,
+                    self.croc_ee_w_rot_rp,
+                    self.croc_ee_w_rot_yaw,
+                    self.croc_ee_w_vel_lin,
+                    self.croc_ee_w_vel_ang_rp,
+                    self.croc_ee_w_vel_ang_yaw,
+                    self.croc_ee_w_u,
+                    self.w_state_reg,
+                    self.w_state_track,
+                    self.croc_ee_w_terminal,
                     self.mpc_max_iter,
                     self.croc_ee_use_thrust_constraints,
                 }
@@ -1447,6 +1714,53 @@ class UamSuiteGUI(QMainWindow):
             self.track_algo_group.setTitle(
                 "Algorithm parameters (Crocoddyl EE pose tracking)"
             )
+        self._refresh_sim_plant_controls_state()
+
+    def _refresh_sim_plant_controls_state(self) -> None:
+        """Enable/disable plant-only simulator widgets (u lag, payload) by tracking mode."""
+        idx = int(self.track_mode_combo.currentIndex()) if hasattr(self, "track_mode_combo") else 0
+        croc_plant_lag = idx in (0, 2)
+        use_lag = (
+            bool(self.croc_use_actuator_first_order.isChecked())
+            if hasattr(self, "croc_use_actuator_first_order")
+            else False
+        )
+        if hasattr(self, "_track_sim_actuator_hint"):
+            self._track_sim_actuator_hint.setVisible(croc_plant_lag)
+        if hasattr(self, "croc_use_actuator_first_order"):
+            self.croc_use_actuator_first_order.setEnabled(croc_plant_lag)
+        if hasattr(self, "tau_thrust_track"):
+            self.tau_thrust_track.setEnabled(croc_plant_lag and use_lag)
+        if hasattr(self, "tau_theta_track"):
+            self.tau_theta_track.setEnabled(croc_plant_lag and use_lag)
+        croc_payload = idx in (0, 2)
+        if hasattr(self, "sim_payload_enable"):
+            self.sim_payload_enable.setEnabled(croc_payload)
+        if hasattr(self, "sim_payload_row"):
+            self.sim_payload_row.setEnabled(
+                croc_payload and self.sim_payload_enable.isChecked()
+            )
+        if hasattr(self, "_sim_payload_label"):
+            self._sim_payload_label.setEnabled(croc_payload)
+
+    def _refresh_track_sim_actuator_taus_enabled(self) -> None:
+        self._refresh_sim_plant_controls_state()
+
+    def _on_sim_payload_enable_toggled(self, on: bool) -> None:
+        self._refresh_sim_plant_controls_state()
+
+    def _refresh_sim_payload_inertia_hint(self) -> None:
+        if not hasattr(self, "sim_payload_inertia_lbl"):
+            return
+        try:
+            from s500_uam_crocoddyl_ee_pose_tracking_mpc import solid_sphere_principal_inertias
+
+            m = float(self.sim_payload_mass.value())
+            r = 0.02
+            ii, _, _ = solid_sphere_principal_inertias(m, r)
+            self.sim_payload_inertia_lbl.setText(f"→ I=⅖mr² (r=2cm) ≈ {ii:.4g} kg·m²")
+        except Exception:
+            self.sim_payload_inertia_lbl.setText("")
 
     def _set_table_from_rows(self, table: QTableWidget, rows: list[list[float]], n_cols: int) -> None:
         table.setRowCount(max(0, len(rows)))
@@ -1469,6 +1783,11 @@ class UamSuiteGUI(QMainWindow):
             "state_w": float(self.state_w.value()),
             "ctrl_w": float(self.ctrl_w.value()),
             "wp_mult": float(self.wp_mult.value()),
+            "ee_knot_w": float(self.ee_knot_w.value()),
+            "ee_knot_state_reg_w": float(self.ee_knot_state_reg_w.value()),
+            "ee_knot_rot_w": float(self.ee_knot_rot_w.value()),
+            "ee_knot_vel_w": float(self.ee_knot_vel_w.value()),
+            "ee_knot_vel_pitch_w": float(self.ee_knot_vel_pitch_w.value()),
             "dt_ee_sample": float(self.dt_ee_sample.value()),
             "ee_plan_type_index": int(self.ee_plan_type_combo.currentIndex()),
             "ee_eight_center": [
@@ -1486,6 +1805,14 @@ class UamSuiteGUI(QMainWindow):
             "N_mpc": int(self.N_mpc.value()),
             "w_ee": float(self.w_ee.value()),
             "w_ee_yaw": float(self.w_ee_yaw.value()),
+            "croc_ee_w_pos": float(self.croc_ee_w_pos.value()),
+            "croc_ee_w_rot_rp": float(self.croc_ee_w_rot_rp.value()),
+            "croc_ee_w_rot_yaw": float(self.croc_ee_w_rot_yaw.value()),
+            "croc_ee_w_vel_lin": float(self.croc_ee_w_vel_lin.value()),
+            "croc_ee_w_vel_ang_rp": float(self.croc_ee_w_vel_ang_rp.value()),
+            "croc_ee_w_vel_ang_yaw": float(self.croc_ee_w_vel_ang_yaw.value()),
+            "croc_ee_w_u": float(self.croc_ee_w_u.value()),
+            "croc_ee_w_terminal": float(self.croc_ee_w_terminal.value()),
             "mpc_max_iter": int(self.mpc_max_iter.value()),
             "mpc_log_iv": int(self.mpc_log_iv.value()),
             "tau_thrust_track": float(self.tau_thrust_track.value()),
@@ -1498,6 +1825,9 @@ class UamSuiteGUI(QMainWindow):
             "w_terminal_track": float(self.w_terminal_track.value()),
             "croc_use_actuator_first_order": bool(self.croc_use_actuator_first_order.isChecked()),
             "croc_ee_use_thrust_constraints": bool(self.croc_ee_use_thrust_constraints.isChecked()),
+            "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
+            "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
+            "sim_payload_mass": float(self.sim_payload_mass.value()),
             "plan_croc_use_actuator_first_order": bool(self.plan_croc_use_actuator_first_order.isChecked()),
             "plan_tau_motor": float(self.plan_tau_motor.value()),
             "plan_tau_joint": float(self.plan_tau_joint.value()),
@@ -1508,7 +1838,10 @@ class UamSuiteGUI(QMainWindow):
             raise ValueError("Parameter file format is invalid (root must be a JSON object).")
 
         if isinstance(p.get("wp_rows"), list):
-            self._set_table_from_rows(self.wp_table, p["wp_rows"], 7)
+            wp_rows = p["wp_rows"]
+            if int(p.get("version", 1)) < 2:
+                wp_rows = _migrate_mixed_wp_rows_v1_to_v2(wp_rows)
+            self._restore_wp_rows(wp_rows)
         if isinstance(p.get("ee_wp_rows"), list):
             self._set_table_from_rows(self.ee_wp_table, p["ee_wp_rows"], 5)
 
@@ -1521,6 +1854,10 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("state_w", self.state_w)
         _set_spin("ctrl_w", self.ctrl_w)
         _set_spin("wp_mult", self.wp_mult)
+        _set_spin("ee_knot_w", self.ee_knot_w)
+        _set_spin("ee_knot_state_reg_w", self.ee_knot_state_reg_w)
+        _set_spin("ee_knot_rot_w", self.ee_knot_rot_w)
+        _set_spin("ee_knot_vel_w", self.ee_knot_vel_w)
         _set_spin("dt_ee_sample", self.dt_ee_sample)
         _set_spin("ee_eight_a", self.ee_eight_a)
         _set_spin("ee_eight_period", self.ee_eight_period)
@@ -1532,6 +1869,25 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("N_mpc", self.N_mpc)
         _set_spin("w_ee", self.w_ee)
         _set_spin("w_ee_yaw", self.w_ee_yaw)
+        _set_spin("croc_ee_w_pos", self.croc_ee_w_pos)
+        _set_spin("croc_ee_w_rot_rp", self.croc_ee_w_rot_rp)
+        _set_spin("croc_ee_w_rot_yaw", self.croc_ee_w_rot_yaw)
+        _set_spin("croc_ee_w_vel_lin", self.croc_ee_w_vel_lin)
+        _set_spin("croc_ee_w_vel_ang_rp", self.croc_ee_w_vel_ang_rp)
+        _set_spin("croc_ee_w_vel_ang_yaw", self.croc_ee_w_vel_ang_yaw)
+        _set_spin("croc_ee_w_u", self.croc_ee_w_u)
+        _set_spin("croc_ee_w_terminal", self.croc_ee_w_terminal)
+        if "sim_payload_enable" in p:
+            self.sim_payload_enable.setChecked(bool(p["sim_payload_enable"]))
+        _set_spin("sim_payload_t_grasp", self.sim_payload_t_grasp)
+        _set_spin("sim_payload_mass", self.sim_payload_mass)
+        if "sim_payload_enable" not in p and "sim_payload_t_grasp" in p:
+            tg = float(p.get("sim_payload_t_grasp", -1.0))
+            m = float(p.get("sim_payload_mass", 0.0))
+            self.sim_payload_enable.setChecked(tg >= 0.0 and m > 1e-9)
+        if hasattr(self, "sim_payload_enable"):
+            self._on_sim_payload_enable_toggled(self.sim_payload_enable.isChecked())
+            self._refresh_sim_payload_inertia_hint()
         _set_spin("mpc_max_iter", self.mpc_max_iter)
         _set_spin("mpc_log_iv", self.mpc_log_iv)
         _set_spin("tau_thrust_track", self.tau_thrust_track)
@@ -1549,6 +1905,12 @@ class UamSuiteGUI(QMainWindow):
             self.plan_tau_motor.setValue(float(p["plan_tau_thrust"]))
         if "plan_tau_joint" not in p and "plan_tau_theta" in p:
             self.plan_tau_joint.setValue(float(p["plan_tau_theta"]))
+
+        # Older parameter files only had w_ee / w_ee_yaw for EE tracking.
+        if "croc_ee_w_pos" not in p and "w_ee" in p:
+            self.croc_ee_w_pos.setValue(float(p["w_ee"]))
+        if "croc_ee_w_rot_yaw" not in p and "w_ee_yaw" in p:
+            self.croc_ee_w_rot_yaw.setValue(float(p["w_ee_yaw"]))
 
         def _set_combo(name: str, widget):
             if name in p:
@@ -1621,25 +1983,106 @@ class UamSuiteGUI(QMainWindow):
             return
         self._write_params_to_path(Path(path))
 
-    def _read_wp_table(self) -> list[list[float]]:
+    def _make_wp_type_combo(self, type_value: str = "Base") -> QComboBox:
+        cb = QComboBox()
+        cb.addItems(["Base", "EE", "EEp"])
+        label = _normalize_wp_type_for_combo(type_value)
+        idx = cb.findText(label)
+        cb.setCurrentIndex(idx if idx >= 0 else 0)
+        return cb
+
+    def _read_wp_table(self) -> list[list]:
         rows = []
         for r in range(self.wp_table.rowCount()):
-            row = []
-            for c in range(7):
+            w0 = self.wp_table.cellWidget(r, 0)
+            if isinstance(w0, QComboBox):
+                mode = (w0.currentText().strip() if w0 else "Base") or "Base"
+            else:
+                it0 = self.wp_table.item(r, 0)
+                mode = (it0.text().strip() if it0 else "Base") or "Base"
+            nums = []
+            for c in range(1, 8):
                 it = self.wp_table.item(r, c)
-                row.append(float(it.text()) if it else 0.0)
-            rows.append(row)
+                nums.append(float(it.text()) if it else 0.0)
+            rows.append([mode] + nums)
         return rows
+
+    def _restore_wp_rows(self, rows: list) -> None:
+        self.wp_table.setRowCount(max(0, len(rows)))
+        for r, row in enumerate(rows):
+            if not isinstance(row, (list, tuple)):
+                continue
+            if len(row) >= 8:
+                mode = str(row[0])
+                nums = [float(row[i]) for i in range(1, 8)]
+            elif len(row) >= 7:
+                mode = "Base"
+                nums = [float(row[i]) for i in range(7)]
+            else:
+                mode = "Base"
+                nums = [0.0] * 7
+            self.wp_table.setCellWidget(r, 0, self._make_wp_type_combo(mode))
+            for c, v in enumerate(nums):
+                self.wp_table.setItem(r, c + 1, QTableWidgetItem(f"{v:g}"))
 
     def _add_wp_row(self):
         r = self.wp_table.rowCount()
         self.wp_table.insertRow(r)
-        for c in range(7):
+        self.wp_table.setCellWidget(r, 0, self._make_wp_type_combo("Base"))
+        for c in range(1, 8):
             self.wp_table.setItem(r, c, QTableWidgetItem("0"))
 
     def _del_wp_row(self):
         if self.wp_table.rowCount() > 2:
             self.wp_table.removeRow(self.wp_table.rowCount() - 1)
+
+    def _mixed_rows_to_waypoints7(self, sorted_rows: list[list]) -> list[list[float]]:
+        """Acados multi-waypoint: 7 floats [x,y,z, j1°, j2°, yaw°, t] (consistent with wp_to_state)."""
+        out: list[list[float]] = []
+        d2r = np.pi / 180.0
+        rk_fn = self._mixed_wp_row_kind
+        if rk_fn is None:
+            from s500_uam_trajectory_gui import mixed_wp_row_kind
+
+            rk_fn = mixed_wp_row_kind
+        import pinocchio as pin
+
+        for row in sorted_rows:
+            rk = rk_fn(row[0])
+            x, y, z, a, b, c, t = (float(row[i]) for i in range(1, 8))
+            if rk == "base":
+                out.append([x, y, z, a, b, c, t])
+            elif rk == "ee_pos" and self.planner is not None and self._make_uam_state is not None:
+                st0 = self._make_uam_state(0.0, 0.0, 1.0, j1=a * d2r, j2=b * d2r, yaw=c * d2r)
+                st = self.planner.align_state_ee_to_world_point(
+                    st0, np.array([x, y, z], dtype=float)
+                )
+                out.append([float(st[0]), float(st[1]), float(st[2]), a, b, c, t])
+            elif rk == "ee_pose" and self.planner is not None:
+                st0 = np.zeros(17)
+                st0[2] = 1.0
+                rpy = np.array([a, b, c], dtype=float) * d2r
+                R = pin.rpy.rpyToMatrix(float(rpy[0]), float(rpy[1]), float(rpy[2]))
+                quat = pin.Quaternion(R)
+                st0[3], st0[4], st0[5], st0[6] = quat.x, quat.y, quat.z, quat.w
+                st = self.planner.align_state_ee_to_world_point(
+                    st0, np.array([x, y, z], dtype=float)
+                )
+                rpy_s = _quat_to_euler_row(st[3:7])
+                out.append(
+                    [
+                        float(st[0]),
+                        float(st[1]),
+                        float(st[2]),
+                        float(np.degrees(st[7])),
+                        float(np.degrees(st[8])),
+                        float(np.degrees(rpy_s[2])),
+                        t,
+                    ]
+                )
+            else:
+                out.append([x, y, z, a, b, c, t])
+        return out
 
     def _read_ee_rows(self) -> list[list[float]]:
         rows = []
@@ -1651,14 +2094,6 @@ class UamSuiteGUI(QMainWindow):
             rows.append(row)
         return rows
 
-    def _sorted_full_wps_and_durations(self, rows: list[list[float]]):
-        wps = sorted(rows, key=lambda x: float(x[6]))
-        durs = []
-        for i in range(len(wps) - 1):
-            d = float(wps[i + 1][6]) - float(wps[i][6])
-            durs.append(d if d > 0 else 1.0)
-        return wps, durs
-
     def _run_plan(self):
         if self.plan_mode_combo.currentIndex() == 1:
             return
@@ -1666,10 +2101,15 @@ class UamSuiteGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Unable to import trajectory_gui / solver.")
             return
         rows = self._read_wp_table()
-        wps, durs = self._sorted_full_wps_and_durations(rows)
-        if len(wps) < 2:
+        sorted_rows = sorted(rows, key=lambda x: float(x[7]))
+        if len(sorted_rows) < 2:
             QMessageBox.warning(self, "Error", "At least 2 waypoints are required.")
             return
+        self._last_plan_sorted_wp_rows = copy.deepcopy(sorted_rows)
+        durs = []
+        for i in range(len(sorted_rows) - 1):
+            d = float(sorted_rows[i + 1][7]) - float(sorted_rows[i][7])
+            durs.append(d if d > 1e-6 else 1.0)
         mid = self.method_combo.currentIndex()
         method = self._method_ids[mid] if mid < len(self._method_ids) else "none"
         if method == "none":
@@ -1678,14 +2118,21 @@ class UamSuiteGUI(QMainWindow):
         if method == "crocoddyl" and self.planner is None:
             QMessageBox.warning(self, "Error", "Crocoddyl planner is not initialized.")
             return
+        wps7 = self._mixed_rows_to_waypoints7(sorted_rows)
         params = {
-            "waypoints": wps,
+            "mixed_wp_rows": sorted_rows,
+            "waypoints": wps7,
             "durations": durs,
             "dt": self.dt_plan.value(),
             "max_iter": self.max_iter_plan.value(),
             "state_weight": self.state_w.value(),
             "control_weight": self.ctrl_w.value(),
             "waypoint_multiplier": self.wp_mult.value(),
+            "ee_knot_weight": self.ee_knot_w.value(),
+            "ee_knot_state_reg_weight": self.ee_knot_state_reg_w.value(),
+            "ee_knot_rotation_weight": self.ee_knot_rot_w.value(),
+            "ee_knot_velocity_weight": self.ee_knot_vel_w.value(),
+            "ee_knot_velocity_pitch_weight": self.ee_knot_vel_pitch_w.value(),
             "planner": self.planner,
             "tau_cmd": np.array(
                 [
@@ -1703,7 +2150,7 @@ class UamSuiteGUI(QMainWindow):
             ),
         }
         self.run_plan_btn.setEnabled(False)
-        self.log(f"Planning started: {method}, {len(wps)} waypoints")
+        self.log(f"Planning started: {method}, {len(sorted_rows)} waypoints")
         self._plan_worker = self.OptimizationWorker(method, params)
         self._plan_worker.finished.connect(self._on_plan_finished)
         self._plan_worker.start()
@@ -1811,21 +2258,25 @@ class UamSuiteGUI(QMainWindow):
                 us = [np.array(u, dtype=float).flatten() for u in pl.solver.us]
             t_plan = np.arange(len(xs), dtype=float) * dt
             x_plan = np.vstack(xs)
+            _wpr = getattr(self, "_last_plan_sorted_wp_rows", None)
             self._plan_bundle = {
                 "kind": "full_croc",
                 "t_plan": t_plan,
                 "x_plan": x_plan,
                 "u_plan": np.vstack(us) if len(us) else np.zeros((0, 6), dtype=float),
+                "plan_mixed_wp_rows": copy.deepcopy(_wpr) if _wpr else None,
             }
         elif result_data.get("method") in ("acados", "acados_cascade"):
             t_plan = np.asarray(result_data["time_arr"], dtype=float).flatten()
             x_plan = np.asarray(result_data["simX"], dtype=float)
             u_plan = np.asarray(result_data.get("simU"), dtype=float)
+            _wpr = getattr(self, "_last_plan_sorted_wp_rows", None)
             self._plan_bundle = {
                 "kind": "full_acados",
                 "t_plan": t_plan,
                 "x_plan": x_plan,
                 "u_plan": u_plan if u_plan.ndim == 2 else np.zeros((0, 6), dtype=float),
+                "plan_mixed_wp_rows": copy.deepcopy(_wpr) if _wpr else None,
             }
         else:
             self._plan_bundle = None
@@ -1897,6 +2348,7 @@ class UamSuiteGUI(QMainWindow):
     def _update_track_mode_enabled(self):
         """Crocoddyl tracking along the trajectory is selectable only when full-state planning is available."""
         if self._plan_bundle is None:
+            self._on_track_mode_changed()
             return
         full = self._plan_bundle["kind"] in ("full_croc", "full_acados")
         try:
@@ -1946,6 +2398,10 @@ class UamSuiteGUI(QMainWindow):
                 "use_actuator_first_order": self.croc_use_actuator_first_order.isChecked(),
                 "tau_thrust": float(self.tau_thrust_track.value()),
                 "tau_theta": float(self.tau_theta_track.value()),
+                "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
+                "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
+                "sim_payload_mass": float(self.sim_payload_mass.value()),
+                "sim_payload_sphere_r": 0.02,
             }
             self.run_track_btn.setEnabled(False)
             self.log("Crocoddyl closed-loop tracking along the plan…")
@@ -1988,6 +2444,11 @@ class UamSuiteGUI(QMainWindow):
             if not self._CROC_EE_OK or self._croc_ee_mpc is None:
                 QMessageBox.warning(self, "Error", "Crocoddyl EE pose tracking is unavailable.")
                 return
+            t_plan_ee = None
+            x_plan_ee = None
+            if pb.get("kind") != "ee_snap" and pb.get("t_plan") is not None and pb.get("x_plan") is not None:
+                t_plan_ee = np.asarray(pb["t_plan"], dtype=float)
+                x_plan_ee = np.asarray(pb["x_plan"], dtype=float)
             params_croc_ee = {
                 "x0": x0_for_ee,
                 "t_ref": t_ref,
@@ -1997,10 +2458,27 @@ class UamSuiteGUI(QMainWindow):
                 "control_dt": self.control_dt.value(),
                 "dt_mpc": self.dt_mpc.value(),
                 "N_mpc": self.N_mpc.value(),
-                "w_ee": self.w_ee.value(),
-                "w_ee_yaw": self.w_ee_yaw.value(),
+                "croc_ee_w_pos": float(self.croc_ee_w_pos.value()),
+                "croc_ee_w_rot_rp": float(self.croc_ee_w_rot_rp.value()),
+                "croc_ee_w_rot_yaw": float(self.croc_ee_w_rot_yaw.value()),
+                "croc_ee_w_vel_lin": float(self.croc_ee_w_vel_lin.value()),
+                "croc_ee_w_vel_ang_rp": float(self.croc_ee_w_vel_ang_rp.value()),
+                "croc_ee_w_vel_ang_yaw": float(self.croc_ee_w_vel_ang_yaw.value()),
+                "croc_ee_w_u": float(self.croc_ee_w_u.value()),
+                "croc_ee_w_terminal": float(self.croc_ee_w_terminal.value()),
+                "w_state_reg": float(self.w_state_reg.value()),
+                "w_state_track": float(self.w_state_track.value()),
                 "mpc_max_iter": self.mpc_max_iter.value(),
                 "use_thrust_constraints": self.croc_ee_use_thrust_constraints.isChecked(),
+                "use_actuator_first_order": self.croc_use_actuator_first_order.isChecked(),
+                "tau_thrust": float(self.tau_thrust_track.value()),
+                "tau_theta": float(self.tau_theta_track.value()),
+                "t_plan": t_plan_ee,
+                "x_plan": x_plan_ee,
+                "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
+                "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
+                "sim_payload_mass": float(self.sim_payload_mass.value()),
+                "sim_payload_sphere_r": 0.02,
             }
             self.run_track_btn.setEnabled(False)
             self.log("Crocoddyl EE pose closed loop…")
@@ -2131,6 +2609,35 @@ class UamSuiteGUI(QMainWindow):
             wp = out["waypoints"]
         elif self._plan_bundle and self._plan_bundle.get("kind") == "ee_snap":
             wp = self._plan_bundle.get("waypoints")
+        ref_time_states = None
+        ref_states = None
+        ref_time_controls = None
+        ref_controls = None
+        pb = self._plan_bundle
+        if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+            try:
+                tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                xp = np.asarray(pb.get("x_plan"), dtype=float)
+                if tp.size >= 2 and xp.ndim == 2 and xp.shape[0] == tp.size:
+                    ref_time_states = tp - tp[0]
+                    ref_states = xp[:, :17] if xp.shape[1] > 17 else xp
+                up = np.asarray(pb.get("u_plan"), dtype=float)
+                if up.ndim == 2 and up.shape[0] > 0 and ref_time_states is not None:
+                    n_u = int(up.shape[0])
+                    if n_u == max(0, len(ref_time_states) - 1):
+                        ref_time_controls = ref_time_states[:-1]
+                    else:
+                        ref_time_controls = np.linspace(
+                            float(ref_time_states[0]),
+                            float(ref_time_states[-1]),
+                            n_u,
+                        )
+                    ref_controls = up
+            except Exception:
+                ref_time_states = None
+                ref_states = None
+                ref_time_controls = None
+                ref_controls = None
         fs = self.fig_states if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_into_figure else None
         f3 = self.fig_3d_track if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_3d_into_figure else None
         if fs is None:
@@ -2157,6 +2664,10 @@ class UamSuiteGUI(QMainWindow):
             control_mode=control_mode,
             plan_waypoints_xyz=wp,
             states_title="MPC closed-loop",
+            ref_time_states=ref_time_states,
+            ref_states=ref_states,
+            ref_time_controls=ref_time_controls,
+            ref_controls=ref_controls,
         )
         self.cv_states.draw()
         self.cv_3d_track.draw()

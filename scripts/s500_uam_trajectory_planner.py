@@ -9,7 +9,9 @@ Features:
 - Support end-effector (gripper_link) position constraints for grasping
 - Perform trajectory optimization: start -> grasp point -> target
 
-State: [x,y,z, qx,qy,qz,qw, j1,j2, vx,vy,vz, wx,wy,wz, j1_dot,j2_dot]  (q then v)
+State: [x,y,z, qx,qy,qz,qw, j1,j2, vx,vy,vz, wx,wy,wz, j1_dot,j2_dot]  (q then v).
+  Base (vx,vy,vz) and (wx,wy,wz) are in the floating-base *body* frame (Pinocchio free-flyer);
+  plots convert them to world frame for display.
 Control: [thrust_1, thrust_2, thrust_3, thrust_4, torque_j1, torque_j2]
 
 Author: Lei He
@@ -55,6 +57,54 @@ def compute_ee_kinematics_along_trajectory(
         ee_v[i] = np.array(vel.linear).flatten()
         ee_w[i] = np.array(vel.angular).flatten()
     return ee_pos, ee_v, ee_rpy, ee_w
+
+
+def quat_xyzw_batch_to_R(quat: np.ndarray) -> np.ndarray:
+    """
+    Rotation matrix R_wb from body to world for each row.
+    quat: (N, 4) with columns [qx, qy, qz, qw] (Pinocchio / state layout).
+    Returns R with shape (N, 3, 3) such that v_world = einsum('nij,nj->ni', R, v_body).
+    """
+    quat = np.asarray(quat, dtype=float)
+    if quat.ndim == 1:
+        quat = quat.reshape(1, -1)
+    qx, qy, qz, qw = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    nn = np.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    nn = np.maximum(nn, 1e-12)
+    qx, qy, qz, qw = qx / nn, qy / nn, qz / nn, qw / nn
+    R = np.empty((len(quat), 3, 3), dtype=float)
+    R[:, 0, 0] = 1.0 - 2.0 * (qy * qy + qz * qz)
+    R[:, 0, 1] = 2.0 * (qx * qy - qw * qz)
+    R[:, 0, 2] = 2.0 * (qx * qz + qw * qy)
+    R[:, 1, 0] = 2.0 * (qx * qy + qw * qz)
+    R[:, 1, 1] = 1.0 - 2.0 * (qx * qx + qz * qz)
+    R[:, 1, 2] = 2.0 * (qy * qz - qw * qx)
+    R[:, 2, 0] = 2.0 * (qx * qz - qw * qy)
+    R[:, 2, 1] = 2.0 * (qy * qz + qw * qx)
+    R[:, 2, 2] = 1.0 - 2.0 * (qx * qx + qy * qy)
+    return R
+
+
+def base_lin_ang_world_from_robot_state(simX: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Base linear and angular velocity in world frame from state rows.
+
+    Pinocchio free-flyer tangent: v[0:3] linear in body, v[3:6] angular in body
+    (same as s500_uam_acados_model q_dot convention).
+    State layout: x = [q(9), v(8)] with q = [x,y,z,qx,qy,qz,qw,j1,j2].
+    """
+    X = np.asarray(simX, dtype=float)
+    if X.ndim == 1:
+        X = X.reshape(1, -1)
+    if X.shape[1] < 15:
+        raise ValueError(f"state needs ≥15 columns for base twist, got {X.shape[1]}")
+    quat = X[:, 3:7]
+    vb = X[:, 9:12]
+    wb = X[:, 12:15]
+    R = quat_xyzw_batch_to_R(quat)
+    vw = np.einsum("nij,nj->ni", R, vb)
+    ww = np.einsum("nij,nj->ni", R, wb)
+    return vw, ww
 
 
 class S500UAMTrajectoryPlanner:
@@ -128,38 +178,77 @@ class S500UAMTrajectoryPlanner:
             print(f"✗ Failed to load model: {e}")
             raise
 
+    def _build_thruster_list(self) -> List[crocoddyl.Thruster]:
+        """Thruster objects from S500 YAML (same geometry for any Pinocchio copy of this robot)."""
+        platform = self.s500_config['platform']
+        cf = platform['cf']
+        cm = platform['cm']
+        rotors = platform['$rotors']
+        min_thrust = platform['min_thrust']
+        max_thrust = platform['max_thrust']
+        thruster_list = []
+        for rotor in rotors:
+            pos = np.array(rotor['translation'])
+            spin_dir = rotor['spin_direction'][0]
+            M = pin.SE3(np.eye(3), pos)
+            ctorque = abs(spin_dir) * cm / cf
+            thruster_type = crocoddyl.ThrusterType.CCW if spin_dir < 0 else crocoddyl.ThrusterType.CW
+            thruster = crocoddyl.Thruster(M, ctorque, thruster_type, min_thrust, max_thrust)
+            thruster_list.append(thruster)
+        return thruster_list
+
+    def thruster_actuation_for_model(self, robot_model: pin.Model):
+        """Crocoddyl floating-base thruster actuation bound to a (possibly copied) ``robot_model``."""
+        state = crocoddyl.StateMultibody(robot_model)
+        thruster_list = self._build_thruster_list()
+        actuation = crocoddyl.ActuationModelFloatingBaseThrusters(state, thruster_list)
+        return state, actuation
+
     def create_actuation_model(self):
         """Create actuation model (thrusters + arm joint torques)"""
         try:
-            platform = self.s500_config['platform']
-            cf = platform['cf']
-            cm = platform['cm']
-            rotors = platform['$rotors']
-            min_thrust = platform['min_thrust']
-            max_thrust = platform['max_thrust']
-
-            thruster_list = []
-            for i, rotor in enumerate(rotors):
-                pos = np.array(rotor['translation'])
-                spin_dir = rotor['spin_direction'][0]
-                M = pin.SE3(np.eye(3), pos)
-                ctorque = abs(spin_dir) * cm / cf
-                thruster_type = crocoddyl.ThrusterType.CCW if spin_dir < 0 else crocoddyl.ThrusterType.CW
-                thruster = crocoddyl.Thruster(M, ctorque, thruster_type, min_thrust, max_thrust)
-                thruster_list.append(thruster)
-
-            self.actuation = crocoddyl.ActuationModelFloatingBaseThrusters(self.state, thruster_list)
+            self.actuation = crocoddyl.ActuationModelFloatingBaseThrusters(
+                self.state, self._build_thruster_list()
+            )
             print(f"✓ Actuation: nu={self.actuation.nu} (thrusters + arm torques)")
         except Exception as e:
             print(f"✗ Failed to create actuation: {e}")
             raise
 
+    def align_state_ee_to_world_point(
+        self, x_robot: np.ndarray, p_des_world: np.ndarray
+    ) -> np.ndarray:
+        """
+        Translate floating-base origin q[0:3] so the EE frame matches p_des_world.
+        Quaternion, arm joints, and velocities unchanged (rigid shift of the whole system).
+        """
+        x = np.asarray(x_robot, dtype=float).flatten().copy()
+        p_des = np.asarray(p_des_world, dtype=float).reshape(3)
+        nq, nv = self.robot_model.nq, self.robot_model.nv
+        data = self.robot_model.createData()
+        q = x[:nq].copy()
+        v = x[nq : nq + nv].copy()
+        pin.forwardKinematics(self.robot_model, data, q, v)
+        pin.updateFramePlacements(self.robot_model, data)
+        ee = np.array(data.oMf[self.ee_frame_id].translation, dtype=float).flatten()
+        delta = p_des - ee
+        x[0] += float(delta[0])
+        x[1] += float(delta[1])
+        x[2] += float(delta[2])
+        return x
+
     def create_cost_model(self,
                          target_state: np.ndarray = None,
                          grasp_position: np.ndarray = None,
+                         grasp_orientation_rpy: Optional[np.ndarray] = None,
                          control_weight: float = 1e-5,
                          state_weight: float = 1,
                          ee_position_weight: float = 0,
+                         ee_rotation_weight: float = 0.0,
+                         ee_frame_velocity_weight: float = 0.0,
+                         ee_frame_velocity_pitch_rate_weight: float = 0.0,
+                         ee_velocity_ref_lin: Optional[np.ndarray] = None,
+                         ee_velocity_ref_ang: Optional[np.ndarray] = None,
                          is_terminal: bool = False,
                          is_waypoint: bool = False,
                          waypoint_multiplier: float = 10.0,
@@ -172,9 +261,20 @@ class S500UAMTrajectoryPlanner:
                 include_state_reg is False; still used as fallback when include_state_reg is True
                 and target_state is None (internal default pose).
             grasp_position: Target end-effector position [x,y,z] (world frame)
+            grasp_orientation_rpy: If set with ee_rotation_weight>0, world RPY (rad, Pinocchio ZYX)
+                for ``ResidualModelFramePlacement`` together with grasp_position. Otherwise only
+                translation cost is used.
             control_weight: Control regularization weight
             state_weight: State tracking weight
-            ee_position_weight: End-effector position tracking weight
+            ee_position_weight: End-effector position tracking weight (or translation part of SE3)
+            ee_rotation_weight: Rotation part weight for SE3 placement (0 => translation-only)
+            ee_frame_velocity_weight: If >0, add ``ResidualModelFrameVelocity`` (LOCAL_WORLD_ALIGNED)
+                penalizing deviation from reference spatial velocity; default ref is zero when refs are None.
+            ee_frame_velocity_pitch_rate_weight: Weight on the angular-velocity component about **world Y**
+                (the middle entry of the 3D angular part in LOCAL_WORLD_ALIGNED, i.e. pitch rate for Z-up).
+                Default 0 leaves pitch angular rate unconstrained in the velocity cost; set >0 to penalize it.
+            ee_velocity_ref_lin: Desired EE linear velocity in world (m/s), shape (3,); default zero.
+            ee_velocity_ref_ang: Desired EE angular velocity in world (rad/s), shape (3,); default zero.
             is_terminal: Terminal cost
             is_waypoint: Waypoint cost (enhanced weight)
             waypoint_multiplier: Weight multiplier for waypoints
@@ -193,10 +293,16 @@ class S500UAMTrajectoryPlanner:
         effective_state_weight = float(state_weight)
         effective_control_weight = float(control_weight)
         effective_ee_weight = float(ee_position_weight)
+        effective_ee_rot_w = float(ee_rotation_weight)
+        effective_ee_vel_w = float(ee_frame_velocity_weight)
+        effective_ee_vel_pitch_w = float(ee_frame_velocity_pitch_rate_weight)
         if is_waypoint:
             effective_state_weight *= waypoint_multiplier
             effective_control_weight *= waypoint_multiplier
             effective_ee_weight *= waypoint_multiplier
+            effective_ee_rot_w *= float(waypoint_multiplier)
+            effective_ee_vel_w *= float(waypoint_multiplier)
+            effective_ee_vel_pitch_w *= float(waypoint_multiplier)
 
         # State cost (optional: off for segments with only task-space targets, e.g. EE at grasp)
         if include_state_reg and effective_state_weight > 0:
@@ -206,21 +312,96 @@ class S500UAMTrajectoryPlanner:
                               crocoddyl.CostModelResidual(self.state, state_activation, state_residual),
                               effective_state_weight)
 
-        # End-effector position cost (grasp point)
+        # End-effector task: SE3 placement or translation-only
         if grasp_position is not None and ee_position_weight > 0:
-            ee_residual = crocoddyl.ResidualModelFrameTranslation(
-                self.state, self.ee_frame_id, grasp_position, control_dim
+            p_des = np.asarray(grasp_position, dtype=float).reshape(3)
+            use_se3 = (
+                grasp_orientation_rpy is not None
+                and float(ee_rotation_weight) > 0.0
             )
-            cost_model.addCost("ee_translation",
-                              crocoddyl.CostModelResidual(self.state, ee_residual),
-                              effective_ee_weight)
+            if use_se3:
+                rpy = np.asarray(grasp_orientation_rpy, dtype=float).reshape(3)
+                R = pin.rpy.rpyToMatrix(float(rpy[0]), float(rpy[1]), float(rpy[2]))
+                T_des = pin.SE3(R, p_des)
+                w6 = np.array(
+                    [effective_ee_weight] * 3 + [effective_ee_rot_w] * 3,
+                    dtype=np.float64,
+                )
+                pose_act = crocoddyl.ActivationModelWeightedQuad(w6)
+                ee_res = crocoddyl.ResidualModelFramePlacement(
+                    self.state, self.ee_frame_id, T_des, control_dim
+                )
+                cost_model.addCost(
+                    "ee_placement",
+                    crocoddyl.CostModelResidual(self.state, pose_act, ee_res),
+                    1.0,
+                )
+            else:
+                ee_residual = crocoddyl.ResidualModelFrameTranslation(
+                    self.state, self.ee_frame_id, p_des, control_dim
+                )
+                cost_model.addCost(
+                    "ee_translation",
+                    crocoddyl.CostModelResidual(self.state, ee_residual),
+                    effective_ee_weight,
+                )
+
+        # EE spatial velocity (e.g. stop at pose waypoint): ref default zero in LOCAL_WORLD_ALIGNED
+        if effective_ee_vel_w > 0.0:
+            v_lin = (
+                np.zeros(3, dtype=np.float64)
+                if ee_velocity_ref_lin is None
+                else np.asarray(ee_velocity_ref_lin, dtype=np.float64).reshape(3)
+            )
+            v_ang = (
+                np.zeros(3, dtype=np.float64)
+                if ee_velocity_ref_ang is None
+                else np.asarray(ee_velocity_ref_ang, dtype=np.float64).reshape(3)
+            )
+            vel_motion_ref = pin.Motion(v_lin, v_ang)
+            rf = pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+            # Residual order: [v_x, v_y, v_z, ω_x, ω_y, ω_z] in LOCAL_WORLD_ALIGNED; ω_y ≈ pitch rate (Z-up).
+            w6 = np.array(
+                [
+                    effective_ee_vel_w,
+                    effective_ee_vel_w,
+                    effective_ee_vel_w,
+                    effective_ee_vel_w,
+                    effective_ee_vel_pitch_w,
+                    effective_ee_vel_w,
+                ],
+                dtype=np.float64,
+            )
+            vel_act = crocoddyl.ActivationModelWeightedQuad(w6)
+            vel_res = None
+            if hasattr(crocoddyl, "ResidualModelFrameVelocityTpl"):
+                try:
+                    vel_res = crocoddyl.ResidualModelFrameVelocityTpl(
+                        self.state, self.ee_frame_id, vel_motion_ref, rf, control_dim
+                    )
+                except Exception:
+                    vel_res = None
+            if vel_res is None:
+                vel_res = crocoddyl.ResidualModelFrameVelocity(
+                    self.state, self.ee_frame_id, vel_motion_ref, rf, control_dim
+                )
+            cost_model.addCost(
+                "ee_velocity",
+                crocoddyl.CostModelResidual(self.state, vel_act, vel_res),
+                1.0,
+            )
 
         # Control cost
         if not is_terminal:
             mass = self.robot_model.inertias[1].mass
             hover_thrust = mass * 9.81 / 4
             control_ref = np.array([hover_thrust] * 4 + [0.0] * (control_dim - 4))
-            control_activation = crocoddyl.ActivationModelQuad(self.actuation.nu)
+            # u = [T1..T4, τ_j1, τ_j2]: penalize arm torques 100× more than thrust (smoother arm u).
+            w_u = np.ones(control_dim, dtype=np.float64)
+            if control_dim >= 6:
+                w_u[4] = 100.0
+                w_u[5] = 100.0
+            control_activation = crocoddyl.ActivationModelWeightedQuad(w_u)
             control_residual = crocoddyl.ResidualModelControl(self.state, control_ref)
             cost_model.addCost("control_reg",
                               crocoddyl.CostModelResidual(self.state, control_activation, control_residual),
@@ -489,6 +670,177 @@ class S500UAMTrajectoryPlanner:
         total_time = sum(durations)
         print(f"✓ Created waypoint trajectory: {len(waypoints)} waypoints, {len(running_models)} nodes, terminal scale N={n_total:.0f}, {total_time:.2f}s total")
 
+    def create_trajectory_problem_mixed_waypoints(
+        self,
+        modes: List[str],
+        resolved_states: List[np.ndarray],
+        ee_targets: List[Optional[np.ndarray]],
+        durations: List[float],
+        dt: float = 0.02,
+        waypoint_multiplier: float = 5000.0,
+        state_weight: float = 1.0,
+        control_weight: float = 1e-5,
+        ee_knot_weight: float = 5000.0,
+        ee_knot_state_reg_weight: float = 0.0,
+        ee_pose_rpy_world: Optional[List[Optional[np.ndarray]]] = None,
+        ee_knot_rotation_weight: float = 0.0,
+        ee_knot_velocity_weight: float = 200.0,
+        ee_knot_velocity_pitch_weight: float = 0.0,
+        use_thrust_constraints: bool = True,
+        use_actuator_first_order: bool = False,
+        tau_cmd: Optional[np.ndarray] = None,
+    ) -> None:
+        """
+        Multi-waypoint problem where each knot may be a full-state (base) constraint or an
+        EE task cost (translation-only or SE3 placement), similar to YAML stages mixing
+        state_reg and translation_ee costs.
+
+        modes[i]: "base" | "ee_pose" | "ee_pos" — cost at the first running node of segment i.
+        resolved_states[i]: nominal full state at knot i (EE rows: base translated so EE matches target xyz).
+        ee_targets[i]: world [x,y,z] when modes[i] is ee_pose or ee_pos, else None.
+        ee_pose_rpy_world[i]: EE orientation (rad, Pinocchio ZYX roll-pitch-yaw) when modes[i]=="ee_pose";
+            used with ee_knot_rotation_weight > 0 for ``ResidualModelFramePlacement``; otherwise translation-only.
+        ee_pos: A,B,C in the table are j1/j2/yaw seeds (deg), not EE orientation.
+        ee_knot_velocity_weight: For ``ee_pose`` knots only, weight on ``ResidualModelFrameVelocity``
+            with reference spatial velocity zero (LOCAL_WORLD_ALIGNED). Set 0 to disable.
+        ee_knot_velocity_pitch_weight: Weight on angular velocity about world Y (pitch rate) in that
+            residual; 0 leaves pitch rate free (default). Use same scale as ee_knot_velocity_weight to
+            penalize pitch rate like other angular axes.
+        durations: len N-1 segment lengths [s].
+        """
+        n = len(modes)
+        if n != len(resolved_states) or n != len(ee_targets) or len(durations) != n - 1:
+            raise ValueError("modes, resolved_states, ee_targets lengths must match; len(durations)==N-1")
+        if ee_pose_rpy_world is None:
+            ee_pose_rpy_world = [None] * n
+        elif len(ee_pose_rpy_world) != n:
+            raise ValueError("ee_pose_rpy_world must have same length as modes")
+        self.dt = dt
+        self._use_actuator_first_order = bool(use_actuator_first_order)
+        self._tau_cmd = None if tau_cmd is None else np.asarray(tau_cmd, dtype=float).reshape(-1)
+        self._plot_cache = None
+
+        x0 = np.array(resolved_states[0], dtype=float).copy()
+        nvq = self.robot_model.nq + self.robot_model.nv
+        if len(x0) != nvq:
+            raise ValueError(f"resolved state must have {nvq} elements")
+
+        segment_n_steps = [max(1, int(d / dt)) for d in durations]
+        n_total = int(sum(segment_n_steps))
+
+        self._waypoint_times = [0.0]
+        self._waypoint_positions = [x0[:3]]
+        self._waypoint_labels = ["Start"]
+        self._waypoint_ee_positions = [self.get_ee_position_from_state(x0)]
+        for i in range(1, n):
+            self._waypoint_times.append(self._waypoint_times[-1] + float(durations[i - 1]))
+            si = np.asarray(resolved_states[i], dtype=float).flatten()
+            self._waypoint_positions.append(si[:3])
+            is_last = i == n - 1
+            mi = str(modes[i]).lower()
+            if mi in ("ee_pose", "ee_pos") and ee_targets[i] is not None:
+                self._waypoint_ee_positions.append(np.asarray(ee_targets[i], dtype=float).reshape(3).copy())
+                if mi == "ee_pose":
+                    self._waypoint_labels.append(
+                        "Target (EE pose)" if is_last else f"WP{i}(EE pose)"
+                    )
+                else:
+                    self._waypoint_labels.append("Target (EE)" if is_last else f"WP{i}(EE)")
+            else:
+                self._waypoint_ee_positions.append(self.get_ee_position_from_state(si))
+                self._waypoint_labels.append("Target" if is_last else f"WP{i}")
+
+        running_models = []
+        for i, duration in enumerate(durations):
+            start_state = np.asarray(resolved_states[i], dtype=float).flatten()
+            target_state = np.asarray(resolved_states[i + 1], dtype=float).flatten()
+            mode_i = str(modes[i]).lower()
+
+            if mode_i in ("ee_pose", "ee_pos") and ee_targets[i] is not None:
+                ee_w = float(ee_knot_weight)
+                sr_w = float(ee_knot_state_reg_weight)
+                rpy_des = None
+                rot_w = 0.0
+                vel_w = 0.0
+                vel_pitch_w = 0.0
+                if mode_i == "ee_pose":
+                    slot = ee_pose_rpy_world[i]
+                    if slot is not None and float(ee_knot_rotation_weight) > 0.0:
+                        rpy_des = np.asarray(slot, dtype=float).reshape(3)
+                        rot_w = float(ee_knot_rotation_weight)
+                    vel_w = float(ee_knot_velocity_weight)
+                    vel_pitch_w = float(ee_knot_velocity_pitch_weight)
+                waypoint_cost = self.create_cost_model(
+                    target_state=start_state,
+                    grasp_position=np.asarray(ee_targets[i], dtype=float).reshape(3),
+                    grasp_orientation_rpy=rpy_des,
+                    state_weight=max(sr_w, 1e-12),
+                    control_weight=control_weight,
+                    ee_position_weight=ee_w,
+                    ee_rotation_weight=rot_w,
+                    ee_frame_velocity_weight=vel_w,
+                    ee_frame_velocity_pitch_rate_weight=vel_pitch_w,
+                    is_waypoint=True,
+                    waypoint_multiplier=waypoint_multiplier,
+                    include_state_reg=(sr_w > 0),
+                )
+            else:
+                waypoint_cost = self.create_cost_model(
+                    target_state=start_state,
+                    state_weight=state_weight,
+                    control_weight=control_weight,
+                    is_waypoint=True,
+                    waypoint_multiplier=waypoint_multiplier,
+                )
+            waypoint_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
+                self.state, self.actuation, waypoint_cost
+            )
+            waypoint_int = crocoddyl.IntegratedActionModelEuler(waypoint_diff, dt)
+            running_models.append(waypoint_int)
+
+            n_steps = segment_n_steps[i]
+            normal_cost = self.create_cost_model(
+                target_state=target_state,
+                state_weight=state_weight,
+                control_weight=control_weight,
+            )
+            normal_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
+                self.state, self.actuation, normal_cost
+            )
+            normal_int = crocoddyl.IntegratedActionModelEuler(normal_diff, dt)
+            for _ in range(n_steps - 1):
+                running_models.append(normal_int)
+
+        if use_thrust_constraints:
+            platform = self.s500_config['platform']
+            u_lb = np.array([platform['min_thrust']] * 4 + [-2.0] * 2)
+            u_ub = np.array([platform['max_thrust']] * 4 + [2.0] * 2)
+            for m in running_models:
+                m.u_lb = u_lb
+                m.u_ub = u_ub
+
+        terminal_target = np.asarray(resolved_states[-1], dtype=float).flatten()
+        terminal_cost = self.create_cost_model(
+            target_state=terminal_target,
+            state_weight=waypoint_multiplier * state_weight,
+            control_weight=control_weight,
+            is_terminal=True,
+            is_waypoint=True,
+            waypoint_multiplier=waypoint_multiplier,
+        )
+        terminal_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
+            self.state, self.actuation, terminal_cost
+        )
+        terminal_model = crocoddyl.IntegratedActionModelEuler(terminal_diff, 0.0)
+
+        self.problem = crocoddyl.ShootingProblem(x0, running_models, terminal_model)
+        total_time = sum(durations)
+        n_ee = sum(1 for m in modes if str(m).lower() in ("ee_pose", "ee_pos"))
+        print(
+            f"✓ Created mixed waypoint trajectory: {n} knots ({n_ee} EE), "
+            f"{len(running_models)} nodes, terminal scale N={n_total:.0f}, {total_time:.2f}s total"
+        )
+
     def solve_trajectory(self, max_iter: int = 150, verbose: bool = True) -> bool:
         """Solve trajectory optimization"""
         if self.problem is None:
@@ -671,8 +1023,7 @@ class S500UAMTrajectoryPlanner:
         quat = states[:, 3:7]
         euler = self._quat_to_euler(quat)
         arm_angles_deg = np.degrees(states[:, 7:9]) if nq >= 9 else np.zeros((len(states), 2))
-        velocities = states[:, nq:nq + 3]
-        angular_vel = states[:, nq + 3:nq + 6]
+        v_lin_w, w_ang_w = base_lin_ang_world_from_robot_state(states)
         arm_vel = states[:, nq + 6:nq + 8] if nv >= 8 else np.zeros((len(states), 2))
 
         ee_pos, ee_v, ee_rpy, ee_w = compute_ee_kinematics_along_trajectory(
@@ -761,13 +1112,13 @@ class S500UAMTrajectoryPlanner:
         ax00.legend(h0, l0, loc='upper right', fontsize=7, framealpha=0.9)
 
         ax01 = fig.add_subplot(gs[0, 1])
-        ax01.plot(time_states, velocities[:, 0], 'r-', label='vx')
-        ax01.plot(time_states, velocities[:, 1], 'g-', label='vy')
-        ax01.plot(time_states, velocities[:, 2], 'b-', label='vz')
+        ax01.plot(time_states, v_lin_w[:, 0], 'r-', label='vx')
+        ax01.plot(time_states, v_lin_w[:, 1], 'g-', label='vy')
+        ax01.plot(time_states, v_lin_w[:, 2], 'b-', label='vz')
         add_waypoint_lines(ax01)
         ax01.set_xlabel('Time (s)', **tinfo)
         ax01.set_ylabel('Velocity (m/s)', **tinfo)
-        ax01.set_title('Base Linear Velocity', fontsize=9)
+        ax01.set_title('Base linear vel. (world)', fontsize=9)
         ax01.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
         ax02 = fig.add_subplot(gs[0, 2])
@@ -781,13 +1132,13 @@ class S500UAMTrajectoryPlanner:
         ax02.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
         ax03 = fig.add_subplot(gs[0, 3])
-        ax03.plot(time_states, angular_vel[:, 0], 'r-', label='ωx')
-        ax03.plot(time_states, angular_vel[:, 1], 'g-', label='ωy')
-        ax03.plot(time_states, angular_vel[:, 2], 'b-', label='ωz')
+        ax03.plot(time_states, np.degrees(w_ang_w[:, 0]), 'r-', label='ωx')
+        ax03.plot(time_states, np.degrees(w_ang_w[:, 1]), 'g-', label='ωy')
+        ax03.plot(time_states, np.degrees(w_ang_w[:, 2]), 'b-', label='ωz')
         add_waypoint_lines(ax03)
         ax03.set_xlabel('Time (s)', **tinfo)
-        ax03.set_ylabel('Angular vel (rad/s)', **tinfo)
-        ax03.set_title('Base Angular Velocity', fontsize=9)
+        ax03.set_ylabel('Angular vel (deg/s)', **tinfo)
+        ax03.set_title('Base angular vel. (world)', fontsize=9)
         ax03.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
         # Row 1: EE — position, linear vel, orientation (RPY), angular vel
@@ -830,7 +1181,7 @@ class S500UAMTrajectoryPlanner:
         add_waypoint_lines(ax11)
         ax11.set_xlabel('Time (s)', **tinfo)
         ax11.set_ylabel('Velocity (m/s)', **tinfo)
-        ax11.set_title('EE Linear Velocity', fontsize=9)
+        ax11.set_title('EE linear vel. (world)', fontsize=9)
         ax11.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
         ax12 = fig.add_subplot(gs[1, 2])
@@ -844,13 +1195,13 @@ class S500UAMTrajectoryPlanner:
         ax12.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
         ax13 = fig.add_subplot(gs[1, 3])
-        ax13.plot(time_states, ee_w[:, 0], 'r-', label='ωx')
-        ax13.plot(time_states, ee_w[:, 1], 'g-', label='ωy')
-        ax13.plot(time_states, ee_w[:, 2], 'b-', label='ωz')
+        ax13.plot(time_states, np.degrees(ee_w[:, 0]), 'r-', label='ωx')
+        ax13.plot(time_states, np.degrees(ee_w[:, 1]), 'g-', label='ωy')
+        ax13.plot(time_states, np.degrees(ee_w[:, 2]), 'b-', label='ωz')
         add_waypoint_lines(ax13)
         ax13.set_xlabel('Time (s)', **tinfo)
-        ax13.set_ylabel('Angular vel (rad/s)', **tinfo)
-        ax13.set_title('EE Angular Velocity', fontsize=9)
+        ax13.set_ylabel('Angular vel (deg/s)', **tinfo)
+        ax13.set_title('EE angular vel. (world)', fontsize=9)
         ax13.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
         # Row 2: Arm joints, arm joint rates, base control, arm control
@@ -864,12 +1215,12 @@ class S500UAMTrajectoryPlanner:
         ax20.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
         ax21 = fig.add_subplot(gs[2, 1])
-        ax21.plot(time_states, arm_vel[:, 0], 'r-', label='j1_dot')
-        ax21.plot(time_states, arm_vel[:, 1], 'g-', label='j2_dot')
+        ax21.plot(time_states, np.degrees(arm_vel[:, 0]), 'r-', label='j1_dot')
+        ax21.plot(time_states, np.degrees(arm_vel[:, 1]), 'g-', label='j2_dot')
         add_waypoint_lines(ax21)
         ax21.set_xlabel('Time (s)', **tinfo)
-        ax21.set_ylabel('Angular vel (rad/s)', **tinfo)
-        ax21.set_title('Arm Joint Angular Velocity', fontsize=9)
+        ax21.set_ylabel('Joint rate (deg/s)', **tinfo)
+        ax21.set_title('Arm joint angular velocity', fontsize=9)
         ax21.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
         colors = ['r', 'g', 'b', 'orange']
@@ -1116,6 +1467,74 @@ class S500UAMTrajectoryPlanner:
                  iterations=self.solver.iter,
                  s500_config=self.s500_config)
         print(f"✓ Data saved: {save_path}")
+
+
+def rotation_world_R_body_tool_z_along(
+    direction_world: np.ndarray,
+    world_up: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Rotation ``R`` (3x3) with columns = body x,y,z expressed in world, such that body +Z aligns
+    with ``direction_world`` (normalized). Use with Pinocchio ``matrixToRpy`` for EE table entries.
+
+    Typical use: make gripper ``+Z`` (check ``gripper_link`` in RViz/Meshcat) point from the EE
+    toward the grasp target. If your approach axis is ``-Z``, negate ``direction_world`` or use
+    ``flip=True`` in :func:`rpy_rad_tool_z_toward_point`.
+    """
+    d = np.asarray(direction_world, dtype=float).reshape(3)
+    n = float(np.linalg.norm(d))
+    if n < 1e-9:
+        raise ValueError("direction_world norm too small")
+    ez = d / n
+    up = np.array([0.0, 0.0, 1.0], dtype=float) if world_up is None else np.asarray(world_up, dtype=float).reshape(3)
+    un = float(np.linalg.norm(up))
+    if un < 1e-9:
+        raise ValueError("world_up norm too small")
+    up = up / un
+    if abs(float(np.dot(ez, up))) > 0.999:
+        up = np.array([1.0, 0.0, 0.0], dtype=float)
+    ex = np.cross(up, ez)
+    exn = float(np.linalg.norm(ex))
+    if exn < 1e-9:
+        up = np.array([0.0, 1.0, 0.0], dtype=float)
+        ex = np.cross(up, ez)
+        exn = float(np.linalg.norm(ex))
+    ex = ex / max(exn, 1e-12)
+    ey = np.cross(ez, ex)
+    return np.stack([ex, ey, ez], axis=1)
+
+
+def rpy_rad_tool_z_toward_point(
+    p_ee: np.ndarray,
+    p_target: np.ndarray,
+    *,
+    world_up: Optional[np.ndarray] = None,
+    flip: bool = False,
+) -> np.ndarray:
+    """
+    Roll-pitch-yaw (rad, Pinocchio ZYX / ``rpyToMatrix`` consistent) so that tool +Z points from
+    ``p_ee`` toward ``p_target``. Only the direction ``(p_target - p_ee)`` matters for attitude.
+
+    Args:
+        p_ee: EE position in world (m), e.g. row ``x,y,z`` or FK sample along approach.
+        p_target: Target point in world (m).
+        flip: If True, align with ``-(p_target - p_ee)`` (e.g. ``-Z`` approach axis).
+        world_up: Reference up vector to resolve roll/yaw ambiguity (default ``[0,0,1]``).
+    """
+    d = np.asarray(p_target, dtype=float).reshape(3) - np.asarray(p_ee, dtype=float).reshape(3)
+    if flip:
+        d = -d
+    R = rotation_world_R_body_tool_z_along(d, world_up=world_up)
+    return pin.rpy.matrixToRpy(R)
+
+
+def rpy_deg_tool_z_toward_point(
+    p_ee: np.ndarray,
+    p_target: np.ndarray,
+    **kwargs,
+) -> np.ndarray:
+    """Same as :func:`rpy_rad_tool_z_toward_point` but returns degrees for GUI waypoint columns."""
+    return np.degrees(rpy_rad_tool_z_toward_point(p_ee, p_target, **kwargs))
 
 
 def make_uam_state(x, y, z, j1=0, j2=0, yaw=0):
