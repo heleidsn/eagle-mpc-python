@@ -11,6 +11,8 @@ Same multibody dynamics and actuation; only the optimal-control objective differ
 
 Simulation: ``sim_dt`` integration, ``control_dt`` ZOH; optional actuator first-order lag before the plant step;
 optional **sim-only** EE payload (same sphere-inertia hack as EE-pose closed loop; MPC keeps nominal model).
+Optional ``sim_control_stack="px4_rate"`` inserts a PX4-like layer (integrated body-rate setpoint, rate PD, thruster mixer)
+before the plant; see ``s500_uam_px4_style_rate_sim``.
 """
 
 from __future__ import annotations
@@ -35,6 +37,8 @@ from s500_uam_trajectory_planner import (
     compute_ee_kinematics_along_trajectory,
     make_uam_state,
 )
+
+from s500_uam_px4_style_rate_sim import px4_rate_compute_plant_u
 
 
 def _apply_first_order_actuator(
@@ -138,6 +142,105 @@ def interp_ref_pose(
     yaw_u = np.unwrap(yaw_ref)
     yaw = float(np.interp(tq, t_ref, yaw_u))
     return np.array([px, py, pz], dtype=float), yaw
+
+
+def _cost_group_from_name(name: str) -> str:
+    s = str(name).lower()
+    if "u_" in s or "control" in s or "act" in s:
+        return "action"
+    if s.startswith("x_") or "state" in s:
+        return "state"
+    if s.startswith("ee_") or "frame" in s or "pose" in s or "yaw" in s:
+        return "ee"
+    return "other"
+
+
+def _extract_solver_cost_terms(
+    solver: crocoddyl.SolverBoxFDDP,
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+    """Aggregate weighted cost terms by stage/group and return per-term coefficients."""
+    out: Dict[str, float] = {}
+    grp: Dict[str, float] = {}
+    coeffs: Dict[str, float] = {}
+
+    def _iter_cost_items(costs_obj):
+        if costs_obj is None:
+            return []
+        if hasattr(costs_obj, "items"):
+            try:
+                return list(costs_obj.items())
+            except Exception:
+                pass
+        if hasattr(costs_obj, "todict"):
+            try:
+                d = costs_obj.todict()
+                if isinstance(d, dict):
+                    return list(d.items())
+            except Exception:
+                pass
+        if hasattr(costs_obj, "keys"):
+            try:
+                ks = list(costs_obj.keys())
+                return [(k, costs_obj[k]) for k in ks]
+            except Exception:
+                pass
+        try:
+            d = dict(costs_obj)
+            return list(d.items())
+        except Exception:
+            return []
+
+    def _accumulate(stage: str, cost_model_sum, cost_data_sum) -> None:
+        model_costs = getattr(cost_model_sum, "costs", None)
+        costs = getattr(cost_data_sum, "costs", None)
+        if costs is None and model_costs is None:
+            return
+        data_map = {str(k): v for k, v in _iter_cost_items(costs)}
+        model_map = {str(k): v for k, v in _iter_cost_items(model_costs)}
+        for name in sorted(set(data_map.keys()) | set(model_map.keys())):
+            m_item = model_map.get(name)
+            d_item = data_map.get(name)
+            w = float(getattr(m_item, "weight", 1.0)) if m_item is not None else 1.0
+            c_raw = float(getattr(d_item, "cost", 0.0)) if d_item is not None else 0.0
+            c = w * c_raw
+            key = f"{stage}/{name}"
+            out[key] = float(out.get(key, 0.0)) + c
+            coeffs[key] = float(w)
+
+    problem = solver.problem
+    running_models = list(getattr(problem, "runningModels", []))
+    running_datas = list(getattr(problem, "runningDatas", []))
+    for m, d in zip(running_models, running_datas):
+        mcost = getattr(getattr(m, "differential", None), "costs", None)
+        dcost = getattr(getattr(d, "differential", None), "costs", None)
+        _accumulate(
+            "running",
+            mcost if mcost is not None else getattr(m, "costs", None),
+            dcost if dcost is not None else getattr(d, "costs", None),
+        )
+    term_model = getattr(problem, "terminalModel", None)
+    td = getattr(problem, "terminalData", None)
+    if td is not None:
+        mcost = getattr(getattr(term_model, "differential", None), "costs", None)
+        dcost = getattr(getattr(td, "differential", None), "costs", None)
+        _accumulate(
+            "terminal",
+            mcost if mcost is not None else getattr(term_model, "costs", None),
+            dcost if dcost is not None else getattr(td, "costs", None),
+        )
+    # Enforce consistency once per solve (across running + terminal together).
+    s = float(np.nansum(np.asarray(list(out.values()), dtype=float))) if out else 0.0
+    total = float(getattr(solver, "cost", np.nan))
+    if out and np.isfinite(total) and np.isfinite(s) and abs(s) > 1e-12:
+        scale = total / s
+        for k in list(out.keys()):
+            out[k] = float(out[k]) * float(scale)
+    # Build grouped costs from the (possibly scaled) term costs.
+    for key, c in out.items():
+        stage, name = key.split("/", 1) if "/" in key else ("running", key)
+        gk = f"{stage}/{_cost_group_from_name(name)}"
+        grp[gk] = float(grp.get(gk, 0.0)) + float(c)
+    return out, grp, coeffs
 
 
 def _yaw_to_rotation_matrix(yaw: float, roll: float = 0.0, pitch: float = 0.0) -> np.ndarray:
@@ -743,6 +846,9 @@ def run_closed_loop_state_tracking(
     sim_payload_t_grasp: float = 1.0,
     sim_payload_mass: float = 0.2,
     sim_payload_sphere_radius: float = 0.02,
+    sim_control_stack: str = "direct",
+    px4_rate_Kp: float = 12.0,
+    px4_rate_Kd: float = 1.5,
     s500_yaml_path: Optional[str] = None,
     urdf_path: Optional[str] = None,
     verbose: bool = False,
@@ -751,7 +857,14 @@ def run_closed_loop_state_tracking(
     Closed-loop simulation: solve the MPC once every control_dt with ZOH in between; propagate the state using sim_dt
     forward integration. MPC dynamics use commanded ``u``; if ``use_actuator_first_order``, the plant integrates with
     lagged ``u_act`` (see module docstring).
+
+    If ``sim_control_stack == "px4_rate"``, the plant command is built from MPC ``u`` via a body-rate setpoint integrator,
+    a rate loop, and a 4-rotor mixer (arm torques still follow ``u_mpc[4:6]``).
     """
+    sim_control_stack = str(sim_control_stack).strip().lower()
+    if sim_control_stack not in ("direct", "px4_rate"):
+        raise ValueError(f"unknown sim_control_stack: {sim_control_stack!r}")
+
     mpc = UAMCrocoddylStateTrackingMPC(
         s500_yaml_path=s500_yaml_path,
         urdf_path=urdf_path,
@@ -789,6 +902,9 @@ def run_closed_loop_state_tracking(
     state_data: List[np.ndarray] = []
     ctrl_data: List[np.ndarray] = []
     mpc_costs: List[float] = []
+    mpc_cost_terms_hist: Dict[str, List[float]] = {}
+    mpc_cost_groups_hist: Dict[str, List[float]] = {}
+    mpc_cost_weights: Dict[str, float] = {}
     mpc_iters: List[int] = []
     mpc_solve_t: List[float] = []
     mpc_solve_steps: List[int] = []
@@ -801,13 +917,15 @@ def run_closed_loop_state_tracking(
     u_cmd_hold = mpc._u_ref.copy()
     u_act = u_cmd_hold.copy()
     nq = mpc.robot_model.nq
+    act_data = mpc.actuation.createData()
+    omega_sp = np.asarray(x0, dtype=float).reshape(-1)[nq + 3 : nq + 6].copy()
 
     for step in range(n_total):
         t = step * sim_dt
         time_data.append(t)
         state_data.append(x.copy())
         plant.on_pre_step(t, step)
-        # ctrl_data records the actuator's "actual applied input" u_act (after first-order response)
+        # ctrl_data records u_act applied to the plant (after optional px4_rate stack and optional 1st-order lag).
 
         dq = pin.difference(mpc.robot_model, x_ref[:nq], x[:nq])
         dv = x[nq:] - x_ref[nq:]
@@ -839,7 +957,21 @@ def run_closed_loop_state_tracking(
                 )
 
             u_cmd_hold = np.array(solver.us[0], dtype=float).copy()
+            solve_idx = len(mpc_costs)
             mpc_costs.append(float(solver.cost))
+            terms, groups, coeffs = _extract_solver_cost_terms(solver)
+            if coeffs:
+                mpc_cost_weights.update({k: float(v) for k, v in coeffs.items()})
+            all_keys = set(mpc_cost_terms_hist.keys()) | set(terms.keys())
+            for k in all_keys:
+                if k not in mpc_cost_terms_hist:
+                    mpc_cost_terms_hist[k] = [float("nan")] * solve_idx
+                mpc_cost_terms_hist[k].append(float(terms.get(k, float("nan"))))
+            grp_keys = set(mpc_cost_groups_hist.keys()) | set(groups.keys())
+            for k in grp_keys:
+                if k not in mpc_cost_groups_hist:
+                    mpc_cost_groups_hist[k] = [float("nan")] * solve_idx
+                mpc_cost_groups_hist[k].append(float(groups.get(k, float("nan"))))
             mpc_iters.append(int(solver.iter))
             mpc_solve_t.append(t)
             mpc_solve_steps.append(step)
@@ -853,17 +985,32 @@ def run_closed_loop_state_tracking(
                 solver.us[-1].copy()
             ]
 
+        if sim_control_stack == "px4_rate":
+            u_plant, omega_sp = px4_rate_compute_plant_u(
+                mpc,
+                act_data,
+                x,
+                u_cmd_hold,
+                omega_sp,
+                sim_dt=sim_dt,
+                rate_Kp=px4_rate_Kp,
+                rate_Kd=px4_rate_Kd,
+            )
+            u_after_stack = u_plant
+        else:
+            u_after_stack = u_cmd_hold
+
         # Update the first-order actuator response (ZOH: u_cmd_hold stays constant within n_inner)
         if use_actuator_first_order:
             u_act = _apply_first_order_actuator(
                 u_act,
-                u_cmd_hold,
+                u_after_stack,
                 tau_thrust=tau_thrust,
                 tau_theta=tau_theta,
                 dt=sim_dt,
             )
         else:
-            u_act = u_cmd_hold.copy()
+            u_act = u_after_stack.copy()
 
         ctrl_data.append(u_act.copy())
 
@@ -874,10 +1021,16 @@ def run_closed_loop_state_tracking(
         "time": np.array(time_data),
         "states": np.array(state_data),
         "controls": np.array(ctrl_data),
+        "sim_control_stack": sim_control_stack,
+        "px4_rate_Kp": float(px4_rate_Kp),
+        "px4_rate_Kd": float(px4_rate_Kd),
         "x_ref": np.asarray(x_ref, dtype=float).copy(),
         "x_nom": np.asarray(x_nom, dtype=float).copy(),
         "track_norm": np.array(track_norm),
         "mpc_costs": np.array(mpc_costs),
+        "mpc_cost_terms": {k: np.asarray(v, dtype=float) for k, v in mpc_cost_terms_hist.items()},
+        "mpc_cost_groups": {k: np.asarray(v, dtype=float) for k, v in mpc_cost_groups_hist.items()},
+        "mpc_cost_weights": {k: float(v) for k, v in mpc_cost_weights.items()},
         "mpc_iters": np.array(mpc_iters, dtype=int),
         "mpc_solve_t": np.array(mpc_solve_t),
         "mpc_solve_steps": np.array(mpc_solve_steps, dtype=int),
@@ -915,6 +1068,9 @@ def run_closed_loop_track_full_state_plan(
     sim_payload_t_grasp: float = 1.0,
     sim_payload_mass: float = 0.2,
     sim_payload_sphere_radius: float = 0.02,
+    sim_control_stack: str = "direct",
+    px4_rate_Kp: float = 12.0,
+    px4_rate_Kd: float = 1.5,
     s500_yaml_path: Optional[str] = None,
     urdf_path: Optional[str] = None,
     verbose: bool = False,
@@ -922,6 +1078,10 @@ def run_closed_loop_track_full_state_plan(
     """
     Track a planned full-state trajectory (t_plan, x_plan) with Crocoddyl receding-horizon tracking; the reference within the horizon is sampled with a time shift.
     """
+    sim_control_stack = str(sim_control_stack).strip().lower()
+    if sim_control_stack not in ("direct", "px4_rate"):
+        raise ValueError(f"unknown sim_control_stack: {sim_control_stack!r}")
+
     t_plan = np.asarray(t_plan, dtype=float).flatten()
     x_plan = np.asarray(x_plan, dtype=float)
     if x_plan.ndim != 2 or len(t_plan) != len(x_plan):
@@ -962,6 +1122,9 @@ def run_closed_loop_track_full_state_plan(
     state_data: List[np.ndarray] = []
     ctrl_data: List[np.ndarray] = []
     mpc_costs: List[float] = []
+    mpc_cost_terms_hist: Dict[str, List[float]] = {}
+    mpc_cost_groups_hist: Dict[str, List[float]] = {}
+    mpc_cost_weights: Dict[str, float] = {}
     mpc_iters: List[int] = []
     mpc_solve_t: List[float] = []
     mpc_solve_steps: List[int] = []
@@ -973,12 +1136,15 @@ def run_closed_loop_track_full_state_plan(
     u_cmd_hold = mpc._u_ref.copy()
     u_act = u_cmd_hold.copy()
     nq = mpc.robot_model.nq
+    act_data = mpc.actuation.createData()
+    omega_sp = np.asarray(x0, dtype=float).reshape(-1)[nq + 3 : nq + 6].copy()
 
     for step in range(n_total):
         t = step * sim_dt
         time_data.append(t)
         state_data.append(x.copy())
         plant.on_pre_step(t, step)
+        # ctrl_data records u_act applied to the plant (after optional px4_rate stack and optional 1st-order lag).
 
         xr = interp_full_state_piecewise(t, t_plan, x_plan, mpc.robot_model)
         dq = pin.difference(mpc.robot_model, xr[:nq], x[:nq])
@@ -1013,7 +1179,21 @@ def run_closed_loop_track_full_state_plan(
                 )
 
             u_cmd_hold = np.array(solver.us[0], dtype=float).copy()
+            solve_idx = len(mpc_costs)
             mpc_costs.append(float(solver.cost))
+            terms, groups, coeffs = _extract_solver_cost_terms(solver)
+            if coeffs:
+                mpc_cost_weights.update({k: float(v) for k, v in coeffs.items()})
+            all_keys = set(mpc_cost_terms_hist.keys()) | set(terms.keys())
+            for k in all_keys:
+                if k not in mpc_cost_terms_hist:
+                    mpc_cost_terms_hist[k] = [float("nan")] * solve_idx
+                mpc_cost_terms_hist[k].append(float(terms.get(k, float("nan"))))
+            grp_keys = set(mpc_cost_groups_hist.keys()) | set(groups.keys())
+            for k in grp_keys:
+                if k not in mpc_cost_groups_hist:
+                    mpc_cost_groups_hist[k] = [float("nan")] * solve_idx
+                mpc_cost_groups_hist[k].append(float(groups.get(k, float("nan"))))
             mpc_iters.append(int(solver.iter))
             mpc_solve_t.append(t)
             mpc_solve_steps.append(step)
@@ -1027,17 +1207,32 @@ def run_closed_loop_track_full_state_plan(
                 solver.us[-1].copy()
             ]
 
+        if sim_control_stack == "px4_rate":
+            u_plant, omega_sp = px4_rate_compute_plant_u(
+                mpc,
+                act_data,
+                x,
+                u_cmd_hold,
+                omega_sp,
+                sim_dt=sim_dt,
+                rate_Kp=px4_rate_Kp,
+                rate_Kd=px4_rate_Kd,
+            )
+            u_after_stack = u_plant
+        else:
+            u_after_stack = u_cmd_hold
+
         # Update the first-order actuator response (ZOH: u_cmd_hold stays constant within n_inner)
         if use_actuator_first_order:
             u_act = _apply_first_order_actuator(
                 u_act,
-                u_cmd_hold,
+                u_after_stack,
                 tau_thrust=tau_thrust,
                 tau_theta=tau_theta,
                 dt=sim_dt,
             )
         else:
-            u_act = u_cmd_hold.copy()
+            u_act = u_after_stack.copy()
 
         ctrl_data.append(u_act.copy())
 
@@ -1048,12 +1243,18 @@ def run_closed_loop_track_full_state_plan(
         "time": np.array(time_data),
         "states": np.array(state_data),
         "controls": np.array(ctrl_data),
+        "sim_control_stack": sim_control_stack,
+        "px4_rate_Kp": float(px4_rate_Kp),
+        "px4_rate_Kd": float(px4_rate_Kd),
         "t_plan": t_plan.copy(),
         "x_plan": x_plan.copy(),
         "x_nom": np.asarray(x_nom, dtype=float).copy(),
         "track_mode": "full_state_trajectory",
         "track_norm": np.array(track_norm),
         "mpc_costs": np.array(mpc_costs),
+        "mpc_cost_terms": {k: np.asarray(v, dtype=float) for k, v in mpc_cost_terms_hist.items()},
+        "mpc_cost_groups": {k: np.asarray(v, dtype=float) for k, v in mpc_cost_groups_hist.items()},
+        "mpc_cost_weights": {k: float(v) for k, v in mpc_cost_weights.items()},
         "mpc_iters": np.array(mpc_iters, dtype=int),
         "mpc_solve_t": np.array(mpc_solve_t),
         "mpc_solve_steps": np.array(mpc_solve_steps, dtype=int),
@@ -1125,8 +1326,11 @@ def crocoddyl_closed_loop_to_ee_tracking_res(out: Dict[str, Any]) -> Dict[str, A
     steps = out.get("mpc_solve_steps")
     iters = out.get("mpc_iters")
     walls = out.get("mpc_wall_s")
+    costs = out.get("mpc_costs")
     if steps is not None and iters is not None and len(steps) == len(iters):
         walls_arr = walls if walls is not None and len(walls) == len(iters) else None
+        costs_arr = costs if costs is not None and len(costs) == len(iters) else None
+        total_cost = np.full(n_mpc, np.nan, dtype=float)
         for j in range(len(steps)):
             st = int(steps[j])
             if n_mpc <= 0:
@@ -1135,7 +1339,21 @@ def crocoddyl_closed_loop_to_ee_tracking_res(out: Dict[str, Any]) -> Dict[str, A
             nit[si] = int(iters[j])
             if walls_arr is not None:
                 wall[si] = float(walls_arr[j])
+            if costs_arr is not None:
+                total_cost[si] = float(costs_arr[j])
             stat[si] = 0
+    else:
+        total_cost = np.full(n_mpc, np.nan, dtype=float)
+
+    mpc_cost_terms = out.get("mpc_cost_terms")
+    if not isinstance(mpc_cost_terms, dict):
+        mpc_cost_terms = {}
+    mpc_cost_groups = out.get("mpc_cost_groups")
+    if not isinstance(mpc_cost_groups, dict):
+        mpc_cost_groups = {}
+    mpc_cost_weights = out.get("mpc_cost_weights")
+    if not isinstance(mpc_cost_weights, dict):
+        mpc_cost_weights = {}
 
     return {
         "t": t,
@@ -1156,7 +1374,13 @@ def crocoddyl_closed_loop_to_ee_tracking_res(out: Dict[str, Any]) -> Dict[str, A
             "cpu_s": wall.copy(),
             "wall_s": wall,
             "status": stat,
+            "total_cost": total_cost,
         },
+        "mpc_cost_t": np.asarray(out.get("mpc_solve_t", []), dtype=float),
+        "mpc_cost_total": np.asarray(out.get("mpc_costs", []), dtype=float),
+        "mpc_cost_terms": {k: np.asarray(v, dtype=float) for k, v in mpc_cost_terms.items()},
+        "mpc_cost_groups": {k: np.asarray(v, dtype=float) for k, v in mpc_cost_groups.items()},
+        "mpc_cost_weights": {k: float(v) for k, v in mpc_cost_weights.items()},
     }
 
 

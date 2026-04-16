@@ -107,6 +107,266 @@ def base_lin_ang_world_from_robot_state(simX: np.ndarray) -> Tuple[np.ndarray, n
     return vw, ww
 
 
+class StateMultibodyActuator(crocoddyl.StateAbstract):
+    """State x = [q; v; u_act] with Pinocchio multibody integrate/diff on the robot block."""
+
+    def __init__(self, robot_model: pin.Model, nu_act: int):
+        self._srobot = crocoddyl.StateMultibody(robot_model)
+        self._nu = int(nu_act)
+        self._nr = int(self._srobot.nx)
+        nx = self._srobot.nx + self._nu
+        ndx = self._srobot.ndx + self._nu
+        crocoddyl.StateAbstract.__init__(self, nx, ndx)
+
+    def zero(self) -> np.ndarray:
+        z = np.zeros(self.nx)
+        z[6] = 1.0
+        return z
+
+    def rand(self) -> np.ndarray:
+        return np.concatenate([self._srobot.rand(), np.random.randn(self._nu) * 0.01])
+
+    def diff(self, x0, x1) -> np.ndarray:
+        x0 = np.asarray(x0, dtype=float).ravel()
+        x1 = np.asarray(x1, dtype=float).ravel()
+        d0 = np.asarray(self._srobot.diff(x0[: self._nr], x1[: self._nr])).ravel()
+        du = (x1[self._nr :] - x0[self._nr :]).ravel()
+        return np.concatenate([d0, du])
+
+    def integrate(self, x, dx) -> np.ndarray:
+        x = np.asarray(x, dtype=float).ravel()
+        dx = np.asarray(dx, dtype=float).ravel()
+        xi = dx[: self._srobot.ndx]
+        xr = np.asarray(self._srobot.integrate(x[: self._nr], xi)).ravel()
+        ua = (x[self._nr :] + dx[self._srobot.ndx :]).ravel()
+        return np.concatenate([xr, ua])
+
+    def Jdiff(self, x0, x1, firstsecond):
+        raise NotImplementedError
+
+    def Jintegrate(self, x, dx, firstsecond):
+        raise NotImplementedError
+
+
+class ResidualMultibodyProjection(crocoddyl.ResidualModelAbstract):
+    """Use a StateMultibody residual on the leading nq+nv block of an augmented state."""
+
+    def __init__(
+        self,
+        state_nd: crocoddyl.StateAbstract,
+        state_mb: crocoddyl.StateMultibody,
+        robot_model: pin.Model,
+        inner: crocoddyl.ResidualModelAbstract,
+    ):
+        self.state_mb = state_mb
+        self.robot_model = robot_model
+        self.inner = inner
+        self.nrobot = int(state_mb.nx)
+        nu = int(inner.nu)
+        crocoddyl.ResidualModelAbstract.__init__(self, state_nd, int(inner.nr), nu, True, True, True)
+
+    @staticmethod
+    def _pin_sync(robot_model: pin.Model, col_multibody, x_robot: np.ndarray) -> None:
+        nq, nv = robot_model.nq, robot_model.nv
+        x_robot = np.asarray(x_robot, dtype=float).ravel()
+        q = x_robot[:nq]
+        v = x_robot[nq : nq + nv]
+        pdata = col_multibody.pinocchio
+        pin.forwardKinematics(robot_model, pdata, q, v)
+        pin.computeJointJacobians(robot_model, pdata)
+        pin.updateFramePlacements(robot_model, pdata)
+
+    def createData(self, collector):
+        data = crocoddyl.ResidualDataAbstract(self, collector)
+        data.inner_data = self.inner.createData(collector)
+        return data
+
+    def calc(self, data, x, u):
+        x = np.asarray(x, dtype=float).ravel()
+        u = np.asarray(u, dtype=float).ravel()
+        self._pin_sync(self.robot_model, data.shared, x[: self.nrobot])
+        self.inner.calc(data.inner_data, x[: self.nrobot], u)
+        data.r[:] = data.inner_data.r
+
+    def calcDiff(self, data, x, u):
+        x = np.asarray(x, dtype=float).ravel()
+        u = np.asarray(u, dtype=float).ravel()
+        self._pin_sync(self.robot_model, data.shared, x[: self.nrobot])
+        self.inner.calcDiff(data.inner_data, x[: self.nrobot], u)
+        ndx_in = int(self.state_mb.ndx)
+        data.Rx[:, :ndx_in] = data.inner_data.Rx
+        data.Rx[:, ndx_in:] = 0.0
+        data.Ru[:, :] = data.inner_data.Ru
+
+
+class ActionDataUAMActuatorFirstOrder(crocoddyl.ActionDataAbstract):
+    def __init__(self, model):
+        crocoddyl.ActionDataAbstract.__init__(self, model)
+        self.iamb_data = model.iamb.createData()
+        pin_shared = self.iamb_data.differential.pinocchio
+        col = crocoddyl.DataCollectorMultibody(pin_shared)
+        self.costData = model.cost_sum.createData(col)
+
+
+class ActionModelUAMActuatorFirstOrder(crocoddyl.ActionModelAbstract):
+    """Discrete dynamics: u_act^+ = u_act + clip(dt/tau)*(u_cmd - u_act); robot Euler with u_act^+."""
+
+    def __init__(
+        self,
+        state_nd: crocoddyl.StateAbstract,
+        robot_state: crocoddyl.StateMultibody,
+        actuation: crocoddyl.ActuationModelAbstract,
+        cost_sum: crocoddyl.CostModelSum,
+        dt: float,
+        tau_vec: np.ndarray,
+        iamb: crocoddyl.IntegratedActionModelEuler,
+    ):
+        self.robot_state = robot_state
+        self.actuation = actuation
+        self.cost_sum = cost_sum
+        self.dt = float(dt)
+        self.tau_vec = np.asarray(tau_vec, dtype=float).reshape(-1)
+        self.iamb = iamb
+        self.nrobot = int(robot_state.nx)
+        nu = int(actuation.nu)
+        crocoddyl.ActionModelAbstract.__init__(self, state_nd, nu, 1)
+
+    def createData(self):
+        return ActionDataUAMActuatorFirstOrder(self)
+
+    def calc(self, data, x, u=None):
+        x = np.asarray(x, dtype=float).ravel()
+        nu_m = int(self.nu)
+        u = np.asarray(u, dtype=float).ravel() if u is not None else np.zeros(nu_m)
+        if u.size != nu_m:
+            u = np.zeros(nu_m)
+        x_r = x[: self.nrobot].copy()
+        u_act = x[self.nrobot :].copy()
+        tau = np.maximum(self.tau_vec, 1e-6)
+        alpha = np.clip(self.dt / tau, 0.0, 1.0)
+        u_act_new = u_act + alpha * (u - u_act)
+        self.iamb.calc(data.iamb_data, x_r, u_act_new)
+        data.xnext[: self.nrobot] = np.asarray(data.iamb_data.xnext, dtype=float).ravel()
+        data.xnext[self.nrobot :] = u_act_new
+        self.cost_sum.calc(data.costData, x, u)
+        data.cost = data.costData.cost
+
+    def calcDiff(self, data, x, u=None):
+        x = np.asarray(x, dtype=float).ravel()
+        nu_m = int(self.nu)
+        u = np.asarray(u, dtype=float).ravel() if u is not None else np.zeros(nu_m)
+        if u.size != nu_m:
+            u = np.zeros(nu_m)
+
+        ndx_r = int(self.robot_state.ndx)
+        nu = int(self.nu)
+        x_r = x[: self.nrobot].copy()
+        u_act = x[self.nrobot :].copy()
+        tau = np.maximum(self.tau_vec, 1e-6)
+        alpha = np.clip(self.dt / tau, 0.0, 1.0)
+        a = np.diag(alpha)
+        ia = np.diag(1.0 - alpha)
+        u_act_new = u_act + alpha * (u - u_act)
+
+        # Robot discrete dynamics linearization at (x_r, u_act_new)
+        self.iamb.calc(data.iamb_data, x_r, u_act_new)
+        self.iamb.calcDiff(data.iamb_data, x_r, u_act_new)
+        fx_r = np.asarray(data.iamb_data.Fx, dtype=float)
+        fu_r = np.asarray(data.iamb_data.Fu, dtype=float)
+
+        data.Fx[:, :] = 0.0
+        data.Fu[:, :] = 0.0
+        data.Fx[:ndx_r, :ndx_r] = fx_r
+        data.Fx[:ndx_r, ndx_r:] = fu_r @ ia
+        data.Fx[ndx_r:, ndx_r:] = ia
+        data.Fu[:ndx_r, :] = fu_r @ a
+        data.Fu[ndx_r:, :] = a
+
+        self.cost_sum.calc(data.costData, x, u)
+        self.cost_sum.calcDiff(data.costData, x, u)
+        data.cost = data.costData.cost
+        data.Lx[:] = data.costData.Lx
+        data.Lu[:] = data.costData.Lu
+        data.Lxx[:, :] = data.costData.Lxx
+        data.Lxu[:, :] = data.costData.Lxu
+        data.Luu[:, :] = data.costData.Luu
+
+
+class ActionDataTerminalAugmented(crocoddyl.ActionDataAbstract):
+    def __init__(self, model):
+        crocoddyl.ActionDataAbstract.__init__(self, model)
+        col = crocoddyl.DataCollectorMultibody(model.pin_data_terminal)
+        self.costData = model.cost_sum.createData(col)
+
+
+class ActionModelTerminalAugmented(crocoddyl.ActionModelAbstract):
+    """Terminal cost on augmented x; xnext = x."""
+
+    def __init__(
+        self,
+        state_nd: crocoddyl.StateAbstract,
+        nu: int,
+        cost_sum: crocoddyl.CostModelSum,
+        pin_data_terminal: pin.Data,
+    ):
+        self.cost_sum = cost_sum
+        self.pin_data_terminal = pin_data_terminal
+        crocoddyl.ActionModelAbstract.__init__(self, state_nd, int(nu), 1)
+
+    def createData(self):
+        return ActionDataTerminalAugmented(self)
+
+    def calc(self, data, x, u=None):
+        x = np.asarray(x, dtype=float).ravel()
+        nu_m = int(self.nu)
+        u = np.asarray(u, dtype=float).ravel() if u is not None else np.zeros(nu_m)
+        if u.size != nu_m:
+            u = np.zeros(nu_m)
+        data.xnext[:] = x
+        self.cost_sum.calc(data.costData, x, u)
+        data.cost = data.costData.cost
+
+    def calcDiff(self, data, x, u=None):
+        x = np.asarray(x, dtype=float).ravel()
+        nu_m = int(self.nu)
+        u = np.asarray(u, dtype=float).ravel() if u is not None else np.zeros(nu_m)
+        if u.size != nu_m:
+            u = np.zeros(nu_m)
+        ndx = int(self.state.ndx)
+        nu = int(self.nu)
+        data.Fx[:, :] = np.eye(ndx)
+        data.Fu[:, :] = np.zeros((ndx, nu), dtype=float)
+        self.cost_sum.calc(data.costData, x, u)
+        self.cost_sum.calcDiff(data.costData, x, u)
+        data.cost = data.costData.cost
+        data.Lx[:] = data.costData.Lx
+        data.Lu[:] = data.costData.Lu
+        data.Lxx[:, :] = data.costData.Lxx
+        data.Lxu[:, :] = data.costData.Lxu
+        data.Luu[:, :] = data.costData.Luu
+
+
+class CallbackActuatorFirstOrderProgress(crocoddyl.CallbackAbstract):
+    """Lightweight progress prints for long actuator-augmented DDP solves."""
+
+    def __init__(self, print_every: int = 10):
+        crocoddyl.CallbackAbstract.__init__(self)
+        self.print_every = max(1, int(print_every))
+
+    def __call__(self, solver):
+        it = int(getattr(solver, "iter", 0))
+        # Always print first few iterations, then decimate.
+        if it < 5 or (it % self.print_every == 0):
+            try:
+                stop = float(getattr(solver, "stop", np.nan))
+            except Exception:
+                stop = np.nan
+            print(
+                f"[act1st-ddp] iter={it:4d} cost={float(solver.cost):.6e} "
+                f"step={float(getattr(solver, 'stepLength', np.nan)):.3f} stop={stop:.3e}"
+            )
+
+
 class S500UAMTrajectoryPlanner:
     """S500 UAM (UAV with Arm) Trajectory Planner"""
 
@@ -140,6 +400,7 @@ class S500UAMTrajectoryPlanner:
         self.ee_frame_id = None
         self._cost_logger = None
         self._use_actuator_first_order = False
+        self._ocp_augmented_actuator = False
         self._tau_cmd = None
         self._plot_cache = None
 
@@ -409,6 +670,161 @@ class S500UAMTrajectoryPlanner:
 
         return cost_model
 
+    def create_cost_model_augmented(
+        self,
+        state_nd: crocoddyl.StateAbstract,
+        target_state: np.ndarray = None,
+        grasp_position: np.ndarray = None,
+        grasp_orientation_rpy: Optional[np.ndarray] = None,
+        control_weight: float = 1e-5,
+        state_weight: float = 1,
+        ee_position_weight: float = 0,
+        ee_rotation_weight: float = 0.0,
+        ee_frame_velocity_weight: float = 0.0,
+        ee_frame_velocity_pitch_rate_weight: float = 0.0,
+        ee_velocity_ref_lin: Optional[np.ndarray] = None,
+        ee_velocity_ref_ang: Optional[np.ndarray] = None,
+        is_terminal: bool = False,
+        is_waypoint: bool = False,
+        waypoint_multiplier: float = 10.0,
+        include_state_reg: bool = True,
+    ) -> crocoddyl.CostModelSum:
+        """
+        Same tasks as ``create_cost_model``, but for an augmented state
+        (robot + actuator commands in state) used by actuator first-order OCP.
+        """
+        control_dim = self.actuation.nu
+        cost_model = crocoddyl.CostModelSum(state_nd, control_dim)
+
+        nq, nv = self.robot_model.nq, self.robot_model.nv
+        if target_state is None:
+            target_state = np.zeros(nq + nv)
+            target_state[2] = 1.0
+            target_state[6] = 1.0
+
+        mass = self.robot_model.inertias[1].mass
+        hover_thrust = mass * 9.81 / 4
+        u_ref = np.array([hover_thrust] * 4 + [0.0] * (control_dim - 4), dtype=np.float64)
+        target_state = np.asarray(target_state, dtype=float).flatten()
+        xref_aug = np.concatenate([target_state, u_ref])
+
+        effective_state_weight = float(state_weight)
+        effective_control_weight = float(control_weight)
+        effective_ee_weight = float(ee_position_weight)
+        effective_ee_rot_w = float(ee_rotation_weight)
+        effective_ee_vel_w = float(ee_frame_velocity_weight)
+        effective_ee_vel_pitch_w = float(ee_frame_velocity_pitch_rate_weight)
+        if is_waypoint:
+            effective_state_weight *= waypoint_multiplier
+            effective_control_weight *= waypoint_multiplier
+            effective_ee_weight *= waypoint_multiplier
+            effective_ee_rot_w *= float(waypoint_multiplier)
+            effective_ee_vel_w *= waypoint_multiplier
+            effective_ee_vel_pitch_w *= waypoint_multiplier
+
+        if include_state_reg and effective_state_weight > 0:
+            w_st = np.ones(state_nd.ndx, dtype=np.float64)
+            w_st[-control_dim:] = 0.0
+            state_activation = crocoddyl.ActivationModelWeightedQuad(w_st)
+            state_residual = crocoddyl.ResidualModelState(state_nd, xref_aug, control_dim)
+            cost_model.addCost(
+                "state_reg",
+                crocoddyl.CostModelResidual(state_nd, state_activation, state_residual),
+                effective_state_weight,
+            )
+
+        if grasp_position is not None and ee_position_weight > 0:
+            p_des = np.asarray(grasp_position, dtype=float).reshape(3)
+            use_se3 = grasp_orientation_rpy is not None and float(ee_rotation_weight) > 0.0
+            if use_se3:
+                rpy = np.asarray(grasp_orientation_rpy, dtype=float).reshape(3)
+                R = pin.rpy.rpyToMatrix(float(rpy[0]), float(rpy[1]), float(rpy[2]))
+                T_des = pin.SE3(R, p_des)
+                w6 = np.array(
+                    [effective_ee_weight] * 3 + [effective_ee_rot_w] * 3,
+                    dtype=np.float64,
+                )
+                pose_act = crocoddyl.ActivationModelWeightedQuad(w6)
+                inner = crocoddyl.ResidualModelFramePlacement(
+                    self.state, self.ee_frame_id, T_des, control_dim
+                )
+                ee_res = ResidualMultibodyProjection(state_nd, self.state, self.robot_model, inner)
+                cost_model.addCost(
+                    "ee_placement",
+                    crocoddyl.CostModelResidual(state_nd, pose_act, ee_res),
+                    1.0,
+                )
+            else:
+                inner = crocoddyl.ResidualModelFrameTranslation(
+                    self.state, self.ee_frame_id, p_des, control_dim
+                )
+                ee_res = ResidualMultibodyProjection(state_nd, self.state, self.robot_model, inner)
+                cost_model.addCost(
+                    "ee_translation",
+                    crocoddyl.CostModelResidual(state_nd, ee_res),
+                    effective_ee_weight,
+                )
+
+        if effective_ee_vel_w > 0.0:
+            v_lin = (
+                np.zeros(3, dtype=np.float64)
+                if ee_velocity_ref_lin is None
+                else np.asarray(ee_velocity_ref_lin, dtype=np.float64).reshape(3)
+            )
+            v_ang = (
+                np.zeros(3, dtype=np.float64)
+                if ee_velocity_ref_ang is None
+                else np.asarray(ee_velocity_ref_ang, dtype=np.float64).reshape(3)
+            )
+            vel_motion_ref = pin.Motion(v_lin, v_ang)
+            rf = pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+            w6 = np.array(
+                [
+                    effective_ee_vel_w,
+                    effective_ee_vel_w,
+                    effective_ee_vel_w,
+                    effective_ee_vel_w,
+                    effective_ee_vel_pitch_w,
+                    effective_ee_vel_w,
+                ],
+                dtype=np.float64,
+            )
+            vel_act = crocoddyl.ActivationModelWeightedQuad(w6)
+            inner = None
+            if hasattr(crocoddyl, "ResidualModelFrameVelocityTpl"):
+                try:
+                    inner = crocoddyl.ResidualModelFrameVelocityTpl(
+                        self.state, self.ee_frame_id, vel_motion_ref, rf, control_dim
+                    )
+                except Exception:
+                    inner = None
+            if inner is None:
+                inner = crocoddyl.ResidualModelFrameVelocity(
+                    self.state, self.ee_frame_id, vel_motion_ref, rf, control_dim
+                )
+            vel_res = ResidualMultibodyProjection(state_nd, self.state, self.robot_model, inner)
+            cost_model.addCost(
+                "ee_velocity",
+                crocoddyl.CostModelResidual(state_nd, vel_act, vel_res),
+                1.0,
+            )
+
+        if not is_terminal:
+            control_ref = np.array([hover_thrust] * 4 + [0.0] * (control_dim - 4))
+            w_u = np.ones(control_dim, dtype=np.float64)
+            if control_dim >= 6:
+                w_u[4] = 100.0
+                w_u[5] = 100.0
+            control_activation = crocoddyl.ActivationModelWeightedQuad(w_u)
+            control_residual = crocoddyl.ResidualModelControl(state_nd, control_ref)
+            cost_model.addCost(
+                "control_reg",
+                crocoddyl.CostModelResidual(state_nd, control_activation, control_residual),
+                effective_control_weight,
+            )
+
+        return cost_model
+
     def create_trajectory_problem_grasp(self,
                                  start_state: np.ndarray,
                                  grasp_position: np.ndarray,
@@ -443,6 +859,7 @@ class S500UAMTrajectoryPlanner:
 
         self.dt = dt
         self._use_actuator_first_order = bool(use_actuator_first_order)
+        self._ocp_augmented_actuator = False
         self._tau_cmd = None if tau_cmd is None else np.asarray(tau_cmd, dtype=float).reshape(-1)
         self._plot_cache = None
 
@@ -590,6 +1007,7 @@ class S500UAMTrajectoryPlanner:
             raise ValueError("Number of waypoints should be one more than number of durations")
         self.dt = dt
         self._use_actuator_first_order = bool(use_actuator_first_order)
+        self._ocp_augmented_actuator = False
         self._tau_cmd = None if tau_cmd is None else np.asarray(tau_cmd, dtype=float).reshape(-1)
         self._plot_cache = None
         x0 = np.array(waypoints[0], dtype=float).copy()
@@ -669,6 +1087,139 @@ class S500UAMTrajectoryPlanner:
         self.problem = crocoddyl.ShootingProblem(x0, running_models, terminal_model)
         total_time = sum(durations)
         print(f"✓ Created waypoint trajectory: {len(waypoints)} waypoints, {len(running_models)} nodes, terminal scale N={n_total:.0f}, {total_time:.2f}s total")
+
+
+    def _build_mixed_waypoints_actuator_ocp(
+        self,
+        modes: List[str],
+        resolved_states: List[np.ndarray],
+        ee_targets: List[Optional[np.ndarray]],
+        durations: List[float],
+        dt: float,
+        waypoint_multiplier: float,
+        state_weight: float,
+        control_weight: float,
+        ee_knot_weight: float,
+        ee_knot_state_reg_weight: float,
+        ee_pose_rpy_world: Optional[List[Optional[np.ndarray]]],
+        ee_knot_rotation_weight: float,
+        ee_knot_velocity_weight: float,
+        ee_knot_velocity_pitch_weight: float,
+        use_thrust_constraints: bool,
+        segment_n_steps: List[int],
+        n_total: int,
+        x0: np.ndarray,
+    ) -> None:
+        """Shooting problem with augmented state [q;v;u_act] and first-order actuator dynamics in the OCP."""
+        nu = int(self.actuation.nu)
+        state_b = StateMultibodyActuator(self.robot_model, nu)
+        state_nd = crocoddyl.StateNumDiff(state_b)
+        zero_cost = crocoddyl.CostModelSum(self.state, nu)
+        diff_z = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, zero_cost)
+        iamb = crocoddyl.IntegratedActionModelEuler(diff_z, dt)
+        tau_vec = self._effective_tau_cmd()
+        n = len(modes)
+
+        running_models = []
+        for i, duration in enumerate(durations):
+            start_state = np.asarray(resolved_states[i], dtype=float).flatten()
+            target_state = np.asarray(resolved_states[i + 1], dtype=float).flatten()
+            mode_i = str(modes[i]).lower()
+            n_steps = segment_n_steps[i]
+
+            if mode_i in ("ee_pose", "ee_pos") and ee_targets[i] is not None:
+                ee_w = float(ee_knot_weight)
+                sr_w = float(ee_knot_state_reg_weight)
+                rpy_des = None
+                rot_w = 0.0
+                vel_w = 0.0
+                vel_pitch_w = 0.0
+                if mode_i == "ee_pose":
+                    slot = ee_pose_rpy_world[i]
+                    if slot is not None and float(ee_knot_rotation_weight) > 0.0:
+                        rpy_des = np.asarray(slot, dtype=float).reshape(3)
+                        rot_w = float(ee_knot_rotation_weight)
+                    vel_w = float(ee_knot_velocity_weight)
+                    vel_pitch_w = float(ee_knot_velocity_pitch_weight)
+                waypoint_cost = self.create_cost_model_augmented(
+                    state_nd,
+                    target_state=start_state,
+                    grasp_position=np.asarray(ee_targets[i], dtype=float).reshape(3),
+                    grasp_orientation_rpy=rpy_des,
+                    state_weight=max(sr_w, 1e-12),
+                    control_weight=control_weight,
+                    ee_position_weight=ee_w,
+                    ee_rotation_weight=rot_w,
+                    ee_frame_velocity_weight=vel_w,
+                    ee_frame_velocity_pitch_rate_weight=vel_pitch_w,
+                    is_waypoint=True,
+                    waypoint_multiplier=waypoint_multiplier,
+                    include_state_reg=(sr_w > 0),
+                )
+            else:
+                waypoint_cost = self.create_cost_model_augmented(
+                    state_nd,
+                    target_state=start_state,
+                    state_weight=state_weight,
+                    control_weight=control_weight,
+                    is_waypoint=True,
+                    waypoint_multiplier=waypoint_multiplier,
+                )
+            am_w = ActionModelUAMActuatorFirstOrder(
+                state_nd, self.state, self.actuation, waypoint_cost, dt, tau_vec, iamb
+            )
+            running_models.append(am_w)
+
+            normal_cost = self.create_cost_model_augmented(
+                state_nd,
+                target_state=target_state,
+                state_weight=state_weight,
+                control_weight=control_weight,
+            )
+            am_n = ActionModelUAMActuatorFirstOrder(
+                state_nd, self.state, self.actuation, normal_cost, dt, tau_vec, iamb
+            )
+            for _ in range(n_steps - 1):
+                running_models.append(am_n)
+
+        if use_thrust_constraints:
+            platform = self.s500_config["platform"]
+            u_lb = np.array([platform["min_thrust"]] * 4 + [-2.0] * 2)
+            u_ub = np.array([platform["max_thrust"]] * 4 + [2.0] * 2)
+            for m in running_models:
+                m.u_lb = u_lb
+                m.u_ub = u_ub
+
+        terminal_target = np.asarray(resolved_states[-1], dtype=float).flatten()
+        terminal_cost = self.create_cost_model_augmented(
+            state_nd,
+            target_state=terminal_target,
+            state_weight=waypoint_multiplier * state_weight,
+            control_weight=control_weight,
+            is_terminal=True,
+            is_waypoint=True,
+            waypoint_multiplier=waypoint_multiplier,
+        )
+        term_base = ActionModelTerminalAugmented(state_nd, nu, terminal_cost, self.robot_data)
+        terminal_model = term_base
+        if use_thrust_constraints:
+            platform = self.s500_config["platform"]
+            u_lb = np.array([platform["min_thrust"]] * 4 + [-2.0] * 2)
+            u_ub = np.array([platform["max_thrust"]] * 4 + [2.0] * 2)
+            terminal_model.u_lb = u_lb
+            terminal_model.u_ub = u_ub
+
+        mass = self.robot_model.inertias[1].mass
+        hover = mass * 9.81 / 4
+        u0 = np.array([hover] * 4 + [0.0] * (nu - 4), dtype=float)
+        x0_aug = np.concatenate([np.asarray(x0, dtype=float).flatten(), u0])
+        self.problem = crocoddyl.ShootingProblem(x0_aug, running_models, terminal_model)
+        total_time = sum(durations)
+        n_ee = sum(1 for m in modes if str(m).lower() in ("ee_pose", "ee_pos"))
+        print(
+            f"Mixed waypoint trajectory (Crocoddyl + actuator 1st-order in OCP): {n} knots ({n_ee} EE), "
+            f"{len(running_models)} nodes, terminal scale N={n_total:.0f}, {total_time:.2f}s total"
+        )
 
     def create_trajectory_problem_mixed_waypoints(
         self,
@@ -750,6 +1301,31 @@ class S500UAMTrajectoryPlanner:
                 self._waypoint_ee_positions.append(self.get_ee_position_from_state(si))
                 self._waypoint_labels.append("Target" if is_last else f"WP{i}")
 
+        if use_actuator_first_order:
+            self._ocp_augmented_actuator = True
+            self._build_mixed_waypoints_actuator_ocp(
+                modes,
+                resolved_states,
+                ee_targets,
+                durations,
+                dt,
+                waypoint_multiplier,
+                state_weight,
+                control_weight,
+                ee_knot_weight,
+                ee_knot_state_reg_weight,
+                ee_pose_rpy_world,
+                ee_knot_rotation_weight,
+                ee_knot_velocity_weight,
+                ee_knot_velocity_pitch_weight,
+                use_thrust_constraints,
+                segment_n_steps,
+                n_total,
+                x0,
+            )
+            return
+
+        self._ocp_augmented_actuator = False
         running_models = []
         for i, duration in enumerate(durations):
             start_state = np.asarray(resolved_states[i], dtype=float).flatten()
@@ -854,6 +1430,12 @@ class S500UAMTrajectoryPlanner:
         callbacks = [self._cost_logger]
         if verbose:
             callbacks.append(crocoddyl.CallbackVerbose())
+        if getattr(self, "_ocp_augmented_actuator", False):
+            print(
+                f"[act1st-ddp] actuator 1st-order OCP solve started: "
+                f"max_iter={int(max_iter)}, nodes={len(self.problem.runningModels)}"
+            )
+            callbacks.append(CallbackActuatorFirstOrderProgress(print_every=10))
         self.solver.setCallbacks(callbacks)
 
         print("Solving trajectory optimization...")
@@ -918,7 +1500,15 @@ class S500UAMTrajectoryPlanner:
             return
         xs_cmd = [np.asarray(x, dtype=float).copy() for x in self.solver.xs]
         us_cmd = [np.asarray(u, dtype=float).copy() for u in self.solver.us]
-        if self._use_actuator_first_order:
+        nvq = self.robot_model.nq + self.robot_model.nv
+        nu = int(self.actuation.nu)
+        if getattr(self, "_ocp_augmented_actuator", False):
+            xs_plot = [np.asarray(x, dtype=float).ravel()[:nvq].copy() for x in xs_cmd]
+            us_plot = []
+            for k in range(len(us_cmd)):
+                xn = np.asarray(xs_cmd[k + 1], dtype=float).ravel()
+                us_plot.append(xn[nvq : nvq + nu].copy())
+        elif self._use_actuator_first_order:
             xs_plot, us_plot = self._rollout_with_actuator_first_order(xs_cmd, us_cmd)
         else:
             xs_plot, us_plot = xs_cmd, us_cmd
@@ -940,6 +1530,7 @@ class S500UAMTrajectoryPlanner:
             "cost_logger": getattr(self, "_cost_logger", None),
             "ee_positions": ee_positions,
             "use_actuator_first_order": bool(self._use_actuator_first_order),
+            "ocp_augmented_actuator": bool(getattr(self, "_ocp_augmented_actuator", False)),
             "tau_cmd": self._effective_tau_cmd().copy(),
         }
 
@@ -947,6 +1538,10 @@ class S500UAMTrajectoryPlanner:
         """Get optimized states and controls"""
         if self.solver is None:
             raise RuntimeError("Solve trajectory first")
+        if getattr(self, "_ocp_augmented_actuator", False):
+            nvq = self.robot_model.nq + self.robot_model.nv
+            xs = [np.asarray(x, dtype=float).ravel()[:nvq].copy() for x in self.solver.xs]
+            return xs, self.solver.us
         return self.solver.xs, self.solver.us
 
     def get_ee_positions(self) -> np.ndarray:
@@ -954,8 +1549,12 @@ class S500UAMTrajectoryPlanner:
         if self.solver is None:
             raise RuntimeError("Solve trajectory first")
         xs = self.solver.xs
+        nvq = self.robot_model.nq + self.robot_model.nv
         ee_positions = []
         for x in xs:
+            x = np.asarray(x, dtype=float).ravel()
+            if getattr(self, "_ocp_augmented_actuator", False) and x.size > nvq:
+                x = x[:nvq]
             q = x[:self.robot_model.nq]
             v = x[self.robot_model.nq:]
             pin.forwardKinematics(self.robot_model, self.robot_data, q, v)

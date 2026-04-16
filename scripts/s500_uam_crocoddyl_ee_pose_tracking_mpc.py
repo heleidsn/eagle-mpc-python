@@ -53,6 +53,7 @@ from s500_uam_crocoddyl_state_tracking_mpc import (
     EETrackingWeights,
     UAMEEPoseTrackingCrocoddylMPC,
     _apply_first_order_actuator,
+    _extract_solver_cost_terms,
     interp_ref_pose,
     solid_sphere_principal_inertias,
     _apply_payload_inertia_on_plant_model,
@@ -166,6 +167,14 @@ def run_closed_loop_ee_pose_tracking(
     u_act = u_cmd_hold.copy()
     xs_guess: Optional[List[np.ndarray]] = None
     us_guess: Optional[List[np.ndarray]] = None
+    mpc_costs: List[float] = []
+    mpc_cost_terms_hist: dict[str, List[float]] = {}
+    mpc_cost_groups_hist: dict[str, List[float]] = {}
+    mpc_cost_weights: dict[str, float] = {}
+    mpc_iters: List[int] = []
+    mpc_solve_t: List[float] = []
+    mpc_solve_steps: List[int] = []
+    mpc_wall_s: List[float] = []
 
     for step in range(n_total):
         t = step * sim_dt
@@ -210,6 +219,25 @@ def run_closed_loop_ee_pose_tracking(
                 print(f"[EE pose MPC] t={t:.3f} converged={converged} cost={solver.cost:.4f} iters={solver.iter} wall={wall_s:.2f}s")
 
             u_cmd_hold = np.array(solver.us[0], dtype=float).copy()
+            solve_idx = len(mpc_costs)
+            mpc_costs.append(float(solver.cost))
+            terms, groups, coeffs = _extract_solver_cost_terms(solver)
+            if coeffs:
+                mpc_cost_weights.update({k: float(v) for k, v in coeffs.items()})
+            all_keys = set(mpc_cost_terms_hist.keys()) | set(terms.keys())
+            for k in all_keys:
+                if k not in mpc_cost_terms_hist:
+                    mpc_cost_terms_hist[k] = [float("nan")] * solve_idx
+                mpc_cost_terms_hist[k].append(float(terms.get(k, float("nan"))))
+            grp_keys = set(mpc_cost_groups_hist.keys()) | set(groups.keys())
+            for k in grp_keys:
+                if k not in mpc_cost_groups_hist:
+                    mpc_cost_groups_hist[k] = [float("nan")] * solve_idx
+                mpc_cost_groups_hist[k].append(float(groups.get(k, float("nan"))))
+            mpc_iters.append(int(solver.iter))
+            mpc_solve_t.append(float(t))
+            mpc_solve_steps.append(int(step))
+            mpc_wall_s.append(float(wall_s))
 
             xs_guess = [solver.xs[i + 1].copy() for i in range(horizon)] + [solver.xs[-1].copy()]
             xs_guess[0] = x.copy()
@@ -254,6 +282,14 @@ def run_closed_loop_ee_pose_tracking(
         "p_ref": ref_p,
         "yaw_ref": ref_yaw,
         "mpc": mpc,
+        "mpc_costs": np.asarray(mpc_costs, dtype=float),
+        "mpc_cost_terms": {k: np.asarray(v, dtype=float) for k, v in mpc_cost_terms_hist.items()},
+        "mpc_cost_groups": {k: np.asarray(v, dtype=float) for k, v in mpc_cost_groups_hist.items()},
+        "mpc_cost_weights": {k: float(v) for k, v in mpc_cost_weights.items()},
+        "mpc_iters": np.asarray(mpc_iters, dtype=int),
+        "mpc_solve_t": np.asarray(mpc_solve_t, dtype=float),
+        "mpc_solve_steps": np.asarray(mpc_solve_steps, dtype=int),
+        "mpc_wall_s": np.asarray(mpc_wall_s, dtype=float),
         "sim_plant_payload_applied": bool(
             isinstance(plant, PayloadSchedulePlant) and plant.schedule_applied
         ),

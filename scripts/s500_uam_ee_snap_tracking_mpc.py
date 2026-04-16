@@ -1302,18 +1302,60 @@ def _plot_tracking_dashboard(
         ax_st.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_st.transAxes)
 
     ax_y = fig.add_subplot(gs[3, :])
-    if res.get("ee_yaw") is not None and res.get("yaw_ref") is not None:
-        ax_y.plot(t, np.degrees(res["ee_yaw"]), "b-", lw=1.0, label="EE ψ (meas.)")
-        ax_y.plot(t, np.degrees(res["yaw_ref"]), "k--", lw=1.0, alpha=0.8, label="ψ ref")
-        ax_y2 = ax_y.twinx()
-        ax_y2.plot(t, np.degrees(res["err_yaw"]), "r-", lw=0.9, alpha=0.85, label="ψ err (wrapped)")
-        ax_y2.set_ylabel("deg", **tinfo, color="red")
-        ax_y2.tick_params(axis="y", labelcolor="red")
-        ax_y2.legend(loc="upper right", fontsize=7)
+    cost_t = np.asarray(res.get("mpc_cost_t", []), dtype=float).flatten()
+    cost_total = np.asarray(res.get("mpc_cost_total", []), dtype=float).flatten()
+    cost_terms = res.get("mpc_cost_terms", {})
+    cost_groups = res.get("mpc_cost_groups", {})
+    has_cost_curve = False
+    if cost_t.size and cost_total.size and cost_t.size == cost_total.size:
+        ax_y.plot(cost_t, cost_total, "k-", lw=1.3, label="total cost")
+        has_cost_curve = True
+    if isinstance(cost_groups, dict):
+        preferred = [
+            "running/state",
+            "running/action",
+            "running/ee",
+            "terminal/state",
+            "terminal/action",
+            "terminal/ee",
+            "running/other",
+            "terminal/other",
+        ]
+        for name in preferred:
+            v = np.asarray(cost_groups.get(name, []), dtype=float).flatten()
+            if v.size != cost_t.size or v.size == 0:
+                continue
+            ax_y.plot(cost_t, v, lw=1.2, alpha=0.95, label=name)
+            has_cost_curve = True
+    if isinstance(cost_terms, dict):
+        shown = 0
+        for name in sorted(cost_terms.keys()):
+            v = np.asarray(cost_terms.get(name, []), dtype=float).flatten()
+            if v.size != cost_t.size or v.size == 0:
+                continue
+            if "/" in str(name):
+                # Detailed terms are still available, but avoid over-crowding:
+                # draw only when grouped curve for this stage/category is not present.
+                continue
+            ax_y.plot(cost_t, v, lw=0.9, alpha=0.8, label=str(name))
+            shown += 1
+            has_cost_curve = True
+            if shown >= 4:
+                break
+    if not has_cost_curve:
+        total_cost = np.asarray(ms.get("total_cost", []), dtype=float).flatten()
+        if total_cost.size == t_u.size and total_cost.size > 0:
+            valid = np.isfinite(total_cost)
+            if np.any(valid):
+                ax_y.plot(t_u[valid], total_cost[valid], "k-", lw=1.3, label="total cost")
+                has_cost_curve = True
+    if not has_cost_curve:
+        ax_y.text(0.5, 0.5, "MPC cost breakdown unavailable", ha="center", va="center", transform=ax_y.transAxes)
     ax_y.set_xlabel("t [s]", **tinfo)
-    ax_y.set_ylabel("deg", **tinfo)
-    ax_y.set_title("EE yaw tracking (ZYX, world)", fontsize=10)
-    ax_y.legend(loc="upper left", fontsize=7)
+    ax_y.set_ylabel("cost", **tinfo)
+    ax_y.set_title("MPC cost breakdown (running/terminal + total)", fontsize=10)
+    if has_cost_curve:
+        ax_y.legend(loc="best", fontsize=7, ncol=2)
     ax_y.grid(True, alpha=0.3)
     _plot_wp_vlines(ax_y, plan_waypoint_times)
 

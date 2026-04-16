@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import sys
 import tempfile
 import traceback
@@ -271,6 +272,9 @@ class TrackCrocAlongPlanWorker(QThread):
                 sim_payload_t_grasp=p.get("sim_payload_t_grasp", 1.0),
                 sim_payload_mass=p.get("sim_payload_mass", 0.2),
                 sim_payload_sphere_radius=p.get("sim_payload_sphere_r", 0.02),
+                sim_control_stack=p.get("sim_control_stack", "direct"),
+                px4_rate_Kp=p.get("px4_rate_Kp", 12.0),
+                px4_rate_Kd=p.get("px4_rate_Kd", 1.5),
                 s500_yaml_path=p.get("s500_yaml_path"),
                 urdf_path=p.get("urdf_path"),
                 verbose=False,
@@ -386,7 +390,23 @@ class TrackEeCrocWorker(QThread):
             err_yaw = (ee_yaw - yaw_ref + np.pi) % (2.0 * np.pi) - np.pi
             n_inner = max(1, int(round(float(p["control_dt"]) / float(p["sim_dt"]))))
             n_mpc = max(0, len(t) - 1)
-            mpc_stub = np.zeros(n_mpc, dtype=float)
+            mpc_wall = np.zeros(n_mpc, dtype=float)
+            mpc_iter = np.zeros(n_mpc, dtype=int)
+            mpc_stat = np.zeros(n_mpc, dtype=int)
+            mpc_total_cost = np.full(n_mpc, np.nan, dtype=float)
+            steps = np.asarray(out.get("mpc_solve_steps", []), dtype=int).flatten()
+            iters = np.asarray(out.get("mpc_iters", []), dtype=int).flatten()
+            walls = np.asarray(out.get("mpc_wall_s", []), dtype=float).flatten()
+            costs = np.asarray(out.get("mpc_costs", []), dtype=float).flatten()
+            n_solves = int(min(len(steps), len(iters), len(walls), len(costs)))
+            for j in range(n_solves):
+                si = min(max(int(steps[j]), 0), max(0, n_mpc - 1))
+                if n_mpc <= 0:
+                    break
+                mpc_iter[si] = int(iters[j])
+                mpc_wall[si] = float(walls[j])
+                mpc_total_cost[si] = float(costs[j])
+                mpc_stat[si] = 0
 
             res = {
                 "t": t,
@@ -403,10 +423,25 @@ class TrackEeCrocWorker(QThread):
                 "control_dt": float(p["control_dt"]),
                 "mpc_stride": n_inner,
                 "mpc_solve": {
-                    "nlp_iter": np.zeros(n_mpc, dtype=int),
-                    "cpu_s": mpc_stub.copy(),
-                    "wall_s": mpc_stub,
-                    "status": np.zeros(n_mpc, dtype=int),
+                    "nlp_iter": mpc_iter,
+                    "cpu_s": mpc_wall.copy(),
+                    "wall_s": mpc_wall,
+                    "status": mpc_stat,
+                    "total_cost": mpc_total_cost,
+                },
+                "mpc_cost_t": np.asarray(out.get("mpc_solve_t", []), dtype=float),
+                "mpc_cost_total": costs,
+                "mpc_cost_terms": {
+                    k: np.asarray(v, dtype=float)
+                    for k, v in (out.get("mpc_cost_terms", {}) or {}).items()
+                },
+                "mpc_cost_groups": {
+                    k: np.asarray(v, dtype=float)
+                    for k, v in (out.get("mpc_cost_groups", {}) or {}).items()
+                },
+                "mpc_cost_weights": {
+                    k: float(v)
+                    for k, v in (out.get("mpc_cost_weights", {}) or {}).items()
                 },
             }
             self.finished.emit(True, "", {"out": out, "res": res})
@@ -545,6 +580,7 @@ class UamSuiteGUI(QMainWindow):
         self._track_worker = None
         self._meshcat_worker = None
         self._last_track_res: dict | None = None
+        self._manual_ref_overlay: dict | None = None
         self._params_path: Path = DEFAULT_PARAMS_PATH
         self._last_plan_sorted_wp_rows: list | None = None
 
@@ -677,6 +713,8 @@ class UamSuiteGUI(QMainWindow):
         if self._CROCODDYL_AVAILABLE:
             self.method_combo.addItem("Crocoddyl (BoxDDP)")
             self._method_ids.append("crocoddyl")
+            self.method_combo.addItem("Crocoddyl (BoxDDP + actuator 1st-order OCP)")
+            self._method_ids.append("crocoddyl_actuator_ocp")
         if self._ACADOS_AVAILABLE:
             self.method_combo.addItem("Acados (thrusters + τ)")
             self._method_ids.append("acados")
@@ -689,6 +727,9 @@ class UamSuiteGUI(QMainWindow):
         method_row.addWidget(QLabel("Method"))
         method_row.addWidget(self.method_combo)
         g_full.addLayout(method_row)
+        self.method_combo.currentIndexChanged.connect(
+            self._refresh_plan_actuator_taus_enabled
+        )
 
         self._wp_type_help_label = QLabel(
             "Columns j1/roll, j2/pitch, yaw: for Base and EEp they mean j1 deg, j2 deg, base yaw deg; "
@@ -739,6 +780,9 @@ class UamSuiteGUI(QMainWindow):
         self.wp_mult.setValue(1000.0)
         self.plan_croc_use_actuator_first_order = QCheckBox("Enable")
         self.plan_croc_use_actuator_first_order.setChecked(False)
+        self.plan_croc_use_actuator_first_order.toggled.connect(
+            self._refresh_plan_actuator_taus_enabled
+        )
         self.plan_tau_motor = QDoubleSpinBox()
         self.plan_tau_motor.setRange(0.001, 2.0)
         self.plan_tau_motor.setDecimals(3)
@@ -804,6 +848,7 @@ class UamSuiteGUI(QMainWindow):
         g_full.addWidget(self.run_plan_btn)
 
         self.plan_stack.addWidget(w_full)
+        self._refresh_plan_actuator_taus_enabled()
 
         # Stack 1: EE snap only
         w_ee = QWidget()
@@ -970,6 +1015,35 @@ class UamSuiteGUI(QMainWindow):
         self.tau_theta_track.setSingleStep(0.005)
         self.tau_theta_track.setValue(0.05)
 
+        self.track_sim_control_stack = QComboBox()
+        self.track_sim_control_stack.addItems(
+            [
+                "direct (MPC u → plant)",
+                "px4_rate (ΣT + ω setpoint + mixer)",
+            ]
+        )
+        self.track_sim_control_stack.currentIndexChanged.connect(
+            self._refresh_sim_plant_controls_state
+        )
+        self.px4_rate_Kp_track = QDoubleSpinBox()
+        self.px4_rate_Kp_track.setRange(0.0, 500.0)
+        self.px4_rate_Kp_track.setDecimals(3)
+        self.px4_rate_Kp_track.setSingleStep(0.5)
+        self.px4_rate_Kp_track.setValue(12.0)
+        self.px4_rate_Kd_track = QDoubleSpinBox()
+        self.px4_rate_Kd_track.setRange(0.0, 100.0)
+        self.px4_rate_Kd_track.setDecimals(3)
+        self.px4_rate_Kd_track.setSingleStep(0.05)
+        self.px4_rate_Kd_track.setValue(1.5)
+        self._px4_gain_row = QWidget()
+        _px4_h = QHBoxLayout(self._px4_gain_row)
+        _px4_h.setContentsMargins(0, 0, 0, 0)
+        _px4_h.addWidget(QLabel("Kp"))
+        _px4_h.addWidget(self.px4_rate_Kp_track)
+        _px4_h.addWidget(QLabel("Kd"))
+        _px4_h.addWidget(self.px4_rate_Kd_track)
+        _px4_h.addStretch(1)
+
         self.croc_horizon = QSpinBox()
         self.croc_horizon.setRange(5, 120)
         self.croc_horizon.setValue(40)
@@ -1045,14 +1119,18 @@ class UamSuiteGUI(QMainWindow):
         sim_g.addWidget(self._track_sim_actuator_hint, 3, 0, 1, 2)
         sim_g.addWidget(QLabel("Plant: u first-order lag"), 4, 0)
         sim_g.addWidget(self.croc_use_actuator_first_order, 4, 1)
-        sim_g.addWidget(QLabel("τ_thrust [s]"), 5, 0)
-        sim_g.addWidget(self.tau_thrust_track, 5, 1)
-        sim_g.addWidget(QLabel("τ_θ [s]"), 6, 0)
-        sim_g.addWidget(self.tau_theta_track, 6, 1)
+        sim_g.addWidget(QLabel("Sim control stack"), 5, 0)
+        sim_g.addWidget(self.track_sim_control_stack, 5, 1)
+        sim_g.addWidget(QLabel("PX4-style rate PD"), 6, 0)
+        sim_g.addWidget(self._px4_gain_row, 6, 1)
+        sim_g.addWidget(QLabel("τ_thrust [s]"), 7, 0)
+        sim_g.addWidget(self.tau_thrust_track, 7, 1)
+        sim_g.addWidget(QLabel("τ_θ [s]"), 8, 0)
+        sim_g.addWidget(self.tau_theta_track, 8, 1)
         self._sim_payload_label = QLabel("Plant: simulation-only payload")
-        sim_g.addWidget(self._sim_payload_label, 7, 0)
-        sim_g.addWidget(self.sim_payload_enable, 7, 1)
-        sim_g.addWidget(self.sim_payload_row, 8, 0, 1, 2)
+        sim_g.addWidget(self._sim_payload_label, 9, 0)
+        sim_g.addWidget(self.sim_payload_enable, 9, 1)
+        sim_g.addWidget(self.sim_payload_row, 10, 0, 1, 2)
         sg = QGroupBox("Simulation parameters (closed-loop simulator; decoupled from MPC weights/horizon above)")
         sg.setLayout(sim_g)
         tk.addWidget(sg)
@@ -1113,6 +1191,95 @@ class UamSuiteGUI(QMainWindow):
         self.meshcat_track_btn.setEnabled(False)
         tk.addWidget(self.meshcat_track_btn)
 
+        # ----- Regulation panel (embedded in Tracking tab) -----
+        self.reg_group = QGroupBox("Regulation (same controllers/weights as Tracking)")
+        reg = QVBoxLayout()
+
+        reg_note = QLabel(
+            "Regulation uses the same controllers and algorithm parameters as Tracking "
+            "(for direct comparison and tuning)."
+        )
+        reg_note.setWordWrap(True)
+        reg_note.setStyleSheet("color: palette(mid);")
+        reg.addWidget(reg_note)
+
+        self.reg_mode_combo = QComboBox()
+        self.reg_mode_combo.addItems(
+            [
+                "Crocoddyl - full-state regulation",
+                "Crocoddyl - EE pose regulation",
+            ]
+        )
+        reg.addWidget(QLabel("Regulation method"))
+        reg.addWidget(self.reg_mode_combo)
+
+        # Full-state: compact table (rows x0 / x_ref), same columns as planning-style state rows
+        self.reg_full_state_label = QLabel(
+            "Full-state regulation — state [x,y,z m; j1,j2,yaw °] (row: x0, x_ref)"
+        )
+        self.reg_full_state_label.setWordWrap(True)
+        reg.addWidget(self.reg_full_state_label)
+        self.reg_full_state_table = QTableWidget(2, 6)
+        self.reg_full_state_table.setHorizontalHeaderLabels(
+            ["x [m]", "y [m]", "z [m]", "j1°", "j2°", "yaw°"]
+        )
+        self.reg_full_state_table.setVerticalHeaderLabels(["x0", "x_ref"])
+        _rfh = self.reg_full_state_table.horizontalHeader()
+        _rfh.setSectionResizeMode(QHeaderView.Stretch)
+        _reg_full_defaults = [
+            {"x": 0.0, "y": 0.0, "z": 1.0, "j1": -68.8, "j2": -34.4, "yaw": 0.0},
+            {"x": 1.0, "y": 0.5, "z": 1.2, "j1": -45.8, "j2": -17.2, "yaw": 45.0},
+        ]
+        for r, rowd in enumerate(_reg_full_defaults):
+            for c, key in enumerate(["x", "y", "z", "j1", "j2", "yaw"]):
+                self.reg_full_state_table.setItem(
+                    r, c, QTableWidgetItem(f"{float(rowd[key]):g}")
+                )
+        reg.addWidget(self.reg_full_state_table)
+
+        # EE regulation: state table + single-row EE pose table
+        self.reg_ee_state_label = QLabel(
+            "EE regulation — state [x,y,z m; j1,j2,yaw °] (row: x0, x_ref)"
+        )
+        self.reg_ee_state_label.setWordWrap(True)
+        reg.addWidget(self.reg_ee_state_label)
+        self.reg_ee_state_table = QTableWidget(2, 6)
+        self.reg_ee_state_table.setHorizontalHeaderLabels(
+            ["x [m]", "y [m]", "z [m]", "j1°", "j2°", "yaw°"]
+        )
+        self.reg_ee_state_table.setVerticalHeaderLabels(["x0", "x_ref"])
+        _reh = self.reg_ee_state_table.horizontalHeader()
+        _reh.setSectionResizeMode(QHeaderView.Stretch)
+        _reg_ee_state_defaults = [
+            {"x": 0.0, "y": 0.0, "z": 1.0, "j1": -68.8, "j2": -34.4, "yaw": 0.0},
+            {"x": 0.0, "y": 0.0, "z": 1.0, "j1": -68.8, "j2": -34.4, "yaw": 0.0},
+        ]
+        for r, rowd in enumerate(_reg_ee_state_defaults):
+            for c, key in enumerate(["x", "y", "z", "j1", "j2", "yaw"]):
+                self.reg_ee_state_table.setItem(
+                    r, c, QTableWidgetItem(f"{float(rowd[key]):g}")
+                )
+        reg.addWidget(self.reg_ee_state_table)
+
+        self.reg_ee_pose_label = QLabel("EE regulation — target EE pose (world)")
+        reg.addWidget(self.reg_ee_pose_label)
+        self.reg_ee_pose_table = QTableWidget(1, 4)
+        self.reg_ee_pose_table.setHorizontalHeaderLabels(["x [m]", "y [m]", "z [m]", "yaw°"])
+        _rph = self.reg_ee_pose_table.horizontalHeader()
+        _rph.setSectionResizeMode(QHeaderView.Stretch)
+        self.reg_ee_pose_table.setVerticalHeaderLabels(["target"])
+        for c, val in enumerate([1.0, 0.2, 0.9, 0.0]):
+            self.reg_ee_pose_table.setItem(0, c, QTableWidgetItem(f"{val:g}"))
+        reg.addWidget(self.reg_ee_pose_table)
+
+        self.reg_run_btn = QPushButton("Run closed-loop regulation")
+        self.reg_run_btn.clicked.connect(self._run_regulation)
+        reg.addWidget(self.reg_run_btn)
+        self.reg_group.setLayout(reg)
+        tk.addWidget(self.reg_group)
+        self.reg_mode_combo.currentIndexChanged.connect(self._on_reg_mode_changed)
+        self._on_reg_mode_changed()
+
         params_btns = QHBoxLayout()
         self.save_params_btn = QPushButton("Save parameters")
         self.save_params_btn.clicked.connect(self._save_params)
@@ -1145,6 +1312,7 @@ class UamSuiteGUI(QMainWindow):
         self.fig_states, self.cv_states = embed_fig("States / controls", (12, 9))
         self.fig_3d_track, self.cv_3d_track = embed_fig("Base 3D", (10, 8))
         self.fig_traj_dash, self.cv_traj_dash = embed_fig("Tracking / MPC", (12, 10))
+        self.fig_cost_analysis, self.cv_cost_analysis = embed_fig("Cost analysis", (12, 10))
         # Backward-compatible aliases for existing planning preview rendering.
         self.fig_combined, self.cv_combined = self.fig_states, self.cv_states
 
@@ -1648,10 +1816,41 @@ class UamSuiteGUI(QMainWindow):
     def _on_plan_mode(self):
         self.plan_stack.setCurrentIndex(self.plan_mode_combo.currentIndex())
 
+    def _refresh_plan_actuator_taus_enabled(self) -> None:
+        if not hasattr(self, "method_combo"):
+            return
+        mid = int(self.method_combo.currentIndex())
+        method = self._method_ids[mid] if 0 <= mid < len(self._method_ids) else "none"
+        is_croc = method in ("crocoddyl", "crocoddyl_actuator_ocp")
+        is_ocp = method == "crocoddyl_actuator_ocp"
+        use_lag = bool(is_ocp or self.plan_croc_use_actuator_first_order.isChecked())
+
+        if hasattr(self, "plan_croc_use_actuator_first_order"):
+            self.plan_croc_use_actuator_first_order.blockSignals(True)
+            if is_ocp:
+                self.plan_croc_use_actuator_first_order.setChecked(True)
+            self.plan_croc_use_actuator_first_order.blockSignals(False)
+            self.plan_croc_use_actuator_first_order.setEnabled(method == "crocoddyl")
+
+        if hasattr(self, "plan_tau_motor"):
+            self.plan_tau_motor.setEnabled(is_croc and use_lag)
+        if hasattr(self, "plan_tau_joint"):
+            self.plan_tau_joint.setEnabled(is_croc and use_lag)
+
     def _on_ee_plan_type_changed(self):
         snap = self.ee_plan_type_combo.currentIndex() == 0
         self.ee_wp_table.setVisible(snap)
         self.ee_eight_group.setVisible(not snap)
+
+    def _on_reg_mode_changed(self):
+        mode = int(self.reg_mode_combo.currentIndex()) if hasattr(self, "reg_mode_combo") else 0
+        full = mode == 0
+        self.reg_full_state_label.setVisible(full)
+        self.reg_full_state_table.setVisible(full)
+        self.reg_ee_state_label.setVisible(not full)
+        self.reg_ee_state_table.setVisible(not full)
+        self.reg_ee_pose_label.setVisible(not full)
+        self.reg_ee_pose_table.setVisible(not full)
 
     def _on_track_mode_changed(self):
         idx = int(self.track_mode_combo.currentIndex())
@@ -1733,6 +1932,20 @@ class UamSuiteGUI(QMainWindow):
             self.tau_thrust_track.setEnabled(croc_plant_lag and use_lag)
         if hasattr(self, "tau_theta_track"):
             self.tau_theta_track.setEnabled(croc_plant_lag and use_lag)
+        stack_idx = (
+            int(self.track_sim_control_stack.currentIndex())
+            if hasattr(self, "track_sim_control_stack")
+            else 0
+        )
+        px4_on = stack_idx == 1
+        if hasattr(self, "track_sim_control_stack"):
+            self.track_sim_control_stack.setEnabled(croc_plant_lag)
+        if hasattr(self, "_px4_gain_row"):
+            self._px4_gain_row.setEnabled(croc_plant_lag and px4_on)
+        if hasattr(self, "px4_rate_Kp_track"):
+            self.px4_rate_Kp_track.setEnabled(croc_plant_lag and px4_on)
+        if hasattr(self, "px4_rate_Kd_track"):
+            self.px4_rate_Kd_track.setEnabled(croc_plant_lag and px4_on)
         croc_payload = idx in (0, 2)
         if hasattr(self, "sim_payload_enable"):
             self.sim_payload_enable.setEnabled(croc_payload)
@@ -1769,12 +1982,75 @@ class UamSuiteGUI(QMainWindow):
                 v = float(row[c]) if c < len(row) else 0.0
                 table.setItem(r, c, QTableWidgetItem(f"{v:g}"))
 
+    def _read_reg_state_table_row(self, table: QTableWidget, row: int) -> dict[str, float]:
+        keys = ["x", "y", "z", "j1", "j2", "yaw"]
+        out: dict[str, float] = {}
+        for c, k in enumerate(keys):
+            it = table.item(row, c)
+            if it is None or not str(it.text()).strip():
+                out[k] = 0.0
+            else:
+                try:
+                    out[k] = float(it.text())
+                except ValueError:
+                    out[k] = 0.0
+        return out
+
+    def _set_reg_state_table_row(self, table: QTableWidget, row: int, d: dict) -> None:
+        keys = ["x", "y", "z", "j1", "j2", "yaw"]
+        for c, k in enumerate(keys):
+            v = float(d.get(k, 0.0))
+            table.setItem(row, c, QTableWidgetItem(f"{v:g}"))
+
+    def _read_reg_ee_pose_table_row(self) -> dict[str, float]:
+        keys = ["x", "y", "z", "yaw"]
+        out: dict[str, float] = {}
+        for c, k in enumerate(keys):
+            it = self.reg_ee_pose_table.item(0, c)
+            if it is None or not str(it.text()).strip():
+                out[k] = 0.0
+            else:
+                try:
+                    out[k] = float(it.text())
+                except ValueError:
+                    out[k] = 0.0
+        return out
+
+    @staticmethod
+    def _reg_table_row_to_uam_state(table: QTableWidget, row: int) -> np.ndarray:
+        from s500_uam_trajectory_planner import make_uam_state
+
+        keys = ["x", "y", "z", "j1", "j2", "yaw"]
+        vals: list[float] = []
+        for c, _k in enumerate(keys):
+            it = table.item(row, c)
+            if it is None or not str(it.text()).strip():
+                vals.append(0.0)
+            else:
+                try:
+                    vals.append(float(it.text()))
+                except ValueError:
+                    vals.append(0.0)
+        x, y, z, j1, j2, yaw = vals
+        return np.asarray(
+            make_uam_state(
+                float(x),
+                float(y),
+                float(z),
+                j1=np.deg2rad(float(j1)),
+                j2=np.deg2rad(float(j2)),
+                yaw=np.deg2rad(float(yaw)),
+            ),
+            dtype=float,
+        ).flatten()
+
     def _collect_params(self) -> dict:
         return {
             "version": 1,
             "plan_mode_index": int(self.plan_mode_combo.currentIndex()),
             "method_index": int(self.method_combo.currentIndex()),
             "track_mode_index": int(self.track_mode_combo.currentIndex()),
+            "reg_mode_index": int(self.reg_mode_combo.currentIndex()),
             "control_mode_track_index": int(self.control_mode_track.currentIndex()),
             "wp_rows": self._read_wp_table(),
             "ee_wp_rows": self._read_ee_rows(),
@@ -1817,6 +2093,9 @@ class UamSuiteGUI(QMainWindow):
             "mpc_log_iv": int(self.mpc_log_iv.value()),
             "tau_thrust_track": float(self.tau_thrust_track.value()),
             "tau_theta_track": float(self.tau_theta_track.value()),
+            "track_sim_control_stack_index": int(self.track_sim_control_stack.currentIndex()),
+            "px4_rate_Kp_track": float(self.px4_rate_Kp_track.value()),
+            "px4_rate_Kd_track": float(self.px4_rate_Kd_track.value()),
             "croc_horizon": int(self.croc_horizon.value()),
             "croc_mpc_iter": int(self.croc_mpc_iter.value()),
             "w_state_track": float(self.w_state_track.value()),
@@ -1831,6 +2110,11 @@ class UamSuiteGUI(QMainWindow):
             "plan_croc_use_actuator_first_order": bool(self.plan_croc_use_actuator_first_order.isChecked()),
             "plan_tau_motor": float(self.plan_tau_motor.value()),
             "plan_tau_joint": float(self.plan_tau_joint.value()),
+            "reg_full_x0": self._read_reg_state_table_row(self.reg_full_state_table, 0),
+            "reg_full_xref": self._read_reg_state_table_row(self.reg_full_state_table, 1),
+            "reg_ee_x0": self._read_reg_state_table_row(self.reg_ee_state_table, 0),
+            "reg_ee_xref": self._read_reg_state_table_row(self.reg_ee_state_table, 1),
+            "reg_ee_target_pose": self._read_reg_ee_pose_table_row(),
         }
 
     def _apply_params(self, p: dict) -> None:
@@ -1892,6 +2176,8 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("mpc_log_iv", self.mpc_log_iv)
         _set_spin("tau_thrust_track", self.tau_thrust_track)
         _set_spin("tau_theta_track", self.tau_theta_track)
+        _set_spin("px4_rate_Kp_track", self.px4_rate_Kp_track)
+        _set_spin("px4_rate_Kd_track", self.px4_rate_Kd_track)
         _set_spin("croc_horizon", self.croc_horizon)
         _set_spin("croc_mpc_iter", self.croc_mpc_iter)
         _set_spin("w_state_track", self.w_state_track)
@@ -1926,10 +2212,28 @@ class UamSuiteGUI(QMainWindow):
         _set_combo("ee_plan_type_index", self.ee_plan_type_combo)
         _set_combo("method_index", self.method_combo)
         _set_combo("track_mode_index", self.track_mode_combo)
+        _set_combo("reg_mode_index", self.reg_mode_combo)
         _set_combo("control_mode_track_index", self.control_mode_track)
+        _set_combo("track_sim_control_stack_index", self.track_sim_control_stack)
         _set_check("croc_use_actuator_first_order", self.croc_use_actuator_first_order)
         _set_check("croc_ee_use_thrust_constraints", self.croc_ee_use_thrust_constraints)
         _set_check("plan_croc_use_actuator_first_order", self.plan_croc_use_actuator_first_order)
+        if isinstance(p.get("reg_full_x0"), dict):
+            self._set_reg_state_table_row(self.reg_full_state_table, 0, p["reg_full_x0"])
+        if isinstance(p.get("reg_full_xref"), dict):
+            self._set_reg_state_table_row(self.reg_full_state_table, 1, p["reg_full_xref"])
+        if isinstance(p.get("reg_ee_x0"), dict):
+            self._set_reg_state_table_row(self.reg_ee_state_table, 0, p["reg_ee_x0"])
+        if isinstance(p.get("reg_ee_xref"), dict):
+            self._set_reg_state_table_row(self.reg_ee_state_table, 1, p["reg_ee_xref"])
+        rp = p.get("reg_ee_target_pose")
+        if isinstance(rp, dict):
+            keys = ["x", "y", "z", "yaw"]
+            for c, k in enumerate(keys):
+                if k in rp:
+                    self.reg_ee_pose_table.setItem(
+                        0, c, QTableWidgetItem(f"{float(rp[k]):g}")
+                    )
         ec = p.get("ee_eight_center")
         if isinstance(ec, list) and len(ec) >= 3:
             self.ee_eight_cx.setValue(float(ec[0]))
@@ -1937,6 +2241,7 @@ class UamSuiteGUI(QMainWindow):
             self.ee_eight_cz.setValue(float(ec[2]))
         self._on_plan_mode()
         self._on_ee_plan_type_changed()
+        self._on_reg_mode_changed()
         self._update_track_mode_enabled()
 
     def _load_params_from_path(self, path: Path, silent_if_missing: bool = False) -> bool:
@@ -2115,9 +2420,14 @@ class UamSuiteGUI(QMainWindow):
         if method == "none":
             QMessageBox.warning(self, "Error", "No available solver.")
             return
-        if method == "crocoddyl" and self.planner is None:
+        if method in ("crocoddyl", "crocoddyl_actuator_ocp") and self.planner is None:
             QMessageBox.warning(self, "Error", "Crocoddyl planner is not initialized.")
             return
+        worker_method = "crocoddyl" if method == "crocoddyl_actuator_ocp" else method
+        use_actuator_first_order = bool(
+            method == "crocoddyl_actuator_ocp"
+            or (method == "crocoddyl" and self.plan_croc_use_actuator_first_order.isChecked())
+        )
         wps7 = self._mixed_rows_to_waypoints7(sorted_rows)
         params = {
             "mixed_wp_rows": sorted_rows,
@@ -2145,13 +2455,11 @@ class UamSuiteGUI(QMainWindow):
                 ],
                 dtype=float,
             ),
-            "use_actuator_first_order": bool(
-                method == "crocoddyl" and self.plan_croc_use_actuator_first_order.isChecked()
-            ),
+            "use_actuator_first_order": use_actuator_first_order,
         }
         self.run_plan_btn.setEnabled(False)
         self.log(f"Planning started: {method}, {len(sorted_rows)} waypoints")
-        self._plan_worker = self.OptimizationWorker(method, params)
+        self._plan_worker = self.OptimizationWorker(worker_method, params)
         self._plan_worker.finished.connect(self._on_plan_finished)
         self._plan_worker.start()
 
@@ -2364,9 +2672,127 @@ class UamSuiteGUI(QMainWindow):
             self.track_mode_combo.setCurrentIndex(1)
         self._on_track_mode_changed()
 
+    def _run_regulation(self):
+        mode = int(self.reg_mode_combo.currentIndex())
+        T_sim = float(self.T_sim.value())
+        sim_dt = float(self.sim_dt.value())
+        self._manual_ref_overlay = None
+        if mode == 0:
+            x0 = self._reg_table_row_to_uam_state(self.reg_full_state_table, 0)
+            x_ref = self._reg_table_row_to_uam_state(self.reg_full_state_table, 1)
+            t_ref = np.arange(0.0, T_sim + 1e-12, sim_dt, dtype=float)
+            if t_ref.size < 2:
+                t_ref = np.array([0.0, max(T_sim, sim_dt)], dtype=float)
+            x_ref_traj = np.tile(x_ref.reshape(1, -1), (t_ref.size, 1))
+            self._manual_ref_overlay = {
+                "ref_time_states": t_ref,
+                "ref_states": x_ref_traj[:, :17],
+                "ref_time_controls": None,
+                "ref_controls": None,
+                "waypoints": None,
+            }
+            params = {
+                "x0": x0,
+                "t_plan": np.array([0.0, T_sim], dtype=float),
+                "x_plan": np.vstack([x_ref, x_ref]),
+                "x_nom": x_ref.copy(),
+                "T_sim": T_sim,
+                "sim_dt": sim_dt,
+                "control_dt": self.control_dt.value(),
+                "dt_mpc": self.dt_mpc.value(),
+                "horizon": self.croc_horizon.value(),
+                "mpc_max_iter": self.croc_mpc_iter.value(),
+                "w_state_track": self.w_state_track.value(),
+                "w_state_reg": self.w_state_reg.value(),
+                "w_control": self.w_control.value(),
+                "w_terminal_track": self.w_terminal_track.value(),
+                "use_actuator_first_order": self.croc_use_actuator_first_order.isChecked(),
+                "tau_thrust": float(self.tau_thrust_track.value()),
+                "tau_theta": float(self.tau_theta_track.value()),
+                "sim_control_stack": (
+                    "px4_rate"
+                    if self.track_sim_control_stack.currentIndex() == 1
+                    else "direct"
+                ),
+                "px4_rate_Kp": float(self.px4_rate_Kp_track.value()),
+                "px4_rate_Kd": float(self.px4_rate_Kd_track.value()),
+                "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
+                "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
+                "sim_payload_mass": float(self.sim_payload_mass.value()),
+                "sim_payload_sphere_r": 0.02,
+            }
+            self.reg_run_btn.setEnabled(False)
+            self.log("Crocoddyl full-state regulation closed loop...")
+            self._track_worker = TrackCrocAlongPlanWorker(params)
+            self._track_worker.finished.connect(self._on_track_croc_finished)
+            self._track_worker.start()
+            return
+
+        if not self._CROC_EE_OK or self._croc_ee_mpc is None:
+            QMessageBox.warning(self, "Error", "Crocoddyl EE pose tracking is unavailable.")
+            return
+        x0 = self._reg_table_row_to_uam_state(self.reg_ee_state_table, 0)
+        x_ref = self._reg_table_row_to_uam_state(self.reg_ee_state_table, 1)
+        t_ref = np.arange(0.0, T_sim + 1e-12, sim_dt, dtype=float)
+        if t_ref.size < 2:
+            t_ref = np.array([0.0, max(T_sim, sim_dt)], dtype=float)
+        pose = self._read_reg_ee_pose_table_row()
+        p_goal = np.array(
+            [pose["x"], pose["y"], pose["z"]],
+            dtype=float,
+        )
+        yaw_goal = np.deg2rad(float(pose["yaw"]))
+        p_ref = np.tile(p_goal.reshape(1, 3), (t_ref.size, 1))
+        yaw_ref = np.full(t_ref.size, yaw_goal, dtype=float)
+        x_ref_traj = np.tile(x_ref.reshape(1, -1), (t_ref.size, 1))
+        self._manual_ref_overlay = {
+            "ref_time_states": t_ref,
+            "ref_states": x_ref_traj[:, :17],
+            "ref_time_controls": None,
+            "ref_controls": None,
+            "waypoints": None,
+        }
+        params_croc_ee = {
+            "x0": x0,
+            "t_ref": t_ref,
+            "p_ref": p_ref,
+            "yaw_ref": yaw_ref,
+            "sim_dt": sim_dt,
+            "control_dt": self.control_dt.value(),
+            "dt_mpc": self.dt_mpc.value(),
+            "N_mpc": self.N_mpc.value(),
+            "croc_ee_w_pos": float(self.croc_ee_w_pos.value()),
+            "croc_ee_w_rot_rp": float(self.croc_ee_w_rot_rp.value()),
+            "croc_ee_w_rot_yaw": float(self.croc_ee_w_rot_yaw.value()),
+            "croc_ee_w_vel_lin": float(self.croc_ee_w_vel_lin.value()),
+            "croc_ee_w_vel_ang_rp": float(self.croc_ee_w_vel_ang_rp.value()),
+            "croc_ee_w_vel_ang_yaw": float(self.croc_ee_w_vel_ang_yaw.value()),
+            "croc_ee_w_u": float(self.croc_ee_w_u.value()),
+            "croc_ee_w_terminal": float(self.croc_ee_w_terminal.value()),
+            "w_state_reg": float(self.w_state_reg.value()),
+            "w_state_track": float(self.w_state_track.value()),
+            "mpc_max_iter": self.mpc_max_iter.value(),
+            "use_thrust_constraints": self.croc_ee_use_thrust_constraints.isChecked(),
+            "use_actuator_first_order": self.croc_use_actuator_first_order.isChecked(),
+            "tau_thrust": float(self.tau_thrust_track.value()),
+            "tau_theta": float(self.tau_theta_track.value()),
+            "t_plan": np.array([0.0, T_sim], dtype=float),
+            "x_plan": np.vstack([x_ref, x_ref]),
+            "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
+            "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
+            "sim_payload_mass": float(self.sim_payload_mass.value()),
+            "sim_payload_sphere_r": 0.02,
+        }
+        self.reg_run_btn.setEnabled(False)
+        self.log("Crocoddyl EE pose regulation closed loop...")
+        self._track_worker = TrackEeCrocWorker(params_croc_ee)
+        self._track_worker.finished.connect(self._on_track_croc_ee_finished)
+        self._track_worker.start()
+
     def _run_track(self):
         if self._plan_bundle is None:
             return
+        self._manual_ref_overlay = None
         mode = self.track_mode_combo.currentIndex()
         if mode == 0:
             if self._plan_bundle["kind"] not in ("full_croc", "full_acados"):
@@ -2398,6 +2824,13 @@ class UamSuiteGUI(QMainWindow):
                 "use_actuator_first_order": self.croc_use_actuator_first_order.isChecked(),
                 "tau_thrust": float(self.tau_thrust_track.value()),
                 "tau_theta": float(self.tau_theta_track.value()),
+                "sim_control_stack": (
+                    "px4_rate"
+                    if self.track_sim_control_stack.currentIndex() == 1
+                    else "direct"
+                ),
+                "px4_rate_Kp": float(self.px4_rate_Kp_track.value()),
+                "px4_rate_Kd": float(self.px4_rate_Kd_track.value()),
                 "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
                 "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
                 "sim_payload_mass": float(self.sim_payload_mass.value()),
@@ -2524,6 +2957,8 @@ class UamSuiteGUI(QMainWindow):
 
     def _on_track_croc_finished(self, ok: bool, err: str, payload: object):
         self.run_track_btn.setEnabled(True)
+        if hasattr(self, "reg_run_btn"):
+            self.reg_run_btn.setEnabled(True)
         if not ok:
             self.log(err)
             QMessageBox.critical(self, "Error", err[:2000])
@@ -2539,6 +2974,8 @@ class UamSuiteGUI(QMainWindow):
 
     def _on_track_croc_ee_finished(self, ok: bool, err: str, payload: object):
         self.run_track_btn.setEnabled(True)
+        if hasattr(self, "reg_run_btn"):
+            self.reg_run_btn.setEnabled(True)
         if not ok:
             self.log(err)
             QMessageBox.critical(self, "Error", err[:2000])
@@ -2554,6 +2991,8 @@ class UamSuiteGUI(QMainWindow):
 
     def _on_track_ee_finished(self, ok: bool, err: str, out: object):
         self.run_track_btn.setEnabled(True)
+        if hasattr(self, "reg_run_btn"):
+            self.reg_run_btn.setEnabled(True)
         if not ok:
             self.log(err)
             QMessageBox.critical(self, "Error", err[:2000])
@@ -2602,6 +3041,7 @@ class UamSuiteGUI(QMainWindow):
             )
             ax.axis("off")
             self.cv_traj_dash.draw()
+            self._render_cost_analysis_figure(res)
             return
 
         wp = None
@@ -2638,6 +3078,14 @@ class UamSuiteGUI(QMainWindow):
                 ref_states = None
                 ref_time_controls = None
                 ref_controls = None
+        manual = self._manual_ref_overlay
+        if isinstance(manual, dict):
+            ref_time_states = manual.get("ref_time_states")
+            ref_states = manual.get("ref_states")
+            ref_time_controls = manual.get("ref_time_controls")
+            ref_controls = manual.get("ref_controls")
+            if wp is None:
+                wp = manual.get("waypoints")
         fs = self.fig_states if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_into_figure else None
         f3 = self.fig_3d_track if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_3d_into_figure else None
         if fs is None:
@@ -2672,6 +3120,69 @@ class UamSuiteGUI(QMainWindow):
         self.cv_states.draw()
         self.cv_3d_track.draw()
         self.cv_traj_dash.draw()
+        self._render_cost_analysis_figure(res)
+
+    def _render_cost_analysis_figure(self, res: dict) -> None:
+        fig = self.fig_cost_analysis
+        fig.clear()
+        t = np.asarray(res.get("mpc_cost_t", []), dtype=float).flatten()
+        total = np.asarray(res.get("mpc_cost_total", []), dtype=float).flatten()
+        groups = res.get("mpc_cost_groups", {})
+        terms = res.get("mpc_cost_terms", {})
+        weights = res.get("mpc_cost_weights", {})
+
+        has_total = bool(t.size and total.size == t.size and np.isfinite(total).any())
+        term_keys = []
+        if isinstance(terms, dict):
+            for k in sorted(terms.keys()):
+                v = np.asarray(terms.get(k, []), dtype=float).flatten()
+                if v.size == t.size and v.size > 0 and np.isfinite(v).any():
+                    term_keys.append(k)
+
+        n_panels = (1 if has_total else 0) + len(term_keys)
+        if n_panels <= 0:
+            ax = fig.add_subplot(111)
+            ax.text(
+                0.5,
+                0.5,
+                "No MPC cost breakdown available for this result",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.axis("off")
+            self.cv_cost_analysis.draw()
+            return
+
+        ncols = 2 if n_panels > 1 else 1
+        nrows = int(math.ceil(float(n_panels) / float(ncols)))
+        axes = [fig.add_subplot(nrows, ncols, i + 1) for i in range(n_panels)]
+        idx = 0
+        if has_total:
+            ax = axes[idx]
+            idx += 1
+            ax.plot(t, total, "k-", lw=1.3)
+            ax.set_title("total", fontsize=10)
+            ax.set_xlabel("t [s]")
+            ax.set_ylabel("cost")
+            ax.grid(True, alpha=0.3)
+        for key in term_keys:
+            ax = axes[idx]
+            idx += 1
+            v = np.asarray(terms.get(key, []), dtype=float).flatten()
+            ax.plot(t, v, lw=1.0, color="tab:orange")
+            w = float(weights.get(key, float("nan"))) if isinstance(weights, dict) else float("nan")
+            if np.isfinite(w):
+                ax.set_title(f"{key} (w={w:g})", fontsize=10)
+            else:
+                ax.set_title(str(key), fontsize=10)
+            ax.set_xlabel("t [s]")
+            ax.set_ylabel("cost")
+            ax.grid(True, alpha=0.3)
+
+        fig.suptitle("MPC cost analysis (total + weighted term costs)", fontsize=12, y=0.99)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        self.cv_cost_analysis.draw()
 
 
 def main():

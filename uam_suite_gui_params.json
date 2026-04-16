@@ -3,6 +3,7 @@
   "plan_mode_index": 0,
   "method_index": 0,
   "track_mode_index": 2,
+  "reg_mode_index": 0,
   "control_mode_track_index": 0,
   "wp_rows": [
     [
@@ -111,9 +112,50 @@
   "w_state_reg": 0.1,
   "w_control": 0.001,
   "w_terminal_track": 100.0,
-  "croc_use_actuator_first_order": true,
+  "croc_use_actuator_first_order": false,
   "croc_ee_use_thrust_constraints": true,
+  "sim_payload_enable": false,
+  "sim_payload_t_grasp": 1.0,
+  "sim_payload_mass": 0.2,
   "plan_croc_use_actuator_first_order": false,
   "plan_tau_motor": 0.06,
-  "plan_tau_joint": 0.05
+  "plan_tau_joint": 0.05,
+  "reg_full_x0": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.0,
+    "j1": 0.0,
+    "j2": 0.0,
+    "yaw": 0.0
+  },
+  "reg_full_xref": {
+    "x": 1.0,
+    "y": 0.0,
+    "z": 1.0,
+    "j1": -45.0,
+    "j2": -45.0,
+    "yaw": 0.0
+  },
+  "reg_ee_x0": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 1.0,
+    "j1": -68.8,
+    "j2": -34.4,
+    "yaw": 0.0
+  },
+  "reg_ee_xref": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 1.0,
+    "j1": -68.8,
+    "j2": -34.4,
+    "yaw": 0.0
+  },
+  "reg_ee_target_pose": {
+    "x": 1.0,
+    "y": 0.2,
+    "z": 0.9,
+    "yaw": 0.0
+  }
 }
