@@ -14,6 +14,8 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -40,6 +42,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QFileDialog,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QTabWidget,
@@ -1294,6 +1297,412 @@ class UamSuiteGUI(QMainWindow):
         self.log_text.setMaximumHeight(140)
         tk.addWidget(self.log_text)
 
+        # ----- ROS Tracking tab -----
+        tab_ros_track = QWidget()
+        rtt_scroll_area = QScrollArea()
+        rtt_scroll_area.setWidgetResizable(True)
+        rtt_inner = QWidget()
+        rtt = QVBoxLayout(rtt_inner)
+        rtt_scroll_area.setWidget(rtt_inner)
+        rtt_outer = QVBoxLayout(tab_ros_track)
+        rtt_outer.setContentsMargins(0, 0, 0, 0)
+        rtt_outer.addWidget(rtt_scroll_area)
+        left_tabs.addTab(tab_ros_track, "ROS Tracking")
+
+        # 内部跟踪：run_tracking_controller 子进程句柄
+        self._rn_process = None
+
+        # ── ROS Tracking Node (run_tracking_controller.py) ───────────────────
+        ros_node_group = QGroupBox("ROS Tracking Node  (run_tracking_controller.py)")
+        ros_node_layout = QVBoxLayout()
+
+        _rn_hint = QLabel(
+            "使用 scripts/ 中的 Crocoddyl Python MPC（与 GUI 数值仿真相同的控制器）"
+            "在 ROS 环境中进行在线闭环跟踪。\n"
+            "支持全状态跟踪（croc_full_state）和 EE 位姿跟踪（croc_ee_pose）两种模式，"
+            "MPC 参数在下方独立设置，与仿真参数互不影响。"
+        )
+        _rn_hint.setWordWrap(True)
+        _rn_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        ros_node_layout.addWidget(_rn_hint)
+
+        rn_grid = QGridLayout()
+
+        rn_grid.addWidget(QLabel("Controller mode"), 0, 0)
+        self.rn_controller_combo = QComboBox()
+        self.rn_controller_combo.addItems(["croc_full_state", "croc_ee_pose", "px4", "geometric"])
+        self.rn_controller_combo.setToolTip(
+            "croc_full_state: Crocoddyl 全状态跟踪 (build_shooting_problem_along_plan)\n"
+            "croc_ee_pose:    Crocoddyl EE 位姿跟踪 (build_shooting_problem_along_ee_ref)\n"
+            "px4:             run_tracking_controller 内部发送 PositionTarget 给 PX4\n"
+            "geometric:       run_tracking_controller 内置 geometric（body_rate + thrust）"
+        )
+        rn_grid.addWidget(self.rn_controller_combo, 0, 1)
+
+        rn_grid.addWidget(QLabel("Odom source"), 1, 0)
+        self.rn_odom_combo = QComboBox()
+        self.rn_odom_combo.addItems(["gazebo", "mavros"])
+        self.rn_odom_combo.setToolTip(
+            "gazebo: 订阅 /gazebo/model_states\nmavros: 订阅 /mavros/local_position/odom"
+        )
+        rn_grid.addWidget(self.rn_odom_combo, 1, 1)
+
+        rn_grid.addWidget(QLabel("Control rate [Hz]"), 2, 0)
+        self.rn_control_rate = QDoubleSpinBox()
+        self.rn_control_rate.setRange(10.0, 200.0)
+        self.rn_control_rate.setSingleStep(10.0)
+        self.rn_control_rate.setValue(50.0)
+        rn_grid.addWidget(self.rn_control_rate, 2, 1)
+
+        rn_grid.addWidget(QLabel("Arm control mode"), 3, 0)
+        self.rn_arm_mode_combo = QComboBox()
+        self.rn_arm_mode_combo.addItems(["position", "position_velocity", "velocity"])
+        rn_grid.addWidget(self.rn_arm_mode_combo, 3, 1)
+
+        rn_grid.addWidget(QLabel("Use simulation"), 4, 0)
+        self.rn_use_sim_check = QCheckBox()
+        self.rn_use_sim_check.setChecked(True)
+        self.rn_use_sim_check.setToolTip(
+            "勾选：从 /arm_controller/joint_states 读取关节状态（Gazebo 仿真）\n"
+            "不勾选：从 /joint_states 读取（实机）"
+        )
+        rn_grid.addWidget(self.rn_use_sim_check, 4, 1)
+
+        ros_node_layout.addLayout(rn_grid)
+
+        # ── ROS MPC Parameters ────────────────────────────────────────────────
+        rn_mpc_group = QGroupBox("MPC Parameters")
+        rn_mpc_vbox = QVBoxLayout()
+        rn_mpc_vbox.setSpacing(4)
+
+        # 公共参数（两种模式均显示）
+        rn_common_grid = QGridLayout()
+        rn_common_grid.setColumnStretch(1, 1)
+        rn_common_grid.setColumnStretch(3, 1)
+
+        rn_common_grid.addWidget(QLabel("dt_mpc [s]"), 0, 0)
+        self.rn_dt_mpc = QDoubleSpinBox()
+        self.rn_dt_mpc.setRange(0.01, 0.2)
+        self.rn_dt_mpc.setDecimals(3)
+        self.rn_dt_mpc.setValue(0.05)
+        rn_common_grid.addWidget(self.rn_dt_mpc, 0, 1)
+
+        rn_common_grid.addWidget(QLabel("Horizon N"), 0, 2)
+        self.rn_horizon = QSpinBox()
+        self.rn_horizon.setRange(5, 120)
+        self.rn_horizon.setValue(40)
+        rn_common_grid.addWidget(self.rn_horizon, 0, 3)
+
+        rn_common_grid.addWidget(QLabel("max_iter"), 1, 0)
+        self.rn_mpc_max_iter = QSpinBox()
+        self.rn_mpc_max_iter.setRange(1, 300)
+        self.rn_mpc_max_iter.setValue(60)
+        rn_common_grid.addWidget(self.rn_mpc_max_iter, 1, 1)
+
+        rn_mpc_vbox.addLayout(rn_common_grid)
+
+        # ── croc_full_state 专用参数面板 ─────────────────────────────────────
+        self._rn_fs_panel = QWidget()
+        rn_fs_grid = QGridLayout(self._rn_fs_panel)
+        rn_fs_grid.setContentsMargins(0, 0, 0, 0)
+        rn_fs_grid.setColumnStretch(1, 1)
+        rn_fs_grid.setColumnStretch(3, 1)
+
+        rn_fs_grid.addWidget(QLabel("w_state_track"), 0, 0)
+        self.rn_w_state_track = QDoubleSpinBox()
+        self.rn_w_state_track.setRange(0.0, 1e5)
+        self.rn_w_state_track.setValue(10.0)
+        rn_fs_grid.addWidget(self.rn_w_state_track, 0, 1)
+
+        rn_fs_grid.addWidget(QLabel("w_state_reg"), 0, 2)
+        self.rn_w_state_reg = QDoubleSpinBox()
+        self.rn_w_state_reg.setRange(0.0, 1e5)
+        self.rn_w_state_reg.setValue(0.1)
+        rn_fs_grid.addWidget(self.rn_w_state_reg, 0, 3)
+
+        rn_fs_grid.addWidget(QLabel("w_control"), 1, 0)
+        self.rn_w_control = QDoubleSpinBox()
+        self.rn_w_control.setRange(0.0, 100.0)
+        self.rn_w_control.setDecimals(6)
+        self.rn_w_control.setValue(1e-3)
+        rn_fs_grid.addWidget(self.rn_w_control, 1, 1)
+
+        rn_fs_grid.addWidget(QLabel("w_terminal"), 1, 2)
+        self.rn_w_terminal_track = QDoubleSpinBox()
+        self.rn_w_terminal_track.setRange(0.0, 1e6)
+        self.rn_w_terminal_track.setValue(3.0)
+        rn_fs_grid.addWidget(self.rn_w_terminal_track, 1, 3)
+
+        rn_mpc_vbox.addWidget(self._rn_fs_panel)
+
+        # ── croc_ee_pose 专用参数面板 ────────────────────────────────────────
+        self._rn_ee_panel = QWidget()
+        rn_ee_grid = QGridLayout(self._rn_ee_panel)
+        rn_ee_grid.setContentsMargins(0, 0, 0, 0)
+        rn_ee_grid.setColumnStretch(1, 1)
+        rn_ee_grid.setColumnStretch(3, 1)
+
+        rn_ee_grid.addWidget(QLabel("ee w_pos"), 0, 0)
+        self.rn_ee_w_pos = QDoubleSpinBox()
+        self.rn_ee_w_pos.setRange(0.0, 5000.0)
+        self.rn_ee_w_pos.setValue(400.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_pos, 0, 1)
+
+        rn_ee_grid.addWidget(QLabel("ee w_rot_rp"), 0, 2)
+        self.rn_ee_w_rot_rp = QDoubleSpinBox()
+        self.rn_ee_w_rot_rp.setRange(0.0, 2000.0)
+        self.rn_ee_w_rot_rp.setValue(1.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_rot_rp, 0, 3)
+
+        rn_ee_grid.addWidget(QLabel("ee w_rot_yaw"), 1, 0)
+        self.rn_ee_w_rot_yaw = QDoubleSpinBox()
+        self.rn_ee_w_rot_yaw.setRange(0.0, 2000.0)
+        self.rn_ee_w_rot_yaw.setValue(200.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_rot_yaw, 1, 1)
+
+        rn_ee_grid.addWidget(QLabel("ee w_vel_lin"), 1, 2)
+        self.rn_ee_w_vel_lin = QDoubleSpinBox()
+        self.rn_ee_w_vel_lin.setRange(0.0, 5000.0)
+        self.rn_ee_w_vel_lin.setValue(1.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_vel_lin, 1, 3)
+
+        rn_ee_grid.addWidget(QLabel("ee w_vel_ang_rp"), 2, 0)
+        self.rn_ee_w_vel_ang_rp = QDoubleSpinBox()
+        self.rn_ee_w_vel_ang_rp.setRange(0.0, 5000.0)
+        self.rn_ee_w_vel_ang_rp.setValue(1.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_vel_ang_rp, 2, 1)
+
+        rn_ee_grid.addWidget(QLabel("ee w_vel_ang_yaw"), 2, 2)
+        self.rn_ee_w_vel_ang_yaw = QDoubleSpinBox()
+        self.rn_ee_w_vel_ang_yaw.setRange(0.0, 5000.0)
+        self.rn_ee_w_vel_ang_yaw.setValue(1.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_vel_ang_yaw, 2, 3)
+
+        rn_ee_grid.addWidget(QLabel("ee w_u"), 3, 0)
+        self.rn_ee_w_u = QDoubleSpinBox()
+        self.rn_ee_w_u.setRange(0.0, 100.0)
+        self.rn_ee_w_u.setDecimals(6)
+        self.rn_ee_w_u.setValue(0.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_u, 3, 1)
+
+        rn_ee_grid.addWidget(QLabel("ee w_terminal"), 3, 2)
+        self.rn_ee_w_terminal = QDoubleSpinBox()
+        self.rn_ee_w_terminal.setRange(0.0, 100.0)
+        self.rn_ee_w_terminal.setDecimals(3)
+        self.rn_ee_w_terminal.setValue(3.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_terminal, 3, 3)
+
+        rn_mpc_vbox.addWidget(self._rn_ee_panel)
+
+        # ── geometric 专用参数面板 ─────────────────────────────────────────────
+        self._rn_geo_panel = QWidget()
+        rn_geo_grid = QGridLayout(self._rn_geo_panel)
+        rn_geo_grid.setContentsMargins(0, 0, 0, 0)
+        rn_geo_grid.setColumnStretch(1, 1)
+        rn_geo_grid.setColumnStretch(3, 1)
+
+        rn_geo_grid.addWidget(QLabel("geo_kp_pos"), 0, 0)
+        self.rn_geo_kp_pos = QDoubleSpinBox()
+        self.rn_geo_kp_pos.setRange(0.0, 100.0)
+        self.rn_geo_kp_pos.setDecimals(3)
+        self.rn_geo_kp_pos.setValue(4.0)
+        rn_geo_grid.addWidget(self.rn_geo_kp_pos, 0, 1)
+
+        rn_geo_grid.addWidget(QLabel("geo_kd_vel"), 0, 2)
+        self.rn_geo_kd_vel = QDoubleSpinBox()
+        self.rn_geo_kd_vel.setRange(0.0, 100.0)
+        self.rn_geo_kd_vel.setDecimals(3)
+        self.rn_geo_kd_vel.setValue(2.5)
+        rn_geo_grid.addWidget(self.rn_geo_kd_vel, 0, 3)
+
+        rn_geo_grid.addWidget(QLabel("geo_kR"), 1, 0)
+        self.rn_geo_kR = QDoubleSpinBox()
+        self.rn_geo_kR.setRange(0.0, 100.0)
+        self.rn_geo_kR.setDecimals(3)
+        self.rn_geo_kR.setValue(4.0)
+        rn_geo_grid.addWidget(self.rn_geo_kR, 1, 1)
+
+        rn_geo_grid.addWidget(QLabel("geo_kOmega"), 1, 2)
+        self.rn_geo_kOmega = QDoubleSpinBox()
+        self.rn_geo_kOmega.setRange(0.0, 100.0)
+        self.rn_geo_kOmega.setDecimals(3)
+        self.rn_geo_kOmega.setValue(0.35)
+        rn_geo_grid.addWidget(self.rn_geo_kOmega, 1, 3)
+
+        rn_geo_grid.addWidget(QLabel("geo_max_tilt_deg"), 2, 0)
+        self.rn_geo_max_tilt_deg = QDoubleSpinBox()
+        self.rn_geo_max_tilt_deg.setRange(1.0, 89.0)
+        self.rn_geo_max_tilt_deg.setDecimals(1)
+        self.rn_geo_max_tilt_deg.setValue(35.0)
+        rn_geo_grid.addWidget(self.rn_geo_max_tilt_deg, 2, 1)
+
+        rn_mpc_vbox.addWidget(self._rn_geo_panel)
+        rn_mpc_group.setLayout(rn_mpc_vbox)
+        ros_node_layout.addWidget(rn_mpc_group)
+
+        # 初始化面板可见性（根据默认 controller mode）
+        self.rn_controller_combo.currentIndexChanged.connect(self._rn_update_mpc_panel)
+        self._rn_update_mpc_panel(0)
+
+
+        self.rn_status_label = QLabel("节点状态：未启动")
+        self.rn_status_label.setStyleSheet("color: gray;")
+        ros_node_layout.addWidget(self.rn_status_label)
+
+        # 按钮行 1：启动 / 停止节点进程
+        rn_btn_row1 = QHBoxLayout()
+        self.rn_launch_btn = QPushButton("▶  Launch ROS Tracking Node")
+        self.rn_launch_btn.setStyleSheet(
+            "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; }"
+        )
+        self.rn_launch_btn.setToolTip(
+            "将当前规划导出为 npz，并启动 run_tracking_controller.py 子进程。\n"
+            "需要 ROS Master 运行中，且 Python 环境与 run_controller 相同。"
+        )
+        self.rn_launch_btn.clicked.connect(self._launch_tracking_node)
+        self.rn_launch_btn.setEnabled(False)
+        rn_btn_row1.addWidget(self.rn_launch_btn)
+
+        self.rn_kill_btn = QPushButton("■  Kill Node")
+        self.rn_kill_btn.setStyleSheet(
+            "QPushButton { background-color: #b71c1c; color: white; }"
+        )
+        self.rn_kill_btn.clicked.connect(self._kill_tracking_node)
+        self.rn_kill_btn.setEnabled(False)
+        rn_btn_row1.addWidget(self.rn_kill_btn)
+        ros_node_layout.addLayout(rn_btn_row1)
+
+        # 按钮行 2：ROS 服务调用（紧凑网格布局，节约横向空间）
+        rn_btn_grid = QGridLayout()
+        rn_btn_grid.setHorizontalSpacing(8)
+        rn_btn_grid.setVerticalSpacing(6)
+        self.rn_start_svc_btn = QPushButton("rosservice: /start_tracking")
+        self.rn_start_svc_btn.setToolTip(
+            "调用 /start_tracking 服务开始轨迹跟踪（需要 OFFBOARD 且已解锁）。"
+        )
+        self.rn_start_svc_btn.clicked.connect(self._call_start_tracking_service)
+        self.rn_start_svc_btn.setEnabled(False)
+        rn_btn_grid.addWidget(self.rn_start_svc_btn, 0, 0)
+
+        self.rn_stop_svc_btn = QPushButton("rosservice: /stop_tracking")
+        self.rn_stop_svc_btn.setToolTip("调用 /stop_tracking 服务暂停跟踪。")
+        self.rn_stop_svc_btn.clicked.connect(self._call_stop_tracking_service)
+        self.rn_stop_svc_btn.setEnabled(False)
+        rn_btn_grid.addWidget(self.rn_stop_svc_btn, 0, 1)
+
+        self.rn_save_svc_btn = QPushButton("rosservice: /save_data")
+        self.rn_save_svc_btn.setToolTip("调用 /save_data 服务保存录制数据。")
+        self.rn_save_svc_btn.clicked.connect(self._call_save_data_service)
+        self.rn_save_svc_btn.setEnabled(False)
+        rn_btn_grid.addWidget(self.rn_save_svc_btn, 1, 0)
+
+        self.rn_update_ctrl_btn = QPushButton("rosservice: /update_controller_params")
+        self.rn_update_ctrl_btn.setToolTip(
+            "在线更新当前 controller mode 与参数（MPC / geometric），无需重启节点。"
+        )
+        self.rn_update_ctrl_btn.clicked.connect(self._call_update_controller_params)
+        self.rn_update_ctrl_btn.setEnabled(False)
+        rn_btn_grid.addWidget(self.rn_update_ctrl_btn, 1, 1)
+        ros_node_layout.addLayout(rn_btn_grid)
+
+        # 按钮行 3：Reset（MPC 控制回初始状态）
+        rn_btn_row3 = QHBoxLayout()
+        self.rn_reset_svc_btn = QPushButton("rosservice: /reset_to_initial")
+        self.rn_reset_svc_btn.setStyleSheet(
+            "QPushButton { background-color: #e65100; color: white; font-weight: bold; }"
+        )
+        self.rn_reset_svc_btn.setToolTip(
+            "调用 /reset_to_initial 服务：\n"
+            "• 停止轨迹跟踪，重置 warm-start 缓存\n"
+            "• 启用 MPC 归位模式，驱动机器人回到 x_plan[0]\n"
+            "• 到达目标后自动停止归位控制"
+        )
+        self.rn_reset_svc_btn.clicked.connect(self._call_reset_to_initial_service)
+        self.rn_reset_svc_btn.setEnabled(False)
+        rn_btn_row3.addWidget(self.rn_reset_svc_btn)
+        ros_node_layout.addLayout(rn_btn_row3)
+
+        # 按钮行 4：离线绘图（加载 npz 数据并在 GUI 中绘制跟踪结果）
+        rn_btn_row4 = QHBoxLayout()
+        self.rn_plot_data_btn = QPushButton("📊 Plot Saved Tracking Data")
+        self.rn_plot_data_btn.setToolTip(
+            "打开 npz 文件（由 /save_data 保存），\n"
+            "在右侧图表区绘制实际轨迹与参考轨迹的对比及误差。"
+        )
+        self.rn_plot_data_btn.clicked.connect(self._plot_ros_tracking_data)
+        rn_btn_row4.addWidget(self.rn_plot_data_btn)
+        ros_node_layout.addLayout(rn_btn_row4)
+
+        ros_node_group.setLayout(ros_node_layout)
+        rtt.addWidget(ros_node_group)
+
+        # ── Regulation Target 设置组 ──────────────────────────────────────────
+        reg_group = QGroupBox("Regulation Target  (MPC 镇定目标)")
+        reg_layout = QVBoxLayout()
+
+        _reg_hint = QLabel(
+            "设置 MPC regulation 的目标状态（速度默认为 0）。\n"
+            "节点启动时自动以 x_plan[0] 为目标进入 regulation 模式；\n"
+            "/reset_to_initial 将目标重置为 x_plan[0]；\n"
+            "/stop_tracking 将目标更新为当前实际位置（原地悬停）。"
+        )
+        _reg_hint.setWordWrap(True)
+        _reg_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        reg_layout.addWidget(_reg_hint)
+
+        reg_grid = QGridLayout()
+
+        reg_grid.addWidget(QLabel("x [m]"), 0, 0)
+        self.rn_reg_x = QDoubleSpinBox()
+        self.rn_reg_x.setRange(-50.0, 50.0); self.rn_reg_x.setSingleStep(0.1); self.rn_reg_x.setValue(0.0)
+        reg_grid.addWidget(self.rn_reg_x, 0, 1)
+
+        reg_grid.addWidget(QLabel("y [m]"), 1, 0)
+        self.rn_reg_y = QDoubleSpinBox()
+        self.rn_reg_y.setRange(-50.0, 50.0); self.rn_reg_y.setSingleStep(0.1); self.rn_reg_y.setValue(0.0)
+        reg_grid.addWidget(self.rn_reg_y, 1, 1)
+
+        reg_grid.addWidget(QLabel("z [m]"), 2, 0)
+        self.rn_reg_z = QDoubleSpinBox()
+        self.rn_reg_z.setRange(0.0, 20.0); self.rn_reg_z.setSingleStep(0.05); self.rn_reg_z.setValue(1.0)
+        reg_grid.addWidget(self.rn_reg_z, 2, 1)
+
+        reg_grid.addWidget(QLabel("yaw [°]"), 3, 0)
+        self.rn_reg_yaw = QDoubleSpinBox()
+        self.rn_reg_yaw.setRange(-180.0, 180.0); self.rn_reg_yaw.setSingleStep(5.0); self.rn_reg_yaw.setValue(0.0)
+        reg_grid.addWidget(self.rn_reg_yaw, 3, 1)
+
+        reg_grid.addWidget(QLabel("j1 [°]"), 4, 0)
+        self.rn_reg_j1 = QDoubleSpinBox()
+        self.rn_reg_j1.setRange(-180.0, 180.0); self.rn_reg_j1.setSingleStep(5.0); self.rn_reg_j1.setValue(0.0)
+        reg_grid.addWidget(self.rn_reg_j1, 4, 1)
+
+        reg_grid.addWidget(QLabel("j2 [°]"), 5, 0)
+        self.rn_reg_j2 = QDoubleSpinBox()
+        self.rn_reg_j2.setRange(-180.0, 180.0); self.rn_reg_j2.setSingleStep(5.0); self.rn_reg_j2.setValue(0.0)
+        reg_grid.addWidget(self.rn_reg_j2, 5, 1)
+
+        reg_layout.addLayout(reg_grid)
+
+        reg_btn_row = QHBoxLayout()
+        self.rn_set_reg_btn = QPushButton("📍 Set Regulation Target")
+        self.rn_set_reg_btn.setStyleSheet(
+            "QPushButton { background-color: #1565c0; color: white; font-weight: bold; }"
+        )
+        self.rn_set_reg_btn.setToolTip(
+            "发布 regulation 目标到节点（话题 ~/regulation_target）。\n"
+            "节点收到后立即切换 MPC 镇定目标，warm-start 重置。\n"
+            "若当前正在 tracking，目标暂存，stop 后生效。"
+        )
+        self.rn_set_reg_btn.clicked.connect(self._call_set_regulation_target)
+        self.rn_set_reg_btn.setEnabled(False)
+        reg_btn_row.addWidget(self.rn_set_reg_btn)
+        reg_layout.addLayout(reg_btn_row)
+
+        reg_group.setLayout(reg_layout)
+        rtt.addWidget(reg_group)
+        rtt.addStretch(1)
+
         # ----- Right: plots -----
         right = QTabWidget()
         root.addWidget(right, stretch=1)
@@ -1323,6 +1732,9 @@ class UamSuiteGUI(QMainWindow):
         if not self._CROC_EE_OK:
             self.log("Crocoddyl EE pose tracking is unavailable.")
 
+    from PyQt5.QtCore import pyqtSlot as _pyqtSlot
+
+    @_pyqtSlot(str)
     def log(self, msg: str) -> None:
         self.log_text.append(msg)
         self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
@@ -2115,6 +2527,27 @@ class UamSuiteGUI(QMainWindow):
             "reg_ee_x0": self._read_reg_state_table_row(self.reg_ee_state_table, 0),
             "reg_ee_xref": self._read_reg_state_table_row(self.reg_ee_state_table, 1),
             "reg_ee_target_pose": self._read_reg_ee_pose_table_row(),
+            # ── ROS Tracking 独立 MPC 参数 ──────────────────────────────────
+            "rn_dt_mpc": float(self.rn_dt_mpc.value()),
+            "rn_horizon": int(self.rn_horizon.value()),
+            "rn_mpc_max_iter": int(self.rn_mpc_max_iter.value()),
+            "rn_w_state_track": float(self.rn_w_state_track.value()),
+            "rn_w_state_reg": float(self.rn_w_state_reg.value()),
+            "rn_w_control": float(self.rn_w_control.value()),
+            "rn_w_terminal_track": float(self.rn_w_terminal_track.value()),
+            "rn_ee_w_pos": float(self.rn_ee_w_pos.value()),
+            "rn_ee_w_rot_rp": float(self.rn_ee_w_rot_rp.value()),
+            "rn_ee_w_rot_yaw": float(self.rn_ee_w_rot_yaw.value()),
+            "rn_ee_w_vel_lin": float(self.rn_ee_w_vel_lin.value()),
+            "rn_ee_w_vel_ang_rp": float(self.rn_ee_w_vel_ang_rp.value()),
+            "rn_ee_w_vel_ang_yaw": float(self.rn_ee_w_vel_ang_yaw.value()),
+            "rn_ee_w_u": float(self.rn_ee_w_u.value()),
+            "rn_ee_w_terminal": float(self.rn_ee_w_terminal.value()),
+            "rn_geo_kp_pos": float(self.rn_geo_kp_pos.value()),
+            "rn_geo_kd_vel": float(self.rn_geo_kd_vel.value()),
+            "rn_geo_kR": float(self.rn_geo_kR.value()),
+            "rn_geo_kOmega": float(self.rn_geo_kOmega.value()),
+            "rn_geo_max_tilt_deg": float(self.rn_geo_max_tilt_deg.value()),
         }
 
     def _apply_params(self, p: dict) -> None:
@@ -2197,6 +2630,28 @@ class UamSuiteGUI(QMainWindow):
             self.croc_ee_w_pos.setValue(float(p["w_ee"]))
         if "croc_ee_w_rot_yaw" not in p and "w_ee_yaw" in p:
             self.croc_ee_w_rot_yaw.setValue(float(p["w_ee_yaw"]))
+
+        # ── ROS Tracking 独立 MPC 参数 ────────────────────────────────────────
+        _set_spin("rn_dt_mpc", self.rn_dt_mpc)
+        _set_spin("rn_horizon", self.rn_horizon)
+        _set_spin("rn_mpc_max_iter", self.rn_mpc_max_iter)
+        _set_spin("rn_w_state_track", self.rn_w_state_track)
+        _set_spin("rn_w_state_reg", self.rn_w_state_reg)
+        _set_spin("rn_w_control", self.rn_w_control)
+        _set_spin("rn_w_terminal_track", self.rn_w_terminal_track)
+        _set_spin("rn_ee_w_pos", self.rn_ee_w_pos)
+        _set_spin("rn_ee_w_rot_rp", self.rn_ee_w_rot_rp)
+        _set_spin("rn_ee_w_rot_yaw", self.rn_ee_w_rot_yaw)
+        _set_spin("rn_ee_w_vel_lin", self.rn_ee_w_vel_lin)
+        _set_spin("rn_ee_w_vel_ang_rp", self.rn_ee_w_vel_ang_rp)
+        _set_spin("rn_ee_w_vel_ang_yaw", self.rn_ee_w_vel_ang_yaw)
+        _set_spin("rn_ee_w_u", self.rn_ee_w_u)
+        _set_spin("rn_ee_w_terminal", self.rn_ee_w_terminal)
+        _set_spin("rn_geo_kp_pos", self.rn_geo_kp_pos)
+        _set_spin("rn_geo_kd_vel", self.rn_geo_kd_vel)
+        _set_spin("rn_geo_kR", self.rn_geo_kR)
+        _set_spin("rn_geo_kOmega", self.rn_geo_kOmega)
+        _set_spin("rn_geo_max_tilt_deg", self.rn_geo_max_tilt_deg)
 
         def _set_combo(name: str, widget):
             if name in p:
@@ -2600,6 +3055,11 @@ class UamSuiteGUI(QMainWindow):
         self.run_track_btn.setEnabled(self._plan_bundle is not None)
         self.meshcat_plan_btn.setEnabled(self._plan_bundle is not None)
         self.meshcat_track_btn.setEnabled(False)
+        _full_plan = (
+            self._plan_bundle is not None
+            and self._plan_bundle["kind"] in ("full_croc", "full_acados")
+        )
+        self.rn_launch_btn.setEnabled(_full_plan)
         self.log("Planning finished. You can run the closed loop on the \"Tracking\" tab.")
 
     def _run_ee_plan(self):
@@ -2651,6 +3111,7 @@ class UamSuiteGUI(QMainWindow):
         self.run_track_btn.setEnabled(True)
         self.meshcat_plan_btn.setEnabled(True)
         self.meshcat_track_btn.setEnabled(False)
+        self.rn_launch_btn.setEnabled(False)
         self.log("EE reference generated. We recommend Acados EE-centric tracking.")
 
     def _update_track_mode_enabled(self):
@@ -2788,6 +3249,450 @@ class UamSuiteGUI(QMainWindow):
         self._track_worker = TrackEeCrocWorker(params_croc_ee)
         self._track_worker.finished.connect(self._on_track_croc_ee_finished)
         self._track_worker.start()
+
+    def _rn_update_mpc_panel(self, _index: int = 0) -> None:
+        """根据 controller mode 切换 full-state / EE 参数面板可见性。"""
+        mode = self.rn_controller_combo.currentText()
+        is_full = mode == "croc_full_state"
+        is_ee = mode == "croc_ee_pose"
+        is_geo = mode == "geometric"
+        self._rn_fs_panel.setVisible(is_full)
+        self._rn_ee_panel.setVisible(is_ee)
+        self._rn_geo_panel.setVisible(is_geo)
+        # px4 / geometric 模式不使用此处 MPC 参数
+        use_mpc_params = mode in ("croc_full_state", "croc_ee_pose")
+        self.rn_dt_mpc.setEnabled(use_mpc_params)
+        self.rn_horizon.setEnabled(use_mpc_params)
+        self.rn_mpc_max_iter.setEnabled(use_mpc_params)
+
+    def _launch_tracking_node(self):
+        """导出规划并启动 run_tracking_controller.py 子进程。"""
+        if self._plan_bundle is None:
+            return
+        pb = self._plan_bundle
+        if pb["kind"] not in ("full_croc", "full_acados"):
+            QMessageBox.warning(
+                self,
+                "Notice",
+                "ROS Tracking Node 需要先完成 Full state 规划（Crocoddyl 或 Acados）。",
+            )
+            return
+
+        # 若已有子进程在运行，先询问是否重启
+        if self._rn_process is not None and self._rn_process.poll() is None:
+            ret = QMessageBox.question(
+                self,
+                "节点已在运行",
+                "run_tracking_controller 进程仍在运行，是否终止并重新启动？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
+            self._kill_tracking_node()
+
+        root = Path(__file__).resolve().parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+
+        # 导出规划 npz
+        try:
+            from suite_plan_export import export_suite_plan_npz
+        except ImportError as e:
+            QMessageBox.critical(self, "Import error", f"无法导入 export_suite_plan_npz:\n{e}")
+            return
+
+        export_dir = root / ".suite_ros_export"
+        export_dir.mkdir(exist_ok=True)
+        npz_path = export_dir / "last_suite_plan.npz"
+        try:
+            export_suite_plan_npz(npz_path, pb, dt_plan_fallback_s=float(self.dt_plan.value()))
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e)[:2000])
+            self.log(f"ROS export failed: {e!r}")
+            return
+
+        ctrl_mode = self.rn_controller_combo.currentText()
+        odom_src = self.rn_odom_combo.currentText()
+        ctrl_rate = float(self.rn_control_rate.value())
+        arm_mode = self.rn_arm_mode_combo.currentText()
+        use_sim = "true" if self.rn_use_sim_check.isChecked() else "false"
+
+        script = root / "run_tracking_controller.py"
+        cmd = [
+            sys.executable,
+            str(script),
+            "__name:=suite_tracking_controller",
+            "_trajectory_source:=suite_npz",
+            f"_suite_plan_path:={npz_path}",
+            f"_controller_mode:={ctrl_mode}",
+            f"_odom_source:={odom_src}",
+            f"_control_rate:={ctrl_rate}",
+            f"_arm_control_mode:={arm_mode}",
+            f"_use_simulation:={use_sim}",
+            # ── ROS-specific MPC parameters (independent from Tracking tab) ──
+            f"_dt_mpc:={self.rn_dt_mpc.value()}",
+            f"_horizon:={self.rn_horizon.value()}",
+            f"_mpc_max_iter:={self.rn_mpc_max_iter.value()}",
+            f"_w_state_track:={self.rn_w_state_track.value()}",
+            f"_w_state_reg:={self.rn_w_state_reg.value()}",
+            f"_w_control:={self.rn_w_control.value()}",
+            f"_w_terminal_track:={self.rn_w_terminal_track.value()}",
+            f"_ee_w_pos:={self.rn_ee_w_pos.value()}",
+            f"_ee_w_rot_rp:={self.rn_ee_w_rot_rp.value()}",
+            f"_ee_w_rot_yaw:={self.rn_ee_w_rot_yaw.value()}",
+            f"_ee_w_vel_lin:={self.rn_ee_w_vel_lin.value()}",
+            f"_ee_w_vel_ang_rp:={self.rn_ee_w_vel_ang_rp.value()}",
+            f"_ee_w_vel_ang_yaw:={self.rn_ee_w_vel_ang_yaw.value()}",
+            f"_ee_w_u:={self.rn_ee_w_u.value()}",
+            f"_ee_w_terminal:={self.rn_ee_w_terminal.value()}",
+            f"_geo_kp_pos:={self.rn_geo_kp_pos.value()}",
+            f"_geo_kd_vel:={self.rn_geo_kd_vel.value()}",
+            f"_geo_kR:={self.rn_geo_kR.value()}",
+            f"_geo_kOmega:={self.rn_geo_kOmega.value()}",
+            f"_geo_max_tilt_deg:={self.rn_geo_max_tilt_deg.value()}",
+        ]
+        try:
+            self._rn_process = subprocess.Popen(
+                cmd, cwd=str(root), env=os.environ.copy()
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Launch failed", str(e)[:2000])
+            self.log(f"ROS tracking launch failed: {e!r}")
+            return
+
+        self.rn_status_label.setText(f"节点状态：运行中  (PID {self._rn_process.pid})")
+        self.rn_status_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
+        self.rn_kill_btn.setEnabled(True)
+        self.rn_start_svc_btn.setEnabled(True)
+        self.rn_stop_svc_btn.setEnabled(True)
+        self.rn_save_svc_btn.setEnabled(True)
+        self.rn_update_ctrl_btn.setEnabled(True)
+        support_reg_services = ctrl_mode in ("croc_full_state", "croc_ee_pose", "px4", "geometric")
+        self.rn_reset_svc_btn.setEnabled(support_reg_services)
+        self.rn_set_reg_btn.setEnabled(support_reg_services)
+        self.log(
+            f"Launched run_tracking_controller.py | PID={self._rn_process.pid} | "
+            f"mode={ctrl_mode} odom={odom_src} rate={ctrl_rate}Hz | plan={npz_path}\n"
+            "节点就绪后，切换 OFFBOARD 并解锁，再点击 /start_tracking 开始跟踪。"
+        )
+
+    def _kill_tracking_node(self):
+        """终止 ROS Tracking 子进程（新节点或 PX4 入口）。"""
+        if self._rn_process is None:
+            return
+        try:
+            self._rn_process.terminate()
+            self._rn_process.wait(timeout=3)
+        except Exception:
+            try:
+                self._rn_process.kill()
+            except Exception:
+                pass
+        self._rn_process = None
+        self.rn_status_label.setText("节点状态：已停止")
+        self.rn_status_label.setStyleSheet("color: gray;")
+        self.rn_kill_btn.setEnabled(False)
+        self.rn_start_svc_btn.setEnabled(False)
+        self.rn_stop_svc_btn.setEnabled(False)
+        self.rn_save_svc_btn.setEnabled(False)
+        self.rn_update_ctrl_btn.setEnabled(False)
+        self.rn_reset_svc_btn.setEnabled(False)
+        self.rn_set_reg_btn.setEnabled(False)
+        self.log("ROS tracking process terminated.")
+
+    def _call_tracking_service(self, srv_name: str):
+        """在后台线程中调用一个无参数的 ROS Trigger 服务，结果通过日志反馈。"""
+        import threading
+
+        def _call():
+            try:
+                import rospy
+                from std_srvs.srv import Trigger
+                rospy.wait_for_service(srv_name, timeout=3.0)
+                svc = rospy.ServiceProxy(srv_name, Trigger)
+                resp = svc()
+                msg = f"[{srv_name}] {'OK' if resp.success else 'FAIL'}: {resp.message}"
+            except Exception as e:
+                msg = f"[{srv_name}] ERROR: {e}"
+            rospy.loginfo(msg) if "OK" in msg else rospy.logwarn(msg)
+            # Log 到 GUI（需在主线程；用 QMetaObject 保证线程安全）
+            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        threading.Thread(target=_call, daemon=True).start()
+
+    def _call_start_tracking_service(self):
+        self._call_tracking_service("/start_tracking")
+
+    def _call_stop_tracking_service(self):
+        self._call_tracking_service("/stop_tracking")
+
+    def _call_save_data_service(self):
+        self._call_tracking_service("/save_data")
+
+    def _call_reset_to_initial_service(self):
+        self._call_tracking_service("/reset_to_initial")
+
+    def _call_update_controller_params(self):
+        """
+        将当前 ROS Tracking 参数写入节点私有参数后，
+        调用 /update_controller_params 在线更新控制器。
+        """
+        import threading
+
+        cfg = {
+            "controller_mode": self.rn_controller_combo.currentText(),
+            "control_rate": float(self.rn_control_rate.value()),
+            "dt_mpc": float(self.rn_dt_mpc.value()),
+            "horizon": int(self.rn_horizon.value()),
+            "mpc_max_iter": int(self.rn_mpc_max_iter.value()),
+            "w_state_track": float(self.rn_w_state_track.value()),
+            "w_state_reg": float(self.rn_w_state_reg.value()),
+            "w_control": float(self.rn_w_control.value()),
+            "w_terminal_track": float(self.rn_w_terminal_track.value()),
+            "ee_w_pos": float(self.rn_ee_w_pos.value()),
+            "ee_w_rot_rp": float(self.rn_ee_w_rot_rp.value()),
+            "ee_w_rot_yaw": float(self.rn_ee_w_rot_yaw.value()),
+            "ee_w_vel_lin": float(self.rn_ee_w_vel_lin.value()),
+            "ee_w_vel_ang_rp": float(self.rn_ee_w_vel_ang_rp.value()),
+            "ee_w_vel_ang_yaw": float(self.rn_ee_w_vel_ang_yaw.value()),
+            "ee_w_u": float(self.rn_ee_w_u.value()),
+            "ee_w_terminal": float(self.rn_ee_w_terminal.value()),
+            "geo_kp_pos": float(self.rn_geo_kp_pos.value()),
+            "geo_kd_vel": float(self.rn_geo_kd_vel.value()),
+            "geo_kR": float(self.rn_geo_kR.value()),
+            "geo_kOmega": float(self.rn_geo_kOmega.value()),
+            "geo_max_tilt_deg": float(self.rn_geo_max_tilt_deg.value()),
+        }
+
+        def _run():
+            try:
+                import rospy
+                from std_srvs.srv import Trigger
+
+                param_path = "/suite_tracking_controller/controller_update_data"
+                rospy.set_param(param_path, cfg)
+
+                svc_name = "/update_controller_params"
+                rospy.wait_for_service(svc_name, timeout=3.0)
+                svc = rospy.ServiceProxy(svc_name, Trigger)
+                resp = svc()
+                if resp.success:
+                    log_msg = f"[update_controller_params] OK: {resp.message}"
+                else:
+                    log_msg = f"[update_controller_params] FAIL: {resp.message}"
+            except Exception as e:
+                log_msg = f"[update_controller_params] ERROR: {e}"
+
+            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, log_msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _call_set_regulation_target(self):
+        """
+        先通过 rospy.set_param 设置目标，再调用 /set_regulation_target 服务。
+        """
+        import threading
+
+        x       = self.rn_reg_x.value()
+        y       = self.rn_reg_y.value()
+        z       = self.rn_reg_z.value()
+        yaw_deg = self.rn_reg_yaw.value()
+        j1_deg  = self.rn_reg_j1.value()
+        j2_deg  = self.rn_reg_j2.value()
+
+        def _run():
+            try:
+                import rospy
+                from std_srvs.srv import Trigger
+
+                # 1. 将目标写入节点私有参数（与 _svc_set_regulation_target 读取的路径一致）
+                param_path = "/suite_tracking_controller/regulation_target_data"
+                rospy.set_param(param_path, [x, y, z, yaw_deg, j1_deg, j2_deg])
+
+                # 2. 调用服务
+                svc_name = "/set_regulation_target"
+                rospy.wait_for_service(svc_name, timeout=3.0)
+                svc = rospy.ServiceProxy(svc_name, Trigger)
+                resp = svc()
+                if resp.success:
+                    log_msg = (
+                        f"[regulation_target] 已设置: "
+                        f"x={x:.2f} y={y:.2f} z={z:.2f} "
+                        f"yaw={yaw_deg:.1f}° j1={j1_deg:.1f}° j2={j2_deg:.1f}°\n"
+                        f"  节点回复: {resp.message}"
+                    )
+                else:
+                    log_msg = f"[regulation_target] 服务返回失败: {resp.message}"
+            except Exception as e:
+                log_msg = f"[regulation_target] 错误: {e}"
+            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, log_msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    # =========================================================================
+    # ROS Tracking 结果绘图
+    # =========================================================================
+
+    def _plot_ros_tracking_data(self):
+        """弹出文件对话框，加载 run_tracking_controller.py 保存的 npz 并绘图。"""
+        default_dir = str(
+            Path(__file__).resolve().parent / "results" / "suite_tracking"
+        )
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load ROS Tracking Data",
+            default_dir,
+            "NumPy archives (*.npz);;All files (*)",
+        )
+        if not filepath:
+            return
+        try:
+            self._render_ros_tracking_figures(filepath)
+            self.log(f"[plot] Loaded and rendered: {filepath}")
+        except Exception as e:
+            import traceback
+            self.log(f"[plot] ERROR rendering {filepath}:\n{traceback.format_exc()}")
+
+    def _render_ros_tracking_figures(self, npz_path: str) -> None:
+        """
+        从 run_tracking_controller.py 保存的 npz 构建 res dict，
+        直接调用 _render_tracking_figures(res, "direct")，
+        与 Run Closed Loop Tracking 完全相同的绘图 API 和 Tab 布局。
+        """
+        import traceback as _tb
+
+        d = np.load(npz_path, allow_pickle=True)
+
+        def _arr(key):
+            if key in d and d[key].size > 0:
+                return np.asarray(d[key], dtype=float)
+            return np.zeros((0,), dtype=float)
+
+        t       = _arr("time").flatten()
+        pos     = _arr("position")                   # (N,3)
+        vel     = _arr("velocity")                   # (N,3)
+        ori     = _arr("orientation")                # (N,4) qx qy qz qw
+        j_pos   = _arr("arm_joint_positions")        # (N,nj)
+        j_vel   = _arr("arm_joint_velocities")       # (N,nj)
+        u_mpc   = _arr("mpc_control")                # (N,nu)
+        t_solve = _arr("mpc_solve_time").flatten()   # ms
+        r_pos   = _arr("reference_position")         # (N,3)
+        r_ori   = _arr("reference_orientation")      # (N,4)
+        r_jpos  = _arr("reference_arm_positions")    # (N,nj)
+
+        N = len(t)
+        if N < 2:
+            self.log("[plot] Not enough data points to plot.")
+            return
+
+        nj = j_pos.shape[1] if (j_pos.ndim == 2 and j_pos.shape[0] == N) else 0
+        nv = 6 + nj
+
+        # ── 重建完整状态矩阵 x (N, nq+nv) ─────────────────────────────────
+        q_part = np.hstack([pos, ori, j_pos[:N]]) if nj > 0 else np.hstack([pos, ori])
+        jv = j_vel[:N] if (nj > 0 and j_vel.ndim == 2 and j_vel.shape[0] >= N) else np.zeros((N, nj))
+        x_act = np.hstack([q_part, vel[:N, :3], np.zeros((N, 3)), jv])
+
+        # ── 重建参考状态矩阵 x_ref ─────────────────────────────────────────
+        has_ref = r_pos.ndim == 2 and r_pos.shape[0] == N
+        if has_ref:
+            qr = np.hstack([r_pos, r_ori, r_jpos[:N]]) if (nj > 0 and r_jpos.ndim == 2 and r_jpos.shape[0] >= N) \
+                 else np.hstack([r_pos, r_ori, np.zeros((N, nj))])
+            x_ref_states = np.hstack([qr, np.zeros((N, nv))])
+        else:
+            x_ref_states = None
+
+        # ── EE FK ──────────────────────────────────────────────────────────
+        try:
+            from s500_uam_trajectory_planner import compute_ee_kinematics_along_trajectory
+            rm, eid = self._robot_model_and_ee()
+            pin_data = rm.createData()
+            ee_act_raw, _, ee_rpy_a, _ = compute_ee_kinematics_along_trajectory(x_act, rm, pin_data, eid)
+            ee_act      = np.asarray(ee_act_raw, dtype=float)
+            ee_yaw_act  = np.unwrap(np.asarray(ee_rpy_a[:, 2], dtype=float).flatten())
+            if x_ref_states is not None:
+                ee_ref_raw, _, ee_rpy_r, _ = compute_ee_kinematics_along_trajectory(x_ref_states, rm, pin_data, eid)
+                ee_ref  = np.asarray(ee_ref_raw, dtype=float)
+                yaw_ref = np.unwrap(np.asarray(ee_rpy_r[:, 2], dtype=float).flatten())
+            else:
+                ee_ref  = ee_act.copy()
+                yaw_ref = ee_yaw_act.copy()
+        except Exception:
+            self.log(f"[plot] EE FK failed (using base pos as fallback):\n{_tb.format_exc()}")
+            ee_act     = pos.copy()
+            ee_yaw_act = np.zeros(N)
+            ee_ref     = r_pos.copy() if has_ref else pos.copy()
+            yaw_ref    = np.zeros(N)
+
+        err     = np.linalg.norm(ee_act - ee_ref, axis=1) if ee_act.ndim == 2 and ee_ref.ndim == 2 else np.zeros(N)
+        err_yaw = (ee_yaw_act - yaw_ref + np.pi) % (2.0 * np.pi) - np.pi
+
+        # ── 控制量对齐 ────────────────────────────────────────────────────
+        if u_mpc.ndim == 2 and u_mpc.shape[0] in (N, N - 1):
+            u_out = u_mpc
+        else:
+            u_out = np.zeros((max(0, N - 1), 4), dtype=float)
+        N_u = u_out.shape[0]
+
+        # ── MPC 求解统计（与 closed-loop tracking 相同结构）─────────────
+        mpc_wall       = np.zeros(N_u, dtype=float)
+        mpc_iter       = np.zeros(N_u, dtype=int)
+        mpc_stat       = np.zeros(N_u, dtype=int)
+        mpc_total_cost = np.full(N_u, np.nan, dtype=float)
+        if t_solve.size >= N_u > 0:
+            mpc_wall[:] = t_solve[:N_u] / 1000.0   # ms → s
+
+        dt = float(t[1] - t[0]) if N >= 2 else 0.1
+
+        # ── 组装 res dict（与 TrackEeCrocWorker 完全相同的 key/格式）─────
+        res = {
+            "t":            t,
+            "x":            x_act,
+            "u":            u_out,
+            "ee":           ee_act,
+            "p_ref":        ee_ref,
+            "err":          err,
+            "ee_yaw":       ee_yaw_act,
+            "yaw_ref":      yaw_ref,
+            "err_yaw":      err_yaw,
+            "control_mode": "direct",
+            "sim_dt":       dt,
+            "control_dt":   dt,
+            "mpc_stride":   1,
+            "mpc_solve": {
+                "nlp_iter":   mpc_iter,
+                "cpu_s":      mpc_wall.copy(),
+                "wall_s":     mpc_wall,
+                "status":     mpc_stat,
+                "total_cost": mpc_total_cost,
+            },
+            "mpc_cost_t":      t[:N_u] if N_u > 0 else np.array([]),
+            "mpc_cost_total":  np.full(N_u, np.nan, dtype=float),
+            "mpc_cost_terms":  {"solve_ms": t_solve[:N_u]} if t_solve.size >= N_u > 0 else {},
+            "mpc_cost_groups": {},
+            "mpc_cost_weights": {},
+        }
+
+        # ── 临时设置参考状态叠加层 ────────────────────────────────────────
+        old_manual = self._manual_ref_overlay
+        if x_ref_states is not None:
+            self._manual_ref_overlay = {
+                "ref_time_states": t,
+                "ref_states":      x_ref_states,
+            }
+        try:
+            self._render_tracking_figures(res, "direct")
+        finally:
+            self._manual_ref_overlay = old_manual
+
+        self.log(
+            f"[plot] Rendered {N} steps | "
+            f"EE err mean={err.mean():.3f} m | "
+            + (f"solve mean={t_solve.mean():.1f} ms" if t_solve.size else "no solve time")
+        )
 
     def _run_track(self):
         if self._plan_bundle is None:
