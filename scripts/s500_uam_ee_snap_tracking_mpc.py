@@ -424,7 +424,7 @@ def create_ee_tracking_mpc_solver(
     control_mode:
       - ``direct``: u = [T1..T4, τ1, τ2] (consistent with the existing model)
       - ``actuator_first_order``: u = [ω_cmd(3), T_total_cmd, θ_cmd(2)]; the state is augmented with u_act,
-        which first-order lags to the actual thrust/torque (see s500_uam_acados_actuator_layer.py)
+        which first-order lags to the actual thrust/torque (see build_acados_model_actuator_first_order in s500_uam_acados_model.py)
     """
     if not ACADOS_AVAILABLE:
         raise ImportError("acados_template not installed")
@@ -437,7 +437,7 @@ def create_ee_tracking_mpc_solver(
     if control_mode == "direct":
         acados_model, pin_model, nq, nv, nu = build_acados_model()
     elif control_mode == "actuator_first_order":
-        from s500_uam_acados_actuator_layer import build_acados_model_actuator_first_order
+        from s500_uam_acados_model import build_acados_model_actuator_first_order
 
         acados_model, pin_model, nq, nv, nu, _meta = build_acados_model_actuator_first_order()
     else:
@@ -754,7 +754,7 @@ def run_closed_loop(
     When ``control_dt`` is ``None``, it matches ``sim_dt``, i.e., solve MPC at every simulation step.
     ``mpc_log_interval``: print statistics every k **MPC solves** (not sim sub-steps); 0 = only print the final summary.
     """
-    from s500_uam_acados_actuator_layer import nominal_command_hover
+    from s500_uam_acados_model import nominal_command_hover
 
     f_fun = _make_f_expl_fun(acados_model)
     plant = CasadiRK4Plant(f_fun, sim_dt, nu)
@@ -1604,7 +1604,7 @@ def run_ee_tracking_pipeline(
     x0 = align_uam_state_ee_to_world_position(x0, pin_model, p0_ref, nq, nv)
 
     if control_mode_canonical == "actuator_first_order":
-        from s500_uam_acados_actuator_layer import pack_initial_state_with_actuators
+        from s500_uam_acados_model import pack_initial_state_with_actuators
 
         x0 = pack_initial_state_with_actuators(x0, pin_model=pin_model)
 
@@ -1740,7 +1740,7 @@ def run_ee_tracking_from_reference_arrays(
     x0 = align_uam_state_ee_to_world_position(x0, pin_model, p0_ref, nq, nv)
 
     if control_mode_canonical == "actuator_first_order":
-        from s500_uam_acados_actuator_layer import pack_initial_state_with_actuators
+        from s500_uam_acados_model import pack_initial_state_with_actuators
 
         x0 = pack_initial_state_with_actuators(x0, pin_model=pin_model)
 

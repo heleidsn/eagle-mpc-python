@@ -276,6 +276,7 @@ class OptimizationWorker(QThread):
             "control_weight": self.params.get("control_weight", 1e-5),
             "waypoint_multiplier": self.params.get("waypoint_multiplier", 1000),
             "max_iter": self.params.get("max_iter", 200),
+            "verbose_opt": False,
         }
         if self.method == "acados_cascade":
             if not ACADOS_AVAILABLE or not CASCADE_TRAJ_AVAILABLE or run_simple_trajectory_cascade is None:
