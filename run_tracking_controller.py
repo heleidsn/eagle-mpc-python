@@ -235,6 +235,14 @@ class SuiteTrackingController:
         self.w_state_reg = rospy.get_param("~w_state_reg", 0.1)
         self.w_control = rospy.get_param("~w_control", 1e-3)
         self.w_terminal_track = rospy.get_param("~w_terminal_track", 100.0)
+        self.w_pos = rospy.get_param("~w_pos", 1.0)
+        self.w_att = rospy.get_param("~w_att", 1.0)
+        self.w_joint = rospy.get_param("~w_joint", 1.0)
+        self.w_vel = rospy.get_param("~w_vel", 1.0)
+        self.w_omega = rospy.get_param("~w_omega", 1.0)
+        self.w_joint_vel = rospy.get_param("~w_joint_vel", 1.0)
+        self.w_u_thrust = rospy.get_param("~w_u_thrust", 1.0)
+        self.w_u_joint_torque = rospy.get_param("~w_u_joint_torque", 1.0)
 
         # EE 位姿跟踪权重
         self.ee_w_pos = rospy.get_param("~ee_w_pos", 10.0)
@@ -420,6 +428,14 @@ class SuiteTrackingController:
                 w_state_reg=self.w_state_reg,
                 w_control=self.w_control,
                 w_terminal_track=self.w_terminal_track,
+                w_pos=self.w_pos,
+                w_att=self.w_att,
+                w_joint=self.w_joint,
+                w_vel=self.w_vel,
+                w_omega=self.w_omega,
+                w_joint_vel=self.w_joint_vel,
+                w_u_thrust=self.w_u_thrust,
+                w_u_joint_torque=self.w_u_joint_torque,
                 use_thrust_constraints=True,
             )
             self.x_nom = default_hover_nominal()
@@ -454,6 +470,14 @@ class SuiteTrackingController:
                 w_state_reg=self.w_state_reg,
                 w_control=self.w_control,
                 w_terminal_track=self.w_terminal_track,
+                w_pos=self.w_pos,
+                w_att=self.w_att,
+                w_joint=self.w_joint,
+                w_vel=self.w_vel,
+                w_omega=self.w_omega,
+                w_joint_vel=self.w_joint_vel,
+                w_u_thrust=self.w_u_thrust,
+                w_u_joint_torque=self.w_u_joint_torque,
                 use_thrust_constraints=True,
             )
         else:
@@ -1695,6 +1719,14 @@ class SuiteTrackingController:
                 self.w_state_reg = float(cfg.get("w_state_reg", self.w_state_reg))
                 self.w_control = float(cfg.get("w_control", self.w_control))
                 self.w_terminal_track = float(cfg.get("w_terminal_track", self.w_terminal_track))
+                self.w_pos = float(cfg.get("w_pos", self.w_pos))
+                self.w_att = float(cfg.get("w_att", self.w_att))
+                self.w_joint = float(cfg.get("w_joint", self.w_joint))
+                self.w_vel = float(cfg.get("w_vel", self.w_vel))
+                self.w_omega = float(cfg.get("w_omega", self.w_omega))
+                self.w_joint_vel = float(cfg.get("w_joint_vel", self.w_joint_vel))
+                self.w_u_thrust = float(cfg.get("w_u_thrust", self.w_u_thrust))
+                self.w_u_joint_torque = float(cfg.get("w_u_joint_torque", self.w_u_joint_torque))
 
                 self.ee_w_pos = float(cfg.get("ee_w_pos", self.ee_w_pos))
                 self.ee_w_rot_rp = float(cfg.get("ee_w_rot_rp", self.ee_w_rot_rp))

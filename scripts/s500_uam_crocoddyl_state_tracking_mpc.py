@@ -304,6 +304,14 @@ class UAMCrocoddylTrackingMPC:
         w_state_reg: float = 0.1,
         w_control: float = 1e-3,
         w_terminal_track: float = 100.0,
+        w_pos: float = 1.0,
+        w_att: float = 1.0,
+        w_joint: float = 1.0,
+        w_vel: float = 1.0,
+        w_omega: float = 1.0,
+        w_joint_vel: float = 1.0,
+        w_u_thrust: float = 1.0,
+        w_u_joint_torque: float = 1.0,
         ee_weights: Optional[EETrackingWeights] = None,
     ):
         if mode not in (self.MODE_FULL_STATE, self.MODE_EE_POSE):
@@ -333,8 +341,18 @@ class UAMCrocoddylTrackingMPC:
             self.w_state_reg = float(w_state_reg)
             self.w_control = float(w_control)
             self.w_terminal_track = float(w_terminal_track)
+            # Per-group state/control unit-balancing weights for full-state MPC.
+            self.w_pos = float(w_pos)
+            self.w_att = float(w_att)
+            self.w_joint = float(w_joint)
+            self.w_vel = float(w_vel)
+            self.w_omega = float(w_omega)
+            self.w_joint_vel = float(w_joint_vel)
+            self.w_u_thrust = float(w_u_thrust)
+            self.w_u_joint_torque = float(w_u_joint_torque)
 
-        mass = float(self.robot_model.inertias[1].mass)
+        # Hover thrust reference should use the full system mass (base + all arm links).
+        mass = float(sum(inertia.mass for inertia in self.robot_model.inertias))
         self._hover_thrust = mass * 9.81 / 4.0
         self._u_ref = np.array([self._hover_thrust] * 4 + [0.0] * (self.nu - 4))
 
@@ -348,10 +366,46 @@ class UAMCrocoddylTrackingMPC:
 
     # ----- Full-state costs -----
 
+    def _full_state_activation_weights(self) -> np.ndarray:
+        """Weights on state tangent [pos(3), att(3), joint(2), vel(3), omega(3), joint_vel(2)]."""
+        return np.array(
+            [
+                self.w_pos, self.w_pos, self.w_pos,
+                self.w_att, self.w_att, self.w_att,
+                self.w_joint, self.w_joint,
+                self.w_vel, self.w_vel, self.w_vel,
+                self.w_omega, self.w_omega, self.w_omega,
+                self.w_joint_vel, self.w_joint_vel,
+            ],
+            dtype=np.float64,
+        )
+
+    def _control_activation_weights(self) -> np.ndarray:
+        """Weights on control [T1,T2,T3,T4,tau1,tau2]."""
+        w_u = np.ones(self.nu, dtype=np.float64)
+        if self.nu >= 4:
+            w_u[:4] = float(self.w_u_thrust)
+        if self.nu >= 6:
+            w_u[4:6] = float(self.w_u_joint_torque)
+        return w_u
+
     def _make_running_cost_state(self, x_ref: np.ndarray, x_nom: np.ndarray) -> crocoddyl.CostModelSum:
+        """Full-state tracking 的 running cost（每个 MPC 时域节点都会用）.
+
+        结构:
+          1) x_track:  跟踪参考状态 x_ref（主任务项）
+          2) x_reg:    向名义状态 x_nom 正则（抑制漂移/病态解）
+          3) u_reg:    控制正则，参考悬停推力 self._u_ref
+
+        说明:
+          - 三项最终由 CostModelSum 做加权求和，权重分别是
+            self.w_state_track / self.w_state_reg / self.w_control。
+          - 对关节力矩通道 (u[4], u[5]) 额外放大激活权重（100x），
+            用于抑制关节力矩过大导致的抖动。
+        """
         nu = self.nu
         c = crocoddyl.CostModelSum(self.state, nu)
-        act_x = crocoddyl.ActivationModelQuad(self.state.ndx)
+        act_x = crocoddyl.ActivationModelWeightedQuad(self._full_state_activation_weights())
         c.addCost(
             "x_track",
             crocoddyl.CostModelResidual(
@@ -365,16 +419,12 @@ class UAMCrocoddylTrackingMPC:
             "x_reg",
             crocoddyl.CostModelResidual(
                 self.state,
-                crocoddyl.ActivationModelQuad(self.state.ndx),
+                crocoddyl.ActivationModelWeightedQuad(self._full_state_activation_weights()),
                 crocoddyl.ResidualModelState(self.state, np.asarray(x_nom, dtype=float), nu),
             ),
             self.w_state_reg,
         )
-        w_u = np.ones(nu, dtype=np.float64)
-        if nu >= 6:
-            w_u[4] = 100.0
-            w_u[5] = 100.0
-        act_u = crocoddyl.ActivationModelWeightedQuad(w_u)
+        act_u = crocoddyl.ActivationModelWeightedQuad(self._control_activation_weights())
         c.addCost(
             "u_reg",
             crocoddyl.CostModelResidual(
@@ -387,13 +437,19 @@ class UAMCrocoddylTrackingMPC:
         return c
 
     def _make_terminal_cost_state(self, x_ref: np.ndarray) -> crocoddyl.CostModelSum:
+        """Full-state tracking 的 terminal cost（时域末端节点）.
+
+        终端仅保留 x_track_term（对 x_ref 的状态跟踪），
+        常见作用是给 MPC 末端一个“收敛方向”，避免短视控制。
+        权重由 self.w_terminal_track 控制。
+        """
         nu = self.nu
         c = crocoddyl.CostModelSum(self.state, nu)
         c.addCost(
             "x_track_term",
             crocoddyl.CostModelResidual(
                 self.state,
-                crocoddyl.ActivationModelQuad(self.state.ndx),
+                crocoddyl.ActivationModelWeightedQuad(self._full_state_activation_weights()),
                 crocoddyl.ResidualModelState(self.state, np.asarray(x_ref, dtype=float), nu),
             ),
             self.w_terminal_track,
@@ -429,6 +485,17 @@ class UAMCrocoddylTrackingMPC:
         *,
         cost_scale: float = 1.0,
     ) -> crocoddyl.CostModelSum:
+        """EE pose tracking 的 running cost（用于 croc_ee_pose 模式）.
+
+        可包含的项（按权重开关）:
+          - ee_pos: EE 位置跟踪
+          - ee_rot: EE 姿态跟踪（roll/pitch/yaw 可分权）
+          - ee_vel: EE 线速度/角速度跟踪（通常用于抓取前减速）
+          - u_reg:  控制正则（参考悬停）
+          - x_reg:  状态正则（默认更弱）
+          - x_track_ref: 可选全状态参考跟踪
+        其中 cost_scale 用于统一放大（终端项会用更大的 scale）。
+        """
         nu = self.nu
         w = self.w
         c = crocoddyl.CostModelSum(self.state, nu)
@@ -734,6 +801,14 @@ class UAMCrocoddylStateTrackingMPC(UAMCrocoddylTrackingMPC):
         w_state_reg: float = 0.1,
         w_control: float = 1e-3,
         w_terminal_track: float = 100.0,
+        w_pos: float = 1.0,
+        w_att: float = 1.0,
+        w_joint: float = 1.0,
+        w_vel: float = 1.0,
+        w_omega: float = 1.0,
+        w_joint_vel: float = 1.0,
+        w_u_thrust: float = 1.0,
+        w_u_joint_torque: float = 1.0,
         use_thrust_constraints: bool = True,
     ):
         super().__init__(
@@ -747,6 +822,14 @@ class UAMCrocoddylStateTrackingMPC(UAMCrocoddylTrackingMPC):
             w_state_reg=w_state_reg,
             w_control=w_control,
             w_terminal_track=w_terminal_track,
+            w_pos=w_pos,
+            w_att=w_att,
+            w_joint=w_joint,
+            w_vel=w_vel,
+            w_omega=w_omega,
+            w_joint_vel=w_joint_vel,
+            w_u_thrust=w_u_thrust,
+            w_u_joint_torque=w_u_joint_torque,
         )
 
 
@@ -837,6 +920,14 @@ def run_closed_loop_state_tracking(
     w_state_reg: float = 0.1,
     w_control: float = 1e-3,
     w_terminal_track: float = 100.0,
+    w_pos: float = 1.0,
+    w_att: float = 1.0,
+    w_joint: float = 1.0,
+    w_vel: float = 1.0,
+    w_omega: float = 1.0,
+    w_joint_vel: float = 1.0,
+    w_u_thrust: float = 1.0,
+    w_u_joint_torque: float = 1.0,
     mpc_max_iter: int = 60,
     use_thrust_constraints: bool = True,
     use_actuator_first_order: bool = False,
@@ -874,6 +965,14 @@ def run_closed_loop_state_tracking(
         w_state_reg=w_state_reg,
         w_control=w_control,
         w_terminal_track=w_terminal_track,
+        w_pos=w_pos,
+        w_att=w_att,
+        w_joint=w_joint,
+        w_vel=w_vel,
+        w_omega=w_omega,
+        w_joint_vel=w_joint_vel,
+        w_u_thrust=w_u_thrust,
+        w_u_joint_torque=w_u_joint_torque,
         use_thrust_constraints=use_thrust_constraints,
     )
 
@@ -1059,6 +1158,14 @@ def run_closed_loop_track_full_state_plan(
     w_state_reg: float = 0.1,
     w_control: float = 1e-3,
     w_terminal_track: float = 100.0,
+    w_pos: float = 1.0,
+    w_att: float = 1.0,
+    w_joint: float = 1.0,
+    w_vel: float = 1.0,
+    w_omega: float = 1.0,
+    w_joint_vel: float = 1.0,
+    w_u_thrust: float = 1.0,
+    w_u_joint_torque: float = 1.0,
     mpc_max_iter: int = 60,
     use_thrust_constraints: bool = True,
     use_actuator_first_order: bool = False,
@@ -1096,6 +1203,14 @@ def run_closed_loop_track_full_state_plan(
         w_state_reg=w_state_reg,
         w_control=w_control,
         w_terminal_track=w_terminal_track,
+        w_pos=w_pos,
+        w_att=w_att,
+        w_joint=w_joint,
+        w_vel=w_vel,
+        w_omega=w_omega,
+        w_joint_vel=w_joint_vel,
+        w_u_thrust=w_u_thrust,
+        w_u_joint_torque=w_u_joint_torque,
         use_thrust_constraints=use_thrust_constraints,
     )
 

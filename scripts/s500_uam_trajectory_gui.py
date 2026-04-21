@@ -69,6 +69,13 @@ except (ImportError, Exception):
     ACADOS_AVAILABLE = False
     CASCADE_TRAJ_AVAILABLE = False
 
+try:
+    from s500_uam_wp3_joint_opt_minimal import run_wp3_joint_opt
+    WP3_JOINT_OPT_AVAILABLE = True
+except Exception:
+    run_wp3_joint_opt = None
+    WP3_JOINT_OPT_AVAILABLE = False
+
 # Fixed path for saving/loading parameters
 DEFAULT_PARAMS_PATH = Path(__file__).parent.parent / "config" / "yaml" / "trajectories" / "s500_uam_trajectory_params.json"
 
@@ -107,14 +114,14 @@ class OptimizationWorker(QThread):
 
     def __init__(self, method, params):
         super().__init__()
-        self.method = method  # "crocoddyl" | "acados" | "acados_cascade"
+        self.method = method  # "crocoddyl" | "acados" | "acados_cascade" | "acados_wp3_joint_opt"
         self.params = params
 
     def run(self):
         try:
             if self.method == "crocoddyl":
                 self._run_crocoddyl()
-            elif self.method in ("acados", "acados_cascade"):
+            elif self.method in ("acados", "acados_cascade", "acados_wp3_joint_opt"):
                 self._run_acados()
         except Exception as e:
             import traceback
@@ -262,6 +269,23 @@ class OptimizationWorker(QThread):
         )
 
     def _run_acados(self):
+        if self.method == "acados_wp3_joint_opt":
+            if not WP3_JOINT_OPT_AVAILABLE or run_wp3_joint_opt is None:
+                self.finished.emit(False, "wp3_joint_opt method is unavailable.", None)
+                return
+            cfg = dict(self.params.get("wp3_config", {}))
+            cfg.setdefault("dt", float(self.params.get("dt", 0.05)))
+            cfg.setdefault("max_iter", int(self.params.get("max_iter", 200)))
+            cfg.setdefault("state_weight", float(self.params.get("state_weight", 1.0)))
+            cfg.setdefault("control_weight", float(self.params.get("control_weight", 1e-5)))
+            cfg.setdefault("terminal_scale", float(self.params.get("waypoint_multiplier", 1000.0)))
+            out = run_wp3_joint_opt(cfg, show_plots=False)
+            if out is None or out.get("simX") is None:
+                self.finished.emit(False, "wp3_joint_opt optimization failed.", None)
+                return
+            self.finished.emit(True, "", out)
+            return
+
         waypoints = self.params.get("waypoints", [])
         durations = self.params.get("durations", [])
         if len(waypoints) < 2:

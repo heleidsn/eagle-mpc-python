@@ -229,7 +229,7 @@ def _codegen_flags(export_dir: Path, model_name: str) -> tuple[bool, bool]:
 
 
 # ========== OCP 构造：代价与约束分块写清 ==========
-def build_ocp(
+def build_ocp_with_ctrl_error(
     waypoints: list[np.ndarray],
     durations: list[float],
     dt: float,
@@ -238,6 +238,8 @@ def build_ocp(
     control_weight: float = 1,
     terminal_scale: float = 1.0,
     max_iter: int = 10,
+    pos_err_gain: np.ndarray | list[float] | float = (0.08, 0.08, 0.08),
+    enable_ctrl_error: bool = True,
 ):
     """
     单条 OCP：3 航点、联合优化。waypoints: 3×17D；durations: 2 段时长。
@@ -263,13 +265,27 @@ def build_ocp(
     # --- 模型参数 p ∈ R^27：前17维=全状态目标，后10维=EE [pos(3),quat(4),v(3)] 目标 ---
     p = ca.SX.sym("p_wp", 27)
     acados_model.p = p
-    acados_model.name = "s500_uam_wp3min"
+    acados_model.name = "s500_uam_wp3min_ctrlerr" if enable_ctrl_error else "s500_uam_wp3min_baseline"
     x = acados_model.x
     q_ee_ref = p[20:24] / ca.fmax(ca.norm_2(p[20:24]), 1e-9)
     R_ee_ref = quat_to_R_expr(q_ee_ref)
     ee_so3 = so3_residual_expr(ee_R, R_ee_ref)
-    acados_model.con_h_expr = ca.vertcat(x - p[:17], ee_pos - p[17:20], ee_so3, ee_v - p[24:27])
-    acados_model.con_h_expr_e = ca.vertcat(x - p[:17], ee_pos - p[17:20], ee_so3, ee_v - p[24:27])
+    k = np.asarray(pos_err_gain, dtype=float).reshape(-1)
+    if k.size == 1:
+        k = np.full(3, float(k[0]))
+    if k.size != 3:
+        raise ValueError("pos_err_gain 必须是标量或3维向量")
+    # 位置控制误差模型：e_p = K * v_base_world（baselink速度越大，位置控制误差越大）
+    quat_b = x[3:7] / ca.fmax(ca.norm_2(x[3:7]), 1e-9)
+    R_bw = quat_to_R_expr(quat_b)  # body->world
+    v_base_world = ca.mtimes(R_bw, x[9:12])
+    p_ctrl_err = ca.diag(ca.DM(k)) @ v_base_world
+    if enable_ctrl_error:
+        acados_model.con_h_expr = ca.vertcat(x - p[:17], ee_pos - p[17:20], ee_so3, ee_v - p[24:27], p_ctrl_err)
+        acados_model.con_h_expr_e = ca.vertcat(x - p[:17], ee_pos - p[17:20], ee_so3, ee_v - p[24:27], p_ctrl_err)
+    else:
+        acados_model.con_h_expr = ca.vertcat(x - p[:17], ee_pos - p[17:20], ee_so3, ee_v - p[24:27])
+        acados_model.con_h_expr_e = ca.vertcat(x - p[:17], ee_pos - p[17:20], ee_so3, ee_v - p[24:27])
 
     ocp = AcadosOcp()
     ocp.model = acados_model
@@ -353,7 +369,7 @@ def build_ocp(
     ocp.constraints.x0 = np.asarray(waypoints[0], dtype=float).reshape(17)
 
     huge = 1e6
-    nh = 26
+    nh = 29 if enable_ctrl_error else 26
     ocp.constraints.lh = -huge * np.ones(nh)
     ocp.constraints.uh = huge * np.ones(nh)
     ocp.constraints.lh_e = -huge * np.ones(nh)
@@ -367,8 +383,12 @@ def build_ocp(
     ocp.solver_options.print_level = 0
 
     script_dir = Path(__file__).resolve().parent
-    code_dir = script_dir.parent / "c_generated_code" / "s500_uam_wp3_minimal"
-    json_path = code_dir / "s500_uam_wp3min_ocp.json"
+    if enable_ctrl_error:
+        code_dir = script_dir.parent / "c_generated_code" / "s500_uam_wp3_minimal_ctrlerr"
+        json_path = code_dir / "s500_uam_wp3min_ctrlerr_ocp.json"
+    else:
+        code_dir = script_dir.parent / "c_generated_code" / "s500_uam_wp3_minimal_baseline"
+        json_path = code_dir / "s500_uam_wp3min_baseline_ocp.json"
     ocp.code_gen_opts.code_export_directory = str(code_dir)
     ocp.code_gen_opts.json_file = str(json_path)
 
@@ -376,7 +396,7 @@ def build_ocp(
     solver = AcadosOcpSolver(
         ocp, json_file=str(json_path), generate=gen, build=bld, verbose=False, check_reuse_possible=True
     )
-    return solver, N, pin_model
+    return solver, N, pin_model, k, enable_ctrl_error
 
 
 def apply_hard_waypoints(
@@ -388,12 +408,14 @@ def apply_hard_waypoints(
     grasp_ee_pos: np.ndarray,
     grasp_ee_quat: np.ndarray,
     grasp_ee_vel: np.ndarray | None = None,
+    grasp_pos_err_max: np.ndarray | list[float] | float = (0.08, 0.08, 0.08),
+    enable_ctrl_error: bool = True,
     loose: float = 1e6,
 ):
     """约束策略：起点全状态(x0)，中间点约束 EE [pos,SO3,v]，终点约束全状态。"""
     _, N, nodes = shooting_nodes(durations, dt)
     frame_id = pin_model.getFrameId("gripper_link")
-    nh = 26
+    nh = 29 if enable_ctrl_error else 26
     L = -loose * np.ones(nh)
     U = loose * np.ones(nh)
     z27 = np.zeros(27)
@@ -410,7 +432,7 @@ def apply_hard_waypoints(
         cset(i, L, U)
         solver.set(i, "p", z27)
 
-    # 中间航点: 仅 EE [pos,rpy,v_lin] 等式约束
+    # 中间航点: EE [pos,SO3,v] 等式约束 (+ 可选位置控制误差界约束)
     k_mid = int(nodes[1])
     if 1 <= k_mid < N:
         p_mid = np.zeros(27)
@@ -425,6 +447,13 @@ def apply_hard_waypoints(
         p_mid[24:27] = gvel
         lh_mid, uh_mid = L.copy(), U.copy()
         lh_mid[17:], uh_mid[17:] = 0.0, 0.0
+        if enable_ctrl_error:
+            emax = np.asarray(grasp_pos_err_max, dtype=float).reshape(-1)
+            if emax.size == 1:
+                emax = np.full(3, float(emax[0]))
+            if emax.size != 3:
+                raise ValueError("grasp_pos_err_max 必须是标量或3维向量")
+            lh_mid[26:29], uh_mid[26:29] = -emax, emax
         solver.set(k_mid, "p", p_mid)
         cset(k_mid, lh_mid, uh_mid)
 
@@ -461,9 +490,35 @@ def extract_open_loop(solver, N: int, nu: int) -> tuple[np.ndarray, np.ndarray]:
     return simX, simU
 
 
+def ee_linear_velocity_world_series(simX: np.ndarray, pin_model, frame_id: int) -> np.ndarray:
+    out = np.zeros((simX.shape[0], 3), dtype=float)
+    for i, x in enumerate(simX):
+        q = np.asarray(x[:9], dtype=float).copy()
+        q[3:7] = _norm_q(q[3:7])
+        v = np.asarray(x[9:17], dtype=float).copy()
+        data = pin_model.createData()
+        pin.forwardKinematics(pin_model, data, q, v)
+        pin.updateFramePlacements(pin_model, data)
+        vel = pin.getFrameVelocity(pin_model, data, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+        out[i, :] = np.asarray(vel.linear).flatten()
+    return out
+
+
+def base_linear_velocity_world_series(simX: np.ndarray) -> np.ndarray:
+    """由状态中的 baselink 体坐标线速度 x[9:12] 转到世界系。"""
+    out = np.zeros((simX.shape[0], 3), dtype=float)
+    for i, x in enumerate(simX):
+        R = quat_to_R_np(np.asarray(x[3:7], dtype=float))
+        v_body = np.asarray(x[9:12], dtype=float).reshape(3)
+        out[i, :] = R @ v_body
+    return out
+
+
 def main():
     # 统一配置区：抓取点（EE）位置/姿态/时刻 + 起终状态
     cfg = {
+        # OCP 模式: "baseline" 保留原方法; "ctrl_error" 启用线性控制误差建模与抓取误差约束
+        "ocp_mode": "baseline",
         "dt": 0.1,
         "total_time": 3.0,
         "grasp_time": 1.5,  # 从 t=0 开始计时，位于中间航点节点
@@ -471,19 +526,65 @@ def main():
         # 配置时使用欧拉角（度）：[roll, pitch, yaw]，内部自动转四元数用于 SO(3) 误差计算
         "grasp_ee_euler_deg": np.array([0.0, 0.0, 0.0], dtype=float),
         "grasp_ee_vel": np.array([0.0, 0.0, 0.0], dtype=float),
+        # 线性位置控制误差模型: e_p = K * v_base_world (逐轴)
+        "pos_err_gain": np.array([0.1, 0.1, 0.1], dtype=float),
+        # 抓取点处允许的位置控制误差上界 |e_p| <= emax
+        "grasp_pos_err_max": np.array([0.02, 0.02, 0.02], dtype=float),
+    }
+    run_wp3_joint_opt(cfg, show_plots=True)
+
+
+def run_wp3_joint_opt(cfg: dict | None = None, *, show_plots: bool = True) -> dict:
+    """Run wp3 joint optimization and optionally render figures. Returns planning bundle dict."""
+    if cfg is None:
+        cfg = {}
+    cfg = {
+        "ocp_mode": "ctrl_error",
+        "dt": 0.1,
+        "total_time": 3.0,
+        "grasp_time": 1.5,
+        "grasp_ee_pos": np.array([0.0, 0.0, 1.0], dtype=float),
+        "grasp_ee_euler_deg": np.array([0.0, 0.0, 0.0], dtype=float),
+        "grasp_ee_vel": np.array([0.0, 0.0, 0.0], dtype=float),
+        "pos_err_gain": np.array([0.08, 0.08, 0.08], dtype=float),
+        "grasp_pos_err_max": np.array([0.06, 0.06, 0.06], dtype=float),
+        "state_weight": 1.0,
+        "control_weight": 1.0,
+        "terminal_scale": 1.0,
+        "max_iter": 10,
+        "wp0": np.array([-1.5, 0, 1.5, 0.0, 0.0, 0.0], dtype=float),  # x,y,z,j1_deg,j2_deg,yaw_deg
+        "wp2": np.array([1.5, 0, 1.5, 0.0, 0.0, 0.0], dtype=float),
+        **cfg,
     }
     dt = float(cfg["dt"])
     tg = float(cfg["grasp_time"])
     tf = float(cfg["total_time"])
     if not (0.0 < tg < tf):
         raise ValueError("要求 0 < grasp_time < total_time")
+    ocp_mode = str(cfg.get("ocp_mode", "ctrl_error")).strip().lower()
+    if ocp_mode not in ("baseline", "ctrl_error"):
+        raise ValueError("ocp_mode 必须是 'baseline' 或 'ctrl_error'")
+    enable_ctrl_error = (ocp_mode == "ctrl_error")
     durs = [tg, tf - tg]
     grasp_euler_rad = np.radians(np.asarray(cfg["grasp_ee_euler_deg"], dtype=float).reshape(3))
     grasp_ee_quat = euler_zyx_to_quat_np(grasp_euler_rad)
 
     # 三个 17D 航点：[x,y,z,qx,qy,qz,qw,j1,j2,v,ω,jdot]
-    wp0 = np.array([-1.5, 0, 1.5, 0, 0, 0, 1, 0.0, 0.0] + [0] * 8, dtype=float)
-    wp2 = np.array([1.5, 0, 1.5, 0, 0, 0, 1, 0.0, 0.0] + [0] * 8, dtype=float)
+    w0 = np.asarray(cfg["wp0"], dtype=float).reshape(6)
+    w2 = np.asarray(cfg["wp2"], dtype=float).reshape(6)
+    wp0 = np.array(
+        [w0[0], w0[1], w0[2], 0, 0, 0, 1, np.deg2rad(w0[3]), np.deg2rad(w0[4])] + [0] * 8, dtype=float
+    )
+    wp2 = np.array(
+        [w2[0], w2[1], w2[2], 0, 0, 0, 1, np.deg2rad(w2[3]), np.deg2rad(w2[4])] + [0] * 8, dtype=float
+    )
+    # yaw from cfg wp yaw_deg
+    qz0 = np.sin(np.deg2rad(w0[5]) * 0.5)
+    qw0 = np.cos(np.deg2rad(w0[5]) * 0.5)
+    qz2 = np.sin(np.deg2rad(w2[5]) * 0.5)
+    qw2 = np.cos(np.deg2rad(w2[5]) * 0.5)
+    wp0[5], wp0[6] = qz0, qw0
+    wp2[5], wp2[6] = qz2, qw2
     # 中间状态仅用于 warm-start 插值；真正中间约束使用 grasp_ee_*（EE 位置/姿态/速度）
     wp1 = 0.5 * (wp0 + wp2)
     wp1[3:7] = _norm_q(wp1[3:7])
@@ -491,7 +592,17 @@ def main():
 
     print("Building OCP (first run compiles acados code)...")
     t0 = time.perf_counter()
-    solver, N, pin_model = build_ocp(wps, durs, dt)
+    solver, N, pin_model, k_err, _use_err = build_ocp_with_ctrl_error(
+        wps,
+        durs,
+        dt,
+        pos_err_gain=cfg["pos_err_gain"],
+        enable_ctrl_error=enable_ctrl_error,
+        state_weight=float(cfg["state_weight"]),
+        control_weight=float(cfg["control_weight"]),
+        terminal_scale=float(cfg["terminal_scale"]),
+        max_iter=int(cfg["max_iter"]),
+    )
     apply_hard_waypoints(
         solver,
         pin_model,
@@ -501,6 +612,8 @@ def main():
         grasp_ee_pos=cfg["grasp_ee_pos"],
         grasp_ee_quat=grasp_ee_quat,
         grasp_ee_vel=cfg["grasp_ee_vel"],
+        grasp_pos_err_max=cfg["grasp_pos_err_max"],
+        enable_ctrl_error=enable_ctrl_error,
     )
     warm_start(solver, wps, durs, dt, pin_model)
 
@@ -523,32 +636,65 @@ def main():
         ],
         dtype=float,
     )
-    fig = plt.figure(figsize=(14, 10))
-    plot_acados_into_figure(
-        simX,
-        simU,
-        t_arr,
-        fig,
-        title="S500 UAM — 3-waypoint joint opt (minimal)",
-        waypoint_times=wp_times,
-        waypoint_positions_base=wp_pos_base,
-        waypoint_positions_ee=wp_pos_ee,
-        timing_info=None,
-        control_layout=CONTROL_INPUT_DIRECT,
-    )
+    fig = None
+    if show_plots:
+        fig = plt.figure(figsize=(14, 10))
+        plot_acados_into_figure(
+            simX,
+            simU,
+            t_arr,
+            fig,
+            title="S500 UAM — 3-waypoint joint opt (minimal)",
+            waypoint_times=wp_times,
+            waypoint_positions_base=wp_pos_base,
+            waypoint_positions_ee=wp_pos_ee,
+            timing_info=None,
+            control_layout=CONTROL_INPUT_DIRECT,
+        )
     # 姿态文本标注：用设置时的欧拉角显示，误差计算内部使用四元数/SO(3)
     r_deg, p_deg, y_deg = np.asarray(cfg["grasp_ee_euler_deg"], dtype=float).reshape(3)
-    fig.text(
-        0.02,
-        0.965,
-        (
-            f"Grasp EE constraint @ t={tg:.2f}s: pos={np.asarray(cfg['grasp_ee_pos']).round(3).tolist()} m, "
-            f"rpy=[{r_deg:.1f}, {p_deg:.1f}, {y_deg:.1f}] deg"
-        ),
-        fontsize=9,
-        color="darkorange",
-    )
-    plt.show()
+    if show_plots and fig is not None:
+        fig.text(
+            0.02,
+            0.965,
+            (
+                f"Grasp EE constraint @ t={tg:.2f}s: pos={np.asarray(cfg['grasp_ee_pos']).round(3).tolist()} m, "
+                f"rpy=[{r_deg:.1f}, {p_deg:.1f}, {y_deg:.1f}] deg"
+            ),
+            fontsize=9,
+            color="darkorange",
+        )
+
+    if enable_ctrl_error and show_plots:
+        # 位置控制误差显示：e_p = K * v_base_world（线性模型）
+        v_base_w = base_linear_velocity_world_series(simX)
+        e_p = v_base_w * np.asarray(k_err, dtype=float).reshape(1, 3)
+        fig_err, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.plot(t_arr, e_p[:, 0], "r-", label="e_px")
+        ax.plot(t_arr, e_p[:, 1], "g-", label="e_py")
+        ax.plot(t_arr, e_p[:, 2], "b-", label="e_pz")
+        emax = np.asarray(cfg["grasp_pos_err_max"], dtype=float).reshape(3)
+        for i, c in enumerate(("r", "g", "b")):
+            ax.axhline(+emax[i], color=c, linestyle="--", alpha=0.4)
+            ax.axhline(-emax[i], color=c, linestyle="--", alpha=0.4)
+        ax.axvline(tg, color="darkorange", linestyle="--", alpha=0.7, label="grasp time")
+        ax.set_title("Linear position-control error (e_p = K * v_base_world)")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Position-control error (m)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8)
+    if show_plots:
+        plt.show()
+    return {
+        "method": "acados_wp3_joint_opt",
+        "simX": simX,
+        "simU": simU,
+        "time_arr": t_arr,
+        "waypoint_positions": wp_pos_base.tolist(),
+        "waypoint_times": wp_times.tolist(),
+        "timing": {"total_s": float(time.perf_counter() - t0), "n_iter": 0, "avg_ms_per_iter": 0.0},
+        "control_layout": "direct",
+    }
 
 
 if __name__ == "__main__":

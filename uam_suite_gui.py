@@ -60,6 +60,10 @@ from matplotlib.figure import Figure
 
 DEFAULT_PARAMS_PATH = Path(__file__).resolve().with_name("uam_suite_gui_params.json")
 
+TAB_PLAN = "planning"
+TAB_TRACK = "tracking"
+TAB_ROS = "ros_tracking"
+
 
 def _quat_to_euler_row(quat: np.ndarray) -> np.ndarray:
     qx, qy, qz, qw = quat[0], quat[1], quat[2], quat[3]
@@ -266,6 +270,14 @@ class TrackCrocAlongPlanWorker(QThread):
                 w_state_reg=p.get("w_state_reg", 0.1),
                 w_control=p.get("w_control", 1e-3),
                 w_terminal_track=p.get("w_terminal_track", 100.0),
+                w_pos=p.get("w_pos", 1.0),
+                w_att=p.get("w_att", 1.0),
+                w_joint=p.get("w_joint", 1.0),
+                w_vel=p.get("w_vel", 1.0),
+                w_omega=p.get("w_omega", 1.0),
+                w_joint_vel=p.get("w_joint_vel", 1.0),
+                w_u_thrust=p.get("w_u_thrust", 1.0),
+                w_u_joint_torque=p.get("w_u_joint_torque", 1.0),
                 mpc_max_iter=p.get("mpc_max_iter", 60),
                 use_thrust_constraints=p.get("use_thrust_constraints", True),
                 use_actuator_first_order=p.get("use_actuator_first_order", False),
@@ -688,13 +700,13 @@ class UamSuiteGUI(QMainWindow):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
-        left_tabs = QTabWidget()
-        root.addWidget(left_tabs, stretch=0)
+        self.left_tabs = QTabWidget()
+        root.addWidget(self.left_tabs, stretch=0)
 
         # ----- Plan tab -----
         tab_plan = QWidget()
         plan_layout = QVBoxLayout(tab_plan)
-        left_tabs.addTab(tab_plan, "Planning")
+        self.left_tabs.addTab(tab_plan, "Planning")
 
         self.plan_mode_combo = QComboBox()
         self.plan_mode_combo.addItems(["Full state (default)", "EE only (Minimum snap)"])
@@ -724,6 +736,8 @@ class UamSuiteGUI(QMainWindow):
             if self._CASCADE_TRAJ_AVAILABLE:
                 self.method_combo.addItem("Acados (ω,T,θ + 1st-order)")
                 self._method_ids.append("acados_cascade")
+            self.method_combo.addItem("Acados (wp3_joint_opt)")
+            self._method_ids.append("acados_wp3_joint_opt")
         if not self._method_ids:
             self.method_combo.addItem("(No solver available)")
             self._method_ids.append("none")
@@ -846,6 +860,45 @@ class UamSuiteGUI(QMainWindow):
         wg.setLayout(cost_g)
         g_full.addWidget(wg)
 
+        wp3g = QGridLayout()
+        self.wp3_mode_combo = QComboBox()
+        self.wp3_mode_combo.addItems(["baseline", "ctrl_error"])
+        self.wp3_total_time = QDoubleSpinBox(); self.wp3_total_time.setRange(0.5, 30.0); self.wp3_total_time.setValue(3.0)
+        self.wp3_grasp_time = QDoubleSpinBox(); self.wp3_grasp_time.setRange(0.1, 30.0); self.wp3_grasp_time.setValue(1.5)
+        self.wp3_gx = QDoubleSpinBox(); self.wp3_gy = QDoubleSpinBox(); self.wp3_gz = QDoubleSpinBox()
+        for w, v in ((self.wp3_gx, 0.0), (self.wp3_gy, 0.0), (self.wp3_gz, 1.0)):
+            w.setRange(-20, 20); w.setDecimals(3); w.setValue(v)
+        self.wp3_gr = QDoubleSpinBox(); self.wp3_gp = QDoubleSpinBox(); self.wp3_gyaw = QDoubleSpinBox()
+        for w in (self.wp3_gr, self.wp3_gp, self.wp3_gyaw):
+            w.setRange(-180, 180); w.setDecimals(2); w.setValue(0.0)
+        self.wp3_kx = QDoubleSpinBox(); self.wp3_ky = QDoubleSpinBox(); self.wp3_kz = QDoubleSpinBox()
+        for w in (self.wp3_kx, self.wp3_ky, self.wp3_kz):
+            w.setRange(0.0, 10.0); w.setDecimals(3); w.setValue(0.08)
+        self.wp3_ex = QDoubleSpinBox(); self.wp3_ey = QDoubleSpinBox(); self.wp3_ez = QDoubleSpinBox()
+        for w in (self.wp3_ex, self.wp3_ey, self.wp3_ez):
+            w.setRange(0.0, 10.0); w.setDecimals(3); w.setValue(0.06)
+        self.wp3_w0x = QDoubleSpinBox(); self.wp3_w0y = QDoubleSpinBox(); self.wp3_w0z = QDoubleSpinBox()
+        self.wp3_w0j1 = QDoubleSpinBox(); self.wp3_w0j2 = QDoubleSpinBox(); self.wp3_w0yaw = QDoubleSpinBox()
+        self.wp3_w2x = QDoubleSpinBox(); self.wp3_w2y = QDoubleSpinBox(); self.wp3_w2z = QDoubleSpinBox()
+        self.wp3_w2j1 = QDoubleSpinBox(); self.wp3_w2j2 = QDoubleSpinBox(); self.wp3_w2yaw = QDoubleSpinBox()
+        for w, v in (
+            (self.wp3_w0x, -1.5), (self.wp3_w0y, 0.0), (self.wp3_w0z, 1.5), (self.wp3_w0j1, 0.0), (self.wp3_w0j2, 0.0), (self.wp3_w0yaw, 0.0),
+            (self.wp3_w2x, 1.5), (self.wp3_w2y, 0.0), (self.wp3_w2z, 1.5), (self.wp3_w2j1, 0.0), (self.wp3_w2j2, 0.0), (self.wp3_w2yaw, 0.0),
+        ):
+            w.setRange(-50, 50); w.setDecimals(3); w.setValue(v)
+        wp3g.addWidget(QLabel("mode"), 0, 0); wp3g.addWidget(self.wp3_mode_combo, 0, 1)
+        wp3g.addWidget(QLabel("total_time"), 0, 2); wp3g.addWidget(self.wp3_total_time, 0, 3)
+        wp3g.addWidget(QLabel("grasp_time"), 0, 4); wp3g.addWidget(self.wp3_grasp_time, 0, 5)
+        wp3g.addWidget(QLabel("grasp pos x/y/z"), 1, 0); wp3g.addWidget(self.wp3_gx, 1, 1); wp3g.addWidget(self.wp3_gy, 1, 2); wp3g.addWidget(self.wp3_gz, 1, 3)
+        wp3g.addWidget(QLabel("grasp r/p/yaw (deg)"), 1, 4); wp3g.addWidget(self.wp3_gr, 1, 5); wp3g.addWidget(self.wp3_gp, 1, 6); wp3g.addWidget(self.wp3_gyaw, 1, 7)
+        wp3g.addWidget(QLabel("pos_err_gain kx/ky/kz"), 2, 0); wp3g.addWidget(self.wp3_kx, 2, 1); wp3g.addWidget(self.wp3_ky, 2, 2); wp3g.addWidget(self.wp3_kz, 2, 3)
+        wp3g.addWidget(QLabel("grasp_pos_err_max"), 2, 4); wp3g.addWidget(self.wp3_ex, 2, 5); wp3g.addWidget(self.wp3_ey, 2, 6); wp3g.addWidget(self.wp3_ez, 2, 7)
+        wp3g.addWidget(QLabel("wp0 x y z j1 j2 yaw"), 3, 0); wp3g.addWidget(self.wp3_w0x, 3, 1); wp3g.addWidget(self.wp3_w0y, 3, 2); wp3g.addWidget(self.wp3_w0z, 3, 3); wp3g.addWidget(self.wp3_w0j1, 3, 4); wp3g.addWidget(self.wp3_w0j2, 3, 5); wp3g.addWidget(self.wp3_w0yaw, 3, 6)
+        wp3g.addWidget(QLabel("wp2 x y z j1 j2 yaw"), 4, 0); wp3g.addWidget(self.wp3_w2x, 4, 1); wp3g.addWidget(self.wp3_w2y, 4, 2); wp3g.addWidget(self.wp3_w2z, 4, 3); wp3g.addWidget(self.wp3_w2j1, 4, 4); wp3g.addWidget(self.wp3_w2j2, 4, 5); wp3g.addWidget(self.wp3_w2yaw, 4, 6)
+        self.wp3_group = QGroupBox("wp3_joint_opt settings")
+        self.wp3_group.setLayout(wp3g)
+        g_full.addWidget(self.wp3_group)
+
         self.run_plan_btn = QPushButton("Run planning")
         self.run_plan_btn.clicked.connect(self._run_plan)
         g_full.addWidget(self.run_plan_btn)
@@ -930,11 +983,19 @@ class UamSuiteGUI(QMainWindow):
         self.meshcat_plan_btn.clicked.connect(self._visualize_planned_meshcat)
         self.meshcat_plan_btn.setEnabled(False)
         plan_layout.addWidget(self.meshcat_plan_btn)
+        plan_param_btns = QHBoxLayout()
+        self.save_plan_params_btn = QPushButton("Save Planning parameters")
+        self.save_plan_params_btn.clicked.connect(lambda: self._save_tab_params(TAB_PLAN))
+        self.save_plan_params_as_btn = QPushButton("Save Planning parameters as")
+        self.save_plan_params_as_btn.clicked.connect(lambda: self._save_tab_params_as(TAB_PLAN))
+        plan_param_btns.addWidget(self.save_plan_params_btn)
+        plan_param_btns.addWidget(self.save_plan_params_as_btn)
+        plan_layout.addLayout(plan_param_btns)
 
         # ----- Track tab -----
         tab_track = QWidget()
         tk = QVBoxLayout(tab_track)
-        left_tabs.addTab(tab_track, "Tracking")
+        self.left_tabs.addTab(tab_track, "Tracking")
 
         self.track_mode_combo = QComboBox()
         self.track_mode_combo.addItems(
@@ -1066,6 +1127,14 @@ class UamSuiteGUI(QMainWindow):
         self.w_terminal_track = QDoubleSpinBox()
         self.w_terminal_track.setRange(0.0, 1e6)
         self.w_terminal_track.setValue(100.0)
+        self.w_pos = QDoubleSpinBox(); self.w_pos.setRange(0.0, 1e5); self.w_pos.setValue(1.0)
+        self.w_att = QDoubleSpinBox(); self.w_att.setRange(0.0, 1e5); self.w_att.setValue(1.0)
+        self.w_joint = QDoubleSpinBox(); self.w_joint.setRange(0.0, 1e5); self.w_joint.setValue(1.0)
+        self.w_vel = QDoubleSpinBox(); self.w_vel.setRange(0.0, 1e5); self.w_vel.setValue(1.0)
+        self.w_omega = QDoubleSpinBox(); self.w_omega.setRange(0.0, 1e5); self.w_omega.setValue(1.0)
+        self.w_joint_vel = QDoubleSpinBox(); self.w_joint_vel.setRange(0.0, 1e5); self.w_joint_vel.setValue(1.0)
+        self.w_u_thrust = QDoubleSpinBox(); self.w_u_thrust.setRange(0.0, 1e5); self.w_u_thrust.setValue(1.0)
+        self.w_u_joint_torque = QDoubleSpinBox(); self.w_u_joint_torque.setRange(0.0, 1e5); self.w_u_joint_torque.setValue(1.0)
         self.croc_use_actuator_first_order = QCheckBox("Enable")
         self.croc_use_actuator_first_order.setChecked(False)
         self.croc_use_actuator_first_order.toggled.connect(self._refresh_track_sim_actuator_taus_enabled)
@@ -1168,6 +1237,14 @@ class UamSuiteGUI(QMainWindow):
                 ("w_state_reg", self.w_state_reg),
                 ("w_control", self.w_control),
                 ("w_terminal_track", self.w_terminal_track),
+                ("w_pos", self.w_pos),
+                ("w_att", self.w_att),
+                ("w_joint", self.w_joint),
+                ("w_vel", self.w_vel),
+                ("w_omega", self.w_omega),
+                ("w_joint_vel", self.w_joint_vel),
+                ("w_u_thrust", self.w_u_thrust),
+                ("w_u_joint_torque", self.w_u_joint_torque),
                 ("use thrust constraints", self.croc_ee_use_thrust_constraints),
             ]
         ):
@@ -1283,14 +1360,14 @@ class UamSuiteGUI(QMainWindow):
         self.reg_mode_combo.currentIndexChanged.connect(self._on_reg_mode_changed)
         self._on_reg_mode_changed()
 
-        params_btns = QHBoxLayout()
-        self.save_params_btn = QPushButton("Save parameters")
-        self.save_params_btn.clicked.connect(self._save_params)
-        self.save_params_as_btn = QPushButton("Save parameters as")
-        self.save_params_as_btn.clicked.connect(self._save_params_as)
-        params_btns.addWidget(self.save_params_btn)
-        params_btns.addWidget(self.save_params_as_btn)
-        tk.addLayout(params_btns)
+        track_param_btns = QHBoxLayout()
+        self.save_track_params_btn = QPushButton("Save Tracking parameters")
+        self.save_track_params_btn.clicked.connect(lambda: self._save_tab_params(TAB_TRACK))
+        self.save_track_params_as_btn = QPushButton("Save Tracking parameters as")
+        self.save_track_params_as_btn.clicked.connect(lambda: self._save_tab_params_as(TAB_TRACK))
+        track_param_btns.addWidget(self.save_track_params_btn)
+        track_param_btns.addWidget(self.save_track_params_as_btn)
+        tk.addLayout(track_param_btns)
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -1307,7 +1384,7 @@ class UamSuiteGUI(QMainWindow):
         rtt_outer = QVBoxLayout(tab_ros_track)
         rtt_outer.setContentsMargins(0, 0, 0, 0)
         rtt_outer.addWidget(rtt_scroll_area)
-        left_tabs.addTab(tab_ros_track, "ROS Tracking")
+        self.left_tabs.addTab(tab_ros_track, "ROS Tracking")
 
         # 内部跟踪：run_tracking_controller 子进程句柄
         self._rn_process = None
@@ -1432,6 +1509,34 @@ class UamSuiteGUI(QMainWindow):
         self.rn_w_terminal_track.setRange(0.0, 1e6)
         self.rn_w_terminal_track.setValue(3.0)
         rn_fs_grid.addWidget(self.rn_w_terminal_track, 1, 3)
+
+        rn_fs_grid.addWidget(QLabel("w_pos / w_att"), 2, 0)
+        self.rn_w_pos = QDoubleSpinBox(); self.rn_w_pos.setRange(0.0, 1e5); self.rn_w_pos.setValue(1.0)
+        self.rn_w_att = QDoubleSpinBox(); self.rn_w_att.setRange(0.0, 1e5); self.rn_w_att.setValue(1.0)
+        _rn_pa = QWidget(); _rn_pa_l = QHBoxLayout(_rn_pa); _rn_pa_l.setContentsMargins(0, 0, 0, 0)
+        _rn_pa_l.addWidget(self.rn_w_pos); _rn_pa_l.addWidget(self.rn_w_att)
+        rn_fs_grid.addWidget(_rn_pa, 2, 1)
+
+        rn_fs_grid.addWidget(QLabel("w_vel / w_omega"), 2, 2)
+        self.rn_w_vel = QDoubleSpinBox(); self.rn_w_vel.setRange(0.0, 1e5); self.rn_w_vel.setValue(1.0)
+        self.rn_w_omega = QDoubleSpinBox(); self.rn_w_omega.setRange(0.0, 1e5); self.rn_w_omega.setValue(1.0)
+        _rn_vo = QWidget(); _rn_vo_l = QHBoxLayout(_rn_vo); _rn_vo_l.setContentsMargins(0, 0, 0, 0)
+        _rn_vo_l.addWidget(self.rn_w_vel); _rn_vo_l.addWidget(self.rn_w_omega)
+        rn_fs_grid.addWidget(_rn_vo, 2, 3)
+
+        rn_fs_grid.addWidget(QLabel("w_joint / w_joint_vel"), 3, 0)
+        self.rn_w_joint = QDoubleSpinBox(); self.rn_w_joint.setRange(0.0, 1e5); self.rn_w_joint.setValue(1.0)
+        self.rn_w_joint_vel = QDoubleSpinBox(); self.rn_w_joint_vel.setRange(0.0, 1e5); self.rn_w_joint_vel.setValue(1.0)
+        _rn_jj = QWidget(); _rn_jj_l = QHBoxLayout(_rn_jj); _rn_jj_l.setContentsMargins(0, 0, 0, 0)
+        _rn_jj_l.addWidget(self.rn_w_joint); _rn_jj_l.addWidget(self.rn_w_joint_vel)
+        rn_fs_grid.addWidget(_rn_jj, 3, 1)
+
+        rn_fs_grid.addWidget(QLabel("w_u_thrust / w_u_joint"), 3, 2)
+        self.rn_w_u_thrust = QDoubleSpinBox(); self.rn_w_u_thrust.setRange(0.0, 1e5); self.rn_w_u_thrust.setValue(1.0)
+        self.rn_w_u_joint_torque = QDoubleSpinBox(); self.rn_w_u_joint_torque.setRange(0.0, 1e5); self.rn_w_u_joint_torque.setValue(1.0)
+        _rn_uu = QWidget(); _rn_uu_l = QHBoxLayout(_rn_uu); _rn_uu_l.setContentsMargins(0, 0, 0, 0)
+        _rn_uu_l.addWidget(self.rn_w_u_thrust); _rn_uu_l.addWidget(self.rn_w_u_joint_torque)
+        rn_fs_grid.addWidget(_rn_uu, 3, 3)
 
         rn_mpc_vbox.addWidget(self._rn_fs_panel)
 
@@ -1635,6 +1740,14 @@ class UamSuiteGUI(QMainWindow):
 
         ros_node_group.setLayout(ros_node_layout)
         rtt.addWidget(ros_node_group)
+        ros_param_btns = QHBoxLayout()
+        self.save_ros_params_btn = QPushButton("Save ROS Tracking parameters")
+        self.save_ros_params_btn.clicked.connect(lambda: self._save_tab_params(TAB_ROS))
+        self.save_ros_params_as_btn = QPushButton("Save ROS Tracking parameters as")
+        self.save_ros_params_as_btn.clicked.connect(lambda: self._save_tab_params_as(TAB_ROS))
+        ros_param_btns.addWidget(self.save_ros_params_btn)
+        ros_param_btns.addWidget(self.save_ros_params_as_btn)
+        rtt.addLayout(ros_param_btns)
 
         # ── Regulation Target 设置组 ──────────────────────────────────────────
         reg_group = QGroupBox("Regulation Target  (MPC 镇定目标)")
@@ -2248,6 +2361,8 @@ class UamSuiteGUI(QMainWindow):
             self.plan_tau_motor.setEnabled(is_croc and use_lag)
         if hasattr(self, "plan_tau_joint"):
             self.plan_tau_joint.setEnabled(is_croc and use_lag)
+        if hasattr(self, "wp3_group"):
+            self.wp3_group.setVisible(method == "acados_wp3_joint_opt")
 
     def _on_ee_plan_type_changed(self):
         snap = self.ee_plan_type_combo.currentIndex() == 0
@@ -2278,6 +2393,14 @@ class UamSuiteGUI(QMainWindow):
                     self.w_state_reg,
                     self.w_control,
                     self.w_terminal_track,
+                    self.w_pos,
+                    self.w_att,
+                    self.w_joint,
+                    self.w_vel,
+                    self.w_omega,
+                    self.w_joint_vel,
+                    self.w_u_thrust,
+                    self.w_u_joint_torque,
                 }
             )
         elif idx == 1:
@@ -2514,6 +2637,14 @@ class UamSuiteGUI(QMainWindow):
             "w_state_reg": float(self.w_state_reg.value()),
             "w_control": float(self.w_control.value()),
             "w_terminal_track": float(self.w_terminal_track.value()),
+            "w_pos": float(self.w_pos.value()),
+            "w_att": float(self.w_att.value()),
+            "w_joint": float(self.w_joint.value()),
+            "w_vel": float(self.w_vel.value()),
+            "w_omega": float(self.w_omega.value()),
+            "w_joint_vel": float(self.w_joint_vel.value()),
+            "w_u_thrust": float(self.w_u_thrust.value()),
+            "w_u_joint_torque": float(self.w_u_joint_torque.value()),
             "croc_use_actuator_first_order": bool(self.croc_use_actuator_first_order.isChecked()),
             "croc_ee_use_thrust_constraints": bool(self.croc_ee_use_thrust_constraints.isChecked()),
             "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
@@ -2535,6 +2666,14 @@ class UamSuiteGUI(QMainWindow):
             "rn_w_state_reg": float(self.rn_w_state_reg.value()),
             "rn_w_control": float(self.rn_w_control.value()),
             "rn_w_terminal_track": float(self.rn_w_terminal_track.value()),
+            "rn_w_pos": float(self.rn_w_pos.value()),
+            "rn_w_att": float(self.rn_w_att.value()),
+            "rn_w_joint": float(self.rn_w_joint.value()),
+            "rn_w_vel": float(self.rn_w_vel.value()),
+            "rn_w_omega": float(self.rn_w_omega.value()),
+            "rn_w_joint_vel": float(self.rn_w_joint_vel.value()),
+            "rn_w_u_thrust": float(self.rn_w_u_thrust.value()),
+            "rn_w_u_joint_torque": float(self.rn_w_u_joint_torque.value()),
             "rn_ee_w_pos": float(self.rn_ee_w_pos.value()),
             "rn_ee_w_rot_rp": float(self.rn_ee_w_rot_rp.value()),
             "rn_ee_w_rot_yaw": float(self.rn_ee_w_rot_yaw.value()),
@@ -2617,6 +2756,14 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("w_state_reg", self.w_state_reg)
         _set_spin("w_control", self.w_control)
         _set_spin("w_terminal_track", self.w_terminal_track)
+        _set_spin("w_pos", self.w_pos)
+        _set_spin("w_att", self.w_att)
+        _set_spin("w_joint", self.w_joint)
+        _set_spin("w_vel", self.w_vel)
+        _set_spin("w_omega", self.w_omega)
+        _set_spin("w_joint_vel", self.w_joint_vel)
+        _set_spin("w_u_thrust", self.w_u_thrust)
+        _set_spin("w_u_joint_torque", self.w_u_joint_torque)
         _set_spin("plan_tau_motor", self.plan_tau_motor)
         _set_spin("plan_tau_joint", self.plan_tau_joint)
         # Backward compatibility with earlier naming.
@@ -2639,6 +2786,14 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("rn_w_state_reg", self.rn_w_state_reg)
         _set_spin("rn_w_control", self.rn_w_control)
         _set_spin("rn_w_terminal_track", self.rn_w_terminal_track)
+        _set_spin("rn_w_pos", self.rn_w_pos)
+        _set_spin("rn_w_att", self.rn_w_att)
+        _set_spin("rn_w_joint", self.rn_w_joint)
+        _set_spin("rn_w_vel", self.rn_w_vel)
+        _set_spin("rn_w_omega", self.rn_w_omega)
+        _set_spin("rn_w_joint_vel", self.rn_w_joint_vel)
+        _set_spin("rn_w_u_thrust", self.rn_w_u_thrust)
+        _set_spin("rn_w_u_joint_torque", self.rn_w_u_joint_torque)
         _set_spin("rn_ee_w_pos", self.rn_ee_w_pos)
         _set_spin("rn_ee_w_rot_rp", self.rn_ee_w_rot_rp)
         _set_spin("rn_ee_w_rot_yaw", self.rn_ee_w_rot_yaw)
@@ -2729,6 +2884,143 @@ class UamSuiteGUI(QMainWindow):
             QMessageBox.critical(self, "Error", msg[:2000])
             return False
 
+    def _param_keys_for_tab(self, tab_id: str) -> set[str]:
+        if tab_id == TAB_PLAN:
+            return {
+                "version",
+                "plan_mode_index",
+                "method_index",
+                "wp_rows",
+                "ee_wp_rows",
+                "dt_plan",
+                "max_iter_plan",
+                "state_w",
+                "ctrl_w",
+                "wp_mult",
+                "ee_knot_w",
+                "ee_knot_state_reg_w",
+                "ee_knot_rot_w",
+                "ee_knot_vel_w",
+                "ee_knot_vel_pitch_w",
+                "dt_ee_sample",
+                "ee_plan_type_index",
+                "ee_eight_center",
+                "ee_eight_a",
+                "ee_eight_period",
+                "ee_eight_tdur",
+                "plan_croc_use_actuator_first_order",
+                "plan_tau_motor",
+                "plan_tau_joint",
+            }
+        if tab_id == TAB_TRACK:
+            return {
+                "version",
+                "track_mode_index",
+                "reg_mode_index",
+                "control_mode_track_index",
+                "T_sim",
+                "sim_dt",
+                "control_dt",
+                "dt_mpc",
+                "N_mpc",
+                "w_ee",
+                "w_ee_yaw",
+                "croc_ee_w_pos",
+                "croc_ee_w_rot_rp",
+                "croc_ee_w_rot_yaw",
+                "croc_ee_w_vel_lin",
+                "croc_ee_w_vel_ang_rp",
+                "croc_ee_w_vel_ang_yaw",
+                "croc_ee_w_u",
+                "croc_ee_w_terminal",
+                "mpc_max_iter",
+                "mpc_log_iv",
+                "tau_thrust_track",
+                "tau_theta_track",
+                "track_sim_control_stack_index",
+                "px4_rate_Kp_track",
+                "px4_rate_Kd_track",
+                "croc_horizon",
+                "croc_mpc_iter",
+                "w_state_track",
+                "w_state_reg",
+                "w_control",
+                "w_terminal_track",
+                "w_pos",
+                "w_att",
+                "w_joint",
+                "w_vel",
+                "w_omega",
+                "w_joint_vel",
+                "w_u_thrust",
+                "w_u_joint_torque",
+                "croc_use_actuator_first_order",
+                "croc_ee_use_thrust_constraints",
+                "sim_payload_enable",
+                "sim_payload_t_grasp",
+                "sim_payload_mass",
+                "reg_full_x0",
+                "reg_full_xref",
+                "reg_ee_x0",
+                "reg_ee_xref",
+                "reg_ee_target_pose",
+            }
+        if tab_id == TAB_ROS:
+            return {
+                "version",
+                "rn_dt_mpc",
+                "rn_horizon",
+                "rn_mpc_max_iter",
+                "rn_w_state_track",
+                "rn_w_state_reg",
+                "rn_w_control",
+                "rn_w_terminal_track",
+                "rn_w_pos",
+                "rn_w_att",
+                "rn_w_joint",
+                "rn_w_vel",
+                "rn_w_omega",
+                "rn_w_joint_vel",
+                "rn_w_u_thrust",
+                "rn_w_u_joint_torque",
+                "rn_ee_w_pos",
+                "rn_ee_w_rot_rp",
+                "rn_ee_w_rot_yaw",
+                "rn_ee_w_vel_lin",
+                "rn_ee_w_vel_ang_rp",
+                "rn_ee_w_vel_ang_yaw",
+                "rn_ee_w_u",
+                "rn_ee_w_terminal",
+                "rn_geo_kp_pos",
+                "rn_geo_kd_vel",
+                "rn_geo_kR",
+                "rn_geo_kOmega",
+                "rn_geo_max_tilt_deg",
+            }
+        return {"version"}
+
+    def _save_tab_params_to_path(self, tab_id: str, path: Path) -> bool:
+        try:
+            current = {}
+            if path.exists():
+                current = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(current, dict):
+                    current = {}
+            collected = self._collect_params()
+            keys = self._param_keys_for_tab(tab_id)
+            for k in keys:
+                if k in collected:
+                    current[k] = collected[k]
+            path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+            self._params_path = path
+            self.log(f"Saved {tab_id} parameters: {path}")
+            return True
+        except Exception as e:
+            msg = f"Failed to save {tab_id} parameters to {path}: {e}"
+            self.log(msg)
+            QMessageBox.critical(self, "Error", msg[:2000])
+            return False
+
     def _save_params(self):
         self._write_params_to_path(self._params_path)
 
@@ -2742,6 +3034,20 @@ class UamSuiteGUI(QMainWindow):
         if not path:
             return
         self._write_params_to_path(Path(path))
+
+    def _save_tab_params(self, tab_id: str):
+        self._save_tab_params_to_path(tab_id, self._params_path)
+
+    def _save_tab_params_as(self, tab_id: str):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save parameters as",
+            str(self._params_path),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        self._save_tab_params_to_path(tab_id, Path(path))
 
     def _make_wp_type_combo(self, type_value: str = "Base") -> QComboBox:
         cb = QComboBox()
@@ -2860,6 +3166,39 @@ class UamSuiteGUI(QMainWindow):
         if self.OptimizationWorker is None or self._wp_to_state is None:
             QMessageBox.warning(self, "Error", "Unable to import trajectory_gui / solver.")
             return
+        mid = self.method_combo.currentIndex()
+        method = self._method_ids[mid] if mid < len(self._method_ids) else "none"
+        if method == "acados_wp3_joint_opt":
+            params = {
+                "dt": self.dt_plan.value(),
+                "max_iter": self.max_iter_plan.value(),
+                "state_weight": self.state_w.value(),
+                "control_weight": self.ctrl_w.value(),
+                "waypoint_multiplier": self.wp_mult.value(),
+                "wp3_config": {
+                    "ocp_mode": self.wp3_mode_combo.currentText(),
+                    "dt": self.dt_plan.value(),
+                    "total_time": self.wp3_total_time.value(),
+                    "grasp_time": self.wp3_grasp_time.value(),
+                    "grasp_ee_pos": np.array([self.wp3_gx.value(), self.wp3_gy.value(), self.wp3_gz.value()], dtype=float),
+                    "grasp_ee_euler_deg": np.array([self.wp3_gr.value(), self.wp3_gp.value(), self.wp3_gyaw.value()], dtype=float),
+                    "grasp_ee_vel": np.zeros(3, dtype=float),
+                    "pos_err_gain": np.array([self.wp3_kx.value(), self.wp3_ky.value(), self.wp3_kz.value()], dtype=float),
+                    "grasp_pos_err_max": np.array([self.wp3_ex.value(), self.wp3_ey.value(), self.wp3_ez.value()], dtype=float),
+                    "state_weight": self.state_w.value(),
+                    "control_weight": self.ctrl_w.value(),
+                    "terminal_scale": self.wp_mult.value(),
+                    "max_iter": self.max_iter_plan.value(),
+                    "wp0": np.array([self.wp3_w0x.value(), self.wp3_w0y.value(), self.wp3_w0z.value(), self.wp3_w0j1.value(), self.wp3_w0j2.value(), self.wp3_w0yaw.value()], dtype=float),
+                    "wp2": np.array([self.wp3_w2x.value(), self.wp3_w2y.value(), self.wp3_w2z.value(), self.wp3_w2j1.value(), self.wp3_w2j2.value(), self.wp3_w2yaw.value()], dtype=float),
+                },
+            }
+            self.run_plan_btn.setEnabled(False)
+            self.log("Planning started: acados_wp3_joint_opt")
+            self._plan_worker = self.OptimizationWorker("acados_wp3_joint_opt", params)
+            self._plan_worker.finished.connect(self._on_plan_finished)
+            self._plan_worker.start()
+            return
         rows = self._read_wp_table()
         sorted_rows = sorted(rows, key=lambda x: float(x[7]))
         if len(sorted_rows) < 2:
@@ -2870,8 +3209,6 @@ class UamSuiteGUI(QMainWindow):
         for i in range(len(sorted_rows) - 1):
             d = float(sorted_rows[i + 1][7]) - float(sorted_rows[i][7])
             durs.append(d if d > 1e-6 else 1.0)
-        mid = self.method_combo.currentIndex()
-        method = self._method_ids[mid] if mid < len(self._method_ids) else "none"
         if method == "none":
             QMessageBox.warning(self, "Error", "No available solver.")
             return
@@ -3029,7 +3366,7 @@ class UamSuiteGUI(QMainWindow):
                 "u_plan": np.vstack(us) if len(us) else np.zeros((0, 6), dtype=float),
                 "plan_mixed_wp_rows": copy.deepcopy(_wpr) if _wpr else None,
             }
-        elif result_data.get("method") in ("acados", "acados_cascade"):
+        elif result_data.get("method") in ("acados", "acados_cascade", "acados_wp3_joint_opt"):
             t_plan = np.asarray(result_data["time_arr"], dtype=float).flatten()
             x_plan = np.asarray(result_data["simX"], dtype=float)
             u_plan = np.asarray(result_data.get("simU"), dtype=float)
@@ -3167,6 +3504,14 @@ class UamSuiteGUI(QMainWindow):
                 "w_state_reg": self.w_state_reg.value(),
                 "w_control": self.w_control.value(),
                 "w_terminal_track": self.w_terminal_track.value(),
+                "w_pos": self.w_pos.value(),
+                "w_att": self.w_att.value(),
+                "w_joint": self.w_joint.value(),
+                "w_vel": self.w_vel.value(),
+                "w_omega": self.w_omega.value(),
+                "w_joint_vel": self.w_joint_vel.value(),
+                "w_u_thrust": self.w_u_thrust.value(),
+                "w_u_joint_torque": self.w_u_joint_torque.value(),
                 "use_actuator_first_order": self.croc_use_actuator_first_order.isChecked(),
                 "tau_thrust": float(self.tau_thrust_track.value()),
                 "tau_theta": float(self.tau_theta_track.value()),
@@ -3337,6 +3682,14 @@ class UamSuiteGUI(QMainWindow):
             f"_w_state_reg:={self.rn_w_state_reg.value()}",
             f"_w_control:={self.rn_w_control.value()}",
             f"_w_terminal_track:={self.rn_w_terminal_track.value()}",
+            f"_w_pos:={self.rn_w_pos.value()}",
+            f"_w_att:={self.rn_w_att.value()}",
+            f"_w_joint:={self.rn_w_joint.value()}",
+            f"_w_vel:={self.rn_w_vel.value()}",
+            f"_w_omega:={self.rn_w_omega.value()}",
+            f"_w_joint_vel:={self.rn_w_joint_vel.value()}",
+            f"_w_u_thrust:={self.rn_w_u_thrust.value()}",
+            f"_w_u_joint_torque:={self.rn_w_u_joint_torque.value()}",
             f"_ee_w_pos:={self.rn_ee_w_pos.value()}",
             f"_ee_w_rot_rp:={self.rn_ee_w_rot_rp.value()}",
             f"_ee_w_rot_yaw:={self.rn_ee_w_rot_yaw.value()}",
@@ -3450,6 +3803,14 @@ class UamSuiteGUI(QMainWindow):
             "w_state_reg": float(self.rn_w_state_reg.value()),
             "w_control": float(self.rn_w_control.value()),
             "w_terminal_track": float(self.rn_w_terminal_track.value()),
+            "w_pos": float(self.rn_w_pos.value()),
+            "w_att": float(self.rn_w_att.value()),
+            "w_joint": float(self.rn_w_joint.value()),
+            "w_vel": float(self.rn_w_vel.value()),
+            "w_omega": float(self.rn_w_omega.value()),
+            "w_joint_vel": float(self.rn_w_joint_vel.value()),
+            "w_u_thrust": float(self.rn_w_u_thrust.value()),
+            "w_u_joint_torque": float(self.rn_w_u_joint_torque.value()),
             "ee_w_pos": float(self.rn_ee_w_pos.value()),
             "ee_w_rot_rp": float(self.rn_ee_w_rot_rp.value()),
             "ee_w_rot_yaw": float(self.rn_ee_w_rot_yaw.value()),
@@ -3726,6 +4087,14 @@ class UamSuiteGUI(QMainWindow):
                 "w_state_reg": self.w_state_reg.value(),
                 "w_control": self.w_control.value(),
                 "w_terminal_track": self.w_terminal_track.value(),
+                "w_pos": self.w_pos.value(),
+                "w_att": self.w_att.value(),
+                "w_joint": self.w_joint.value(),
+                "w_vel": self.w_vel.value(),
+                "w_omega": self.w_omega.value(),
+                "w_joint_vel": self.w_joint_vel.value(),
+                "w_u_thrust": self.w_u_thrust.value(),
+                "w_u_joint_torque": self.w_u_joint_torque.value(),
                 "use_actuator_first_order": self.croc_use_actuator_first_order.isChecked(),
                 "tau_thrust": float(self.tau_thrust_track.value()),
                 "tau_theta": float(self.tau_theta_track.value()),
