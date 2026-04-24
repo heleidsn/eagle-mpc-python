@@ -1,0 +1,10 @@
+index,feature_name
+0,v_track_world_norm
+1,v_plan_norm
+2,v_diff_norm
+3,a_plan_norm
+4,jerk_plan_norm
+5,snap_plan_norm
+6,vx_world_error
+7,vy_world_error
+8,vz_world_error

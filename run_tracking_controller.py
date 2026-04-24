@@ -63,6 +63,7 @@ import os
 import sys
 import time
 import math
+import csv
 import threading
 from collections import deque
 from pathlib import Path
@@ -241,6 +242,7 @@ class SuiteTrackingController:
         self.robot_name = rospy.get_param("~robot_name", "s500_uam")
         self.controller_mode = rospy.get_param("~controller_mode", "croc_full_state")
         self.trajectory_source = rospy.get_param("~trajectory_source", "suite_npz")
+        self.trajectory_name = str(rospy.get_param("~trajectory_name", "trajectory"))
         self.odom_source = rospy.get_param("~odom_source", "gazebo")
         self.use_simulation = rospy.get_param("~use_simulation", True)
         self.arm_enabled = rospy.get_param("~arm_enabled", True)
@@ -368,12 +370,15 @@ class SuiteTrackingController:
         self.recording_enabled = False
         self.recorded_data: Dict[str, list] = {
             "time": [], "position": [], "velocity": [], "orientation": [],
+            "angular_velocity": [],
             "arm_joint_positions": [], "arm_joint_velocities": [],
             "mpc_control": [], "mpc_cost": [], "mpc_solve_time": [],
             "body_rate_commands": [], "thrust_command": [],
             "arm_joint_commands": [], "reference_position": [],
-            "reference_orientation": [], "reference_arm_positions": [],
+            "reference_orientation": [], "reference_velocity": [],
+            "reference_angular_velocity": [], "reference_arm_positions": [],
         }
+        self._active_tracking_tag: Optional[str] = None
         self.solve_times: deque = deque(maxlen=200)
 
         # ── ROS 话题 ─────────────────────────────────────────────────────────
@@ -528,6 +533,133 @@ class SuiteTrackingController:
         if zero_vel and out.size > nq:
             out[nq:] = 0.0
         return out
+
+    @staticmethod
+    def _safe_token(text: str) -> str:
+        s = str(text or "").strip().lower()
+        out = []
+        for ch in s:
+            if ch.isalnum() or ch in ("-", "_"):
+                out.append(ch)
+            elif ch in (" ", "/", "\\", "."):
+                out.append("_")
+        tok = "".join(out).strip("_")
+        return tok or "trajectory"
+
+    def _clear_recorded_data(self) -> None:
+        for k in list(self.recorded_data.keys()):
+            self.recorded_data[k].clear()
+        self.solve_times.clear()
+
+    def _tracking_results_dir(self) -> Path:
+        out_dir = Path(__file__).resolve().parent / "tracking_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    def _compose_tracking_file_tag(self) -> str:
+        traj = self._safe_token(self.trajectory_name)
+        mode = self._safe_token(self.controller_mode)
+        return f"{traj}__{mode}"
+
+    def _compute_tracking_stats(self) -> Dict[str, float]:
+        stats: Dict[str, float] = {}
+        t = np.asarray(self.recorded_data.get("time", []), dtype=float).reshape(-1)
+        pos = np.asarray(self.recorded_data.get("position", []), dtype=float)
+        pos_ref = np.asarray(self.recorded_data.get("reference_position", []), dtype=float)
+        quat = np.asarray(self.recorded_data.get("orientation", []), dtype=float)
+        quat_ref = np.asarray(self.recorded_data.get("reference_orientation", []), dtype=float)
+        solve_ms = np.asarray(self.recorded_data.get("mpc_solve_time", []), dtype=float).reshape(-1)
+        stats["samples"] = float(t.size)
+        stats["duration_s"] = float(t[-1] - t[0]) if t.size >= 2 else 0.0
+        if pos.ndim == 2 and pos_ref.ndim == 2 and pos.shape == pos_ref.shape and pos.shape[0] > 0:
+            pe = np.linalg.norm(pos - pos_ref, axis=1)
+            stats["pos_rmse_m"] = float(np.sqrt(np.mean(pe ** 2)))
+            stats["pos_mean_m"] = float(np.mean(pe))
+            stats["pos_max_m"] = float(np.max(pe))
+        if quat.ndim == 2 and quat_ref.ndim == 2 and quat.shape == quat_ref.shape and quat.shape[0] > 0:
+            dot = np.sum(quat * quat_ref, axis=1)
+            dot = np.clip(np.abs(dot), 0.0, 1.0)
+            ang = 2.0 * np.arccos(dot)
+            stats["att_rmse_deg"] = float(np.degrees(np.sqrt(np.mean(ang ** 2))))
+            stats["att_mean_deg"] = float(np.degrees(np.mean(ang)))
+            stats["att_max_deg"] = float(np.degrees(np.max(ang)))
+        if solve_ms.size > 0:
+            stats["solve_ms_mean"] = float(np.mean(solve_ms))
+            stats["solve_ms_p95"] = float(np.percentile(solve_ms, 95))
+            stats["solve_ms_max"] = float(np.max(solve_ms))
+        return stats
+
+    def _save_tracking_csv_and_stats(self, tag: str) -> Tuple[Path, Path]:
+        out_dir = self._tracking_results_dir()
+        csv_path = out_dir / f"{tag}.csv"
+        txt_path = out_dir / f"{tag}_stats.txt"
+        t = np.asarray(self.recorded_data.get("time", []), dtype=float).reshape(-1)
+        pos = np.asarray(self.recorded_data.get("position", []), dtype=float)
+        vel = np.asarray(self.recorded_data.get("velocity", []), dtype=float)
+        omega = np.asarray(self.recorded_data.get("angular_velocity", []), dtype=float)
+        quat = np.asarray(self.recorded_data.get("orientation", []), dtype=float)
+        u = np.asarray(self.recorded_data.get("mpc_control", []), dtype=float)
+        bcmd = np.asarray(self.recorded_data.get("body_rate_commands", []), dtype=float)
+        thrust_cmd = np.asarray(self.recorded_data.get("thrust_command", []), dtype=float).reshape(-1)
+        pos_ref = np.asarray(self.recorded_data.get("reference_position", []), dtype=float)
+        vel_ref = np.asarray(self.recorded_data.get("reference_velocity", []), dtype=float)
+        omega_ref = np.asarray(self.recorded_data.get("reference_angular_velocity", []), dtype=float)
+        quat_ref = np.asarray(self.recorded_data.get("reference_orientation", []), dtype=float)
+        solve_ms = np.asarray(self.recorded_data.get("mpc_solve_time", []), dtype=float).reshape(-1)
+        n = int(t.size)
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            header = [
+                "time",
+                "px", "py", "pz",
+                "qx", "qy", "qz", "qw",
+                "vx_b", "vy_b", "vz_b",
+                "wx_b", "wy_b", "wz_b",
+                "ref_px", "ref_py", "ref_pz",
+                "ref_qx", "ref_qy", "ref_qz", "ref_qw",
+                "ref_vx_b", "ref_vy_b", "ref_vz_b",
+                "ref_wx_b", "ref_wy_b", "ref_wz_b",
+                "u0", "u1", "u2", "u3", "u4", "u5",
+                "cmd_wx", "cmd_wy", "cmd_wz", "cmd_thrust_norm",
+                "solve_ms",
+            ]
+            w.writerow(header)
+            for i in range(n):
+                row = [float(t[i])]
+                row.extend(pos[i].tolist() if pos.ndim == 2 and i < pos.shape[0] else [float("nan")] * 3)
+                row.extend(quat[i].tolist() if quat.ndim == 2 and i < quat.shape[0] else [float("nan")] * 4)
+                row.extend(vel[i].tolist() if vel.ndim == 2 and i < vel.shape[0] else [float("nan")] * 3)
+                row.extend(omega[i].tolist() if omega.ndim == 2 and i < omega.shape[0] else [float("nan")] * 3)
+                row.extend(pos_ref[i].tolist() if pos_ref.ndim == 2 and i < pos_ref.shape[0] else [float("nan")] * 3)
+                row.extend(quat_ref[i].tolist() if quat_ref.ndim == 2 and i < quat_ref.shape[0] else [float("nan")] * 4)
+                row.extend(vel_ref[i].tolist() if vel_ref.ndim == 2 and i < vel_ref.shape[0] else [float("nan")] * 3)
+                row.extend(omega_ref[i].tolist() if omega_ref.ndim == 2 and i < omega_ref.shape[0] else [float("nan")] * 3)
+                if u.ndim == 2 and i < u.shape[0]:
+                    ui = u[i].tolist()
+                    row.extend(ui[:6] + [float("nan")] * max(0, 6 - len(ui)))
+                else:
+                    row.extend([float("nan")] * 6)
+                row.extend(bcmd[i].tolist() if bcmd.ndim == 2 and i < bcmd.shape[0] else [float("nan")] * 3)
+                row.append(float(thrust_cmd[i]) if i < thrust_cmd.size else float("nan"))
+                row.append(float(solve_ms[i]) if i < solve_ms.size else float("nan"))
+                w.writerow(row)
+
+        stats = self._compute_tracking_stats()
+        with txt_path.open("w", encoding="utf-8") as f:
+            f.write(f"trajectory_name: {self.trajectory_name}\n")
+            f.write(f"controller_mode: {self.controller_mode}\n")
+            f.write(f"robot_name: {self.robot_name}\n")
+            f.write(f"odom_source: {self.odom_source}\n")
+            f.write(f"samples: {int(stats.get('samples', 0.0))}\n")
+            for k in (
+                "duration_s",
+                "pos_rmse_m", "pos_mean_m", "pos_max_m",
+                "att_rmse_deg", "att_mean_deg", "att_max_deg",
+                "solve_ms_mean", "solve_ms_p95", "solve_ms_max",
+            ):
+                if k in stats:
+                    f.write(f"{k}: {stats[k]:.6f}\n")
+        return csv_path, txt_path
 
     def _build_mpc(self):
         """构建 Crocoddyl MPC 实例（与 scripts/ 仿真脚本相同的类）。"""
@@ -1714,6 +1846,7 @@ class SuiteTrackingController:
         self.recorded_data["time"].append(t)
         self.recorded_data["position"].append(s[0:3].tolist())
         self.recorded_data["velocity"].append(s[nq : nq + 3].tolist())
+        self.recorded_data["angular_velocity"].append(s[nq + 3 : nq + 6].tolist())
         self.recorded_data["orientation"].append(s[3:7].tolist())
         self.recorded_data["arm_joint_positions"].append(s[7 : 7 + nj].tolist())
         self.recorded_data["arm_joint_velocities"].append(s[-nj:].tolist() if nj > 0 else [])
@@ -1725,6 +1858,8 @@ class SuiteTrackingController:
         )
         self.recorded_data["reference_position"].append(x_ref[0:3].tolist())
         self.recorded_data["reference_orientation"].append(x_ref[3:7].tolist())
+        self.recorded_data["reference_velocity"].append(x_ref[nq : nq + 3].tolist())
+        self.recorded_data["reference_angular_velocity"].append(x_ref[nq + 3 : nq + 6].tolist())
         self.recorded_data["reference_arm_positions"].append(x_ref[7 : 7 + nj].tolist())
 
     # =========================================================================
@@ -1744,8 +1879,11 @@ class SuiteTrackingController:
         self.trajectory_started = True
         self.traj_finished = False
         self.controller_start_time = rospy.Time.now()
+        self.trajectory_name = str(rospy.get_param("~trajectory_name", self.trajectory_name))
         self._xs_guess = None
         self._us_guess = None
+        self._clear_recorded_data()
+        self._active_tracking_tag = self._compose_tracking_file_tag()
         self.recording_enabled = True
         self._clear_actual_paths()   # 重置实际路径，使实际轨迹从跟踪起点开始
         rospy.loginfo("Tracking started! (regulation mode off)")
@@ -1766,14 +1904,25 @@ class SuiteTrackingController:
             f"Tracking stopped. Switched to regulation at trajectory end-point "
             f"x={tgt[0]:.2f} y={tgt[1]:.2f} z={tgt[2]:.2f}"
         )
-        return TriggerResponse(True, "Tracking stopped, holding position")
+        try:
+            tag = self._active_tracking_tag or self._compose_tracking_file_tag()
+            csv_path, txt_path = self._save_tracking_csv_and_stats(tag)
+            self._active_tracking_tag = None
+            return TriggerResponse(
+                True,
+                f"Tracking stopped, holding position. Saved: {csv_path.name}, {txt_path.name}",
+            )
+        except Exception as e:
+            return TriggerResponse(
+                False,
+                f"Tracking stopped, but save failed: {e}",
+            )
 
     def _svc_save_data(self, req) -> TriggerResponse:
         try:
             out_dir = Path(__file__).resolve().parent / "results" / "suite_tracking"
             out_dir.mkdir(parents=True, exist_ok=True)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            filepath = out_dir / f"tracking_{self.controller_mode}_{ts}.npz"
+            filepath = out_dir / f"tracking_{self._safe_token(self.controller_mode)}.npz"
             save_data = {}
             for k, v in self.recorded_data.items():
                 if v:
@@ -1781,8 +1930,10 @@ class SuiteTrackingController:
                 else:
                     save_data[k] = np.array([])
             np.savez_compressed(str(filepath), **save_data)
-            rospy.loginfo(f"Data saved: {filepath}")
-            return TriggerResponse(True, f"Saved to {filepath}")
+            tag = self._active_tracking_tag or self._compose_tracking_file_tag()
+            csv_path, txt_path = self._save_tracking_csv_and_stats(tag)
+            rospy.loginfo(f"Data saved: {filepath} | {csv_path} | {txt_path}")
+            return TriggerResponse(True, f"Saved to {filepath}, {csv_path}, {txt_path}")
         except Exception as e:
             return TriggerResponse(False, f"Save failed: {e}")
 
@@ -1793,6 +1944,7 @@ class SuiteTrackingController:
         """
         try:
             with self._thread_lock:
+                self.trajectory_name = str(rospy.get_param("~trajectory_name", self.trajectory_name))
                 self._load_trajectory()
                 self._build_mpc()
                 self.arm_joint_number = self.mpc.robot_model.nq - 7

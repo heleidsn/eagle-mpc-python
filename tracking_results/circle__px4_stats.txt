@@ -1,0 +1,15 @@
+trajectory_name: circle
+controller_mode: px4
+robot_name: s500
+odom_source: gazebo
+samples: 1000
+duration_s: 19.980000
+pos_rmse_m: 0.037596
+pos_mean_m: 0.030382
+pos_max_m: 0.074365
+att_rmse_deg: 4.336809
+att_mean_deg: 3.163582
+att_max_deg: 11.187469
+solve_ms_mean: 0.000000
+solve_ms_p95: 0.000000
+solve_ms_max: 0.000000

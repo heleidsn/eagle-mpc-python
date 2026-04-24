@@ -1,0 +1,15 @@
+trajectory_name: figure8
+controller_mode: px4
+robot_name: s500
+odom_source: gazebo
+samples: 400
+duration_s: 7.980000
+pos_rmse_m: 0.048551
+pos_mean_m: 0.041219
+pos_max_m: 0.110820
+att_rmse_deg: 3.177782
+att_mean_deg: 2.512444
+att_max_deg: 8.133265
+solve_ms_mean: 0.000000
+solve_ms_p95: 0.000000
+solve_ms_max: 0.000000

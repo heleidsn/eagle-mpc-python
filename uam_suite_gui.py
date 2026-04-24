@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import copy
+import csv
 import json
 import math
 import os
@@ -187,6 +188,18 @@ def _predict_gazebo_spawn_sdf_path(launch_file: str, model_type: str) -> tuple[s
     full = (root / rel).resolve()
     hint = "ok" if full.is_file() else "path computed but file not found (check package install)"
     return str(full), hint
+
+
+def _safe_name_token(text: str) -> str:
+    s = str(text or "").strip().lower()
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch in ("-", "_"):
+            out.append(ch)
+        elif ch in (" ", "/", "\\", "."):
+            out.append("_")
+    tok = "".join(out).strip("_")
+    return tok or "trajectory"
 
 
 def build_ee_ref_from_full_state(
@@ -3326,6 +3339,72 @@ class UamSuiteGUI(QMainWindow):
         if filepath:
             self.ee_csv_path.setText(filepath)
 
+    def _current_trajectory_save_name(self) -> str:
+        name = self.task_traj_combo.currentText() if hasattr(self, "task_traj_combo") else "trajectory"
+        if str(name) == "csv_import":
+            p = self.ee_csv_path.text().strip() if hasattr(self, "ee_csv_path") else ""
+            if p:
+                name = Path(p).stem
+            vmax = float(self.ee_csv_vmax_limit.value()) if hasattr(self, "ee_csv_vmax_limit") else 0.0
+            yaw_hold = bool(self.ee_csv_yaw_hold.isChecked()) if hasattr(self, "ee_csv_yaw_hold") else False
+            if yaw_hold:
+                yaw_const = float(self.ee_csv_yaw_const.value()) if hasattr(self, "ee_csv_yaw_const") else 0.0
+                name = f"{name}_vmax{vmax:g}_yaw_fixed_{yaw_const:g}deg"
+            else:
+                name = f"{name}_vmax{vmax:g}_yaw_free"
+        return _safe_name_token(name)
+
+    def _save_generated_plan_csv(self, pb: dict) -> Path | None:
+        if not isinstance(pb, dict):
+            return None
+        out_dir = Path(__file__).resolve().parent / "tracking_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        traj_name = self._current_trajectory_save_name()
+        out = out_dir / f"{traj_name}_plan.csv"
+
+        kind = str(pb.get("kind", ""))
+        with out.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if kind in ("full_croc", "full_acados"):
+                t = np.asarray(pb.get("t_plan", []), dtype=float).reshape(-1)
+                x = np.asarray(pb.get("x_plan", []), dtype=float)
+                u = np.asarray(pb.get("u_plan", []), dtype=float) if pb.get("u_plan") is not None else np.zeros((0, 0))
+                nx = int(x.shape[1]) if x.ndim == 2 and x.size > 0 else 0
+                nu = int(u.shape[1]) if u.ndim == 2 and u.size > 0 else 0
+                header = ["t"] + [f"x_{i}" for i in range(nx)] + [f"u_{j}" for j in range(nu)]
+                w.writerow(header)
+                n = int(t.size)
+                for i in range(n):
+                    row = [float(t[i])]
+                    if nx > 0:
+                        row.extend(np.asarray(x[i], dtype=float).tolist())
+                    if nu > 0:
+                        if i < int(u.shape[0]):
+                            row.extend(np.asarray(u[i], dtype=float).tolist())
+                        else:
+                            row.extend([float("nan")] * nu)
+                    w.writerow(row)
+            elif kind == "ee_snap":
+                t = np.asarray(pb.get("t_ref", []), dtype=float).reshape(-1)
+                p = np.asarray(pb.get("p_ref", []), dtype=float)
+                yaw = np.asarray(pb.get("yaw_ref", []), dtype=float).reshape(-1)
+                dp = np.asarray(pb.get("dp_ref"), dtype=float) if pb.get("dp_ref") is not None else None
+                ddp = np.asarray(pb.get("ddp_ref"), dtype=float) if pb.get("ddp_ref") is not None else None
+                dyaw = np.asarray(pb.get("dyaw_ref"), dtype=float).reshape(-1) if pb.get("dyaw_ref") is not None else None
+                w.writerow(["t", "px", "py", "pz", "yaw", "vx", "vy", "vz", "ax", "ay", "az", "dyaw"])
+                for i in range(int(t.size)):
+                    row = [float(t[i])]
+                    row.extend(np.asarray(p[i], dtype=float).tolist() if p.ndim == 2 and i < p.shape[0] else [float("nan")] * 3)
+                    row.append(float(yaw[i]) if i < yaw.size else float("nan"))
+                    row.extend(np.asarray(dp[i], dtype=float).tolist() if dp is not None and dp.ndim == 2 and i < dp.shape[0] else [float("nan")] * 3)
+                    row.extend(np.asarray(ddp[i], dtype=float).tolist() if ddp is not None and ddp.ndim == 2 and i < ddp.shape[0] else [float("nan")] * 3)
+                    row.append(float(dyaw[i]) if dyaw is not None and i < dyaw.size else float("nan"))
+                    w.writerow(row)
+            else:
+                return None
+        self.log(f"[planning] Generated trajectory saved: {out}")
+        return out
+
     def _on_reg_mode_changed(self):
         mode = int(self.reg_mode_combo.currentIndex()) if hasattr(self, "reg_mode_combo") else 0
         full = mode == 0
@@ -4491,6 +4570,11 @@ class UamSuiteGUI(QMainWindow):
         self.run_track_btn.setEnabled(self._plan_bundle is not None)
         self.meshcat_plan_btn.setEnabled(self._plan_bundle is not None)
         self.meshcat_track_btn.setEnabled(False)
+        try:
+            if self._plan_bundle is not None:
+                self._save_generated_plan_csv(self._plan_bundle)
+        except Exception as e:
+            self.log(f"[planning] Failed to save generated CSV: {e!r}")
         _full_plan = (
             self._plan_bundle is not None
             and (
@@ -4598,6 +4682,10 @@ class UamSuiteGUI(QMainWindow):
         self.run_track_btn.setEnabled(True)
         self.meshcat_plan_btn.setEnabled(True)
         self.meshcat_track_btn.setEnabled(False)
+        try:
+            self._save_generated_plan_csv(self._plan_bundle)
+        except Exception as e:
+            self.log(f"[planning] Failed to save generated CSV: {e!r}")
         self.rn_launch_btn.setEnabled(self._is_s500_mode())
         if payload.get("track_kind") == "csv_import" and isinstance(payload.get("meta"), dict):
             m = payload["meta"]
@@ -5032,6 +5120,7 @@ class UamSuiteGUI(QMainWindow):
         odom_src = self.rn_odom_combo.currentText()
         ctrl_rate = float(self.rn_control_rate.value())
         arm_mode = self.rn_arm_mode_combo.currentText()
+        traj_name = self._current_trajectory_save_name()
         use_sim = "true" if self.rn_use_sim_check.isChecked() else "false"
         is_s500 = self._is_s500_mode()
         if is_s500 and ctrl_mode == "croc_ee_pose":
@@ -5047,6 +5136,7 @@ class UamSuiteGUI(QMainWindow):
             f"_suite_plan_path:={npz_path}",
             f"_robot_name:={self.task_robot_combo.currentText()}",
             f"_arm_enabled:={'false' if is_s500 else 'true'}",
+            f"_trajectory_name:={traj_name}",
             f"_controller_mode:={ctrl_mode}",
             f"_odom_source:={odom_src}",
             f"_control_rate:={ctrl_rate}",
@@ -5195,12 +5285,16 @@ class UamSuiteGUI(QMainWindow):
             return
         try:
             from suite_plan_export import export_suite_plan_npz
+            import rospy
             root = Path(__file__).resolve().parent
             export_dir = root / ".suite_ros_export"
             export_dir.mkdir(exist_ok=True)
             npz_path = export_dir / "last_suite_plan.npz"
             export_suite_plan_npz(npz_path, export_pb, dt_plan_fallback_s=float(self.dt_plan.value()))
+            traj_name = self._current_trajectory_save_name()
+            rospy.set_param("/suite_tracking_controller/trajectory_name", traj_name)
             self.log(f"[update_trajectory] 已导出最新规划到 {npz_path}")
+            self.log(f"[update_trajectory] trajectory_name 已更新为: {traj_name}")
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e)[:2000])
             self.log(f"[update_trajectory] 轨迹导出失败: {e!r}")

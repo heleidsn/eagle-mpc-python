@@ -1,0 +1,49 @@
+Tracking error vs speed fitting report
+==========================================
+
+[all_trajectories]
+samples: 6663.000000
+linear_coef_0: 0.030993
+linear_coef_vtrack: 0.037012
+linear_coef_vdiff: 0.156500
+linear_r2: 0.398066
+quad_coef_0: 0.007752
+quad_coef_vtrack: 0.044601
+quad_coef_vdiff: 0.387900
+quad_coef_vtrack2: 0.000275
+quad_coef_vdiff2: 0.001896
+quad_coef_cross: -0.061482
+quad_r2: 0.431061
+mean_error: 0.166332
+max_error: 1.049900
+linear model: error = c0 + c1*|v_track| + c2*|v_track-v_plan|
+quadratic model: error = c0 + c1*|v_track| + c2*|v_track-v_plan| + c3*|v_track|^2 + c4*|v_track-v_plan|^2 + c5*|v_track|*|v_track-v_plan|
+
+[all_trajectories_detailed]
+samples: 6663.000000
+r2_multi_linear: 0.469875
+r2_multi_quadratic: 0.510809
+r2_linear_v_track: 0.370877
+r2_quadratic_v_track: 0.373251
+r2_linear_v_plan: 0.397040
+r2_quadratic_v_plan: 0.399069
+r2_linear_v_diff: 0.134278
+r2_quadratic_v_diff: 0.156211
+r2_linear_acc: 0.202155
+r2_quadratic_acc: 0.287773
+r2_linear_jerk: 0.118851
+r2_quadratic_jerk: 0.137756
+r2_linear_snap: 0.057897
+r2_quadratic_snap: 0.102919
+sensitivity_v_track: 2.348266
+coef_multi_linear_v_track: -0.158654
+sensitivity_v_plan: 2.974121
+coef_multi_linear_v_plan: 0.204853
+sensitivity_v_diff: 0.165932
+coef_multi_linear_v_diff: 0.147653
+sensitivity_acc: 0.041389
+coef_multi_linear_acc: -0.002137
+sensitivity_jerk: 0.104693
+coef_multi_linear_jerk: -0.002362
+sensitivity_snap: 0.082420
+coef_multi_linear_snap: 0.000329

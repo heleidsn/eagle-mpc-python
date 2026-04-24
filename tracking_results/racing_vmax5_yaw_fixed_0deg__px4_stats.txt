@@ -1,0 +1,15 @@
+trajectory_name: racing_vmax5_yaw_fixed_0deg
+controller_mode: px4
+robot_name: s500
+odom_source: gazebo
+samples: 1512
+duration_s: 30.220000
+pos_rmse_m: 0.149536
+pos_mean_m: 0.132289
+pos_max_m: 0.293508
+att_rmse_deg: 5.282505
+att_mean_deg: 4.866693
+att_max_deg: 9.087134
+solve_ms_mean: 0.000000
+solve_ms_p95: 0.000000
+solve_ms_max: 0.000000
