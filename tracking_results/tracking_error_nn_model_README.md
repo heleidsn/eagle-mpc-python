@@ -1,43 +1,48 @@
-# Tracking Error NN Model说明
+# Tracking Error NN 模型说明
 
 ## 模型文件
-- 模型路径: `/home/helei/catkin_eagle_mpc/src/eagle-mpc-python/tracking_results/tracking_error_nn_model.joblib`
+- 模型: `/home/helei/catkin_eagle_mpc/src/eagle-mpc-python/tracking_results/tracking_error_nn_model.joblib`
 - 输入特征顺序: `/home/helei/catkin_eagle_mpc/src/eagle-mpc-python/tracking_results/tracking_error_nn_feature_names.csv`
-- 单次切分评估: `/home/helei/catkin_eagle_mpc/src/eagle-mpc-python/tracking_results/tracking_error_nn_metrics.csv`
-- GroupKFold评估: `/home/helei/catkin_eagle_mpc/src/eagle-mpc-python/tracking_results/tracking_error_nn_kfold_metrics.csv`
+- 训练指标: `/home/helei/catkin_eagle_mpc/src/eagle-mpc-python/tracking_results/tracking_error_nn_metrics.csv`
 
-## 输入 (X)
-输入是9维浮点向量，顺序必须严格一致：
-0. `v_track_world_norm`
-1. `v_plan_norm`
-2. `v_diff_norm`
-3. `a_plan_norm`
-4. `jerk_plan_norm`
-5. `snap_plan_norm`
-6. `vx_world_error`
-7. `vy_world_error`
-8. `vz_world_error`
+## 输入 X
+- 单帧特征维度: 25
+- 窗口长度: 1 帧
+- 实际输入维度: 25
+- 单帧特征按以下顺序拼接：
+  - 0: `ep_x`
+  - 1: `ep_y`
+  - 2: `ep_z`
+  - 3: `ev_x`
+  - 4: `ev_y`
+  - 5: `ev_z`
+  - 6: `a_ref_x`
+  - 7: `a_ref_y`
+  - 8: `a_ref_z`
+  - 9: `j_ref_x`
+  - 10: `j_ref_y`
+  - 11: `j_ref_z`
+  - 12: `yaw_ref`
+  - 13: `yaw_rate_ref`
+  - 14: `v_world_x`
+  - 15: `v_world_y`
+  - 16: `v_world_z`
+  - 17: `omega_x`
+  - 18: `omega_y`
+  - 19: `omega_z`
+  - 20: `body_z_world_x`
+  - 21: `body_z_world_y`
+  - 22: `body_z_world_z`
+  - 23: `u_thrust`
+  - 24: `thrust_margin`
 
-各特征定义：
-- `v_track_world_norm`: tracking机体系速度经四元数旋转到世界系后的速度模长
-- `v_plan_norm`: planning速度模长
-- `v_diff_norm`: `|v_track_world_norm - v_plan_norm|`
-- `a_plan_norm`: planning加速度模长
-- `jerk_plan_norm`: planning jerk模长（由加速度对时间求导）
-- `snap_plan_norm`: planning snap模长（由jerk对时间求导）
-- `vx_world_error, vy_world_error, vz_world_error`: 世界系速度分量误差
+## 输出 y
+- 6维向量，拟合当前误差：
+  - 位置误差 `e_p = p_ref - p` 的3个分量
+  - 速度误差 `e_v = v_ref - v` 的3个分量
 
-## 输出 (y)
-- 网络输出为 `log1p(position_error)` 域的预测值，脚本中会做 `expm1` 还原。
-- 最终物理输出是 `position_error`，定义为：
-  `sqrt((px_track-px_plan)^2 + (py_track-py_plan)^2 + (pz_track-pz_plan)^2)`，单位米。
-
-## 推理注意事项
-1. 推理时必须使用同样的输入定义和顺序。
-2. 模型文件是包含 `StandardScaler + MLPRegressor` 的 Pipeline，可直接 `model.predict(X)`。
-3. `predict` 后需执行：`y_pred = np.expm1(y_pred_log)`，并建议 `clip(y_pred, 0, +inf)`。
-
-## 训练结构
-- MLP: hidden layers `(128, 128)`, ReLU, Adam, alpha=1e-3
-- 目标变换: `log1p(error)`
-- 验证策略: 按轨迹 GroupKFold 交叉验证
+## 训练设置
+- MLP 结构: `(128, 128)`
+- 激活: ReLU, 优化器: Adam
+- 训练轮数: 逐epoch warm-start, 共 `EPOCHS` 轮
+- 训练/测试loss图: `analysis_plots/tracking_error_nn_loss.png`
