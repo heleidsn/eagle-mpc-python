@@ -1,40 +1,50 @@
 {
   "version": 1,
   "plan_mode_index": 0,
-  "method_index": 4,
+  "method_index": 0,
   "track_mode_index": 2,
   "reg_mode_index": 0,
   "control_mode_track_index": 0,
   "wp_rows": [
     [
       "Base",
-      -1.5,
       0.0,
-      1.5,
+      0.0,
+      1.0,
       0.0,
       0.0,
       0.0,
       0.0
     ],
     [
-      "EE",
+      "Base",
+      1.0,
+      0.0,
+      1.0,
       0.0,
       0.0,
-      0.8,
       0.0,
-      0.0,
-      0.0,
-      2.0
+      3.0
     ],
     [
       "Base",
-      1.5,
+      1.0,
+      1.0,
+      2.0,
       0.0,
-      1.5,
+      0.0,
+      0.0,
+      6.0
+    ],
+    [
+      "Base",
+      0.0,
+      1.0,
+      1.0,
       0.0,
       0.0,
       0.0,
-      4.0
+      9.0
     ]
   ],
   "ee_wp_rows": [
@@ -78,14 +88,14 @@
   "ee_knot_vel_w": 200.0,
   "ee_knot_vel_pitch_w": 0.0,
   "dt_ee_sample": 0.02,
-  "ee_plan_type_index": 0,
+  "ee_plan_type_index": 1,
   "ee_eight_center": [
-    0.55,
-    0.05,
-    0.92
+    0.0,
+    0.0,
+    1.0
   ],
-  "ee_eight_a": 0.22,
-  "ee_eight_period": 6.0,
+  "ee_eight_a": 1.0,
+  "ee_eight_period": 8.0,
   "ee_eight_tdur": 8.0,
   "T_sim": 6.0,
   "sim_dt": 0.001,
@@ -185,5 +195,46 @@
   "rn_w_u_thrust": 1.0,
   "rn_w_control": 0.0,
   "rn_ee_w_pos": 400.0,
-  "rn_geo_kd_vel": 2.5
+  "rn_geo_kd_vel": 2.5,
+  "task_traj_index": 0,
+  "task_robot_index": 1,
+  "gz_model_type": "ideal",
+  "gz_model": "s500",
+  "gz_model_type_index": 1,
+  "gz_model_index": 1,
+  "gz_launch_args": "",
+  "gz_world_index": 1,
+  "gz_launch_file": "s500_sitl.launch",
+  "gz_pkg": "eagle_mpc_debugger",
+  "gz_world": "empty",
+  "ee_sun_center": [
+    0.0,
+    0.0,
+    1.0
+  ],
+  "ee_circle_yaw_const_deg": 0.0,
+  "ee_circle_loops": 3,
+  "ee_sun_yaw_const_deg": 0.0,
+  "ee_circle_yaw_hold": false,
+  "ee_sun_plane_index": 0,
+  "ee_csv_vmax_limit": 5.0,
+  "ee_csv_z_offset_m": 0.0,
+  "ee_circle_center": [
+    0.0,
+    0.0,
+    1.0
+  ],
+  "ee_csv_yaw_hold": false,
+  "ee_circle_period": 6.0,
+  "ee_sun_vmax": 10.0,
+  "ee_sun_amax": 20.0,
+  "ee_sun_loops": 2,
+  "ee_sun_buffer_s": 1.0,
+  "ee_circle_buffer_s": 1.0,
+  "ee_circle_r": 1.0,
+  "ee_csv_path": "",
+  "ee_sun_n": 2.0,
+  "ee_circle_tdur": 18.0,
+  "ee_sun_yaw_hold": false,
+  "ee_csv_yaw_const_deg": 0.0
 }

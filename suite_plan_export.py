@@ -48,12 +48,23 @@ def export_suite_plan_npz(
     else:
         dt_ms = 50
 
+    ddp_raw = pb.get("ddp_plan")
+    if ddp_raw is None:
+        ddp_plan = np.zeros((0, 0), dtype=float)
+    else:
+        ddp_plan = np.asarray(ddp_raw, dtype=float)
+        if ddp_plan.ndim != 2:
+            ddp_plan = np.zeros((0, 0), dtype=float)
+    velocity_frame = str(pb.get("velocity_frame", "unknown")).strip().lower() or "unknown"
+
     np.savez(
         out,
         kind=np.array(kind, dtype=object),
+        velocity_frame=np.array(velocity_frame, dtype=object),
         t_plan=t_plan,
         x_plan=x_plan,
         u_plan=u_plan,
+        ddp_plan=ddp_plan,
         dt_traj_opt_ms=np.array(dt_ms, dtype=np.int32),
     )
     return out

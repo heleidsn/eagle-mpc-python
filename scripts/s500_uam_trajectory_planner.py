@@ -430,11 +430,14 @@ class S500UAMTrajectoryPlanner:
 
             self.ee_frame_id = self.robot_model.getFrameId(self.EE_FRAME_NAME)
             if self.ee_frame_id == -1:
-                raise ValueError(f"Frame '{self.EE_FRAME_NAME}' not found in model")
+                self.ee_frame_id = None
 
             print(f"✓ Loaded Pinocchio model")
             print(f"  - nq: {self.robot_model.nq}, nv: {self.robot_model.nv}, ndx: {self.state.ndx}")
-            print(f"  - EE frame '{self.EE_FRAME_NAME}' id: {self.ee_frame_id}")
+            if self.ee_frame_id is None:
+                print(f"  - EE frame '{self.EE_FRAME_NAME}' not found (EE features disabled)")
+            else:
+                print(f"  - EE frame '{self.EE_FRAME_NAME}' id: {self.ee_frame_id}")
         except Exception as e:
             print(f"✗ Failed to load model: {e}")
             raise

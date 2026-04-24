@@ -323,6 +323,8 @@ def sample_ee_figure_eight_trajectory(
     Gerono figure-eight (vertical ∞): in the local xy plane
       x = cx + a*sin(θ), y = cy + a*sin(θ)*cos(θ), z = cz
     where θ = 2π * t / period; one closed figure-eight every ``period`` seconds.
+    A quintic time-scaling is applied so that speed ramps up/down smoothly:
+      s=t/T, sigma=10s^3-15s^4+6s^5, theta=2π*(T*sigma)/period
 
     Reference yaw is fixed to 0 (no longer aligned to the velocity tangent).
 
@@ -344,7 +346,18 @@ def sample_ee_figure_eight_trajectory(
     if len(t_grid) == 0 or abs(t_grid[-1] - tf) > 1e-6:
         t_grid = np.append(t_grid, tf)
 
-    theta = omega * t_grid
+    # Quintic ease-in/out time scaling for smooth start/stop speed.
+    if tf <= 1e-9:
+        tau = t_grid.copy()
+        dtau_dt = np.zeros_like(t_grid)
+    else:
+        s = np.clip(t_grid / tf, 0.0, 1.0)
+        sigma = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
+        dsigma_ds = 30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4
+        tau = tf * sigma
+        dtau_dt = dsigma_ds
+
+    theta = omega * tau
     st = np.sin(theta)
     ct = np.cos(theta)
     # Use sin(θ)cos(θ) = (1/2)sin(2θ) to simplify writing the velocity
@@ -357,8 +370,9 @@ def sample_ee_figure_eight_trajectory(
     p[:, 2] = c[2]
 
     dp = np.zeros((N, 3))
-    dp[:, 0] = a * ct * omega
-    dp[:, 1] = a * np.cos(2.0 * theta) * omega
+    # Chain rule: d/dt = d/dtau * dtau/dt
+    dp[:, 0] = a * ct * omega * dtau_dt
+    dp[:, 1] = a * np.cos(2.0 * theta) * omega * dtau_dt
     dp[:, 2] = 0.0
 
     yaw_ref = np.zeros(N)

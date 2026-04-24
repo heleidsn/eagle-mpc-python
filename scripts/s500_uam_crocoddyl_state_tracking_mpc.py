@@ -358,8 +358,13 @@ class UAMCrocoddylTrackingMPC:
 
         if use_thrust_constraints:
             p = self.s500_config["platform"]
-            self._u_lb = np.array([p["min_thrust"]] * 4 + [-2.0] * 2)
-            self._u_ub = np.array([p["max_thrust"]] * 4 + [2.0] * 2)
+            lb = [p["min_thrust"]] * min(4, self.nu)
+            ub = [p["max_thrust"]] * min(4, self.nu)
+            if self.nu > 4:
+                lb += [-2.0] * (self.nu - 4)
+                ub += [2.0] * (self.nu - 4)
+            self._u_lb = np.asarray(lb, dtype=float)
+            self._u_ub = np.asarray(ub, dtype=float)
         else:
             self._u_lb = -1e6 * np.ones(self.nu)
             self._u_ub = 1e6 * np.ones(self.nu)
@@ -367,18 +372,23 @@ class UAMCrocoddylTrackingMPC:
     # ----- Full-state costs -----
 
     def _full_state_activation_weights(self) -> np.ndarray:
-        """Weights on state tangent [pos(3), att(3), joint(2), vel(3), omega(3), joint_vel(2)]."""
-        return np.array(
-            [
-                self.w_pos, self.w_pos, self.w_pos,
-                self.w_att, self.w_att, self.w_att,
-                self.w_joint, self.w_joint,
-                self.w_vel, self.w_vel, self.w_vel,
-                self.w_omega, self.w_omega, self.w_omega,
-                self.w_joint_vel, self.w_joint_vel,
-            ],
-            dtype=np.float64,
+        """Weights on state tangent [pos(3), att(3), joints, vel(3), omega(3), joint_vels]."""
+        n_joint_q = max(0, int(self.nq) - 7)
+        n_joint_v = max(0, int(self.nv) - 6)
+        w = (
+            [self.w_pos] * 3
+            + [self.w_att] * 3
+            + [self.w_joint] * n_joint_q
+            + [self.w_vel] * 3
+            + [self.w_omega] * 3
+            + [self.w_joint_vel] * n_joint_v
         )
+        w = np.asarray(w, dtype=np.float64)
+        if w.size != int(self.state.ndx):
+            raise ValueError(
+                f"state activation weight size mismatch: got {w.size}, expected ndx={self.state.ndx}"
+            )
+        return w
 
     def _control_activation_weights(self) -> np.ndarray:
         """Weights on control [T1,T2,T3,T4,tau1,tau2]."""

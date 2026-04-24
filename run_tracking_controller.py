@@ -127,12 +127,37 @@ def _load_suite_npz(path: str) -> Dict[str, Any]:
     t_plan = np.asarray(data["t_plan"], dtype=float).ravel()
     x_plan = np.asarray(data["x_plan"], dtype=float)
     dt_ms = int(np.asarray(data.get("dt_traj_opt_ms", 50)).item())
+    kind = "unknown"
+    if "kind" in data.files:
+        try:
+            kind = str(np.asarray(data["kind"]).item())
+        except Exception:
+            kind = "unknown"
+    velocity_frame = "unknown"
+    if "velocity_frame" in data.files:
+        try:
+            velocity_frame = str(np.asarray(data["velocity_frame"]).item()).strip().lower() or "unknown"
+        except Exception:
+            velocity_frame = "unknown"
     u_plan = None
     if "u_plan" in data.files:
         u = np.asarray(data["u_plan"], dtype=float)
         if u.ndim == 2 and u.shape[0] > 0:
             u_plan = u
-    return {"t_plan": t_plan, "x_plan": x_plan, "dt_traj_opt_ms": dt_ms, "u_plan": u_plan}
+    ddp_plan = None
+    if "ddp_plan" in data.files:
+        ddp = np.asarray(data["ddp_plan"], dtype=float)
+        if ddp.ndim == 2 and ddp.shape[0] == t_plan.shape[0] and ddp.shape[1] == 3:
+            ddp_plan = ddp
+    return {
+        "kind": kind,
+        "velocity_frame": velocity_frame,
+        "t_plan": t_plan,
+        "x_plan": x_plan,
+        "dt_traj_opt_ms": dt_ms,
+        "u_plan": u_plan,
+        "ddp_plan": ddp_plan,
+    }
 
 
 def _load_yaml_trajectory(dt_traj_opt_ms: int, use_squash: bool = True):
@@ -220,6 +245,8 @@ class SuiteTrackingController:
         self.use_simulation = rospy.get_param("~use_simulation", True)
         self.arm_enabled = rospy.get_param("~arm_enabled", True)
         self.arm_control_mode = rospy.get_param("~arm_control_mode", "position")
+        if str(self.robot_name).strip().lower() == "s500":
+            self.arm_enabled = False
 
         # 控制速率
         self.control_rate = rospy.get_param("~control_rate", 50.0)  # Hz
@@ -282,6 +309,7 @@ class SuiteTrackingController:
         self._traj_data: Dict[str, Any] = {}
         self.t_plan: Optional[np.ndarray] = None
         self.x_plan: Optional[np.ndarray] = None
+        self.ddp_plan: Optional[np.ndarray] = None
         self.t_ref_ee: Optional[np.ndarray] = None
         self.p_ref_ee: Optional[np.ndarray] = None
         self.yaw_ref_ee: Optional[np.ndarray] = None
@@ -316,7 +344,7 @@ class SuiteTrackingController:
         self._rebuild_cached_viz_paths()
 
         # ── 初始状态（从规划起点） ────────────────────────────────────────────
-        self.state = np.asarray(self.x_plan[0], dtype=float).copy()
+        self.state = self._match_state_dim(np.asarray(self.x_plan[0], dtype=float).copy())
         self.arm_joint_number = self.mpc.robot_model.nq - 7  # nq = 7(base) + n_arm
 
         # WarmStart 缓存（shift-warm-start）
@@ -328,7 +356,11 @@ class SuiteTrackingController:
         # 节点启动时默认处于 regulation 模式，目标 = x_plan[0]
         # 调用 /start_tracking 才切换到轨迹跟踪；/stop_tracking 切回 regulation
         self._regulating: bool = True
-        self._reg_target: np.ndarray = np.asarray(self.x_plan[0], dtype=float).copy()
+        self._reg_target: np.ndarray = self._match_state_dim(
+            np.asarray(self.x_plan[0], dtype=float).copy(), zero_vel=True
+        )
+        # False: use default start/end target policy; True: keep user-set regulation target.
+        self._reg_target_locked: bool = False
         self._reg_xs_guess: Optional[List[np.ndarray]] = None
         self._reg_us_guess: Optional[List[np.ndarray]] = None
 
@@ -389,6 +421,13 @@ class SuiteTrackingController:
 
         self.t_plan = self._traj_data["t_plan"]
         self.x_plan = self._traj_data["x_plan"]
+        self.ddp_plan = self._traj_data.get("ddp_plan")
+        traj_kind = str(self._traj_data.get("kind", "unknown"))
+        vel_frame = str(self._traj_data.get("velocity_frame", "unknown"))
+        rospy.loginfo(
+            f"Suite plan metadata: kind={traj_kind}, velocity_frame={vel_frame}. "
+            "full_croc/full_acados body-frame velocities are used directly (no extra conversion)."
+        )
 
         # EE 参考（用于 croc_ee_pose 模式，从 FK 建立）
         if self.controller_mode == "croc_ee_pose":
@@ -402,7 +441,13 @@ class SuiteTrackingController:
 
     def _build_ee_ref_from_full_state(self):
         """从全状态轨迹 FK 计算 EE 参考（位置 + yaw），用于 EE 位姿跟踪模式。"""
-        planner = S500UAMTrajectoryPlanner()
+        s500_yaml_path, urdf_path = self._model_paths_for_robot()
+        planner = S500UAMTrajectoryPlanner(
+            s500_yaml_path=s500_yaml_path,
+            urdf_path=urdf_path,
+        )
+        if planner.ee_frame_id is None:
+            raise ValueError("Current robot model has no EE frame 'gripper_link'.")
         rm = planner.robot_model
         data = rm.createData()
         eid = planner.ee_frame_id
@@ -418,10 +463,79 @@ class SuiteTrackingController:
         )
         rospy.loginfo("EE reference built from full-state FK.")
 
+    def _model_paths_for_robot(self) -> Tuple[str, str]:
+        root = Path(__file__).resolve().parent
+        s500_yaml = str(root / "config" / "yaml" / "multicopter" / "s500.yaml")
+        robot = str(self.robot_name).strip().lower()
+        if robot == "s500":
+            urdf = str(root / "models" / "urdf" / "s500_simple.urdf")
+        else:
+            urdf = str(root / "models" / "urdf" / "s500_uam_simple.urdf")
+        return s500_yaml, urdf
+
+    def _compute_x_nominal(self, mpc_obj) -> np.ndarray:
+        """
+        Build a dimension-safe nominal state for MPC regularization.
+        Priority: x_plan[0] (if compatible) -> default_hover_nominal() (if compatible) -> neutral+zero-vel.
+        """
+        expected_dim = int(mpc_obj.nq + mpc_obj.nv)
+
+        if self.x_plan is not None and len(self.x_plan) > 0:
+            x0 = np.asarray(self.x_plan[0], dtype=float).reshape(-1)
+            if x0.size == expected_dim:
+                return x0.copy()
+
+        x_def = np.asarray(default_hover_nominal(), dtype=float).reshape(-1)
+        if x_def.size == expected_dim:
+            return x_def.copy()
+
+        # Fallback for model mismatch (e.g., s500 13D vs s500_uam 17D)
+        x_nom = np.zeros(expected_dim, dtype=float)
+        try:
+            x_nom[: mpc_obj.nq] = pin.neutral(mpc_obj.robot_model)
+        except Exception:
+            pass
+        if expected_dim >= 3:
+            x_nom[2] = 1.0
+        rospy.logwarn(
+            f"Nominal state dimension mismatch: using neutral fallback ({expected_dim}D)."
+        )
+        return x_nom
+
+    def _match_state_dim(self, x: np.ndarray, zero_vel: bool = False) -> np.ndarray:
+        """Resize/crop a state vector to current MPC model dimension (nq+nv)."""
+        x_in = np.asarray(x, dtype=float).reshape(-1)
+        nq = int(self.mpc.nq)
+        nx = int(self.mpc.nq + self.mpc.nv)
+        if x_in.size == nx:
+            out = x_in.copy()
+        else:
+            out = np.zeros(nx, dtype=float)
+            if x_in.size > 0:
+                out[: min(nx, x_in.size)] = x_in[: min(nx, x_in.size)]
+            # Prefer a valid neutral configuration when input dimension mismatches.
+            try:
+                q0 = np.asarray(pin.neutral(self.mpc.robot_model), dtype=float).reshape(-1)
+                out[: min(nq, q0.size)] = q0[: min(nq, q0.size)]
+            except Exception:
+                pass
+            if nq >= 3 and out[2] == 0.0:
+                out[2] = 1.0
+            rospy.logwarn_throttle(
+                1.0,
+                f"State dimension mismatch fixed: input={x_in.size}, expected={nx}.",
+            )
+        if zero_vel and out.size > nq:
+            out[nq:] = 0.0
+        return out
+
     def _build_mpc(self):
         """构建 Crocoddyl MPC 实例（与 scripts/ 仿真脚本相同的类）。"""
+        s500_yaml_path, urdf_path = self._model_paths_for_robot()
         if self.controller_mode in ("croc_full_state", "px4", "geometric"):
             self.mpc = UAMCrocoddylStateTrackingMPC(
+                s500_yaml_path=s500_yaml_path,
+                urdf_path=urdf_path,
                 dt_mpc=self.dt_mpc,
                 horizon=self.horizon,
                 w_state_track=self.w_state_track,
@@ -438,10 +552,14 @@ class SuiteTrackingController:
                 w_u_joint_torque=self.w_u_joint_torque,
                 use_thrust_constraints=True,
             )
-            self.x_nom = default_hover_nominal()
             # 全状态模式下 mpc_reg 直接复用 mpc（避免重复构建）
             self.mpc_reg = self.mpc
         elif self.controller_mode == "croc_ee_pose":
+            if not self.arm_enabled:
+                raise ValueError(
+                    "controller_mode 'croc_ee_pose' requires arm/EE model; "
+                    "use 'croc_full_state', 'px4', or 'geometric' for s500."
+                )
             ee_weights = EETrackingWeights(
                 w_pos=self.ee_w_pos,
                 w_rot_rp=self.ee_w_rot_rp,
@@ -455,15 +573,18 @@ class SuiteTrackingController:
                 w_state_track=self.w_state_track,
             )
             self.mpc = UAMEEPoseTrackingCrocoddylMPC(
+                s500_yaml_path=s500_yaml_path,
+                urdf_path=urdf_path,
                 dt_mpc=self.dt_mpc,
                 horizon=self.horizon,
                 ee_weights=ee_weights,
                 use_thrust_constraints=True,
             )
-            self.x_nom = default_hover_nominal()
             # EE-pose 模式下，regulation 需要单独的全状态 MPC
             # （build_shooting_problem_along_plan 仅支持 full-state 模式）
             self.mpc_reg = UAMCrocoddylStateTrackingMPC(
+                s500_yaml_path=s500_yaml_path,
+                urdf_path=urdf_path,
                 dt_mpc=self.dt_mpc,
                 horizon=self.horizon,
                 w_state_track=self.w_state_track,
@@ -485,6 +606,7 @@ class SuiteTrackingController:
                 f"Unknown controller_mode: {self.controller_mode!r}. "
                 "Use 'croc_full_state', 'croc_ee_pose', 'px4', or 'geometric'."
             )
+        self.x_nom = self._compute_x_nominal(self.mpc_reg)
 
         # 从 s500_config 提取推力参数（用于归一化）
         p = self.mpc.s500_config["platform"]
@@ -605,6 +727,7 @@ class SuiteTrackingController:
         rospy.Service("start_tracking", Trigger, self._svc_start_tracking)
         rospy.Service("stop_tracking", Trigger, self._svc_stop_tracking)
         rospy.Service("save_data", Trigger, self._svc_save_data)
+        rospy.Service("update_trajectory", Trigger, self._svc_update_trajectory)
         rospy.Service("reset_to_initial", Trigger, self._svc_reset_to_initial)
         rospy.Service("set_regulation_target", Trigger, self._svc_set_regulation_target)
         rospy.Service("update_controller_params", Trigger, self._svc_update_controller_params)
@@ -697,6 +820,9 @@ class SuiteTrackingController:
 
         # ── Regulation 模式：MPC 镇定到 _reg_target ──────────────────────────
         if self._regulating:
+            # Keep reference policy deterministic in regulation mode.
+            if not self._reg_target_locked:
+                self._reg_target = self._default_reg_target()
             t0 = time.perf_counter()
             u_cmd, xs_next = self._solve_mpc_regulate(x_now)
             solve_ms = (time.perf_counter() - t0) * 1000.0
@@ -709,7 +835,7 @@ class SuiteTrackingController:
             self._publish_body_rate_thrust(self._u_hold, xs_next)
             if self.arm_enabled:
                 self._publish_arm_cmd(xs_next)
-            self._publish_debug(0.0, solve_ms)
+            self._publish_debug(0.0, solve_ms, x_ref_override=self._reg_target)
             # Regulation 模式下也追加实际路径（方便观察归位过程）
             self._append_uav_actual_path_point()
             if self.arm_enabled:
@@ -942,6 +1068,7 @@ class SuiteTrackingController:
                 j1_deg=float(d[4]), j2_deg=float(d[5]),
             )
             self._reg_target    = new_target
+            self._reg_target_locked = True
             self._reg_xs_guess  = None   # 目标改变，丢弃旧 warm-start
             self._reg_us_guess  = None
             # 只有在未进行跟踪（trajectory_started=False）时才立即激活 regulation
@@ -985,17 +1112,35 @@ class SuiteTrackingController:
         pos = np.asarray(x_ref[0:3], dtype=float).copy()
         vel = self._linear_vel_world_from_state(x_ref)
 
-        dt = max(float(self.dt_control), 1e-3)
-        t_prev = max(0.0, float(t_elapsed) - dt)
-        t_next = min(float(self.t_plan[-1] - self.t_plan[0]), float(t_elapsed) + dt)
-        if t_next > t_prev + 1e-6:
-            x_prev = self._sample_ref_state(t_prev)
-            x_next = self._sample_ref_state(t_next)
-            v_prev = self._linear_vel_world_from_state(x_prev)
-            v_next = self._linear_vel_world_from_state(x_next)
-            acc = (v_next - v_prev) / (t_next - t_prev)
+        if (
+            self.ddp_plan is not None
+            and isinstance(self.ddp_plan, np.ndarray)
+            and self.ddp_plan.ndim == 2
+            and self.ddp_plan.shape[0] == len(self.t_plan)
+            and self.ddp_plan.shape[1] == 3
+        ):
+            t_query = float(self.t_plan[0]) + float(t_elapsed)
+            tq = float(np.clip(t_query, float(self.t_plan[0]), float(self.t_plan[-1])))
+            acc = np.array(
+                [
+                    np.interp(tq, self.t_plan, self.ddp_plan[:, 0]),
+                    np.interp(tq, self.t_plan, self.ddp_plan[:, 1]),
+                    np.interp(tq, self.t_plan, self.ddp_plan[:, 2]),
+                ],
+                dtype=float,
+            )
         else:
-            acc = np.zeros(3, dtype=float)
+            dt = max(float(self.dt_control), 1e-3)
+            t_prev = max(0.0, float(t_elapsed) - dt)
+            t_next = min(float(self.t_plan[-1] - self.t_plan[0]), float(t_elapsed) + dt)
+            if t_next > t_prev + 1e-6:
+                x_prev = self._sample_ref_state(t_prev)
+                x_next = self._sample_ref_state(t_next)
+                v_prev = self._linear_vel_world_from_state(x_prev)
+                v_next = self._linear_vel_world_from_state(x_next)
+                acc = (v_next - v_prev) / (t_next - t_prev)
+            else:
+                acc = np.zeros(3, dtype=float)
 
         quat = np.asarray(x_ref[3:7], dtype=float)
         yaw = float(euler_from_quaternion([quat[0], quat[1], quat[2], quat[3]])[2])
@@ -1003,6 +1148,8 @@ class SuiteTrackingController:
 
     def _control_callback_high_level(self, t_elapsed: float) -> None:
         if self._regulating:
+            if not self._reg_target_locked:
+                self._reg_target = self._default_reg_target()
             # PX4 / Geometric 下 regulation 使用常值目标（而非 Crocoddyl regulate 求解）
             x_ref = np.asarray(self._reg_target, dtype=float).copy()
             pos_ref = np.asarray(x_ref[0:3], dtype=float)
@@ -1026,7 +1173,10 @@ class SuiteTrackingController:
         if self.arm_enabled:
             self._publish_arm_cmd(x_ref)
 
-        self._publish_debug(t_elapsed, 0.0)
+        if self._regulating:
+            self._publish_debug(t_elapsed, 0.0, x_ref_override=self._reg_target)
+        else:
+            self._publish_debug(t_elapsed, 0.0)
         if self.trajectory_started:
             self._append_uav_actual_path_point()
             if self.arm_enabled:
@@ -1069,7 +1219,8 @@ class SuiteTrackingController:
         )
 
         # ── Body angular rate（来自 MPC xs[1]） ───────────────────────────
-        if xs_next is not None and xs_next.size > nq + 6:
+        # s500: nq+nv = 13, and body rates are at [nq+3 : nq+6], so equality is valid.
+        if xs_next is not None and xs_next.size >= nq + 6:
             roll_rate = float(xs_next[nq + 3])
             pitch_rate = float(xs_next[nq + 4])
             yaw_rate = float(xs_next[nq + 5])
@@ -1264,16 +1415,24 @@ class SuiteTrackingController:
         if self.recording_enabled:
             self.recorded_data["arm_joint_commands"].append(list(ref_j))
 
-    def _publish_debug(self, t_elapsed: float, solve_ms: float):
+    def _publish_debug(
+        self,
+        t_elapsed: float,
+        solve_ms: float,
+        x_ref_override: Optional[np.ndarray] = None,
+    ):
         """发布 /suite_mpc/state 调试话题。"""
         try:
             msg = MpcState()
             msg.header.stamp = rospy.Time.now()
             msg.state = self.state.tolist()
 
-            x_ref = interp_full_state_piecewise(
-                float(self.t_plan[0]) + t_elapsed, self.t_plan, self.x_plan, self.mpc.robot_model
-            )
+            if x_ref_override is not None:
+                x_ref = np.asarray(x_ref_override, dtype=float).flatten()
+            else:
+                x_ref = interp_full_state_piecewise(
+                    float(self.t_plan[0]) + t_elapsed, self.t_plan, self.x_plan, self.mpc.robot_model
+                )
             msg.state_ref = x_ref.tolist()
             nq = self.mpc.nq
             err = pin.difference(self.mpc.robot_model, x_ref[:nq], self.state[:nq])
@@ -1515,7 +1674,8 @@ class SuiteTrackingController:
         empty.header.stamp    = rospy.Time.now()
         empty.header.frame_id = "map"
         self.uav_actual_path_pub.publish(empty)
-        self.ee_actual_path_pub.publish(empty)
+        if self.arm_enabled:
+            self.ee_actual_path_pub.publish(empty)
 
     # =========================================================================
     # 工具方法
@@ -1529,6 +1689,19 @@ class SuiteTrackingController:
         u = np.zeros(nu, dtype=float)
         u[: self._n_rotors] = T_hover
         return u
+
+    def _default_reg_target(self) -> np.ndarray:
+        """
+        Regulation 默认参考策略：
+        - 未开始 tracking（traj_finished=False）: 轨迹起点 x_plan[0]
+        - tracking 结束后（traj_finished=True）: 轨迹终点 x_plan[-1]
+        """
+        if self.x_plan is None or len(self.x_plan) == 0:
+            return self._match_state_dim(np.asarray(self.state, dtype=float).copy(), zero_vel=True)
+        idx = -1 if bool(self.traj_finished) else 0
+        x_tgt = np.asarray(self.x_plan[idx], dtype=float).copy()
+        # Regulation is a point stabilization task; clear velocity targets.
+        return self._match_state_dim(x_tgt, zero_vel=True)
 
     # =========================================================================
     # 数据录制
@@ -1567,6 +1740,7 @@ class SuiteTrackingController:
             return TriggerResponse(False, "Tracking already started")
         # 退出 regulation 模式，切换到轨迹跟踪
         self._regulating = False
+        self._reg_target_locked = False
         self.trajectory_started = True
         self.traj_finished = False
         self.controller_start_time = rospy.Time.now()
@@ -1581,17 +1755,16 @@ class SuiteTrackingController:
         self.trajectory_started = False
         self.traj_finished = True
         self.recording_enabled = False
-        # 停止跟踪后切回 regulation 模式，目标 = 当前位置（速度置零，保持原地悬停）
-        cur = self.state.copy()
-        nq = self.mpc.nq
-        cur[nq:] = 0.0          # 清除速度分量，避免 MPC 尝试复现当前速度
-        self._reg_target   = cur
+        # 停止跟踪后切回 regulation 模式，目标固定为轨迹终点。
+        self._reg_target   = self._default_reg_target()
+        self._reg_target_locked = False
         self._reg_xs_guess = None
         self._reg_us_guess = None
         self._regulating   = True
+        tgt = self._reg_target
         rospy.loginfo(
-            f"Tracking stopped. Switched to regulation (hold) at "
-            f"x={cur[0]:.2f} y={cur[1]:.2f} z={cur[2]:.2f}"
+            f"Tracking stopped. Switched to regulation at trajectory end-point "
+            f"x={tgt[0]:.2f} y={tgt[1]:.2f} z={tgt[2]:.2f}"
         )
         return TriggerResponse(True, "Tracking stopped, holding position")
 
@@ -1612,6 +1785,44 @@ class SuiteTrackingController:
             return TriggerResponse(True, f"Saved to {filepath}")
         except Exception as e:
             return TriggerResponse(False, f"Save failed: {e}")
+
+    def _svc_update_trajectory(self, req) -> TriggerResponse:
+        """
+        /update_trajectory 服务：
+        重新加载轨迹并重建 MPC/缓存，不重启节点进程。
+        """
+        try:
+            with self._thread_lock:
+                self._load_trajectory()
+                self._build_mpc()
+                self.arm_joint_number = self.mpc.robot_model.nq - 7
+                self._rebuild_cached_viz_paths()
+                self._u_hold = self._hover_thrust_cmd()
+
+                # Reset warm starts under the new trajectory/model.
+                self._xs_guess = None
+                self._us_guess = None
+                self._reg_xs_guess = None
+                self._reg_us_guess = None
+
+                # Keep safe: switch to regulation at updated default target.
+                self.trajectory_started = False
+                self.traj_finished = False
+                self.controller_start_time = None
+                self._reg_target = self._default_reg_target()
+                self._reg_target_locked = False
+                self._regulating = True
+                self._clear_actual_paths()
+
+            msg = (
+                f"Trajectory reloaded: {len(self.t_plan)} points, "
+                f"mode={self.controller_mode}, regulation target reset."
+            )
+            rospy.loginfo(f"[update_trajectory] {msg}")
+            return TriggerResponse(True, msg)
+        except Exception as e:
+            rospy.logerr(f"[update_trajectory] failed: {e}")
+            return TriggerResponse(False, f"Error: {e}")
 
     # ── reset_to_initial ────────────────────────────────────────────────────
 
@@ -1634,7 +1845,8 @@ class SuiteTrackingController:
         self._u_hold = self._hover_thrust_cmd()
 
         # ── 2. 将 regulation 目标设为 x_plan[0]，切换到 regulation 模式 ──────
-        self._reg_target   = np.asarray(self.x_plan[0], dtype=float).copy()
+        self._reg_target   = self._default_reg_target()
+        self._reg_target_locked = False
         self._reg_xs_guess = None
         self._reg_us_guess = None
         self._regulating   = True
@@ -1670,6 +1882,7 @@ class SuiteTrackingController:
                 yaw_deg=data[3], j1_deg=data[4], j2_deg=data[5],
             )
             self._reg_target   = new_target
+            self._reg_target_locked = True
             self._reg_xs_guess = None
             self._reg_us_guess = None
             if not self.trajectory_started:
@@ -1768,7 +1981,8 @@ class SuiteTrackingController:
 
                 # 若维度变化导致目标不兼容，回退到 x_plan[0]
                 if self._reg_target.shape[0] != self.mpc.nq + self.mpc.nv:
-                    self._reg_target = np.asarray(self.x_plan[0], dtype=float).copy()
+                    self._reg_target = self._default_reg_target()
+                    self._reg_target_locked = False
 
             msg = (
                 f"Controller params updated: mode={self.controller_mode}, "

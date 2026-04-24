@@ -29,6 +29,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from PyQt5.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -38,12 +39,15 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QFileDialog,
     QScrollArea,
     QSpinBox,
+    QSizePolicy,
+    QSplitter,
     QStackedWidget,
     QTabWidget,
     QTableWidget,
@@ -141,6 +145,50 @@ def _migrate_mixed_wp_rows_v1_to_v2(rows: list) -> list:
     return out
 
 
+def _predict_gazebo_spawn_sdf_path(launch_file: str, model_type: str) -> tuple[str | None, str]:
+    """
+    For eagle_mpc_debugger SITL launches, resolve the SDF file that spawn_model / PX4 will use.
+    Paths follow the <arg name="sdf" / "sdf_file"> rules in those launch files.
+    """
+    lf = Path(launch_file).name.lower()
+    mt = (model_type or "real").strip().lower()
+    rel: str | None = None
+    if lf == "s500_sitl.launch":
+        rel = (
+            "models/sdf/s500_uam/s500_ideal.sdf"
+            if mt == "ideal"
+            else "models/sdf/s500_uam/s500.sdf"
+        )
+    elif lf == "s500_uam_sitl.launch":
+        rel = (
+            "models/sdf/s500_uam/s500_uam_ideal.sdf"
+            if mt == "ideal"
+            else "models/sdf/s500_uam/s500_uam_real.sdf"
+        )
+    else:
+        return None, (
+            f"SDF path not auto-resolved for '{lf}' "
+            "(supported: s500_sitl.launch, s500_uam_sitl.launch)."
+        )
+    try:
+        proc = subprocess.run(
+            ["rospack", "find", "eagle_mpc_debugger"],
+            capture_output=True,
+            text=True,
+            timeout=6.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return None, f"Could not run rospack ({e!r}). Source ROS workspace, then retry."
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        return None, f"rospack find eagle_mpc_debugger failed: {err or proc.returncode}"
+    root = Path(proc.stdout.strip())
+    full = (root / rel).resolve()
+    hint = "ok" if full.is_file() else "path computed but file not found (check package install)"
+    return str(full), hint
+
+
 def build_ee_ref_from_full_state(
     t_plan: np.ndarray,
     x_plan: np.ndarray,
@@ -187,23 +235,331 @@ class EeRefPlanWorker(QThread):
 
             p = self.params
             mode = p.get("mode", "snap")
+            def _apply_zero_speed_buffer(
+                t: np.ndarray,
+                pos: np.ndarray,
+                yaw: np.ndarray,
+                vel: np.ndarray,
+                acc: np.ndarray,
+                dyaw: np.ndarray,
+                buffer_s: float,
+                dt_hint: float,
+            ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                t = np.asarray(t, dtype=float).flatten()
+                pos = np.asarray(pos, dtype=float)
+                yaw = np.asarray(yaw, dtype=float).flatten()
+                vel = np.asarray(vel, dtype=float)
+                acc = np.asarray(acc, dtype=float)
+                dyaw = np.asarray(dyaw, dtype=float).flatten()
+                b = max(0.0, float(buffer_s))
+                if b <= 1e-9 or t.size == 0:
+                    return t, pos, yaw, vel, acc, dyaw
+                dt = float(dt_hint) if float(dt_hint) > 1e-9 else (
+                    float(np.median(np.diff(t))) if t.size >= 2 else 0.02
+                )
+                nbuf = max(1, int(np.round(b / max(dt, 1e-9))))
+                t_pre = np.arange(0, nbuf, dtype=float) * dt
+                t_mid = t + float(nbuf) * dt
+                t_post = t_mid[-1] + (np.arange(1, nbuf + 1, dtype=float) * dt)
+                p_pre = np.repeat(pos[0:1, :], nbuf, axis=0)
+                p_post = np.repeat(pos[-1:, :], nbuf, axis=0)
+                y_pre = np.repeat(yaw[0:1], nbuf, axis=0)
+                y_post = np.repeat(yaw[-1:], nbuf, axis=0)
+                z3_pre = np.zeros((nbuf, 3), dtype=float)
+                z3_post = np.zeros((nbuf, 3), dtype=float)
+                z1_pre = np.zeros(nbuf, dtype=float)
+                z1_post = np.zeros(nbuf, dtype=float)
+                t_out = np.concatenate([t_pre, t_mid, t_post], axis=0)
+                p_out = np.vstack([p_pre, pos, p_post])
+                y_out = np.concatenate([y_pre, yaw, y_post], axis=0)
+                v_out = np.vstack([z3_pre, vel, z3_post])
+                a_out = np.vstack([z3_pre, acc, z3_post])
+                dy_out = np.concatenate([z1_pre, dyaw, z1_post], axis=0)
+                return t_out, p_out, y_out, v_out, a_out, dy_out
+            def _numdiff_1d(y: np.ndarray, t: np.ndarray) -> np.ndarray:
+                y = np.asarray(y, dtype=float).flatten()
+                t = np.asarray(t, dtype=float).flatten()
+                if y.size <= 1 or t.size <= 1:
+                    return np.zeros_like(y, dtype=float)
+                dt = np.diff(t)
+                dt = np.where(np.abs(dt) < 1e-12, 1e-12, dt)
+                g = np.gradient(y, t)
+                return np.asarray(g, dtype=float).flatten()
             if mode == "eight":
                 center = np.asarray(p["eight_center"], dtype=float).reshape(3)
-                t_grid, p_ref, yaw_ref, _ = sample_ee_figure_eight_trajectory(
+                t_grid, p_ref, yaw_ref, dp_ref = sample_ee_figure_eight_trajectory(
                     t_duration=float(p["t_duration"]),
                     dt_sample=float(p["dt_sample"]),
                     center=center,
                     semi_axis=float(p["eight_a"]),
                     period=float(p["eight_period"]),
                 )
+                if t_grid.size >= 2:
+                    ddp_ref = np.gradient(dp_ref, t_grid, axis=0)
+                else:
+                    ddp_ref = np.zeros_like(dp_ref)
+                dyaw_ref = _numdiff_1d(yaw_ref, t_grid)
                 payload = {
                     "kind": "ee_ref",
                     "track_kind": "eight",
                     "t_ref": t_grid,
                     "p_ref": p_ref,
                     "yaw_ref": yaw_ref,
+                    "dp_ref": dp_ref,
+                    "ddp_ref": ddp_ref,
+                    "dyaw_ref": dyaw_ref,
                     "waypoints_xyz_yaw": None,
                     "t_wp": None,
+                }
+            elif mode == "sun_ellipse":
+                dt = float(p["dt_sample"])
+                vmax = max(1e-6, float(p["vmax"]))
+                amax = max(1e-6, float(p["amax"]))
+                n_ell = max(1.0, float(p["ellipticity"]))
+                loops = max(1, int(p.get("loops", 1)))
+                center = np.asarray(p.get("center", [0.0, 0.0, 1.0]), dtype=float).reshape(3)
+                plane = str(p.get("plane", "horizontal")).strip().lower()
+                yaw_const = float(np.deg2rad(float(p.get("yaw_const_deg", 0.0))))
+                yaw_hold = bool(p.get("yaw_hold", False))
+
+                # Sun et al. (2024), Sec. VI-A, Eq. (36)-(38)
+                rmax = (vmax * vmax) / amax
+                k = amax / vmax
+                rmin = rmax / n_ell
+                T = 2.0 * np.pi / max(k, 1e-9)
+                t_end = float(loops) * T
+                t_grid = np.arange(0.0, t_end + 1e-12, dt, dtype=float)
+                if t_grid.size < 2:
+                    t_grid = np.array([0.0, max(dt, 1e-2)], dtype=float)
+                # Quintic time-scaling: motion starts/ends with zero speed.
+                tau = np.clip(t_grid / max(t_end, 1e-9), 0.0, 1.0)
+                sigma = 10.0 * tau**3 - 15.0 * tau**4 + 6.0 * tau**5
+                sigma_dot = (30.0 * tau**2 - 60.0 * tau**3 + 30.0 * tau**4) / max(t_end, 1e-9)
+                sigma_ddot = (60.0 * tau - 180.0 * tau**2 + 120.0 * tau**3) / max(t_end * t_end, 1e-9)
+                phi_end = 2.0 * np.pi * float(loops)
+                s = phi_end * sigma
+                s_dot = phi_end * sigma_dot
+                s_ddot = phi_end * sigma_ddot
+
+                p_ref = np.zeros((t_grid.size, 3), dtype=float)
+                dp_ref = np.zeros((t_grid.size, 3), dtype=float)
+                ddp_ref = np.zeros((t_grid.size, 3), dtype=float)
+                yaw_ref = np.zeros(t_grid.size, dtype=float)
+
+                if plane.startswith("v"):
+                    p_ref[:, 0] = center[0] + rmax * np.sin(s)
+                    p_ref[:, 1] = center[1]
+                    p_ref[:, 2] = center[2] + rmin * np.cos(s)
+                    dp_ref[:, 0] = rmax * np.cos(s) * s_dot
+                    dp_ref[:, 2] = -rmin * np.sin(s) * s_dot
+                    ddp_ref[:, 0] = rmax * (-np.sin(s) * s_dot * s_dot + np.cos(s) * s_ddot)
+                    ddp_ref[:, 2] = -rmin * (np.cos(s) * s_dot * s_dot + np.sin(s) * s_ddot)
+                    yaw_ref[:] = yaw_const
+                else:
+                    p_ref[:, 0] = center[0] + rmax * np.sin(s)
+                    p_ref[:, 1] = center[1] + rmin * np.cos(s)
+                    p_ref[:, 2] = center[2]
+                    dp_ref[:, 0] = rmax * np.cos(s) * s_dot
+                    dp_ref[:, 1] = -rmin * np.sin(s) * s_dot
+                    ddp_ref[:, 0] = rmax * (-np.sin(s) * s_dot * s_dot + np.cos(s) * s_ddot)
+                    ddp_ref[:, 1] = -rmin * (np.cos(s) * s_dot * s_dot + np.sin(s) * s_ddot)
+                    if yaw_hold:
+                        yaw_ref[:] = yaw_const
+                    else:
+                        to_center = center[:2].reshape(1, 2) - p_ref[:, :2]
+                        yaw_ref = np.unwrap(np.arctan2(to_center[:, 1], to_center[:, 0]))
+
+                dyaw_ref = _numdiff_1d(yaw_ref, t_grid)
+                t_grid, p_ref, yaw_ref, dp_ref, ddp_ref, dyaw_ref = _apply_zero_speed_buffer(
+                    t_grid,
+                    p_ref,
+                    yaw_ref,
+                    dp_ref,
+                    ddp_ref,
+                    dyaw_ref,
+                    float(p.get("buffer_s", 1.0)),
+                    dt,
+                )
+                payload = {
+                    "kind": "ee_ref",
+                    "track_kind": "sun_ellipse",
+                    "t_ref": t_grid,
+                    "p_ref": p_ref,
+                    "yaw_ref": yaw_ref,
+                    "dp_ref": dp_ref,
+                    "ddp_ref": ddp_ref,
+                    "dyaw_ref": dyaw_ref,
+                    "waypoints_xyz_yaw": None,
+                    "t_wp": None,
+                }
+            elif mode == "circle":
+                dt = float(p["dt_sample"])
+                center = np.asarray(p.get("center", [0.0, 0.0, 1.0]), dtype=float).reshape(3)
+                radius = max(1e-6, float(p.get("radius", 1.0)))
+                period = max(1e-6, float(p.get("period", 6.0)))
+                loops = max(1, int(p.get("loops", 3)))
+                duration = max(dt, float(p.get("duration", loops * period)))
+                yaw_const = float(np.deg2rad(float(p.get("yaw_const_deg", 0.0))))
+                yaw_hold = bool(p.get("yaw_hold", False))
+
+                t_grid = np.arange(0.0, duration + 1e-12, dt, dtype=float)
+                if t_grid.size < 2:
+                    t_grid = np.array([0.0, max(dt, 1e-2)], dtype=float)
+
+                # Quintic time-scaling for zero start/end speed.
+                tau = np.clip(t_grid / max(duration, 1e-9), 0.0, 1.0)
+                sigma = 10.0 * tau**3 - 15.0 * tau**4 + 6.0 * tau**5
+                sigma_dot = (30.0 * tau**2 - 60.0 * tau**3 + 30.0 * tau**4) / max(duration, 1e-9)
+                sigma_ddot = (60.0 * tau - 180.0 * tau**2 + 120.0 * tau**3) / max(duration * duration, 1e-9)
+                # Total phase covered during the motion window; quintic scaling enforces zero start/end speed.
+                phi_end = 2.0 * np.pi * (duration / period)
+                s = phi_end * sigma
+                s_dot = phi_end * sigma_dot
+                s_ddot = phi_end * sigma_ddot
+
+                p_ref = np.zeros((t_grid.size, 3), dtype=float)
+                dp_ref = np.zeros((t_grid.size, 3), dtype=float)
+                ddp_ref = np.zeros((t_grid.size, 3), dtype=float)
+                yaw_ref = np.zeros(t_grid.size, dtype=float)
+
+                p_ref[:, 0] = center[0] + radius * np.cos(s)
+                p_ref[:, 1] = center[1] + radius * np.sin(s)
+                p_ref[:, 2] = center[2]
+                dp_ref[:, 0] = -radius * np.sin(s) * s_dot
+                dp_ref[:, 1] = radius * np.cos(s) * s_dot
+                ddp_ref[:, 0] = -radius * (np.cos(s) * s_dot * s_dot + np.sin(s) * s_ddot)
+                ddp_ref[:, 1] = radius * (-np.sin(s) * s_dot * s_dot + np.cos(s) * s_ddot)
+
+                if yaw_hold:
+                    yaw_ref[:] = yaw_const
+                else:
+                    # Heading points to circle center.
+                    to_center = center[:2].reshape(1, 2) - p_ref[:, :2]
+                    yaw_ref = np.unwrap(np.arctan2(to_center[:, 1], to_center[:, 0]))
+
+                dyaw_ref = _numdiff_1d(yaw_ref, t_grid)
+                t_grid, p_ref, yaw_ref, dp_ref, ddp_ref, dyaw_ref = _apply_zero_speed_buffer(
+                    t_grid,
+                    p_ref,
+                    yaw_ref,
+                    dp_ref,
+                    ddp_ref,
+                    dyaw_ref,
+                    float(p.get("buffer_s", 1.0)),
+                    dt,
+                )
+
+                payload = {
+                    "kind": "ee_ref",
+                    "track_kind": "circle",
+                    "t_ref": t_grid,
+                    "p_ref": p_ref,
+                    "yaw_ref": yaw_ref,
+                    "dp_ref": dp_ref,
+                    "ddp_ref": ddp_ref,
+                    "dyaw_ref": dyaw_ref,
+                    "waypoints_xyz_yaw": None,
+                    "t_wp": None,
+                }
+            elif mode == "csv_import":
+                csv_path = str(p.get("csv_path", "")).strip()
+                if not csv_path:
+                    raise ValueError("CSV path is empty.")
+                csv_file = Path(csv_path).expanduser()
+                if not csv_file.is_absolute():
+                    csv_file = (Path(__file__).resolve().parent / csv_file).resolve()
+                if not csv_file.exists():
+                    raise FileNotFoundError(f"CSV file not found: {csv_file}")
+                arr = np.genfromtxt(str(csv_file), delimiter=",", names=True, dtype=float, encoding="utf-8")
+                if arr.size == 0:
+                    raise ValueError(f"CSV has no data rows: {csv_file}")
+                required = ("t", "p_x", "p_y", "p_z", "v_x", "v_y", "v_z")
+                names = tuple(arr.dtype.names or ())
+                missing = [k for k in required if k not in names]
+                if missing:
+                    raise ValueError(f"CSV missing columns: {missing}; required={required}")
+                t_raw = np.atleast_1d(np.asarray(arr["t"], dtype=float).flatten())
+                pos_raw = np.column_stack(
+                    [
+                        np.asarray(arr["p_x"], dtype=float).flatten(),
+                        np.asarray(arr["p_y"], dtype=float).flatten(),
+                        np.asarray(arr["p_z"], dtype=float).flatten(),
+                    ]
+                )
+                vel_raw = np.column_stack(
+                    [
+                        np.asarray(arr["v_x"], dtype=float).flatten(),
+                        np.asarray(arr["v_y"], dtype=float).flatten(),
+                        np.asarray(arr["v_z"], dtype=float).flatten(),
+                    ]
+                )
+                valid = (
+                    np.isfinite(t_raw)
+                    & np.all(np.isfinite(pos_raw), axis=1)
+                    & np.all(np.isfinite(vel_raw), axis=1)
+                )
+                if int(np.sum(valid)) < 2:
+                    raise ValueError("CSV valid samples < 2 after filtering NaN/Inf.")
+                t0 = t_raw[valid]
+                p0 = pos_raw[valid]
+                v0 = vel_raw[valid]
+                order = np.argsort(t0)
+                t1 = t0[order]
+                p1 = p0[order]
+                v1 = v0[order]
+                keep = np.ones(t1.size, dtype=bool)
+                keep[1:] = np.diff(t1) > 1e-12
+                t_base = t1[keep]
+                p_ref = p1[keep]
+                vel_base = v1[keep]
+                if t_base.size < 2:
+                    raise ValueError("CSV time values are not strictly increasing.")
+                z_offset_m = float(p.get("z_offset_m", 0.0))
+                p_ref[:, 2] = p_ref[:, 2] + z_offset_m
+                t_base = t_base - float(t_base[0])
+                vmax_raw = float(np.max(np.linalg.norm(vel_base, axis=1)))
+                vmax_limit = max(1e-6, float(p.get("vmax_limit", 5.0)))
+                time_scale = max(1.0, vmax_raw / vmax_limit)
+                t_ref = t_base * time_scale
+                dp_ref = vel_base / time_scale
+                ddp_ref = np.gradient(dp_ref, t_ref, axis=0)
+                yaw_hold = bool(p.get("yaw_hold", False))
+                yaw_const = float(np.deg2rad(float(p.get("yaw_const_deg", 0.0))))
+                if yaw_hold:
+                    yaw_ref = np.full(t_ref.size, yaw_const, dtype=float)
+                    dyaw_ref = np.zeros(t_ref.size, dtype=float)
+                else:
+                    yaw_ref = np.zeros(t_ref.size, dtype=float)
+                    v_xy = np.linalg.norm(dp_ref[:, :2], axis=1)
+                    yaw_dyn = np.unwrap(np.arctan2(dp_ref[:, 1], dp_ref[:, 0]))
+                    idx0 = int(np.argmax(v_xy > 1e-4)) if np.any(v_xy > 1e-4) else 0
+                    yaw_ref[:] = float(yaw_dyn[idx0])
+                    for i in range(t_ref.size):
+                        if v_xy[i] > 1e-4:
+                            yaw_ref[i] = yaw_dyn[i]
+                        elif i > 0:
+                            yaw_ref[i] = yaw_ref[i - 1]
+                    dyaw_ref = _numdiff_1d(yaw_ref, t_ref)
+                payload = {
+                    "kind": "ee_ref",
+                    "track_kind": "csv_import",
+                    "t_ref": t_ref,
+                    "p_ref": p_ref,
+                    "yaw_ref": yaw_ref,
+                    "dp_ref": dp_ref,
+                    "ddp_ref": ddp_ref,
+                    "dyaw_ref": dyaw_ref,
+                    "waypoints_xyz_yaw": None,
+                    "t_wp": None,
+                    "meta": {
+                        "csv_path": str(csv_file),
+                        "vmax_raw": vmax_raw,
+                        "vmax_limit": vmax_limit,
+                        "time_scale": time_scale,
+                        "z_offset_m": z_offset_m,
+                        "yaw_hold": yaw_hold,
+                        "yaw_const_deg": float(np.rad2deg(yaw_const)),
+                    },
                 }
             else:
                 rows = p["rows"]
@@ -216,15 +572,23 @@ class EeRefPlanWorker(QThread):
                     wp[i, 2] = r[2]
                     wp[i, 3] = r[3] * deg
                     tw[i] = r[4]
-                t_grid, p_ref, yaw_ref, _ = sample_ee_minimum_snap_trajectory(
+                t_grid, p_ref, yaw_ref, dp_ref = sample_ee_minimum_snap_trajectory(
                     wp, tw, float(p["dt_sample"])
                 )
+                if t_grid.size >= 2:
+                    ddp_ref = np.gradient(dp_ref, t_grid, axis=0)
+                else:
+                    ddp_ref = np.zeros_like(dp_ref)
+                dyaw_ref = _numdiff_1d(yaw_ref, t_grid)
                 payload = {
                     "kind": "ee_ref",
                     "track_kind": "snap",
                     "t_ref": t_grid,
                     "p_ref": p_ref,
                     "yaw_ref": yaw_ref,
+                    "dp_ref": dp_ref,
+                    "ddp_ref": ddp_ref,
+                    "dyaw_ref": dyaw_ref,
                     "waypoints_xyz_yaw": wp,
                     "t_wp": tw,
                 }
@@ -598,6 +962,11 @@ class UamSuiteGUI(QMainWindow):
         self._manual_ref_overlay: dict | None = None
         self._params_path: Path = DEFAULT_PARAMS_PATH
         self._last_plan_sorted_wp_rows: list | None = None
+        self._gazebo_process = None
+        self._task_trajectories = {
+            "s500_uam": ["full_state_default", "wp3_joint_opt", "minimum_snap", "figure8"],
+            "s500": ["full_state_crocoddyl", "minimum_snap", "figure8", "sun_ellipse", "circle", "csv_import"],
+        }
 
         try:
             from s500_uam_trajectory_gui import (
@@ -649,9 +1018,10 @@ class UamSuiteGUI(QMainWindow):
             self._croc_ee_mpc = None
 
         self.planner = None
-        self._init_croc_planner()
         self._build_ui()
         self._load_params_from_path(self._params_path, silent_if_missing=True)
+        # Ensure UI sections match current default/loaded task selection on startup.
+        self._refresh_task_selection_ui()
 
     def _init_croc_planner(self):
         if not self._CROCODDYL_AVAILABLE:
@@ -693,7 +1063,7 @@ class UamSuiteGUI(QMainWindow):
         return x0
 
     def _build_ui(self):
-        self.setWindowTitle("S500 UAM — Planning + Tracking Overview")
+        self.setWindowTitle("S500 / S500-UAM — Planning + Tracking Overview")
         self.resize(1680, 960)
 
         central = QWidget()
@@ -707,16 +1077,50 @@ class UamSuiteGUI(QMainWindow):
         tab_plan = QWidget()
         plan_layout = QVBoxLayout(tab_plan)
         self.left_tabs.addTab(tab_plan, "Planning")
+        plan_splitter = QSplitter(Qt.Vertical)
+        plan_layout.addWidget(plan_splitter)
+        plan_top = QWidget()
+        plan_top_layout = QVBoxLayout(plan_top)
+        plan_top_layout.setContentsMargins(0, 0, 0, 0)
+        plan_splitter.addWidget(plan_top)
+
+        self.task_group = QGroupBox("Task configuration")
+        tg = QGridLayout()
+        tg.addWidget(QLabel("Robot mode"), 0, 0)
+        self.task_robot_combo = QComboBox()
+        self.task_robot_combo.addItems(["s500_uam", "s500"])
+        self.task_robot_combo.setCurrentIndex(1)
+        tg.addWidget(self.task_robot_combo, 0, 1)
+        tg.addWidget(QLabel("Trajectory template"), 1, 0)
+        self.task_traj_combo = QComboBox()
+        tg.addWidget(self.task_traj_combo, 1, 1)
+        tg.addWidget(QLabel("Sampling dt [s]"), 2, 0)
+        self.dt_plan = QDoubleSpinBox()
+        self.dt_plan.setRange(0.001, 0.5)
+        self.dt_plan.setValue(0.02)
+        tg.addWidget(self.dt_plan, 2, 1)
+        self.task_hint_label = QLabel("")
+        self.task_hint_label.setWordWrap(True)
+        self.task_hint_label.setStyleSheet("color: palette(mid);")
+        tg.addWidget(self.task_hint_label, 3, 0, 1, 2)
+        self.task_robot_combo.currentTextChanged.connect(self._on_task_robot_changed)
+        self.task_traj_combo.currentTextChanged.connect(self._on_task_traj_changed)
+        self.task_group.setLayout(tg)
+        self.task_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        plan_top_layout.addWidget(self.task_group)
 
         self.plan_mode_combo = QComboBox()
-        self.plan_mode_combo.addItems(["Full state (default)", "EE only (Minimum snap)"])
+        self.plan_mode_combo.addItems(["Full state (default)", "Position trajectory"])
         self.plan_mode_combo.setCurrentIndex(0)
         self.plan_mode_combo.currentIndexChanged.connect(self._on_plan_mode)
-        plan_layout.addWidget(QLabel("Planning type"))
-        plan_layout.addWidget(self.plan_mode_combo)
 
+        self.traj_group = QGroupBox("Trajectory setting")
+        traj_layout = QVBoxLayout()
         self.plan_stack = QStackedWidget()
-        plan_layout.addWidget(self.plan_stack)
+        self.plan_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        traj_layout.addWidget(self.plan_stack)
+        self.traj_group.setLayout(traj_layout)
+        plan_top_layout.addWidget(self.traj_group)
 
         # Stack 0: full state
         w_full = QWidget()
@@ -780,9 +1184,6 @@ class UamSuiteGUI(QMainWindow):
         g_full.addLayout(wp_btn)
 
         cost_g = QGridLayout()
-        self.dt_plan = QDoubleSpinBox()
-        self.dt_plan.setRange(0.001, 0.5)
-        self.dt_plan.setValue(0.02)
         self.max_iter_plan = QSpinBox()
         self.max_iter_plan.setRange(10, 2000)
         self.max_iter_plan.setValue(200)
@@ -810,22 +1211,20 @@ class UamSuiteGUI(QMainWindow):
         self.plan_tau_joint.setDecimals(3)
         self.plan_tau_joint.setSingleStep(0.005)
         self.plan_tau_joint.setValue(0.05)
-        cost_g.addWidget(QLabel("dt"), 0, 0)
-        cost_g.addWidget(self.dt_plan, 0, 1)
-        cost_g.addWidget(QLabel("max_iter"), 0, 2)
-        cost_g.addWidget(self.max_iter_plan, 0, 3)
-        cost_g.addWidget(QLabel("state_w"), 1, 0)
-        cost_g.addWidget(self.state_w, 1, 1)
-        cost_g.addWidget(QLabel("ctrl_w"), 1, 2)
-        cost_g.addWidget(self.ctrl_w, 1, 3)
-        cost_g.addWidget(QLabel("wp_mult"), 2, 0)
-        cost_g.addWidget(self.wp_mult, 2, 1)
-        cost_g.addWidget(QLabel("Croc actuator 1st-order"), 2, 2)
-        cost_g.addWidget(self.plan_croc_use_actuator_first_order, 2, 3)
-        cost_g.addWidget(QLabel("tau motor thrust [s]"), 3, 0)
-        cost_g.addWidget(self.plan_tau_motor, 3, 1)
-        cost_g.addWidget(QLabel("tau joint torque [s]"), 3, 2)
-        cost_g.addWidget(self.plan_tau_joint, 3, 3)
+        cost_g.addWidget(QLabel("max_iter"), 0, 0)
+        cost_g.addWidget(self.max_iter_plan, 0, 1)
+        cost_g.addWidget(QLabel("state_w"), 0, 2)
+        cost_g.addWidget(self.state_w, 0, 3)
+        cost_g.addWidget(QLabel("ctrl_w"), 1, 0)
+        cost_g.addWidget(self.ctrl_w, 1, 1)
+        cost_g.addWidget(QLabel("wp_mult"), 1, 2)
+        cost_g.addWidget(self.wp_mult, 1, 3)
+        cost_g.addWidget(QLabel("Croc actuator 1st-order"), 2, 0)
+        cost_g.addWidget(self.plan_croc_use_actuator_first_order, 2, 1)
+        cost_g.addWidget(QLabel("tau motor thrust [s]"), 2, 2)
+        cost_g.addWidget(self.plan_tau_motor, 2, 3)
+        cost_g.addWidget(QLabel("tau joint torque [s]"), 3, 0)
+        cost_g.addWidget(self.plan_tau_joint, 3, 1)
         self.ee_knot_w = QDoubleSpinBox()
         self.ee_knot_w.setRange(1.0, 1e6)
         self.ee_knot_w.setDecimals(1)
@@ -848,7 +1247,7 @@ class UamSuiteGUI(QMainWindow):
         self.ee_knot_vel_w.setRange(0.0, 1e6)
         self.ee_knot_vel_w.setDecimals(1)
         self.ee_knot_vel_w.setValue(200.0)
-        cost_g.addWidget(QLabel("EE knot vel w (EE only, ref=0)"), 5, 2)
+        cost_g.addWidget(QLabel("EE knot vel w (ref=0)"), 5, 2)
         cost_g.addWidget(self.ee_knot_vel_w, 5, 3)
         self.ee_knot_vel_pitch_w = QDoubleSpinBox()
         self.ee_knot_vel_pitch_w.setRange(0.0, 1e6)
@@ -899,25 +1298,25 @@ class UamSuiteGUI(QMainWindow):
         self.wp3_group.setLayout(wp3g)
         g_full.addWidget(self.wp3_group)
 
-        self.run_plan_btn = QPushButton("Run planning")
-        self.run_plan_btn.clicked.connect(self._run_plan)
-        g_full.addWidget(self.run_plan_btn)
-
         self.plan_stack.addWidget(w_full)
         self._refresh_plan_actuator_taus_enabled()
 
         # Stack 1: EE snap only
         w_ee = QWidget()
         g_ee = QVBoxLayout(w_ee)
-        ee_type_row = QHBoxLayout()
+        self.ee_type_row_widget = QWidget()
+        ee_type_row = QHBoxLayout(self.ee_type_row_widget)
+        ee_type_row.setContentsMargins(0, 0, 0, 0)
         self.ee_plan_type_combo = QComboBox()
         self.ee_plan_type_combo.addItems(
-            ["Minimum snap (waypoints)", "Figure-eight (figure-8)"]
+            ["Minimum snap (waypoints)", "Figure-eight (figure-8)", "Sun2024 ellipse", "Circle", "Import CSV"]
         )
-        ee_type_row.addWidget(QLabel("EE trajectory type"))
+        self.ee_type_label = QLabel("EE trajectory type")
+        ee_type_row.addWidget(self.ee_type_label)
         ee_type_row.addWidget(self.ee_plan_type_combo)
-        g_ee.addLayout(ee_type_row)
-        g_ee.addWidget(QLabel("EE waypoints (x,y,z m, yaw°, time s) — consistent with the EE tracking GUI"))
+        g_ee.addWidget(self.ee_type_row_widget)
+        self.ee_wp_label = QLabel("EE waypoints (x,y,z m, yaw°, time s) — consistent with the EE tracking GUI")
+        g_ee.addWidget(self.ee_wp_label)
         self.ee_wp_table = QTableWidget(4, 5)
         self.ee_wp_table.setHorizontalHeaderLabels(["x", "y", "z", "yaw°", "t [s]"])
         ee_header = self.ee_wp_table.horizontalHeader()
@@ -964,33 +1363,180 @@ class UamSuiteGUI(QMainWindow):
         ee8.addWidget(self.ee_eight_tdur, 2, 3)
         self.ee_eight_group.setLayout(ee8)
         g_ee.addWidget(self.ee_eight_group)
-        self.dt_ee_sample = QDoubleSpinBox()
-        self.dt_ee_sample.setRange(0.005, 0.2)
-        self.dt_ee_sample.setValue(0.02)
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("Sampling dt"))
-        hl.addWidget(self.dt_ee_sample)
-        g_ee.addLayout(hl)
-        self.run_ee_plan_btn = QPushButton("Generate EE reference (from planning)")
-        self.run_ee_plan_btn.clicked.connect(self._run_ee_plan)
-        g_ee.addWidget(self.run_ee_plan_btn)
+        self.ee_sun_group = QGroupBox("Sun2024 ellipse parameters")
+        sun = QGridLayout()
+        self.ee_sun_plane_combo = QComboBox()
+        self.ee_sun_plane_combo.addItems(["horizontal", "vertical"])
+        self.ee_sun_vmax = QDoubleSpinBox()
+        self.ee_sun_vmax.setRange(0.1, 50.0)
+        self.ee_sun_vmax.setDecimals(2)
+        self.ee_sun_vmax.setValue(10.0)
+        self.ee_sun_amax = QDoubleSpinBox()
+        self.ee_sun_amax.setRange(0.1, 100.0)
+        self.ee_sun_amax.setDecimals(2)
+        self.ee_sun_amax.setValue(20.0)
+        self.ee_sun_n = QDoubleSpinBox()
+        self.ee_sun_n.setRange(1.0, 20.0)
+        self.ee_sun_n.setDecimals(2)
+        self.ee_sun_n.setValue(2.0)
+        self.ee_sun_loops = QSpinBox()
+        self.ee_sun_loops.setRange(1, 20)
+        self.ee_sun_loops.setValue(2)
+        self.ee_sun_cx = QDoubleSpinBox()
+        self.ee_sun_cy = QDoubleSpinBox()
+        self.ee_sun_cz = QDoubleSpinBox()
+        for w, v in zip((self.ee_sun_cx, self.ee_sun_cy, self.ee_sun_cz), (0.0, 0.0, 1.0)):
+            w.setRange(-20, 20)
+            w.setDecimals(3)
+            w.setSingleStep(0.05)
+            w.setValue(v)
+        self.ee_sun_yaw_const = QDoubleSpinBox()
+        self.ee_sun_yaw_const.setRange(-180.0, 180.0)
+        self.ee_sun_yaw_const.setDecimals(2)
+        self.ee_sun_yaw_const.setValue(0.0)
+        self.ee_sun_yaw_hold = QCheckBox("Keep yaw constant")
+        self.ee_sun_yaw_hold.setChecked(False)
+        self.ee_sun_buffer = QDoubleSpinBox()
+        self.ee_sun_buffer.setRange(0.0, 20.0)
+        self.ee_sun_buffer.setDecimals(2)
+        self.ee_sun_buffer.setValue(1.0)
+        sun.addWidget(QLabel("Plane"), 0, 0)
+        sun.addWidget(self.ee_sun_plane_combo, 0, 1)
+        sun.addWidget(QLabel("Vmax [m/s]"), 0, 2)
+        sun.addWidget(self.ee_sun_vmax, 0, 3)
+        sun.addWidget(QLabel("amax [m/s²]"), 1, 0)
+        sun.addWidget(self.ee_sun_amax, 1, 1)
+        sun.addWidget(QLabel("ellipticity n"), 1, 2)
+        sun.addWidget(self.ee_sun_n, 1, 3)
+        sun.addWidget(QLabel("loops"), 2, 0)
+        sun.addWidget(self.ee_sun_loops, 2, 1)
+        sun.addWidget(QLabel("center cx"), 2, 2)
+        sun.addWidget(self.ee_sun_cx, 2, 3)
+        sun.addWidget(QLabel("cy"), 3, 0)
+        sun.addWidget(self.ee_sun_cy, 3, 1)
+        sun.addWidget(QLabel("cz"), 3, 2)
+        sun.addWidget(self.ee_sun_cz, 3, 3)
+        sun.addWidget(QLabel("yaw const [deg] (vertical)"), 4, 0)
+        sun.addWidget(self.ee_sun_yaw_const, 4, 1)
+        sun.addWidget(self.ee_sun_yaw_hold, 5, 0, 1, 2)
+        sun.addWidget(QLabel("buffer each end [s]"), 4, 2)
+        sun.addWidget(self.ee_sun_buffer, 4, 3)
+        self.ee_sun_group.setLayout(sun)
+        g_ee.addWidget(self.ee_sun_group)
+        self.ee_circle_group = QGroupBox("Circle parameters")
+        cir = QGridLayout()
+        self.ee_circle_cx = QDoubleSpinBox()
+        self.ee_circle_cy = QDoubleSpinBox()
+        self.ee_circle_cz = QDoubleSpinBox()
+        for w, v in zip((self.ee_circle_cx, self.ee_circle_cy, self.ee_circle_cz), (0.0, 0.0, 1.0)):
+            w.setRange(-20, 20); w.setDecimals(3); w.setSingleStep(0.05); w.setValue(v)
+        self.ee_circle_r = QDoubleSpinBox()
+        self.ee_circle_r.setRange(0.05, 20.0); self.ee_circle_r.setDecimals(3); self.ee_circle_r.setValue(1.0)
+        self.ee_circle_period = QDoubleSpinBox()
+        self.ee_circle_period.setRange(0.2, 120.0); self.ee_circle_period.setDecimals(2); self.ee_circle_period.setValue(6.0)
+        self.ee_circle_loops = QSpinBox()
+        self.ee_circle_loops.setRange(1, 200)
+        self.ee_circle_loops.setValue(3)
+        self.ee_circle_tdur = QDoubleSpinBox()
+        self.ee_circle_tdur.setRange(0.2, 240.0); self.ee_circle_tdur.setDecimals(2); self.ee_circle_tdur.setValue(18.0)
+        self.ee_circle_tdur.setReadOnly(True)
+        self.ee_circle_tdur.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.ee_circle_yaw_const = QDoubleSpinBox()
+        self.ee_circle_yaw_const.setRange(-180.0, 180.0); self.ee_circle_yaw_const.setDecimals(2); self.ee_circle_yaw_const.setValue(0.0)
+        self.ee_circle_yaw_hold = QCheckBox("Keep yaw constant"); self.ee_circle_yaw_hold.setChecked(False)
+        self.ee_circle_buffer = QDoubleSpinBox()
+        self.ee_circle_buffer.setRange(0.0, 20.0); self.ee_circle_buffer.setDecimals(2); self.ee_circle_buffer.setValue(1.0)
+        cir.addWidget(QLabel("center cx"), 0, 0); cir.addWidget(self.ee_circle_cx, 0, 1)
+        cir.addWidget(QLabel("cy"), 0, 2); cir.addWidget(self.ee_circle_cy, 0, 3)
+        cir.addWidget(QLabel("cz"), 1, 0); cir.addWidget(self.ee_circle_cz, 1, 1)
+        cir.addWidget(QLabel("radius [m]"), 1, 2); cir.addWidget(self.ee_circle_r, 1, 3)
+        cir.addWidget(QLabel("period [s]"), 2, 0); cir.addWidget(self.ee_circle_period, 2, 1)
+        cir.addWidget(QLabel("loops"), 2, 2); cir.addWidget(self.ee_circle_loops, 2, 3)
+        cir.addWidget(QLabel("duration [s]"), 3, 0); cir.addWidget(self.ee_circle_tdur, 3, 1)
+        cir.addWidget(QLabel("yaw const [deg]"), 3, 2); cir.addWidget(self.ee_circle_yaw_const, 3, 3)
+        cir.addWidget(self.ee_circle_yaw_hold, 4, 0, 1, 2)
+        cir.addWidget(QLabel("buffer each end [s]"), 4, 2); cir.addWidget(self.ee_circle_buffer, 4, 3)
+        self.ee_circle_group.setLayout(cir)
+        g_ee.addWidget(self.ee_circle_group)
+        self.ee_circle_period.valueChanged.connect(
+            lambda _v: self.ee_circle_tdur.setValue(self.ee_circle_period.value() * self.ee_circle_loops.value())
+        )
+        self.ee_circle_loops.valueChanged.connect(
+            lambda _v: self.ee_circle_tdur.setValue(self.ee_circle_period.value() * self.ee_circle_loops.value())
+        )
+        self.ee_csv_group = QGroupBox("CSV trajectory import")
+        csv_g = QGridLayout()
+        self.ee_csv_path = QLineEdit("")
+        self.ee_csv_path.setPlaceholderText("trajectory/result_segment_latest.csv")
+        self.ee_csv_browse_btn = QPushButton("Browse CSV")
+        self.ee_csv_vmax_limit = QDoubleSpinBox()
+        self.ee_csv_vmax_limit.setRange(0.1, 50.0)
+        self.ee_csv_vmax_limit.setDecimals(2)
+        self.ee_csv_vmax_limit.setValue(5.0)
+        self.ee_csv_z_offset = QDoubleSpinBox()
+        self.ee_csv_z_offset.setRange(-20.0, 20.0)
+        self.ee_csv_z_offset.setDecimals(3)
+        self.ee_csv_z_offset.setValue(0.0)
+        self.ee_csv_yaw_const = QDoubleSpinBox()
+        self.ee_csv_yaw_const.setRange(-180.0, 180.0)
+        self.ee_csv_yaw_const.setDecimals(2)
+        self.ee_csv_yaw_const.setValue(0.0)
+        self.ee_csv_yaw_hold = QCheckBox("Keep yaw constant")
+        self.ee_csv_yaw_hold.setChecked(False)
+        csv_g.addWidget(QLabel("CSV path"), 0, 0)
+        csv_g.addWidget(self.ee_csv_path, 0, 1, 1, 3)
+        csv_g.addWidget(self.ee_csv_browse_btn, 0, 4)
+        csv_g.addWidget(QLabel("Max speed limit [m/s]"), 1, 0)
+        csv_g.addWidget(self.ee_csv_vmax_limit, 1, 1)
+        csv_g.addWidget(QLabel("Z offset [m]"), 2, 0)
+        csv_g.addWidget(self.ee_csv_z_offset, 2, 1)
+        csv_g.addWidget(self.ee_csv_yaw_hold, 1, 2, 1, 2)
+        csv_g.addWidget(QLabel("yaw const [deg]"), 3, 0)
+        csv_g.addWidget(self.ee_csv_yaw_const, 3, 1)
+        self.ee_csv_group.setLayout(csv_g)
+        g_ee.addWidget(self.ee_csv_group)
+        self.ee_csv_browse_btn.clicked.connect(self._browse_ee_csv_file)
+        # Reuse global sampling dt from Task configuration (avoid duplicated dt controls).
+        self.dt_ee_sample = self.dt_plan
         self.ee_plan_type_combo.currentIndexChanged.connect(self._on_ee_plan_type_changed)
         self._on_ee_plan_type_changed()
         self.plan_stack.addWidget(w_ee)
 
+        self._on_task_robot_changed(self.task_robot_combo.currentText())
         self._on_plan_mode()
+        self.plan_actions_group = QGroupBox("Actions")
+        plan_actions = QVBoxLayout()
+        self.task_generate_btn = QPushButton("Generate trajectory")
+        self.task_generate_btn.setMinimumHeight(44)
+        self.task_generate_btn.clicked.connect(self._generate_task_trajectory_now)
+        plan_actions.addWidget(self.task_generate_btn)
+        plan_actions_row2 = QHBoxLayout()
         self.meshcat_plan_btn = QPushButton("Visualize planned trajectory (Meshcat)")
         self.meshcat_plan_btn.clicked.connect(self._visualize_planned_meshcat)
         self.meshcat_plan_btn.setEnabled(False)
-        plan_layout.addWidget(self.meshcat_plan_btn)
-        plan_param_btns = QHBoxLayout()
+        plan_actions_row2.addWidget(self.meshcat_plan_btn)
         self.save_plan_params_btn = QPushButton("Save Planning parameters")
         self.save_plan_params_btn.clicked.connect(lambda: self._save_tab_params(TAB_PLAN))
         self.save_plan_params_as_btn = QPushButton("Save Planning parameters as")
         self.save_plan_params_as_btn.clicked.connect(lambda: self._save_tab_params_as(TAB_PLAN))
-        plan_param_btns.addWidget(self.save_plan_params_btn)
-        plan_param_btns.addWidget(self.save_plan_params_as_btn)
-        plan_layout.addLayout(plan_param_btns)
+        plan_actions_row2.addWidget(self.save_plan_params_btn)
+        plan_actions_row2.addWidget(self.save_plan_params_as_btn)
+        plan_actions.addLayout(plan_actions_row2)
+        self.plan_actions_group.setLayout(plan_actions)
+        self.plan_actions_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        plan_top_layout.addWidget(self.plan_actions_group)
+
+        self.plan_info_group = QGroupBox("Info")
+        info_layout = QVBoxLayout()
+        self.plan_info_text = QTextEdit()
+        self.plan_info_text.setReadOnly(True)
+        self.plan_info_text.setPlaceholderText("Planning messages and hints...")
+        info_layout.addWidget(self.plan_info_text)
+        self.plan_info_group.setLayout(info_layout)
+        plan_splitter.addWidget(self.plan_info_group)
+        plan_splitter.setStretchFactor(0, 3)
+        plan_splitter.setStretchFactor(1, 1)
+        plan_splitter.setSizes([720, 180])
 
         # ----- Track tab -----
         tab_track = QWidget()
@@ -1389,6 +1935,49 @@ class UamSuiteGUI(QMainWindow):
         # 内部跟踪：run_tracking_controller 子进程句柄
         self._rn_process = None
 
+        gazebo_group = QGroupBox("Gazebo")
+        gz = QGridLayout()
+        gz.addWidget(QLabel("Package"), 0, 0)
+        self.gz_pkg_combo = QComboBox()
+        self.gz_pkg_combo.setEditable(True)
+        self.gz_pkg_combo.addItems(["eagle_mpc_debugger"])
+        self.gz_pkg_combo.setCurrentText("eagle_mpc_debugger")
+        gz.addWidget(self.gz_pkg_combo, 0, 1)
+        gz.addWidget(QLabel("Launch file"), 1, 0)
+        self.gz_launch_combo = QComboBox()
+        self.gz_launch_combo.setEditable(True)
+        self.gz_launch_combo.addItems(["s500_uam_sitl.launch", "s500_sitl.launch"])
+        self.gz_launch_combo.setCurrentText("s500_uam_sitl.launch")
+        gz.addWidget(self.gz_launch_combo, 1, 1)
+        gz.addWidget(QLabel("Model"), 2, 0)
+        self.gz_model_combo = QComboBox()
+        self.gz_model_combo.addItems(["s500_uam", "s500"])
+        gz.addWidget(self.gz_model_combo, 2, 1)
+        gz.addWidget(QLabel("Model type"), 3, 0)
+        self.gz_model_type_combo = QComboBox()
+        self.gz_model_type_combo.addItems(["real", "ideal"])
+        self.gz_model_type_combo.setCurrentText("real")
+        gz.addWidget(self.gz_model_type_combo, 3, 1)
+        gz.addWidget(QLabel("Environment"), 4, 0)
+        self.gz_world_combo = QComboBox()
+        self.gz_world_combo.setEditable(True)
+        self.gz_world_combo.addItems(["table_beer_with_stand", "empty", "warehouse"])
+        self.gz_world_combo.setCurrentText("table_beer_with_stand")
+        gz.addWidget(self.gz_world_combo, 4, 1)
+        gz.addWidget(QLabel("Extra args"), 5, 0)
+        self.gz_args_edit = QLineEdit("")
+        gz.addWidget(self.gz_args_edit, 5, 1)
+        gz_btn_row = QHBoxLayout()
+        self.gz_start_btn = QPushButton("Start Gazebo")
+        self.gz_start_btn.clicked.connect(self._start_ros_gazebo)
+        self.gz_stop_btn = QPushButton("Stop Gazebo")
+        self.gz_stop_btn.clicked.connect(self._stop_ros_gazebo)
+        gz_btn_row.addWidget(self.gz_start_btn)
+        gz_btn_row.addWidget(self.gz_stop_btn)
+        gz.addLayout(gz_btn_row, 6, 0, 1, 2)
+        gazebo_group.setLayout(gz)
+        rtt.addWidget(gazebo_group)
+
         # ── ROS Tracking Node (run_tracking_controller.py) ───────────────────
         ros_node_group = QGroupBox("ROS Tracking Node  (run_tracking_controller.py)")
         ros_node_layout = QVBoxLayout()
@@ -1708,6 +2297,14 @@ class UamSuiteGUI(QMainWindow):
         self.rn_update_ctrl_btn.clicked.connect(self._call_update_controller_params)
         self.rn_update_ctrl_btn.setEnabled(False)
         rn_btn_grid.addWidget(self.rn_update_ctrl_btn, 1, 1)
+
+        self.rn_update_traj_btn = QPushButton("rosservice: /update_trajectory")
+        self.rn_update_traj_btn.setToolTip(
+            "重新读取当前导出的轨迹并重建 MPC（不重启节点）。"
+        )
+        self.rn_update_traj_btn.clicked.connect(self._call_update_trajectory_service)
+        self.rn_update_traj_btn.setEnabled(False)
+        rn_btn_grid.addWidget(self.rn_update_traj_btn, 2, 0, 1, 2)
         ros_node_layout.addLayout(rn_btn_grid)
 
         # 按钮行 3：Reset（MPC 控制回初始状态）
@@ -1740,6 +2337,7 @@ class UamSuiteGUI(QMainWindow):
 
         ros_node_group.setLayout(ros_node_layout)
         rtt.addWidget(ros_node_group)
+
         ros_param_btns = QHBoxLayout()
         self.save_ros_params_btn = QPushButton("Save ROS Tracking parameters")
         self.save_ros_params_btn.clicked.connect(lambda: self._save_tab_params(TAB_ROS))
@@ -1851,6 +2449,11 @@ class UamSuiteGUI(QMainWindow):
     def log(self, msg: str) -> None:
         self.log_text.append(msg)
         self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        if hasattr(self, "plan_info_text"):
+            self.plan_info_text.append(msg)
+            self.plan_info_text.verticalScrollBar().setValue(
+                self.plan_info_text.verticalScrollBar().maximum()
+            )
 
     @staticmethod
     def _mixed_rows_to_plot_xyz(
@@ -1890,6 +2493,100 @@ class UamSuiteGUI(QMainWindow):
         self._draw_suite_states_3d_combined(res)
         self.cv_combined.draw()
 
+    def _render_s500_base_only_planning_figures(
+        self, t_rel: np.ndarray, simX: np.ndarray, title_prefix: str, u_plan: np.ndarray | None = None
+    ) -> None:
+        """Render planning figures for s500 using base-only channels."""
+        t = np.asarray(t_rel, dtype=float).flatten()
+        X = np.asarray(simX, dtype=float)
+        if X.ndim != 2 or X.shape[0] != t.shape[0]:
+            raise ValueError("Invalid base-only plotting arrays")
+
+        self.fig_states.clear()
+        axs = [self.fig_states.add_subplot(2, 2, i + 1) for i in range(4)]
+        pos = X[:, 0:3]
+        eul = _euler_deg_from_simX(X)
+        vel = X[:, 9:12] if X.shape[1] >= 12 else np.zeros((len(t), 3), dtype=float)
+        omg = X[:, 12:15] if X.shape[1] >= 15 else np.zeros((len(t), 3), dtype=float)
+        omg_deg = np.degrees(omg)
+        if len(t) >= 2:
+            acc = np.gradient(vel, t, axis=0)
+            jerk = np.gradient(acc, t, axis=0)
+        else:
+            acc = np.zeros_like(vel)
+            jerk = np.zeros_like(vel)
+
+        for j, c, n in ((0, "r", "x"), (1, "g", "y"), (2, "b", "z")):
+            axs[0].plot(t, pos[:, j], c + "-", lw=1.1, label=n)
+            axs[1].plot(t, eul[:, j], c + "-", lw=1.1, label=("roll", "pitch", "yaw")[j])
+            axs[2].plot(t, vel[:, j], c + "-", lw=1.1, label=n)
+            axs[3].plot(t, omg_deg[:, j], c + "-", lw=1.1, label=n)
+        axs[0].set_title("Base position", fontsize=9)
+        axs[0].set_ylabel("m")
+        axs[1].set_title("Base orientation (Euler ZYX)", fontsize=9)
+        axs[1].set_ylabel("deg")
+        axs[2].set_title("Base linear velocity", fontsize=9)
+        axs[2].set_ylabel("m/s")
+        axs[3].set_title("Base angular velocity", fontsize=9)
+        axs[3].set_ylabel("deg/s")
+        for ax in axs:
+            ax.set_xlabel("t [s]")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
+
+        self.fig_3d_track.clear()
+        ax3 = self.fig_3d_track.add_subplot(111, projection="3d")
+        ax3.plot(pos[:, 0], pos[:, 1], pos[:, 2], "b-", lw=1.6, label="base ref")
+        ax3.set_xlabel("X [m]")
+        ax3.set_ylabel("Y [m]")
+        ax3.set_zlabel("Z [m]")
+        ax3.set_title(f"{title_prefix} (base_link only)", fontsize=10)
+        ax3.legend(loc="upper left", fontsize=7, framealpha=0.9)
+
+        self.fig_traj_dash.clear()
+        ad = [self.fig_traj_dash.add_subplot(3, 2, i + 1) for i in range(6)]
+        ad[0].plot(pos[:, 0], pos[:, 1], "b-", lw=1.2)
+        ad[0].set_title("XY path", fontsize=9)
+        ad[0].set_xlabel("x [m]")
+        ad[0].set_ylabel("y [m]")
+        ad[1].plot(pos[:, 0], pos[:, 2], "b-", lw=1.2)
+        ad[1].set_title("XZ path", fontsize=9)
+        ad[1].set_xlabel("x [m]")
+        ad[1].set_ylabel("z [m]")
+        speed = np.linalg.norm(vel, axis=1)
+        ad[2].plot(t, speed, "k-", lw=1.2)
+        ad[2].set_title("Speed norm", fontsize=9)
+        ad[2].set_xlabel("t [s]")
+        ad[2].set_ylabel("m/s")
+        acc_norm = np.linalg.norm(acc, axis=1)
+        jerk_norm = np.linalg.norm(jerk, axis=1)
+        ad[3].plot(t, acc_norm, "m-", lw=1.2)
+        ad[3].set_title("Acceleration norm", fontsize=9)
+        ad[3].set_xlabel("t [s]")
+        ad[3].set_ylabel("m/s²")
+        ad[4].plot(t, jerk_norm, "c-", lw=1.2)
+        ad[4].set_title("Jerk norm", fontsize=9)
+        ad[4].set_xlabel("t [s]")
+        ad[4].set_ylabel("m/s³")
+        # Control preview from plan control sequence.
+        if u_plan is not None:
+            U = np.asarray(u_plan, dtype=float)
+            if U.ndim == 2 and U.shape[0] > 0:
+                nu = int(U.shape[1])
+                tu = t[: U.shape[0]]
+                for j in range(nu):
+                    ad[5].plot(tu, U[:, j], lw=1.0, label=f"u{j+1}")
+                ad[5].legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=2)
+            else:
+                ad[5].text(0.5, 0.5, "No control sequence", ha="center", va="center", transform=ad[5].transAxes)
+        else:
+            ad[5].text(0.5, 0.5, "No control sequence", ha="center", va="center", transform=ad[5].transAxes)
+        ad[5].set_title("Control inputs", fontsize=9)
+        ad[5].set_xlabel("t [s]")
+        ad[5].set_ylabel("u")
+        for ax in ad:
+            ax.grid(True, alpha=0.3)
+
     def _render_planning_reference_full_state(self) -> None:
         """Render the full-state planning *reference* using the same dashboard framework as EE tracking GUI."""
         import matplotlib.figure
@@ -1912,13 +2609,19 @@ class UamSuiteGUI(QMainWindow):
         simX = X
 
         # EE reference from FK along the planned full-state trajectory.
-        rm, eid = self._robot_model_and_ee()
-        data = rm.createData()
-        from s500_uam_trajectory_planner import compute_ee_kinematics_along_trajectory
+        # In s500 mode (no arm), keep EE channels empty.
+        if self._is_s500_mode():
+            ee_pos = np.full((simX.shape[0], 3), np.nan, dtype=float)
+            yaw_ref = np.full(simX.shape[0], np.nan, dtype=float)
+            ee_yaw = yaw_ref.copy()
+        else:
+            rm, eid = self._robot_model_and_ee()
+            data = rm.createData()
+            from s500_uam_trajectory_planner import compute_ee_kinematics_along_trajectory
 
-        ee_pos, _, ee_rpy, _ = compute_ee_kinematics_along_trajectory(simX, rm, data, eid)
-        yaw_ref = np.unwrap(np.asarray(ee_rpy[:, 2], dtype=float).flatten())
-        ee_yaw = yaw_ref.copy()
+            ee_pos, _, ee_rpy, _ = compute_ee_kinematics_along_trajectory(simX, rm, data, eid)
+            yaw_ref = np.unwrap(np.asarray(ee_rpy[:, 2], dtype=float).flatten())
+            ee_yaw = yaw_ref.copy()
 
         n = len(t_rel)
         u_plan = np.asarray(pb.get("u_plan", np.zeros((0, 6), dtype=float)), dtype=float)
@@ -2000,26 +2703,34 @@ class UamSuiteGUI(QMainWindow):
                 },
             }
 
-        # Render into the same 3 figures as the tracking GUI.
-        em.render_ee_tracking_results_to_figures(
-            res_ref,
-            fs,
-            f3,
-            self.fig_traj_dash,
-            control_mode="direct",
-            plan_waypoints_xyz=None,
-            plan_waypoint_times=tw_rel,
-            plan_waypoints_base_xyz=base_wp,
-            plan_waypoints_ee_xyz=ee_wp,
-            states_title="Planned reference",
-            traj_solver_meta=traj_meta,
-        )
+        # s500 has no arm/EE: render base-only plots.
+        if self._is_s500_mode():
+            self._render_s500_base_only_planning_figures(
+                t_rel, simX, title_prefix="Planned reference", u_plan=u
+            )
+        else:
+            # Render into the same 3 figures as the tracking GUI.
+            em.render_ee_tracking_results_to_figures(
+                res_ref,
+                fs,
+                f3,
+                self.fig_traj_dash,
+                control_mode="direct",
+                plan_waypoints_xyz=None,
+                plan_waypoint_times=tw_rel,
+                plan_waypoints_base_xyz=base_wp,
+                plan_waypoints_ee_xyz=ee_wp,
+                states_title="Planned reference",
+                traj_solver_meta=traj_meta,
+            )
         self.cv_states.draw()
         self.cv_3d_track.draw()
         self.cv_traj_dash.draw()
 
     def _render_planning_reference_ee_snap(self) -> None:
         """Render the EE-only (minimum-snap) planning reference using the same dashboard framework."""
+        import pinocchio as pin
+
         pb = self._plan_bundle
         assert pb is not None
         em = self._ee_mpc
@@ -2037,42 +2748,71 @@ class UamSuiteGUI(QMainWindow):
 
         t_rel = t_raw - t_raw[0]
         yaw_ref_u = np.unwrap(yaw_ref)
+        dp_ref = np.asarray(pb.get("dp_ref"), dtype=float) if pb.get("dp_ref") is not None else None
+        dyaw_ref = np.asarray(pb.get("dyaw_ref"), dtype=float).flatten() if pb.get("dyaw_ref") is not None else None
+        if dp_ref is None or dp_ref.ndim != 2 or dp_ref.shape[0] != n or dp_ref.shape[1] != 3:
+            dp_ref = np.zeros((n, 3), dtype=float)
+        if dyaw_ref is None or dyaw_ref.size != n:
+            if n >= 2:
+                dyaw_ref = np.gradient(yaw_ref_u, t_rel)
+            else:
+                dyaw_ref = np.zeros(n, dtype=float)
 
-        # Construct a plausible robot state sequence by:
-        # - using a fixed nominal joint configuration
-        # - setting base yaw from yaw_ref
-        # - translating the base so that FK EE position matches p_ref at each time
-        rm, _ = self._robot_model_and_ee()
-        nq = int(getattr(rm, "nq", 0))
-        nv = int(getattr(rm, "nv", 0))
-        if nq <= 0 or nv <= 0:
-            raise ValueError(f"Invalid pinocchio model dims: nq={nq}, nv={nv}")
+        # Build a plotting-friendly full-state sequence (17D convention used by dashboard):
+        # [x,y,z,qx,qy,qz,qw,j1,j2,vx,vy,vz,wx,wy,wz,j1dot,j2dot]
+        # For s500, j* channels stay zero. Attitude/omega are reconstructed from (ddp_ref, yaw_ref).
+        if n >= 2:
+            ddp_ref = np.gradient(dp_ref, t_rel, axis=0)
+        else:
+            ddp_ref = np.zeros_like(dp_ref)
 
-        from s500_uam_trajectory_planner import make_uam_state
-        from s500_uam_ee_snap_tracking_mpc import align_uam_state_ee_to_world_position
+        def _normalize(v: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+            nrm = float(np.linalg.norm(v))
+            if nrm < 1e-9:
+                return np.asarray(fallback, dtype=float).copy()
+            return (np.asarray(v, dtype=float) / nrm).copy()
 
-        x_nom_base = np.asarray(make_uam_state(0.0, 0.0, 1.0, j1=0.0, j2=0.0, yaw=0.0), dtype=float)
-        x_nom = x_nom_base.copy()
-
-        xs: list[np.ndarray] = []
+        R_seq: list[np.ndarray] = []
+        quat_seq = np.zeros((n, 4), dtype=float)
         for i in range(n):
-            xi = x_nom.copy()
-            # Update quaternion yaw component (indices follow make_uam_state convention).
-            # We simply rebuild full state for each time for clarity.
-            xi = make_uam_state(
-                float(x_nom[0]),
-                float(x_nom[1]),
-                float(x_nom[2]),
-                j1=0.0,
-                j2=0.0,
-                yaw=float(yaw_ref_u[i]),
-            )
-            xi_aligned = align_uam_state_ee_to_world_position(
-                xi, rm, p_ref[i], nq=nq, nv=nv
-            )
-            xs.append(np.asarray(xi_aligned, dtype=float).flatten())
+            a_des = np.asarray(ddp_ref[i], dtype=float) + np.array([0.0, 0.0, 9.81], dtype=float)
+            b3 = _normalize(a_des, np.array([0.0, 0.0, 1.0], dtype=float))
+            yaw_i = float(yaw_ref_u[i])
+            b1_yaw = np.array([np.cos(yaw_i), np.sin(yaw_i), 0.0], dtype=float)
+            b2 = np.cross(b3, b1_yaw)
+            if np.linalg.norm(b2) < 1e-9:
+                b2 = np.array([-np.sin(yaw_i), np.cos(yaw_i), 0.0], dtype=float)
+            b2 = _normalize(b2, np.array([0.0, 1.0, 0.0], dtype=float))
+            b1 = _normalize(np.cross(b2, b3), np.array([1.0, 0.0, 0.0], dtype=float))
+            R = np.column_stack([b1, b2, b3])
+            R_seq.append(R)
+            q = pin.Quaternion(R)
+            quat_seq[i, :] = np.array([q.x, q.y, q.z, q.w], dtype=float)
 
-        simX = np.asarray(xs, dtype=float)
+        omega_seq = np.zeros((n, 3), dtype=float)
+        if n >= 2:
+            for i in range(n):
+                if i == 0:
+                    dt = float(max(t_rel[1] - t_rel[0], 1e-9))
+                    Rdot = (R_seq[1] - R_seq[0]) / dt
+                elif i == n - 1:
+                    dt = float(max(t_rel[-1] - t_rel[-2], 1e-9))
+                    Rdot = (R_seq[-1] - R_seq[-2]) / dt
+                else:
+                    dt = float(max(t_rel[i + 1] - t_rel[i - 1], 1e-9))
+                    Rdot = (R_seq[i + 1] - R_seq[i - 1]) / dt
+                W = R_seq[i].T @ Rdot
+                omega_seq[i, 0] = 0.5 * (W[2, 1] - W[1, 2])
+                omega_seq[i, 1] = 0.5 * (W[0, 2] - W[2, 0])
+                omega_seq[i, 2] = 0.5 * (W[1, 0] - W[0, 1])
+        else:
+            omega_seq[:, 2] = dyaw_ref
+
+        simX = np.zeros((n, 17), dtype=float)
+        simX[:, 0:3] = p_ref
+        simX[:, 3:7] = quat_seq
+        simX[:, 9:12] = dp_ref
+        simX[:, 12:15] = omega_seq
 
         # Placeholder controls for acados-style control plots.
         u = np.zeros((max(0, n - 1), 6), dtype=float)
@@ -2097,17 +2837,20 @@ class UamSuiteGUI(QMainWindow):
             "waypoints": pb.get("waypoints"),
         }
 
-        wp_xyz = pb.get("waypoints")
-
-        em.render_ee_tracking_results_to_figures(
-            res_ref,
-            self.fig_states if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_into_figure else None,
-            self.fig_3d_track if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_3d_into_figure else None,
-            self.fig_traj_dash,
-            control_mode="direct",
-            plan_waypoints_xyz=wp_xyz,
-            states_title="Planned reference (EE-only)",
-        )
+        if self._is_s500_mode():
+            self._render_s500_base_only_planning_figures(
+                t_rel, simX, title_prefix="Planned position trajectory", u_plan=u
+            )
+        else:
+            em.render_ee_tracking_results_to_figures(
+                res_ref,
+                self.fig_states if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_into_figure else None,
+                self.fig_3d_track if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_3d_into_figure else None,
+                self.fig_traj_dash,
+                control_mode="direct",
+                plan_waypoints_xyz=pb.get("waypoints"),
+                states_title="Planned reference (EE-only)",
+            )
         self.cv_states.draw()
         self.cv_3d_track.draw()
         self.cv_traj_dash.draw()
@@ -2147,6 +2890,7 @@ class UamSuiteGUI(QMainWindow):
         axes = [fig.add_subplot(gs[i, 0]) for i in range(4)]
         ax3d = fig.add_subplot(gs[:, 1], projection="3d")
 
+        s500_mode = self._is_s500_mode()
         t_ref = base_ref = X_r = ee_ref = None
         if pb["kind"] in ("full_croc", "full_acados"):
             tp = np.asarray(pb["t_plan"], dtype=float).flatten()
@@ -2155,22 +2899,23 @@ class UamSuiteGUI(QMainWindow):
             if X_r.shape[1] > 17:
                 X_r = X_r[:, :17]
             base_ref = X_r[:, :3]
-            try:
-                rm, eid = self._robot_model_and_ee()
-                data = rm.createData()
-                from s500_uam_trajectory_planner import (
-                    compute_ee_kinematics_along_trajectory,
-                )
+            if not s500_mode:
+                try:
+                    rm, eid = self._robot_model_and_ee()
+                    data = rm.createData()
+                    from s500_uam_trajectory_planner import (
+                        compute_ee_kinematics_along_trajectory,
+                    )
 
-                ee_ref, _, _, _ = compute_ee_kinematics_along_trajectory(
-                    X_r, rm, data, eid
-                )
-            except Exception:
-                ee_ref = None
+                    ee_ref, _, _, _ = compute_ee_kinematics_along_trajectory(
+                        X_r, rm, data, eid
+                    )
+                except Exception:
+                    ee_ref = None
         elif pb["kind"] == "ee_snap":
             tr = np.asarray(pb["t_ref"], dtype=float).flatten()
             t_ref = tr - tr[0]
-            ee_ref = np.asarray(pb["p_ref"], dtype=float)
+            ee_ref = None if s500_mode else np.asarray(pb["p_ref"], dtype=float)
 
         t_m = X_m = base_m = ee_m = None
         if has_real:
@@ -2178,7 +2923,18 @@ class UamSuiteGUI(QMainWindow):
             t_m = np.asarray(res["t"], dtype=float).flatten()
             X_m = _extract_x17(res)
             base_m = X_m[:, :3]
-            ee_m = np.asarray(res["ee"], dtype=float)
+            ee_m = None if s500_mode else np.asarray(res["ee"], dtype=float)
+
+        u_ref = None
+        if pb.get("kind") in ("full_croc", "full_acados"):
+            U = np.asarray(pb.get("u_plan"), dtype=float) if pb.get("u_plan") is not None else None
+            if U is not None and U.ndim == 2 and U.shape[0] > 0:
+                u_ref = U
+        u_real = None
+        if has_real and res is not None:
+            Ur = np.asarray(res.get("u"), dtype=float) if res.get("u") is not None else None
+            if Ur is not None and Ur.ndim == 2 and Ur.shape[0] > 0:
+                u_real = Ur
 
         def _style_leg(ax):
             ax.legend(loc="upper right", fontsize=6, framealpha=0.88, ncol=2)
@@ -2217,46 +2973,66 @@ class UamSuiteGUI(QMainWindow):
         ax.set_title("Base orientation (Euler ZYX)", fontsize=9)
         _style_leg(ax)
 
-        # 2: EE position
+        # 2: EE position (or base linear velocity in s500 mode)
         ax = axes[2]
-        if ee_ref is not None:
-            ax.plot(t_ref, ee_ref[:, 0], "r--", lw=1.0, alpha=0.9, label="ref x")
-            ax.plot(t_ref, ee_ref[:, 1], "g--", lw=1.0, alpha=0.9, label="ref y")
-            ax.plot(t_ref, ee_ref[:, 2], "b--", lw=1.0, alpha=0.9, label="ref z")
-        if ee_m is not None:
-            ax.plot(t_m, ee_m[:, 0], "r-", lw=1.1, label="real x")
-            ax.plot(t_m, ee_m[:, 1], "g-", lw=1.1, label="real y")
-            ax.plot(t_m, ee_m[:, 2], "b-", lw=1.1, label="real z")
+        if s500_mode:
+            if X_r is not None and X_r.shape[1] >= 12:
+                ax.plot(t_ref, X_r[:, 9], "r--", lw=1.0, alpha=0.9, label="ref vx")
+                ax.plot(t_ref, X_r[:, 10], "g--", lw=1.0, alpha=0.9, label="ref vy")
+                ax.plot(t_ref, X_r[:, 11], "b--", lw=1.0, alpha=0.9, label="ref vz")
+            if X_m is not None and X_m.shape[1] >= 12:
+                ax.plot(t_m, X_m[:, 9], "r-", lw=1.1, label="real vx")
+                ax.plot(t_m, X_m[:, 10], "g-", lw=1.1, label="real vy")
+                ax.plot(t_m, X_m[:, 11], "b-", lw=1.1, label="real vz")
+        else:
+            if ee_ref is not None:
+                ax.plot(t_ref, ee_ref[:, 0], "r--", lw=1.0, alpha=0.9, label="ref x")
+                ax.plot(t_ref, ee_ref[:, 1], "g--", lw=1.0, alpha=0.9, label="ref y")
+                ax.plot(t_ref, ee_ref[:, 2], "b--", lw=1.0, alpha=0.9, label="ref z")
+            if ee_m is not None:
+                ax.plot(t_m, ee_m[:, 0], "r-", lw=1.1, label="real x")
+                ax.plot(t_m, ee_m[:, 1], "g-", lw=1.1, label="real y")
+                ax.plot(t_m, ee_m[:, 2], "b-", lw=1.1, label="real z")
         ax.set_xlabel("t [s]", **tinfo)
-        ax.set_ylabel("m", **tinfo)
-        ax.set_title("EE position (FK ref / meas. real)", fontsize=9)
+        ax.set_ylabel("m/s" if s500_mode else "m", **tinfo)
+        ax.set_title("Base linear velocity" if s500_mode else "EE position (FK ref / meas. real)", fontsize=9)
         _style_leg(ax)
 
-        # 3: arm joints
+        # 3: arm joints (or control inputs in s500 mode)
         ax = axes[3]
-        if X_r is not None:
-            ax.plot(
-                t_ref,
-                np.degrees(X_r[:, 7]),
-                "r--",
-                lw=1.0,
-                alpha=0.9,
-                label="ref j1",
-            )
-            ax.plot(
-                t_ref,
-                np.degrees(X_r[:, 8]),
-                "g--",
-                lw=1.0,
-                alpha=0.9,
-                label="ref j2",
-            )
-        if X_m is not None:
-            ax.plot(t_m, np.degrees(X_m[:, 7]), "r-", lw=1.1, label="real j1")
-            ax.plot(t_m, np.degrees(X_m[:, 8]), "g-", lw=1.1, label="real j2")
+        if s500_mode:
+            if u_ref is not None and t_ref is not None:
+                tu_ref = t_ref[: u_ref.shape[0]]
+                for j in range(int(u_ref.shape[1])):
+                    ax.plot(tu_ref, u_ref[:, j], "--", lw=1.0, alpha=0.9, label=f"ref u{j+1}")
+            if u_real is not None and t_m is not None:
+                tu_real = t_m[: u_real.shape[0]]
+                for j in range(int(u_real.shape[1])):
+                    ax.plot(tu_real, u_real[:, j], "-", lw=1.1, label=f"real u{j+1}")
+        else:
+            if X_r is not None:
+                ax.plot(
+                    t_ref,
+                    np.degrees(X_r[:, 7]),
+                    "r--",
+                    lw=1.0,
+                    alpha=0.9,
+                    label="ref j1",
+                )
+                ax.plot(
+                    t_ref,
+                    np.degrees(X_r[:, 8]),
+                    "g--",
+                    lw=1.0,
+                    alpha=0.9,
+                    label="ref j2",
+                )
+            if X_m is not None:
+                ax.plot(t_m, np.degrees(X_m[:, 7]), "r-", lw=1.1, label="real j1")
+                ax.plot(t_m, np.degrees(X_m[:, 8]), "g-", lw=1.1, label="real j2")
         ax.set_xlabel("t [s]", **tinfo)
-        ax.set_ylabel("deg", **tinfo)
-        ax.set_title("Arm joints", fontsize=9)
+        ax.set_ylabel("u" if s500_mode else "deg", **tinfo)
+        ax.set_title("Control inputs" if s500_mode else "Arm joints", fontsize=9)
         _style_leg(ax)
 
         # 3D
@@ -2298,7 +3074,7 @@ class UamSuiteGUI(QMainWindow):
                 lw=1.25,
                 label="EE real",
             )
-        if pb.get("kind") == "ee_snap" and pb.get("waypoints") is not None:
+        if (not s500_mode) and pb.get("kind") == "ee_snap" and pb.get("waypoints") is not None:
             W = np.asarray(pb["waypoints"], dtype=float)
             W = W[:, :3] if W.shape[1] >= 3 else W.reshape(-1, 3)
             ax3d.scatter(
@@ -2340,6 +3116,172 @@ class UamSuiteGUI(QMainWindow):
 
     def _on_plan_mode(self):
         self.plan_stack.setCurrentIndex(self.plan_mode_combo.currentIndex())
+        self._refresh_trajectory_setting_height()
+        self._refresh_actions_height()
+
+    def _refresh_trajectory_setting_height(self) -> None:
+        if not hasattr(self, "plan_stack"):
+            return
+        w = self.plan_stack.currentWidget()
+        if w is None:
+            return
+        # Keep trajectory setting height adaptive to current content.
+        h = int(max(180, min(900, w.sizeHint().height() + 24)))
+        self.plan_stack.setMaximumHeight(h)
+        if hasattr(self, "traj_group"):
+            self.traj_group.setMaximumHeight(h + 36)
+
+    def _refresh_task_selection_ui(self) -> None:
+        """Apply current robot/trajectory selection to the planning panes."""
+        if not hasattr(self, "task_robot_combo") or not hasattr(self, "task_traj_combo"):
+            return
+        self._on_task_robot_changed(self.task_robot_combo.currentText())
+        self._apply_task_to_planning(emit_log=False)
+        self._refresh_task_config_height()
+        self._on_plan_mode()
+
+    def _is_s500_mode(self) -> bool:
+        return hasattr(self, "task_robot_combo") and self.task_robot_combo.currentText() == "s500"
+
+    def _s500_plot_sanitize_res(self, res: dict) -> dict:
+        """For s500 plotting, hide EE-specific channels while keeping base/state channels."""
+        out = dict(res)
+        t = np.asarray(out.get("t", []), dtype=float).flatten()
+        n = int(t.size)
+        out["ee"] = np.full((n, 3), np.nan, dtype=float)
+        out["p_ref"] = np.full((n, 3), np.nan, dtype=float)
+        out["err"] = np.full(n, np.nan, dtype=float)
+        out["ee_yaw"] = np.full(n, np.nan, dtype=float)
+        out["yaw_ref"] = np.full(n, np.nan, dtype=float)
+        out["err_yaw"] = np.full(n, np.nan, dtype=float)
+        out["waypoints"] = None
+        return out
+
+    def _refresh_task_config_height(self) -> None:
+        if not hasattr(self, "task_group"):
+            return
+        h = int(max(120, min(320, self.task_group.sizeHint().height() + 12)))
+        self.task_group.setMaximumHeight(h)
+
+    def _refresh_actions_height(self) -> None:
+        if not hasattr(self, "plan_actions_group"):
+            return
+        h = int(max(110, min(280, self.plan_actions_group.sizeHint().height() + 10)))
+        self.plan_actions_group.setMaximumHeight(h)
+
+    def _on_task_robot_changed(self, robot_mode: str) -> None:
+        self.task_traj_combo.blockSignals(True)
+        self.task_traj_combo.clear()
+        self.task_traj_combo.addItems(self._task_trajectories.get(robot_mode, []))
+        self.task_traj_combo.blockSignals(False)
+        # s500 has no arm EE-tracking semantics in UI wording.
+        if robot_mode == "s500":
+            self.plan_mode_combo.setItemText(1, "Position trajectory")
+            if hasattr(self, "ee_type_label"):
+                self.ee_type_label.setText("Trajectory type")
+            if hasattr(self, "ee_wp_label"):
+                self.ee_wp_label.setText("Waypoints (x,y,z m, yaw°, time s)")
+            if hasattr(self, "ee_type_row_widget"):
+                self.ee_type_row_widget.setVisible(False)
+        else:
+            self.plan_mode_combo.setItemText(1, "Manipulator/EE trajectory")
+            if hasattr(self, "ee_type_label"):
+                self.ee_type_label.setText("EE trajectory type")
+            if hasattr(self, "ee_wp_label"):
+                self.ee_wp_label.setText("EE waypoints (x,y,z m, yaw°, time s) — consistent with the EE tracking GUI")
+            if hasattr(self, "ee_type_row_widget"):
+                self.ee_type_row_widget.setVisible(True)
+        self._on_task_traj_changed(self.task_traj_combo.currentText())
+        self._sync_gazebo_launch_with_task()
+
+    def _on_task_traj_changed(self, traj_name: str) -> None:
+        hints = {
+            "full_state_default": "全状态航点轨迹（使用 Planning 页 Full-state OCP）",
+            "full_state_crocoddyl": "全状态航点轨迹（s500 + Crocoddyl）",
+            "wp3_joint_opt": "三航点联合优化（acados wp3_joint_opt）",
+            "minimum_snap": "最小 snap 位置轨迹",
+            "figure8": "8 字位置轨迹",
+            "sun_ellipse": "Sun2024 椭圆轨迹（Vmax/amax/n）",
+            "circle": "圆形轨迹（Circle）",
+            "csv_import": "从 CSV 导入位置/速度轨迹，并按速度上限自动时间缩放",
+        }
+        self.task_hint_label.setText(hints.get(str(traj_name), ""))
+        # Selection should immediately drive the parameter panel below.
+        self._apply_task_to_planning(emit_log=False)
+        self._refresh_task_config_height()
+
+    def _sync_gazebo_launch_with_task(self) -> None:
+        robot = self.task_robot_combo.currentText() if hasattr(self, "task_robot_combo") else "s500_uam"
+        if not hasattr(self, "gz_launch_combo"):
+            return
+        if robot == "s500":
+            self.gz_launch_combo.setCurrentText("s500_sitl.launch")
+            if hasattr(self, "gz_model_combo"):
+                self.gz_model_combo.setCurrentText("s500")
+            if hasattr(self, "gz_pkg_combo") and not self.gz_pkg_combo.currentText().strip():
+                self.gz_pkg_combo.setCurrentText("eagle_mpc_debugger")
+        else:
+            self.gz_launch_combo.setCurrentText("s500_uam_sitl.launch")
+            if hasattr(self, "gz_model_combo"):
+                self.gz_model_combo.setCurrentText("s500_uam")
+            if hasattr(self, "gz_pkg_combo") and not self.gz_pkg_combo.currentText().strip():
+                self.gz_pkg_combo.setCurrentText("eagle_mpc_debugger")
+
+    def _apply_task_to_planning(self, emit_log: bool = True) -> None:
+        robot = self.task_robot_combo.currentText()
+        traj = self.task_traj_combo.currentText()
+        if robot == "s500":
+            if self.wp_table.rowCount() >= 1:
+                self.wp_table.setItem(0, 4, QTableWidgetItem("0.0"))
+                self.wp_table.setItem(0, 5, QTableWidgetItem("0.0"))
+            if self.wp_table.rowCount() >= 2:
+                self.wp_table.setItem(1, 4, QTableWidgetItem("0.0"))
+                self.wp_table.setItem(1, 5, QTableWidgetItem("0.0"))
+        if traj == "full_state_crocoddyl":
+            self.plan_mode_combo.setCurrentIndex(0)
+            self._restore_wp_rows(_full_wp_default_rows())
+            if "crocoddyl" in getattr(self, "_method_ids", []):
+                self.method_combo.setCurrentIndex(self._method_ids.index("crocoddyl"))
+            elif "crocoddyl_actuator_ocp" in getattr(self, "_method_ids", []):
+                self.method_combo.setCurrentIndex(self._method_ids.index("crocoddyl_actuator_ocp"))
+            else:
+                QMessageBox.warning(self, "Notice", "当前环境不可用 Crocoddyl，已保留 Full-state 模式。")
+        elif traj == "full_state_default":
+            self.plan_mode_combo.setCurrentIndex(0)
+            self._restore_wp_rows(_full_wp_default_rows())
+        elif traj == "wp3_joint_opt":
+            self.plan_mode_combo.setCurrentIndex(0)
+            if "acados_wp3_joint_opt" in getattr(self, "_method_ids", []):
+                self.method_combo.setCurrentIndex(self._method_ids.index("acados_wp3_joint_opt"))
+            else:
+                QMessageBox.warning(self, "Notice", "当前环境不可用 acados_wp3_joint_opt，已保留 Full-state 模式。")
+        elif traj == "figure8":
+            self.plan_mode_combo.setCurrentIndex(1)
+            self.ee_plan_type_combo.setCurrentIndex(1)
+        elif traj == "sun_ellipse":
+            self.plan_mode_combo.setCurrentIndex(1)
+            self.ee_plan_type_combo.setCurrentIndex(2)
+        elif traj == "circle":
+            self.plan_mode_combo.setCurrentIndex(1)
+            self.ee_plan_type_combo.setCurrentIndex(3)
+        elif traj == "csv_import":
+            self.plan_mode_combo.setCurrentIndex(1)
+            self.ee_plan_type_combo.setCurrentIndex(4)
+        else:  # minimum_snap
+            self.plan_mode_combo.setCurrentIndex(1)
+            self.ee_plan_type_combo.setCurrentIndex(0)
+        self._on_plan_mode()
+        self._refresh_plan_actuator_taus_enabled()
+        if emit_log:
+            self.log(f"Task applied: robot={robot}, trajectory={traj}")
+
+    def _generate_task_trajectory_now(self) -> None:
+        # Do not re-apply task template on every Generate click.
+        # Template application resets waypoint inputs to defaults and can wipe user edits.
+        if self.plan_mode_combo.currentIndex() == 0:
+            self._run_plan()
+        else:
+            self._run_ee_plan()
 
     def _refresh_plan_actuator_taus_enabled(self) -> None:
         if not hasattr(self, "method_combo"):
@@ -2365,9 +3307,24 @@ class UamSuiteGUI(QMainWindow):
             self.wp3_group.setVisible(method == "acados_wp3_joint_opt")
 
     def _on_ee_plan_type_changed(self):
-        snap = self.ee_plan_type_combo.currentIndex() == 0
-        self.ee_wp_table.setVisible(snap)
-        self.ee_eight_group.setVisible(not snap)
+        idx = int(self.ee_plan_type_combo.currentIndex())
+        self.ee_wp_table.setVisible(idx == 0)
+        self.ee_eight_group.setVisible(idx == 1)
+        self.ee_sun_group.setVisible(idx == 2)
+        self.ee_circle_group.setVisible(idx == 3)
+        self.ee_csv_group.setVisible(idx == 4)
+        self._refresh_trajectory_setting_height()
+
+    def _browse_ee_csv_file(self):
+        default_dir = str(Path(__file__).resolve().parent / "trajectory")
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select CSV trajectory file",
+            default_dir,
+            "CSV files (*.csv);;All files (*)",
+        )
+        if filepath:
+            self.ee_csv_path.setText(filepath)
 
     def _on_reg_mode_changed(self):
         mode = int(self.reg_mode_combo.currentIndex()) if hasattr(self, "reg_mode_combo") else 0
@@ -2551,8 +3508,7 @@ class UamSuiteGUI(QMainWindow):
                     out[k] = 0.0
         return out
 
-    @staticmethod
-    def _reg_table_row_to_uam_state(table: QTableWidget, row: int) -> np.ndarray:
+    def _reg_table_row_to_uam_state(self, table: QTableWidget, row: int) -> np.ndarray:
         from s500_uam_trajectory_planner import make_uam_state
 
         keys = ["x", "y", "z", "j1", "j2", "yaw"]
@@ -2567,7 +3523,7 @@ class UamSuiteGUI(QMainWindow):
                 except ValueError:
                     vals.append(0.0)
         x, y, z, j1, j2, yaw = vals
-        return np.asarray(
+        x_uam = np.asarray(
             make_uam_state(
                 float(x),
                 float(y),
@@ -2578,10 +3534,25 @@ class UamSuiteGUI(QMainWindow):
             ),
             dtype=float,
         ).flatten()
+        # Keep regulation state size consistent with active robot model.
+        try:
+            rm, _ = self._robot_model_and_ee()
+            nx = int(rm.nq + rm.nv)
+            if nx > 0:
+                if x_uam.size >= nx:
+                    return x_uam[:nx].copy()
+                out = np.zeros(nx, dtype=float)
+                out[: x_uam.size] = x_uam
+                return out
+        except Exception:
+            pass
+        return x_uam
 
     def _collect_params(self) -> dict:
         return {
             "version": 1,
+            "task_robot_index": int(self.task_robot_combo.currentIndex()),
+            "task_traj_index": int(self.task_traj_combo.currentIndex()),
             "plan_mode_index": int(self.plan_mode_combo.currentIndex()),
             "method_index": int(self.method_combo.currentIndex()),
             "track_mode_index": int(self.track_mode_combo.currentIndex()),
@@ -2609,6 +3580,36 @@ class UamSuiteGUI(QMainWindow):
             "ee_eight_a": float(self.ee_eight_a.value()),
             "ee_eight_period": float(self.ee_eight_period.value()),
             "ee_eight_tdur": float(self.ee_eight_tdur.value()),
+            "ee_sun_plane_index": int(self.ee_sun_plane_combo.currentIndex()),
+            "ee_sun_vmax": float(self.ee_sun_vmax.value()),
+            "ee_sun_amax": float(self.ee_sun_amax.value()),
+            "ee_sun_n": float(self.ee_sun_n.value()),
+            "ee_sun_loops": int(self.ee_sun_loops.value()),
+            "ee_sun_center": [
+                float(self.ee_sun_cx.value()),
+                float(self.ee_sun_cy.value()),
+                float(self.ee_sun_cz.value()),
+            ],
+            "ee_sun_yaw_const_deg": float(self.ee_sun_yaw_const.value()),
+            "ee_sun_yaw_hold": bool(self.ee_sun_yaw_hold.isChecked()),
+            "ee_sun_buffer_s": float(self.ee_sun_buffer.value()),
+            "ee_circle_center": [
+                float(self.ee_circle_cx.value()),
+                float(self.ee_circle_cy.value()),
+                float(self.ee_circle_cz.value()),
+            ],
+            "ee_circle_r": float(self.ee_circle_r.value()),
+            "ee_circle_period": float(self.ee_circle_period.value()),
+            "ee_circle_loops": int(self.ee_circle_loops.value()),
+            "ee_circle_tdur": float(self.ee_circle_tdur.value()),
+            "ee_circle_yaw_const_deg": float(self.ee_circle_yaw_const.value()),
+            "ee_circle_yaw_hold": bool(self.ee_circle_yaw_hold.isChecked()),
+            "ee_circle_buffer_s": float(self.ee_circle_buffer.value()),
+            "ee_csv_path": self.ee_csv_path.text().strip(),
+            "ee_csv_vmax_limit": float(self.ee_csv_vmax_limit.value()),
+            "ee_csv_z_offset_m": float(self.ee_csv_z_offset.value()),
+            "ee_csv_yaw_const_deg": float(self.ee_csv_yaw_const.value()),
+            "ee_csv_yaw_hold": bool(self.ee_csv_yaw_hold.isChecked()),
             "T_sim": float(self.T_sim.value()),
             "sim_dt": float(self.sim_dt.value()),
             "control_dt": float(self.control_dt.value()),
@@ -2687,6 +3688,15 @@ class UamSuiteGUI(QMainWindow):
             "rn_geo_kR": float(self.rn_geo_kR.value()),
             "rn_geo_kOmega": float(self.rn_geo_kOmega.value()),
             "rn_geo_max_tilt_deg": float(self.rn_geo_max_tilt_deg.value()),
+            "gz_pkg": self.gz_pkg_combo.currentText().strip(),
+            "gz_launch_file": self.gz_launch_combo.currentText().strip(),
+            "gz_model": self.gz_model_combo.currentText().strip(),
+            "gz_model_type": self.gz_model_type_combo.currentText().strip(),
+            "gz_world": self.gz_world_combo.currentText().strip(),
+            "gz_model_index": int(self.gz_model_combo.currentIndex()),
+            "gz_model_type_index": int(self.gz_model_type_combo.currentIndex()),
+            "gz_world_index": int(self.gz_world_combo.currentIndex()),
+            "gz_launch_args": self.gz_args_edit.text().strip(),
         }
 
     def _apply_params(self, p: dict) -> None:
@@ -2704,6 +3714,12 @@ class UamSuiteGUI(QMainWindow):
         def _set_spin(name: str, widget):
             if name in p:
                 widget.setValue(p[name])
+        def _set_text(name: str, widget):
+            if name in p and hasattr(widget, "setText"):
+                widget.setText(str(p[name]))
+        def _set_combo_text(name: str, widget):
+            if name in p and hasattr(widget, "setCurrentText"):
+                widget.setCurrentText(str(p[name]))
 
         _set_spin("dt_plan", self.dt_plan)
         _set_spin("max_iter_plan", self.max_iter_plan)
@@ -2718,6 +3734,28 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("ee_eight_a", self.ee_eight_a)
         _set_spin("ee_eight_period", self.ee_eight_period)
         _set_spin("ee_eight_tdur", self.ee_eight_tdur)
+        _set_spin("ee_sun_vmax", self.ee_sun_vmax)
+        _set_spin("ee_sun_amax", self.ee_sun_amax)
+        _set_spin("ee_sun_n", self.ee_sun_n)
+        _set_spin("ee_sun_loops", self.ee_sun_loops)
+        _set_spin("ee_sun_yaw_const_deg", self.ee_sun_yaw_const)
+        _set_spin("ee_sun_buffer_s", self.ee_sun_buffer)
+        _set_spin("ee_circle_r", self.ee_circle_r)
+        _set_spin("ee_circle_period", self.ee_circle_period)
+        _set_spin("ee_circle_loops", self.ee_circle_loops)
+        _set_spin("ee_circle_tdur", self.ee_circle_tdur)
+        _set_spin("ee_circle_yaw_const_deg", self.ee_circle_yaw_const)
+        _set_spin("ee_circle_buffer_s", self.ee_circle_buffer)
+        _set_spin("ee_csv_vmax_limit", self.ee_csv_vmax_limit)
+        _set_spin("ee_csv_z_offset_m", self.ee_csv_z_offset)
+        _set_spin("ee_csv_yaw_const_deg", self.ee_csv_yaw_const)
+        _set_text("ee_csv_path", self.ee_csv_path)
+        if "ee_sun_yaw_hold" in p:
+            self.ee_sun_yaw_hold.setChecked(bool(p["ee_sun_yaw_hold"]))
+        if "ee_circle_yaw_hold" in p:
+            self.ee_circle_yaw_hold.setChecked(bool(p["ee_circle_yaw_hold"]))
+        if "ee_csv_yaw_hold" in p:
+            self.ee_csv_yaw_hold.setChecked(bool(p["ee_csv_yaw_hold"]))
         _set_spin("T_sim", self.T_sim)
         _set_spin("sim_dt", self.sim_dt)
         _set_spin("control_dt", self.control_dt)
@@ -2807,6 +3845,12 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("rn_geo_kR", self.rn_geo_kR)
         _set_spin("rn_geo_kOmega", self.rn_geo_kOmega)
         _set_spin("rn_geo_max_tilt_deg", self.rn_geo_max_tilt_deg)
+        _set_combo_text("gz_pkg", self.gz_pkg_combo)
+        _set_combo_text("gz_launch_file", self.gz_launch_combo)
+        _set_combo_text("gz_model", self.gz_model_combo)
+        _set_combo_text("gz_model_type", self.gz_model_type_combo)
+        _set_combo_text("gz_world", self.gz_world_combo)
+        _set_text("gz_launch_args", self.gz_args_edit)
 
         def _set_combo(name: str, widget):
             if name in p:
@@ -2818,13 +3862,19 @@ class UamSuiteGUI(QMainWindow):
             if name in p:
                 widget.setChecked(bool(p[name]))
 
+        _set_combo("task_robot_index", self.task_robot_combo)
+        _set_combo("task_traj_index", self.task_traj_combo)
         _set_combo("plan_mode_index", self.plan_mode_combo)
         _set_combo("ee_plan_type_index", self.ee_plan_type_combo)
+        _set_combo("ee_sun_plane_index", self.ee_sun_plane_combo)
         _set_combo("method_index", self.method_combo)
         _set_combo("track_mode_index", self.track_mode_combo)
         _set_combo("reg_mode_index", self.reg_mode_combo)
         _set_combo("control_mode_track_index", self.control_mode_track)
         _set_combo("track_sim_control_stack_index", self.track_sim_control_stack)
+        _set_combo("gz_model_index", self.gz_model_combo)
+        _set_combo("gz_model_type_index", self.gz_model_type_combo)
+        _set_combo("gz_world_index", self.gz_world_combo)
         _set_check("croc_use_actuator_first_order", self.croc_use_actuator_first_order)
         _set_check("croc_ee_use_thrust_constraints", self.croc_ee_use_thrust_constraints)
         _set_check("plan_croc_use_actuator_first_order", self.plan_croc_use_actuator_first_order)
@@ -2849,7 +3899,17 @@ class UamSuiteGUI(QMainWindow):
             self.ee_eight_cx.setValue(float(ec[0]))
             self.ee_eight_cy.setValue(float(ec[1]))
             self.ee_eight_cz.setValue(float(ec[2]))
-        self._on_plan_mode()
+        sc = p.get("ee_sun_center")
+        if isinstance(sc, list) and len(sc) >= 3:
+            self.ee_sun_cx.setValue(float(sc[0]))
+            self.ee_sun_cy.setValue(float(sc[1]))
+            self.ee_sun_cz.setValue(float(sc[2]))
+        cc = p.get("ee_circle_center")
+        if isinstance(cc, list) and len(cc) >= 3:
+            self.ee_circle_cx.setValue(float(cc[0]))
+            self.ee_circle_cy.setValue(float(cc[1]))
+            self.ee_circle_cz.setValue(float(cc[2]))
+        self._refresh_task_selection_ui()
         self._on_ee_plan_type_changed()
         self._on_reg_mode_changed()
         self._update_track_mode_enabled()
@@ -2888,6 +3948,8 @@ class UamSuiteGUI(QMainWindow):
         if tab_id == TAB_PLAN:
             return {
                 "version",
+                "task_robot_index",
+                "task_traj_index",
                 "plan_mode_index",
                 "method_index",
                 "wp_rows",
@@ -2908,6 +3970,28 @@ class UamSuiteGUI(QMainWindow):
                 "ee_eight_a",
                 "ee_eight_period",
                 "ee_eight_tdur",
+                "ee_sun_plane_index",
+                "ee_sun_vmax",
+                "ee_sun_amax",
+                "ee_sun_n",
+                "ee_sun_loops",
+                "ee_sun_center",
+                "ee_sun_yaw_const_deg",
+                "ee_sun_yaw_hold",
+                "ee_sun_buffer_s",
+                "ee_circle_center",
+                "ee_circle_r",
+                "ee_circle_period",
+                "ee_circle_loops",
+                "ee_circle_tdur",
+                "ee_circle_yaw_const_deg",
+                "ee_circle_yaw_hold",
+                "ee_circle_buffer_s",
+                "ee_csv_path",
+                "ee_csv_vmax_limit",
+                "ee_csv_z_offset_m",
+                "ee_csv_yaw_const_deg",
+                "ee_csv_yaw_hold",
                 "plan_croc_use_actuator_first_order",
                 "plan_tau_motor",
                 "plan_tau_joint",
@@ -2996,6 +4080,15 @@ class UamSuiteGUI(QMainWindow):
                 "rn_geo_kR",
                 "rn_geo_kOmega",
                 "rn_geo_max_tilt_deg",
+                "gz_pkg",
+                "gz_launch_file",
+                "gz_model",
+                "gz_model_type",
+                "gz_world",
+                "gz_model_index",
+                "gz_model_type_index",
+                "gz_world_index",
+                "gz_launch_args",
             }
         return {"version"}
 
@@ -3193,7 +4286,7 @@ class UamSuiteGUI(QMainWindow):
                     "wp2": np.array([self.wp3_w2x.value(), self.wp3_w2y.value(), self.wp3_w2z.value(), self.wp3_w2j1.value(), self.wp3_w2j2.value(), self.wp3_w2yaw.value()], dtype=float),
                 },
             }
-            self.run_plan_btn.setEnabled(False)
+            self.task_generate_btn.setEnabled(False)
             self.log("Planning started: acados_wp3_joint_opt")
             self._plan_worker = self.OptimizationWorker("acados_wp3_joint_opt", params)
             self._plan_worker.finished.connect(self._on_plan_finished)
@@ -3213,8 +4306,10 @@ class UamSuiteGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "No available solver.")
             return
         if method in ("crocoddyl", "crocoddyl_actuator_ocp") and self.planner is None:
-            QMessageBox.warning(self, "Error", "Crocoddyl planner is not initialized.")
-            return
+            self._init_croc_planner()
+            if self.planner is None:
+                QMessageBox.warning(self, "Error", "Crocoddyl planner is not initialized.")
+                return
         worker_method = "crocoddyl" if method == "crocoddyl_actuator_ocp" else method
         use_actuator_first_order = bool(
             method == "crocoddyl_actuator_ocp"
@@ -3249,7 +4344,7 @@ class UamSuiteGUI(QMainWindow):
             ),
             "use_actuator_first_order": use_actuator_first_order,
         }
-        self.run_plan_btn.setEnabled(False)
+        self.task_generate_btn.setEnabled(False)
         self.log(f"Planning started: {method}, {len(sorted_rows)} waypoints")
         self._plan_worker = self.OptimizationWorker(worker_method, params)
         self._plan_worker.finished.connect(self._on_plan_finished)
@@ -3335,7 +4430,7 @@ class UamSuiteGUI(QMainWindow):
         self._start_meshcat_playback(X, dt, traj_points=traj)
 
     def _on_plan_finished(self, ok: bool, err: str, result_data: object):
-        self.run_plan_btn.setEnabled(True)
+        self.task_generate_btn.setEnabled(True)
         if not ok:
             self.log("Planning failed:\n" + err)
             QMessageBox.critical(self, "Planning failed", err[:2000])
@@ -3364,6 +4459,8 @@ class UamSuiteGUI(QMainWindow):
                 "t_plan": t_plan,
                 "x_plan": x_plan,
                 "u_plan": np.vstack(us) if len(us) else np.zeros((0, 6), dtype=float),
+                # Crocoddyl full-state convention: linear/angular velocities are body-frame.
+                "velocity_frame": "body",
                 "plan_mixed_wp_rows": copy.deepcopy(_wpr) if _wpr else None,
             }
         elif result_data.get("method") in ("acados", "acados_cascade", "acados_wp3_joint_opt"):
@@ -3376,6 +4473,8 @@ class UamSuiteGUI(QMainWindow):
                 "t_plan": t_plan,
                 "x_plan": x_plan,
                 "u_plan": u_plan if u_plan.ndim == 2 else np.zeros((0, 6), dtype=float),
+                # Acados full-state export in this project also follows body-frame velocity convention.
+                "velocity_frame": "body",
                 "plan_mixed_wp_rows": copy.deepcopy(_wpr) if _wpr else None,
             }
         else:
@@ -3394,21 +4493,25 @@ class UamSuiteGUI(QMainWindow):
         self.meshcat_track_btn.setEnabled(False)
         _full_plan = (
             self._plan_bundle is not None
-            and self._plan_bundle["kind"] in ("full_croc", "full_acados")
+            and (
+                self._plan_bundle["kind"] in ("full_croc", "full_acados")
+                or (self._is_s500_mode() and self._plan_bundle["kind"] == "ee_snap")
+            )
         )
         self.rn_launch_btn.setEnabled(_full_plan)
         self.log("Planning finished. You can run the closed loop on the \"Tracking\" tab.")
 
     def _run_ee_plan(self):
-        self.run_ee_plan_btn.setEnabled(False)
+        self.task_generate_btn.setEnabled(False)
         self.log("Generating EE reference…")
-        if self.ee_plan_type_combo.currentIndex() == 0:
+        pt = int(self.ee_plan_type_combo.currentIndex())
+        if pt == 0:
             params = {
                 "mode": "snap",
                 "rows": self._read_ee_rows(),
                 "dt_sample": self.dt_ee_sample.value(),
             }
-        else:
+        elif pt == 1:
             params = {
                 "mode": "eight",
                 "dt_sample": self.dt_ee_sample.value(),
@@ -3421,12 +4524,56 @@ class UamSuiteGUI(QMainWindow):
                 "eight_period": self.ee_eight_period.value(),
                 "t_duration": self.ee_eight_tdur.value(),
             }
+        elif pt == 2:
+            params = {
+                "mode": "sun_ellipse",
+                "dt_sample": self.dt_ee_sample.value(),
+                "plane": self.ee_sun_plane_combo.currentText(),
+                "vmax": self.ee_sun_vmax.value(),
+                "amax": self.ee_sun_amax.value(),
+                "ellipticity": self.ee_sun_n.value(),
+                "loops": self.ee_sun_loops.value(),
+                "center": [
+                    self.ee_sun_cx.value(),
+                    self.ee_sun_cy.value(),
+                    self.ee_sun_cz.value(),
+                ],
+                "yaw_const_deg": self.ee_sun_yaw_const.value(),
+                "yaw_hold": self.ee_sun_yaw_hold.isChecked(),
+                "buffer_s": self.ee_sun_buffer.value(),
+            }
+        elif pt == 3:
+            params = {
+                "mode": "circle",
+                "dt_sample": self.dt_ee_sample.value(),
+                "center": [
+                    self.ee_circle_cx.value(),
+                    self.ee_circle_cy.value(),
+                    self.ee_circle_cz.value(),
+                ],
+                "radius": self.ee_circle_r.value(),
+                "period": self.ee_circle_period.value(),
+                "loops": self.ee_circle_loops.value(),
+                "duration": self.ee_circle_period.value() * self.ee_circle_loops.value(),
+                "yaw_const_deg": self.ee_circle_yaw_const.value(),
+                "yaw_hold": self.ee_circle_yaw_hold.isChecked(),
+                "buffer_s": self.ee_circle_buffer.value(),
+            }
+        else:
+            params = {
+                "mode": "csv_import",
+                "csv_path": self.ee_csv_path.text().strip(),
+                "vmax_limit": self.ee_csv_vmax_limit.value(),
+                "z_offset_m": self.ee_csv_z_offset.value(),
+                "yaw_const_deg": self.ee_csv_yaw_const.value(),
+                "yaw_hold": self.ee_csv_yaw_hold.isChecked(),
+            }
         self._plan_worker = EeRefPlanWorker(params)
         self._plan_worker.finished.connect(self._on_ee_plan_finished)
         self._plan_worker.start()
 
     def _on_ee_plan_finished(self, ok: bool, err: str, payload: object):
-        self.run_ee_plan_btn.setEnabled(True)
+        self.task_generate_btn.setEnabled(True)
         if not ok:
             self.log(err)
             QMessageBox.critical(self, "Error", err[:2000])
@@ -3439,6 +4586,9 @@ class UamSuiteGUI(QMainWindow):
             "t_ref": payload["t_ref"],
             "p_ref": payload["p_ref"],
             "yaw_ref": payload["yaw_ref"],
+            "dp_ref": payload.get("dp_ref"),
+            "ddp_ref": payload.get("ddp_ref"),
+            "dyaw_ref": payload.get("dyaw_ref"),
             "waypoints": payload["waypoints_xyz_yaw"],
             "t_wp": payload["t_wp"],
         }
@@ -3448,7 +4598,15 @@ class UamSuiteGUI(QMainWindow):
         self.run_track_btn.setEnabled(True)
         self.meshcat_plan_btn.setEnabled(True)
         self.meshcat_track_btn.setEnabled(False)
-        self.rn_launch_btn.setEnabled(False)
+        self.rn_launch_btn.setEnabled(self._is_s500_mode())
+        if payload.get("track_kind") == "csv_import" and isinstance(payload.get("meta"), dict):
+            m = payload["meta"]
+            self.log(
+                "[csv_import] "
+                f"raw vmax={float(m.get('vmax_raw', 0.0)):.3f} m/s, "
+                f"limit={float(m.get('vmax_limit', 0.0)):.3f} m/s, "
+                f"time_scale={float(m.get('time_scale', 1.0)):.3f}"
+            )
         self.log("EE reference generated. We recommend Acados EE-centric tracking.")
 
     def _update_track_mode_enabled(self):
@@ -3484,7 +4642,7 @@ class UamSuiteGUI(QMainWindow):
             x_ref_traj = np.tile(x_ref.reshape(1, -1), (t_ref.size, 1))
             self._manual_ref_overlay = {
                 "ref_time_states": t_ref,
-                "ref_states": x_ref_traj[:, :17],
+                "ref_states": x_ref_traj.copy(),
                 "ref_time_controls": None,
                 "ref_controls": None,
                 "waypoints": None,
@@ -3553,7 +4711,7 @@ class UamSuiteGUI(QMainWindow):
         x_ref_traj = np.tile(x_ref.reshape(1, -1), (t_ref.size, 1))
         self._manual_ref_overlay = {
             "ref_time_states": t_ref,
-            "ref_states": x_ref_traj[:, :17],
+            "ref_states": x_ref_traj.copy(),
             "ref_time_controls": None,
             "ref_controls": None,
             "waypoints": None,
@@ -3610,17 +4768,231 @@ class UamSuiteGUI(QMainWindow):
         self.rn_horizon.setEnabled(use_mpc_params)
         self.rn_mpc_max_iter.setEnabled(use_mpc_params)
 
+    def _start_ros_gazebo(self) -> None:
+        pkg = self.gz_pkg_combo.currentText().strip() if hasattr(self, "gz_pkg_combo") else ""
+        launch_file = self.gz_launch_combo.currentText().strip() if hasattr(self, "gz_launch_combo") else ""
+        args = self.gz_args_edit.text().strip() if hasattr(self, "gz_args_edit") else ""
+        model = self.gz_model_combo.currentText().strip() if hasattr(self, "gz_model_combo") else ""
+        model_type = self.gz_model_type_combo.currentText().strip() if hasattr(self, "gz_model_type_combo") else ""
+        world = self.gz_world_combo.currentText().strip() if hasattr(self, "gz_world_combo") else ""
+        if not pkg or not launch_file:
+            QMessageBox.warning(self, "Error", "Gazebo 启动参数不完整（package/launch file）。")
+            return
+        if self._gazebo_process is not None and self._gazebo_process.poll() is None:
+            QMessageBox.information(self, "Notice", "Gazebo 进程已在运行。")
+            return
+        cmd = ["roslaunch", pkg, launch_file]
+        if world:
+            cmd.append(f"world_name:={world}")
+        if model_type:
+            cmd.append(f"model_type:={model_type}")
+        if model:
+            cmd.append(f"robot_model:={model}")
+        if args:
+            cmd.extend(args.split())
+        sdf_path, sdf_note = _predict_gazebo_spawn_sdf_path(launch_file, model_type)
+        if sdf_path:
+            self.log(f"[Gazebo] Spawn SDF (expected): {sdf_path} ({sdf_note})")
+        else:
+            self.log(f"[Gazebo] SDF path: {sdf_note}")
+        if args and ("sdf:=" in args or "sdf_file:=" in args):
+            self.log(
+                "[Gazebo] Note: extra args may override the default SDF; "
+                "the path above matches the launch file defaults only."
+            )
+        try:
+            self._gazebo_process = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), env=os.environ.copy())
+            self.log(f"Started Gazebo: {' '.join(cmd)} (PID={self._gazebo_process.pid})")
+        except Exception as e:
+            QMessageBox.critical(self, "Launch failed", str(e)[:2000])
+            self.log(f"Gazebo launch failed: {e!r}")
+
+    def _stop_ros_gazebo(self) -> None:
+        try:
+            # 1) 优先关闭当前 GUI 记录的 roslaunch 进程
+            if self._gazebo_process is not None:
+                try:
+                    self._gazebo_process.terminate()
+                    self._gazebo_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._gazebo_process.kill()
+                    self._gazebo_process.wait(timeout=2)
+                except Exception:
+                    try:
+                        self._gazebo_process.kill()
+                    except Exception:
+                        pass
+                finally:
+                    self._gazebo_process = None
+
+            # 2) 清理常见仿真相关 ROS 节点（忽略不存在的节点）
+            ros_nodes = [
+                "/gazebo",
+                "/gazebo_gui",
+                "/rviz",
+                "/rviz_gui",
+                "/robot_state_publisher",
+                "/joint_state_publisher",
+                "/joint_state_publisher_gui",
+                "/move_group",
+                "/controller_spawner",
+                "/controller_manager",
+                "/groundtruth_pub",
+            ]
+            subprocess.run(
+                ["rosnode", "kill", *ros_nodes],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            # 3) 清理残留进程（避免下次启动端口/资源冲突）
+            subprocess.run(
+                ["killall", "-q", "-9", "gazebo", "gzserver", "gzclient", "gazebo_gui"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            subprocess.run(
+                ["killall", "-q", "-9", "rviz", "rviz_gui"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            subprocess.run(
+                ["killall", "-q", "-9", "px4"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            subprocess.run(
+                ["pkill", "-9", "-f", "python.*simulation"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            # 给系统一点时间完成资源回收
+            time.sleep(1.0)
+            self.log("Gazebo stopped (clean shutdown + residual process cleanup).")
+        except Exception as e:
+            self.log(f"Failed to stop Gazebo cleanly: {e!r}")
+
+    def _s500_ros_plan_from_ee_snap(self, pb: dict) -> dict:
+        """Convert ee_snap reference to a dynamically consistent full-state plan for s500 ROS tracking."""
+        import pinocchio as pin
+
+        root = Path(__file__).resolve().parent
+        urdf = str(root / "models" / "urdf" / "s500_simple.urdf")
+        rm = pin.buildModelFromUrdf(urdf, pin.JointModelFreeFlyer())
+        nq, nv = int(rm.nq), int(rm.nv)
+
+        t_ref = np.asarray(pb.get("t_ref", []), dtype=float).flatten()
+        p_ref = np.asarray(pb.get("p_ref", []), dtype=float)
+        yaw_ref = np.asarray(pb.get("yaw_ref", []), dtype=float).flatten()
+        if t_ref.size == 0 or p_ref.ndim != 2 or p_ref.shape[1] != 3:
+            raise ValueError("Invalid ee_snap bundle for s500 ROS export")
+        if yaw_ref.size != t_ref.size:
+            yaw_ref = np.zeros_like(t_ref)
+        dp_ref = np.asarray(pb.get("dp_ref"), dtype=float) if pb.get("dp_ref") is not None else None
+        if dp_ref is None or dp_ref.shape != p_ref.shape:
+            if t_ref.size >= 2:
+                dp_ref = np.gradient(p_ref, t_ref, axis=0)
+            else:
+                dp_ref = np.zeros_like(p_ref)
+        dyaw_ref = np.asarray(pb.get("dyaw_ref"), dtype=float).flatten() if pb.get("dyaw_ref") is not None else None
+        if dyaw_ref is None or dyaw_ref.size != t_ref.size:
+            if t_ref.size >= 2:
+                dyaw_ref = np.gradient(yaw_ref, t_ref)
+            else:
+                dyaw_ref = np.zeros_like(t_ref)
+
+        if t_ref.size >= 2:
+            ddp_ref = np.asarray(pb.get("ddp_ref"), dtype=float) if pb.get("ddp_ref") is not None else None
+            if ddp_ref is None or ddp_ref.shape != dp_ref.shape:
+                ddp_ref = np.gradient(dp_ref, t_ref, axis=0)
+        else:
+            ddp_ref = np.zeros_like(dp_ref)
+
+        def _normalize(v: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+            nrm = float(np.linalg.norm(v))
+            if nrm < 1e-9:
+                return np.asarray(fallback, dtype=float).copy()
+            return (np.asarray(v, dtype=float) / nrm).copy()
+
+        R_list: list[np.ndarray] = []
+        x_plan = np.zeros((t_ref.size, nq + nv), dtype=float)
+        for i in range(t_ref.size):
+            q = pin.neutral(rm)
+            q[:3] = p_ref[i]
+
+            # Build attitude from desired acceleration + yaw:
+            # b3 follows thrust direction, yaw sets heading around b3.
+            a_des = np.asarray(ddp_ref[i], dtype=float) + np.array([0.0, 0.0, 9.81], dtype=float)
+            b3 = _normalize(a_des, np.array([0.0, 0.0, 1.0], dtype=float))
+            yaw_i = float(yaw_ref[i])
+            b1_yaw = np.array([np.cos(yaw_i), np.sin(yaw_i), 0.0], dtype=float)
+            b2 = np.cross(b3, b1_yaw)
+            if np.linalg.norm(b2) < 1e-9:
+                # Near singular case when b3 and heading align.
+                b2 = np.array([-np.sin(yaw_i), np.cos(yaw_i), 0.0], dtype=float)
+            b2 = _normalize(b2, np.array([0.0, 1.0, 0.0], dtype=float))
+            b1 = _normalize(np.cross(b2, b3), np.array([1.0, 0.0, 0.0], dtype=float))
+            R = np.column_stack([b1, b2, b3])
+            R_list.append(R)
+            quat = pin.Quaternion(R)
+            q[3:7] = np.array([quat.x, quat.y, quat.z, quat.w], dtype=float)
+
+            v = np.zeros(nv, dtype=float)
+            if nv >= 3:
+                # Crocoddyl state convention uses body-frame linear velocity.
+                # dp_ref from GUI trajectories is typically world-frame, so convert here.
+                v[:3] = R.T @ np.asarray(dp_ref[i], dtype=float)
+            x_plan[i, :nq] = q
+            x_plan[i, nq:] = v
+
+        # Fill angular velocity reference (body frame) from attitude time derivative.
+        if nv >= 6 and len(R_list) > 0:
+            omega_ref = np.zeros((t_ref.size, 3), dtype=float)
+            if t_ref.size >= 2:
+                for i in range(t_ref.size):
+                    if i == 0:
+                        dt = float(max(t_ref[1] - t_ref[0], 1e-9))
+                        Rdot = (R_list[1] - R_list[0]) / dt
+                    elif i == t_ref.size - 1:
+                        dt = float(max(t_ref[-1] - t_ref[-2], 1e-9))
+                        Rdot = (R_list[-1] - R_list[-2]) / dt
+                    else:
+                        dt = float(max(t_ref[i + 1] - t_ref[i - 1], 1e-9))
+                        Rdot = (R_list[i + 1] - R_list[i - 1]) / dt
+                    W = R_list[i].T @ Rdot
+                    omega_ref[i, 0] = 0.5 * (W[2, 1] - W[1, 2])
+                    omega_ref[i, 1] = 0.5 * (W[0, 2] - W[2, 0])
+                    omega_ref[i, 2] = 0.5 * (W[1, 0] - W[0, 1])
+            else:
+                omega_ref[:, 2] = dyaw_ref
+            x_plan[:, nq + 3 : nq + 6] = omega_ref
+
+        return {
+            "kind": "full_acados",
+            "t_plan": t_ref,
+            "x_plan": x_plan,
+            "u_plan": np.zeros((max(0, t_ref.size - 1), 4), dtype=float),
+            "ddp_plan": ddp_ref,
+            "velocity_frame": "body",
+        }
+
     def _launch_tracking_node(self):
         """导出规划并启动 run_tracking_controller.py 子进程。"""
         if self._plan_bundle is None:
             return
-        pb = self._plan_bundle
-        if pb["kind"] not in ("full_croc", "full_acados"):
-            QMessageBox.warning(
-                self,
-                "Notice",
-                "ROS Tracking Node 需要先完成 Full state 规划（Crocoddyl 或 Acados）。",
-            )
+        export_pb = self._prepare_ros_export_plan_bundle()
+        if export_pb is None:
             return
 
         # 若已有子进程在运行，先询问是否重启
@@ -3650,7 +5022,7 @@ class UamSuiteGUI(QMainWindow):
         export_dir.mkdir(exist_ok=True)
         npz_path = export_dir / "last_suite_plan.npz"
         try:
-            export_suite_plan_npz(npz_path, pb, dt_plan_fallback_s=float(self.dt_plan.value()))
+            export_suite_plan_npz(npz_path, export_pb, dt_plan_fallback_s=float(self.dt_plan.value()))
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e)[:2000])
             self.log(f"ROS export failed: {e!r}")
@@ -3661,6 +5033,10 @@ class UamSuiteGUI(QMainWindow):
         ctrl_rate = float(self.rn_control_rate.value())
         arm_mode = self.rn_arm_mode_combo.currentText()
         use_sim = "true" if self.rn_use_sim_check.isChecked() else "false"
+        is_s500 = self._is_s500_mode()
+        if is_s500 and ctrl_mode == "croc_ee_pose":
+            QMessageBox.warning(self, "Notice", "s500 模式无机械臂，不支持 croc_ee_pose，请选择 croc_full_state / px4 / geometric。")
+            return
 
         script = root / "run_tracking_controller.py"
         cmd = [
@@ -3669,6 +5045,8 @@ class UamSuiteGUI(QMainWindow):
             "__name:=suite_tracking_controller",
             "_trajectory_source:=suite_npz",
             f"_suite_plan_path:={npz_path}",
+            f"_robot_name:={self.task_robot_combo.currentText()}",
+            f"_arm_enabled:={'false' if is_s500 else 'true'}",
             f"_controller_mode:={ctrl_mode}",
             f"_odom_source:={odom_src}",
             f"_control_rate:={ctrl_rate}",
@@ -3720,6 +5098,7 @@ class UamSuiteGUI(QMainWindow):
         self.rn_stop_svc_btn.setEnabled(True)
         self.rn_save_svc_btn.setEnabled(True)
         self.rn_update_ctrl_btn.setEnabled(True)
+        self.rn_update_traj_btn.setEnabled(True)
         support_reg_services = ctrl_mode in ("croc_full_state", "croc_ee_pose", "px4", "geometric")
         self.rn_reset_svc_btn.setEnabled(support_reg_services)
         self.rn_set_reg_btn.setEnabled(support_reg_services)
@@ -3728,6 +5107,28 @@ class UamSuiteGUI(QMainWindow):
             f"mode={ctrl_mode} odom={odom_src} rate={ctrl_rate}Hz | plan={npz_path}\n"
             "节点就绪后，切换 OFFBOARD 并解锁，再点击 /start_tracking 开始跟踪。"
         )
+
+    def _prepare_ros_export_plan_bundle(self) -> dict | None:
+        """Prepare a ROS-trackable full-state plan bundle from current planning result."""
+        if self._plan_bundle is None:
+            QMessageBox.warning(self, "Notice", "当前没有可导出的规划轨迹。")
+            return None
+        pb = self._plan_bundle
+        export_pb = pb
+        if pb.get("kind") == "ee_snap" and self._is_s500_mode():
+            try:
+                export_pb = self._s500_ros_plan_from_ee_snap(pb)
+            except Exception as e:
+                QMessageBox.warning(self, "Notice", f"s500 轨迹转换为 ROS full-state 失败：{e}")
+                return None
+        if export_pb["kind"] not in ("full_croc", "full_acados"):
+            QMessageBox.warning(
+                self,
+                "Notice",
+                "ROS Tracking Node 需要先完成 Full state 规划（Crocoddyl 或 Acados）。",
+            )
+            return None
+        return export_pb
 
     def _kill_tracking_node(self):
         """终止 ROS Tracking 子进程（新节点或 PX4 入口）。"""
@@ -3749,6 +5150,7 @@ class UamSuiteGUI(QMainWindow):
         self.rn_stop_svc_btn.setEnabled(False)
         self.rn_save_svc_btn.setEnabled(False)
         self.rn_update_ctrl_btn.setEnabled(False)
+        self.rn_update_traj_btn.setEnabled(False)
         self.rn_reset_svc_btn.setEnabled(False)
         self.rn_set_reg_btn.setEnabled(False)
         self.log("ROS tracking process terminated.")
@@ -3782,6 +5184,28 @@ class UamSuiteGUI(QMainWindow):
 
     def _call_save_data_service(self):
         self._call_tracking_service("/save_data")
+
+    def _call_update_trajectory_service(self):
+        """Export current GUI plan, then call /update_trajectory for hot reload."""
+        if self._rn_process is None or self._rn_process.poll() is not None:
+            QMessageBox.warning(self, "Notice", "ROS Tracking Node 未运行，无法在线更新轨迹。")
+            return
+        export_pb = self._prepare_ros_export_plan_bundle()
+        if export_pb is None:
+            return
+        try:
+            from suite_plan_export import export_suite_plan_npz
+            root = Path(__file__).resolve().parent
+            export_dir = root / ".suite_ros_export"
+            export_dir.mkdir(exist_ok=True)
+            npz_path = export_dir / "last_suite_plan.npz"
+            export_suite_plan_npz(npz_path, export_pb, dt_plan_fallback_s=float(self.dt_plan.value()))
+            self.log(f"[update_trajectory] 已导出最新规划到 {npz_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e)[:2000])
+            self.log(f"[update_trajectory] 轨迹导出失败: {e!r}")
+            return
+        self._call_tracking_service("/update_trajectory")
 
     def _call_reset_to_initial_service(self):
         self._call_tracking_service("/reset_to_initial")
@@ -3967,29 +5391,37 @@ class UamSuiteGUI(QMainWindow):
             x_ref_states = None
 
         # ── EE FK ──────────────────────────────────────────────────────────
-        try:
-            from s500_uam_trajectory_planner import compute_ee_kinematics_along_trajectory
-            rm, eid = self._robot_model_and_ee()
-            pin_data = rm.createData()
-            ee_act_raw, _, ee_rpy_a, _ = compute_ee_kinematics_along_trajectory(x_act, rm, pin_data, eid)
-            ee_act      = np.asarray(ee_act_raw, dtype=float)
-            ee_yaw_act  = np.unwrap(np.asarray(ee_rpy_a[:, 2], dtype=float).flatten())
-            if x_ref_states is not None:
-                ee_ref_raw, _, ee_rpy_r, _ = compute_ee_kinematics_along_trajectory(x_ref_states, rm, pin_data, eid)
-                ee_ref  = np.asarray(ee_ref_raw, dtype=float)
-                yaw_ref = np.unwrap(np.asarray(ee_rpy_r[:, 2], dtype=float).flatten())
-            else:
-                ee_ref  = ee_act.copy()
-                yaw_ref = ee_yaw_act.copy()
-        except Exception:
-            self.log(f"[plot] EE FK failed (using base pos as fallback):\n{_tb.format_exc()}")
-            ee_act     = pos.copy()
-            ee_yaw_act = np.zeros(N)
-            ee_ref     = r_pos.copy() if has_ref else pos.copy()
-            yaw_ref    = np.zeros(N)
+        if self._is_s500_mode():
+            ee_act = np.full((N, 3), np.nan, dtype=float)
+            ee_ref = np.full((N, 3), np.nan, dtype=float)
+            ee_yaw_act = np.full(N, np.nan, dtype=float)
+            yaw_ref = np.full(N, np.nan, dtype=float)
+            err = np.full(N, np.nan, dtype=float)
+            err_yaw = np.full(N, np.nan, dtype=float)
+        else:
+            try:
+                from s500_uam_trajectory_planner import compute_ee_kinematics_along_trajectory
+                rm, eid = self._robot_model_and_ee()
+                pin_data = rm.createData()
+                ee_act_raw, _, ee_rpy_a, _ = compute_ee_kinematics_along_trajectory(x_act, rm, pin_data, eid)
+                ee_act      = np.asarray(ee_act_raw, dtype=float)
+                ee_yaw_act  = np.unwrap(np.asarray(ee_rpy_a[:, 2], dtype=float).flatten())
+                if x_ref_states is not None:
+                    ee_ref_raw, _, ee_rpy_r, _ = compute_ee_kinematics_along_trajectory(x_ref_states, rm, pin_data, eid)
+                    ee_ref  = np.asarray(ee_ref_raw, dtype=float)
+                    yaw_ref = np.unwrap(np.asarray(ee_rpy_r[:, 2], dtype=float).flatten())
+                else:
+                    ee_ref  = ee_act.copy()
+                    yaw_ref = ee_yaw_act.copy()
+            except Exception:
+                self.log(f"[plot] EE FK failed (using base pos as fallback):\n{_tb.format_exc()}")
+                ee_act     = pos.copy()
+                ee_yaw_act = np.zeros(N)
+                ee_ref     = r_pos.copy() if has_ref else pos.copy()
+                yaw_ref    = np.zeros(N)
 
-        err     = np.linalg.norm(ee_act - ee_ref, axis=1) if ee_act.ndim == 2 and ee_ref.ndim == 2 else np.zeros(N)
-        err_yaw = (ee_yaw_act - yaw_ref + np.pi) % (2.0 * np.pi) - np.pi
+            err     = np.linalg.norm(ee_act - ee_ref, axis=1) if ee_act.ndim == 2 and ee_ref.ndim == 2 else np.zeros(N)
+            err_yaw = (ee_yaw_act - yaw_ref + np.pi) % (2.0 * np.pi) - np.pi
 
         # ── 控制量对齐 ────────────────────────────────────────────────────
         if u_mpc.ndim == 2 and u_mpc.shape[0] in (N, N - 1):
@@ -4323,6 +5755,8 @@ class UamSuiteGUI(QMainWindow):
             wp = out["waypoints"]
         elif self._plan_bundle and self._plan_bundle.get("kind") == "ee_snap":
             wp = self._plan_bundle.get("waypoints")
+        if self._is_s500_mode():
+            wp = None
         ref_time_states = None
         ref_states = None
         ref_time_controls = None
@@ -4378,8 +5812,9 @@ class UamSuiteGUI(QMainWindow):
             self.fig_3d_track.clear()
             ax = self.fig_3d_track.add_subplot(111, projection="3d")
             ax.text2D(0.2, 0.5, "3D plot unavailable", transform=ax.transAxes)
+        plot_res = self._s500_plot_sanitize_res(res) if self._is_s500_mode() else res
         em.render_ee_tracking_results_to_figures(
-            res,
+            plot_res,
             fs,
             f3,
             self.fig_traj_dash,
