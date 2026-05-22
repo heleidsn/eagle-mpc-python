@@ -57,3 +57,21 @@ Thumbs.db
 
 results/
 s500_uam_ocp.json
+
+# Local suite/ROS exports
+.suite_ros_export/
+
+# Generated tracking and benchmark outputs
+tracking_results/
+acados_mpc_quad_bench.json
+
+# Racing trajectory optimization outputs
+racing_traj_opt/results/
+racing_traj_opt/result_segment_*.csv
+racing_traj_opt/result_segment_*.png
+racing_traj_opt/racing_s500.csv
+racing_traj_opt/error_model/tracking_error_nn_model.joblib
+
+# Locally exported trajectories for tracking runs
+trajectory/traj_planned*.csv
+trajectory/racing_s500_new.csv
