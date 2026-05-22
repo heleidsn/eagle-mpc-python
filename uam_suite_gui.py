@@ -2,8 +2,9 @@
 """
 S500 UAM integrated GUI: trajectory planning (full-state / EE-only) + closed-loop tracking (Crocoddyl along the plan / Acados EE-centric).
 
-Single-page main plot on the right, "States + 3D": time-domain states on the left (dashed ref = plan, solid real = closed loop),
-3D base/EE trajectory comparison on the right; an additional page "MPC / Error overview" reuses the EE tracking dashboard.
+右侧绘图标签页：States（位置、姿态、速度、角速度、线加/角加、jerk、snap）、Controls（s500 执行器）、
+Base 3D（等比例 XYZ）、Tracking / MPC（轨迹、位置/速度跟踪误差、运动学范数、MPC 或 snap）、Cost analysis。
+UAM 模式下 Controls 页提示见 States 的 Acados 布局；EE 的 Tracking 页含速度误差等（见 s500_uam_ee_snap_tracking_mpc）。
 
 Usage:
   python uam_suite_gui.py
@@ -86,10 +87,126 @@ def _euler_deg_from_simX(simX: np.ndarray) -> np.ndarray:
     return np.degrees(euler)
 
 
+def _set_mplot3d_equal_xyz(ax, *xyz_arrays: np.ndarray | None, margin: float = 0.06) -> None:
+    """Make X/Y/Z axes use the same scale (cube box) for mplot3d."""
+    pts: list[np.ndarray] = []
+    for arr in xyz_arrays:
+        if arr is None:
+            continue
+        A = np.asarray(arr, dtype=float)
+        if A.ndim == 2 and A.shape[1] >= 3 and A.shape[0] > 0:
+            pts.append(A[:, :3])
+    if not pts:
+        return
+    P = np.vstack(pts)
+    ok = np.isfinite(P).all(axis=1)
+    P = P[ok]
+    if P.shape[0] == 0:
+        return
+    lo = np.min(P, axis=0)
+    hi = np.max(P, axis=0)
+    ctr = 0.5 * (lo + hi)
+    span = float(np.max(hi - lo))
+    r = 0.5 * span * (1.0 + margin) if span > 1e-9 else 0.5
+    ax.set_xlim(float(ctr[0] - r), float(ctr[0] + r))
+    ax.set_ylim(float(ctr[1] - r), float(ctr[1] + r))
+    ax.set_zlim(float(ctr[2] - r), float(ctr[2] + r))
+    try:
+        ax.set_box_aspect([1, 1, 1])
+    except Exception:
+        pass
+
+
+def _set_2d_path_equal_meters(ax, *xy2: np.ndarray, margin: float = 0.06) -> None:
+    """XY 或 XZ 路径：横纵轴采用相同米制比例（取包络正方形）。"""
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    for A in xy2:
+        if A is None:
+            continue
+        M = np.asarray(A, dtype=float)
+        if M.size == 0 or M.ndim != 2 or M.shape[1] < 2:
+            continue
+        xs.append(M[:, 0].ravel())
+        ys.append(M[:, 1].ravel())
+    if not xs:
+        ax.set_aspect("equal", adjustable="box")
+        return
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x = x[ok]
+    y = y[ok]
+    if x.size == 0:
+        ax.set_aspect("equal", adjustable="box")
+        return
+    xmin, xmax = float(np.min(x)), float(np.max(x))
+    ymin, ymax = float(np.min(y)), float(np.max(y))
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+    span = max(xmax - xmin, ymax - ymin, 1e-9)
+    half = 0.5 * span * (1.0 + margin)
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_aspect("equal", adjustable="box")
+
+
 def _extract_x17(res: dict) -> np.ndarray:
     x = np.asarray(res["x"], dtype=float)
     n = min(17, x.shape[1])
     return x[:, :n].copy()
+
+
+def _ensure_uam17_for_s500_base_plot(X: np.ndarray) -> np.ndarray:
+    """将状态规范为 17 列 UAM 布局，供 s500 机体图按固定列取 twist（9:15）。"""
+    X = np.asarray(X, dtype=float)
+    if X.ndim != 2:
+        return X
+    n, m = int(X.shape[0]), int(X.shape[1])
+    if m >= 17:
+        return X[:, :17].copy()
+    if m == 13:
+        out = np.zeros((n, 17), dtype=float)
+        out[:, :7] = X[:, :7]
+        out[:, 9:15] = X[:, 7:13]
+        return out
+    if m == 7:
+        # 仅参考位姿 [xyz+quat]，速度/关节补零（与 plot 中 ref 仅有 p/q 一致）
+        out = np.zeros((n, 17), dtype=float)
+        out[:, :7] = X[:, :7]
+        return out
+    # 其它列数：左对齐写入再补零，避免 X[:,9:12] 变成空切片
+    out = np.zeros((n, 17), dtype=float)
+    out[:, : min(m, 17)] = X[:, : min(m, 17)]
+    return out
+
+
+def _first_order_accel_response_piecewise(
+    t_nodes: np.ndarray,
+    a_cmd: np.ndarray,
+    tau_s: float,
+) -> np.ndarray:
+    """
+    离散网格上实现 τ·da/dt + a = a_cmd，各段内 a_cmd 取左端点常值（与 acc_track 积分约定一致）。
+    初值 a(0)=0（冷启动）。τ 极小时退回为指令轨迹。
+    """
+    t_nodes = np.asarray(t_nodes, dtype=float).reshape(-1)
+    a_cmd = np.asarray(a_cmd, dtype=float).reshape(-1, 3)
+    n = int(t_nodes.size)
+    out = np.zeros_like(a_cmd, dtype=float)
+    if n < 2:
+        return out
+    if tau_s <= 1e-12:
+        return a_cmd.copy()
+    for i in range(1, n):
+        dt = float(t_nodes[i] - t_nodes[i - 1])
+        if dt <= 0.0:
+            out[i] = out[i - 1]
+            continue
+        dec = float(np.exp(-dt / tau_s))
+        c = a_cmd[i - 1]
+        out[i, :] = c + (out[i - 1] - c) * dec
+    return out
 
 
 def _snap_default_rows() -> list[list[float]]:
@@ -131,7 +248,10 @@ def _normalize_wp_type_for_combo(cell0: str) -> str:
 
 
 def _migrate_mixed_wp_rows_v1_to_v2(rows: list) -> list:
-    """v1: Base/EEp columns are yaw,j1,j2; v2: j1,j2,yaw. EE rows remain roll,pitch,yaw."""
+    """v1: Base/EEp columns are yaw,j1,j2; v2: j1,j2,yaw. EE rows remain roll,pitch,yaw.
+
+    Trailing optional element (index 8) is the per-row ``zero_v`` flag and is preserved as-is.
+    """
     out: list = []
     for row in rows:
         if not isinstance(row, (list, tuple)) or len(row) < 8:
@@ -977,8 +1097,22 @@ class UamSuiteGUI(QMainWindow):
         self._last_plan_sorted_wp_rows: list | None = None
         self._gazebo_process = None
         self._task_trajectories = {
-            "s500_uam": ["full_state_default", "wp3_joint_opt", "minimum_snap", "figure8"],
-            "s500": ["full_state_crocoddyl", "minimum_snap", "figure8", "sun_ellipse", "circle", "csv_import"],
+            "s500_uam": [
+                "full_state_default",
+                "wp3_joint_opt",
+                "minimum_snap",
+                "figure8",
+                "acc_track",
+            ],
+            "s500": [
+                "full_state_crocoddyl",
+                "minimum_snap",
+                "figure8",
+                "sun_ellipse",
+                "circle",
+                "csv_import",
+                "acc_track",
+            ],
         }
 
         try:
@@ -1042,15 +1176,28 @@ class UamSuiteGUI(QMainWindow):
         try:
             from s500_uam_trajectory_planner import S500UAMTrajectoryPlanner
 
-            self.planner = S500UAMTrajectoryPlanner()
+            urdf_path = self._selected_robot_urdf_path()
+            self.planner = S500UAMTrajectoryPlanner(urdf_path=urdf_path)
+            robot_name = self.task_robot_combo.currentText() if hasattr(self, "task_robot_combo") else "s500_uam"
+            self.log(
+                f"[planner] robot={robot_name} -> urdf={urdf_path}"
+            )
         except Exception:
             self.planner = None
+
+    def _selected_robot_urdf_path(self) -> str:
+        root = Path(__file__).resolve().parent
+        if self._is_s500_mode():
+            return str(root / "models" / "urdf" / "s500_simple.urdf")
+        return str(root / "models" / "urdf" / "s500_uam_simple.urdf")
 
     def _robot_model_and_ee(self):
         if self._lazy_pin_planner is None:
             from s500_uam_trajectory_planner import S500UAMTrajectoryPlanner
 
-            self._lazy_pin_planner = S500UAMTrajectoryPlanner()
+            self._lazy_pin_planner = S500UAMTrajectoryPlanner(
+                urdf_path=self._selected_robot_urdf_path()
+            )
         pl = self._lazy_pin_planner
         return pl.robot_model, pl.ee_frame_id
 
@@ -1123,7 +1270,9 @@ class UamSuiteGUI(QMainWindow):
         plan_top_layout.addWidget(self.task_group)
 
         self.plan_mode_combo = QComboBox()
-        self.plan_mode_combo.addItems(["Full state (default)", "Position trajectory"])
+        self.plan_mode_combo.addItems(
+            ["Full state (default)", "Position trajectory", "Acc tracking test"]
+        )
         self.plan_mode_combo.setCurrentIndex(0)
         self.plan_mode_combo.currentIndexChanged.connect(self._on_plan_mode)
 
@@ -1168,17 +1317,19 @@ class UamSuiteGUI(QMainWindow):
         self._wp_type_help_label = QLabel(
             "Columns j1/roll, j2/pitch, yaw: for Base and EEp they mean j1 deg, j2 deg, base yaw deg; "
             "for EE they mean roll deg, pitch deg, yaw deg (ZYX). "
-            "EEp constrains only end-effector position; the three angles are alignment seeds."
+            "EEp constrains only end-effector position; the three angles are alignment seeds. "
+            "Zero v: 勾选则在该航点上约束速度为 0 (Base：完整状态速度；EE 模式：EE 笛卡尔速度)，"
+            "取消勾选则不约束该航点速度 (仅 full_state_crocoddyl 生效)."
         )
         self._wp_type_help_label.setWordWrap(True)
         g_full.addWidget(self._wp_type_help_label)
-        self.wp_table = QTableWidget(2, 8)
+        self.wp_table = QTableWidget(2, 9)
         self.wp_table.setHorizontalHeaderLabels(
-            ["Type", "x", "y", "z", "j1/roll°", "j2/pitch°", "yaw°", "t [s]"]
+            ["Type", "x", "y", "z", "j1/roll°", "j2/pitch°", "yaw°", "t [s]", "Zero v"]
         )
         wp_header = self.wp_table.horizontalHeader()
         wp_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        for col in range(1, 8):
+        for col in range(1, 9):
             wp_header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         wp_header.setStretchLastSection(False)
         wp_header.setMinimumSectionSize(56)
@@ -1186,6 +1337,7 @@ class UamSuiteGUI(QMainWindow):
             self.wp_table.setCellWidget(r, 0, self._make_wp_type_combo(str(row[0])))
             for c, val in enumerate(row[1:], start=1):
                 self.wp_table.setItem(r, c, QTableWidgetItem(f"{float(val):g}"))
+            self.wp_table.setCellWidget(r, 8, self._make_wp_zero_v_widget(True))
         g_full.addWidget(self.wp_table)
         wp_btn = QHBoxLayout()
         add_r = QPushButton("Add row")
@@ -1514,6 +1666,144 @@ class UamSuiteGUI(QMainWindow):
         self.ee_plan_type_combo.currentIndexChanged.connect(self._on_ee_plan_type_changed)
         self._on_ee_plan_type_changed()
         self.plan_stack.addWidget(w_ee)
+
+        # Stack 2: world acceleration reference (step / sine), integrated to p,v for tracking
+        w_acc = QWidget()
+        g_acc = QVBoxLayout(w_acc)
+        g_acc.addWidget(
+            QLabel(
+                "在世界系指定基座线加速度 a_W(t)（单轴）"
+            )
+        )
+        acc_row0 = QHBoxLayout()
+        self.acc_track_shape_combo = QComboBox()
+        self.acc_track_shape_combo.addItems(["Step", "Sine"])
+        acc_row0.addWidget(QLabel("Profile"))
+        acc_row0.addWidget(self.acc_track_shape_combo)
+        self.acc_track_axis_combo = QComboBox()
+        self.acc_track_axis_combo.addItems(["World X", "World Y", "World Z"])
+        acc_row0.addWidget(QLabel("Axis"))
+        acc_row0.addWidget(self.acc_track_axis_combo)
+        g_acc.addLayout(acc_row0)
+
+        acc_p = QGridLayout()
+        self.acc_track_px = QDoubleSpinBox()
+        self.acc_track_py = QDoubleSpinBox()
+        self.acc_track_pz = QDoubleSpinBox()
+        for w, v in ((self.acc_track_px, 0.0), (self.acc_track_py, 0.0), (self.acc_track_pz, 1.0)):
+            w.setRange(-50.0, 50.0)
+            w.setDecimals(4)
+            w.setSingleStep(0.05)
+            w.setValue(v)
+        self.acc_track_yaw_deg = QDoubleSpinBox()
+        self.acc_track_yaw_deg.setRange(-180.0, 180.0)
+        self.acc_track_yaw_deg.setDecimals(2)
+        self.acc_track_yaw_deg.setValue(0.0)
+        self.acc_track_duration = QDoubleSpinBox()
+        self.acc_track_duration.setRange(0.1, 300.0)
+        self.acc_track_duration.setDecimals(2)
+        self.acc_track_duration.setValue(8.0)
+        acc_p.addWidget(QLabel("Initial p x/y/z [m]"), 0, 0)
+        acc_p.addWidget(self.acc_track_px, 0, 1)
+        acc_p.addWidget(self.acc_track_py, 0, 2)
+        acc_p.addWidget(self.acc_track_pz, 0, 3)
+        acc_p.addWidget(QLabel("Yaw const [deg]"), 1, 0)
+        acc_p.addWidget(self.acc_track_yaw_deg, 1, 1)
+        acc_p.addWidget(QLabel("Duration [s]"), 1, 2)
+        acc_p.addWidget(self.acc_track_duration, 1, 3)
+        g_acc.addLayout(acc_p)
+
+        self.acc_track_step_group = QGroupBox("Step profile")
+        sg = QGridLayout()
+        self.acc_track_step_time = QDoubleSpinBox()
+        self.acc_track_step_time.setRange(0.0, 300.0)
+        self.acc_track_step_time.setDecimals(3)
+        self.acc_track_step_time.setValue(2.0)
+        self.acc_track_a_before = QDoubleSpinBox()
+        self.acc_track_a_after = QDoubleSpinBox()
+        for w in (self.acc_track_a_before, self.acc_track_a_after):
+            w.setRange(-50.0, 50.0)
+            w.setDecimals(4)
+            w.setSingleStep(0.1)
+        self.acc_track_a_before.setValue(0.0)
+        self.acc_track_a_after.setValue(1.0)
+        self.acc_track_pulse_end = QDoubleSpinBox()
+        self.acc_track_pulse_end.setRange(0.0, 300.0)
+        self.acc_track_pulse_end.setDecimals(3)
+        self.acc_track_pulse_end.setValue(4.0)
+        self.acc_track_brake_to_rest = QCheckBox("脉冲结束后制动至终点速度为零")
+        self.acc_track_brake_to_rest.setChecked(True)
+        self.acc_track_brake_to_rest.setToolTip(
+            "在 t₁ 之前保持阶跃后的加速度；t₁ 之后用常值制动加速度，使该轴在轨迹终点速度约为 0。"
+        )
+        sg.addWidget(QLabel("Step time t₀ [s] (a = before if t < t₀)"), 0, 0)
+        sg.addWidget(self.acc_track_step_time, 0, 1)
+        sg.addWidget(QLabel("a before [m/s²]"), 0, 2)
+        sg.addWidget(self.acc_track_a_before, 0, 3)
+        sg.addWidget(QLabel("a after [m/s²] (t₀ ≤ t < t₁)"), 1, 0)
+        sg.addWidget(self.acc_track_a_after, 1, 1)
+        sg.addWidget(QLabel("脉冲结束 t₁ [s]"), 1, 2)
+        sg.addWidget(self.acc_track_pulse_end, 1, 3)
+        sg.addWidget(self.acc_track_brake_to_rest, 2, 0, 1, 4)
+        self.acc_track_step_group.setLayout(sg)
+        g_acc.addWidget(self.acc_track_step_group)
+
+        self.acc_track_sin_group = QGroupBox("Sine profile")
+        sng = QGridLayout()
+        self.acc_track_sin_amp = QDoubleSpinBox()
+        self.acc_track_sin_amp.setRange(0.0, 50.0)
+        self.acc_track_sin_amp.setDecimals(4)
+        self.acc_track_sin_amp.setValue(0.5)
+        self.acc_track_sin_freq = QDoubleSpinBox()
+        self.acc_track_sin_freq.setRange(0.0, 10.0)
+        self.acc_track_sin_freq.setDecimals(4)
+        self.acc_track_sin_freq.setValue(0.2)
+        self.acc_track_sin_phase_deg = QDoubleSpinBox()
+        self.acc_track_sin_phase_deg.setRange(-360.0, 360.0)
+        self.acc_track_sin_phase_deg.setDecimals(2)
+        self.acc_track_sin_phase_deg.setValue(0.0)
+        sng.addWidget(QLabel("Amplitude A [m/s²]"), 0, 0)
+        sng.addWidget(self.acc_track_sin_amp, 0, 1)
+        sng.addWidget(QLabel("Frequency f [Hz]"), 0, 2)
+        sng.addWidget(self.acc_track_sin_freq, 0, 3)
+        sng.addWidget(QLabel("Phase [deg]"), 1, 0)
+        sng.addWidget(self.acc_track_sin_phase_deg, 1, 1)
+        self.acc_track_sin_group.setLayout(sng)
+        g_acc.addWidget(self.acc_track_sin_group)
+
+        self.acc_track_actuator_group = QGroupBox("Actuator dynamics (rotor 1st-order, optional)")
+        ag_dyn = QGridLayout()
+        self.acc_track_rotor_dyn_chk = QCheckBox(
+            "规划时考虑加速度一阶响应 (τ·da/dt + a = a_cmd，模拟旋翼/推力回路)"
+        )
+        self.acc_track_rotor_dyn_chk.setChecked(False)
+        self.acc_track_rotor_dyn_chk.setToolTip(
+            "勾选后：先将理想指令加速度 a_cmd 经一阶低通得到可实现加速度 a，再对 a 积分得到 v、p。"
+            "初值 a(0)=0。τ 为等效时间常数 [s]。"
+        )
+        self.acc_track_rotor_tau = QDoubleSpinBox()
+        self.acc_track_rotor_tau.setRange(0.001, 10.0)
+        self.acc_track_rotor_tau.setDecimals(3)
+        self.acc_track_rotor_tau.setSingleStep(0.01)
+        self.acc_track_rotor_tau.setValue(0.1)
+        self.acc_track_rotor_tau.setToolTip("一阶时间常数 τ [s]，典型旋翼推力回路约 0.05–0.2 s。")
+        ag_dyn.addWidget(self.acc_track_rotor_dyn_chk, 0, 0, 1, 2)
+        ag_dyn.addWidget(QLabel("时间常数 τ [s]"), 1, 0)
+        ag_dyn.addWidget(self.acc_track_rotor_tau, 1, 1)
+        self.acc_track_actuator_group.setLayout(ag_dyn)
+        g_acc.addWidget(self.acc_track_actuator_group)
+
+        def _on_acc_rotor_dyn_toggled(checked: bool) -> None:
+            self.acc_track_rotor_tau.setEnabled(bool(checked))
+
+        self.acc_track_rotor_dyn_chk.toggled.connect(_on_acc_rotor_dyn_toggled)
+        _on_acc_rotor_dyn_toggled(self.acc_track_rotor_dyn_chk.isChecked())
+
+        self.acc_track_shape_combo.currentIndexChanged.connect(
+            self._on_acc_track_shape_changed
+        )
+        self._on_acc_track_shape_changed()
+        self.plan_stack.addWidget(w_acc)
 
         self._on_task_robot_changed(self.task_robot_combo.currentText())
         self._on_plan_mode()
@@ -2429,6 +2719,7 @@ class UamSuiteGUI(QMainWindow):
 
         # ----- Right: plots -----
         right = QTabWidget()
+        self._right_plot_tabs = right
         root.addWidget(right, stretch=1)
 
         def embed_fig(title: str, figsize=(14, 9)):
@@ -2442,9 +2733,10 @@ class UamSuiteGUI(QMainWindow):
             right.addTab(w, title)
             return fig, cv
 
-        self.fig_states, self.cv_states = embed_fig("States / controls", (12, 9))
+        self.fig_states, self.cv_states = embed_fig("States", (12, 12))
+        self.fig_control, self.cv_control = embed_fig("Controls", (10, 6))
         self.fig_3d_track, self.cv_3d_track = embed_fig("Base 3D", (10, 8))
-        self.fig_traj_dash, self.cv_traj_dash = embed_fig("Tracking / MPC", (12, 10))
+        self.fig_traj_dash, self.cv_traj_dash = embed_fig("Tracking / MPC", (12, 11))
         self.fig_cost_analysis, self.cv_cost_analysis = embed_fig("Cost analysis", (12, 10))
         # Backward-compatible aliases for existing planning preview rendering.
         self.fig_combined, self.cv_combined = self.fig_states, self.cv_states
@@ -2506,17 +2798,56 @@ class UamSuiteGUI(QMainWindow):
         self._draw_suite_states_3d_combined(res)
         self.cv_combined.draw()
 
+    def _set_control_tab_uam_placeholder(self) -> None:
+        """UAM / Acados：旋翼与关节指令仍在 States 页的 4×4 面板中。"""
+        self.fig_control.clear()
+        ax = self.fig_control.add_subplot(111)
+        ax.text(
+            0.5,
+            0.5,
+            "UAM / Acados：执行器指令见「States」标签页中的 Acados 布局。",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=11,
+        )
+        ax.axis("off")
+
     def _render_s500_base_only_planning_figures(
-        self, t_rel: np.ndarray, simX: np.ndarray, title_prefix: str, u_plan: np.ndarray | None = None
+        self,
+        t_rel: np.ndarray,
+        simX: np.ndarray,
+        title_prefix: str,
+        u_plan: np.ndarray | None = None,
+        *,
+        t_ref: np.ndarray | None = None,
+        x_ref: np.ndarray | None = None,
+        t_u_ref: np.ndarray | None = None,
+        u_ref: np.ndarray | None = None,
+        mpc_solve: dict | None = None,
     ) -> None:
-        """Render planning figures for s500 using base-only channels."""
+        """s500 机体状态/控制图。可选 ``t_ref``/``x_ref`` 在同一时间轴上叠加参考（虚线），用于对比跟踪效果。"""
         t = np.asarray(t_rel, dtype=float).flatten()
-        X = np.asarray(simX, dtype=float)
+        X = _ensure_uam17_for_s500_base_plot(np.asarray(simX, dtype=float))
         if X.ndim != 2 or X.shape[0] != t.shape[0]:
             raise ValueError("Invalid base-only plotting arrays")
 
+        Xr_on_t: np.ndarray | None = None
+        if t_ref is not None and x_ref is not None:
+            tr = np.asarray(t_ref, dtype=float).flatten()
+            Xraw = _ensure_uam17_for_s500_base_plot(np.asarray(x_ref, dtype=float))
+            if Xraw.ndim == 2 and Xraw.shape[0] == tr.size and tr.size >= 1 and t.size >= 1:
+                if tr.shape == t.shape and np.allclose(tr, t, rtol=0.0, atol=1e-6):
+                    Xr_on_t = Xraw.copy()
+                elif tr.size >= 2 and t.size >= 2:
+                    Xr_on_t = np.column_stack([np.interp(t, tr, Xraw[:, c]) for c in range(Xraw.shape[1])])
+                else:
+                    Xr_on_t = np.tile(Xraw[0:1, :], (t.size, 1))
+        if Xr_on_t is not None:
+            Xr_on_t = _ensure_uam17_for_s500_base_plot(Xr_on_t)
+
         self.fig_states.clear()
-        axs = [self.fig_states.add_subplot(2, 2, i + 1) for i in range(4)]
+
         pos = X[:, 0:3]
         eul = _euler_deg_from_simX(X)
         vel = X[:, 9:12] if X.shape[1] >= 12 else np.zeros((len(t), 3), dtype=float)
@@ -2525,80 +2856,308 @@ class UamSuiteGUI(QMainWindow):
         if len(t) >= 2:
             acc = np.gradient(vel, t, axis=0)
             jerk = np.gradient(acc, t, axis=0)
+            snap = np.gradient(jerk, t, axis=0)
+            omg_rad = np.asarray(omg, dtype=float)
+            alpha_rad = np.gradient(omg_rad, t, axis=0)
         else:
             acc = np.zeros_like(vel)
             jerk = np.zeros_like(vel)
+            snap = np.zeros_like(vel)
+            alpha_rad = np.zeros_like(omg)
 
-        for j, c, n in ((0, "r", "x"), (1, "g", "y"), (2, "b", "z")):
-            axs[0].plot(t, pos[:, j], c + "-", lw=1.1, label=n)
-            axs[1].plot(t, eul[:, j], c + "-", lw=1.1, label=("roll", "pitch", "yaw")[j])
-            axs[2].plot(t, vel[:, j], c + "-", lw=1.1, label=n)
-            axs[3].plot(t, omg_deg[:, j], c + "-", lw=1.1, label=n)
-        axs[0].set_title("Base position", fontsize=9)
-        axs[0].set_ylabel("m")
-        axs[1].set_title("Base orientation (Euler ZYX)", fontsize=9)
-        axs[1].set_ylabel("deg")
-        axs[2].set_title("Base linear velocity", fontsize=9)
-        axs[2].set_ylabel("m/s")
-        axs[3].set_title("Base angular velocity", fontsize=9)
-        axs[3].set_ylabel("deg/s")
-        for ax in axs:
+        alpha_deg = np.degrees(alpha_rad)
+
+        pos_r = eul_r = vel_r = omg_deg_r = acc_r = jerk_r = snap_r = alpha_deg_r = None
+        if Xr_on_t is not None and Xr_on_t.shape[0] == t.shape[0]:
+            pos_r = Xr_on_t[:, 0:3]
+            eul_r = _euler_deg_from_simX(Xr_on_t)
+            vel_r = Xr_on_t[:, 9:12] if Xr_on_t.shape[1] >= 12 else np.zeros((len(t), 3), dtype=float)
+            omg_r = Xr_on_t[:, 12:15] if Xr_on_t.shape[1] >= 15 else np.zeros((len(t), 3), dtype=float)
+            omg_deg_r = np.degrees(omg_r)
+            if len(t) >= 2:
+                acc_r = np.gradient(vel_r, t, axis=0)
+                jerk_r = np.gradient(acc_r, t, axis=0)
+                snap_r = np.gradient(jerk_r, t, axis=0)
+                alpha_deg_r = np.degrees(np.gradient(np.asarray(omg_r, dtype=float), t, axis=0))
+            else:
+                acc_r = np.zeros_like(vel_r)
+                jerk_r = np.zeros_like(vel_r)
+                snap_r = np.zeros_like(vel_r)
+                alpha_deg_r = np.zeros_like(omg_deg_r)
+
+        gs = self.fig_states.add_gridspec(4, 2, hspace=0.38, wspace=0.32)
+        axs = [self.fig_states.add_subplot(gs[i, j]) for i in range(4) for j in range(2)]
+        titles = (
+            ("Base position", "m"),
+            ("Base orientation (Euler ZYX)", "deg"),
+            ("Base linear velocity", "m/s"),
+            ("Base angular velocity", "deg/s"),
+            ("Base linear acceleration (d v/dt)", "m/s²"),
+            ("Base angular acceleration (d ω/dt)", "deg/s²"),
+            ("Base linear jerk (d a/dt)", "m/s³"),
+            ("Base linear snap (d j/dt)", "m/s⁴"),
+        )
+        series_meas = (
+            (pos, ("x", "y", "z")),
+            (eul, ("roll", "pitch", "yaw")),
+            (vel, ("vx", "vy", "vz")),
+            (omg_deg, ("ωx", "ωy", "ωz")),
+            (acc, ("ax", "ay", "az")),
+            (alpha_deg, ("αx", "αy", "αz")),
+            (jerk, ("jx", "jy", "jz")),
+            (snap, ("sx", "sy", "sz")),
+        )
+        series_ref_rows = [None] * 8
+        if pos_r is not None:
+            series_ref_rows = [
+                (pos_r, ("x", "y", "z")),
+                (eul_r, ("roll", "pitch", "yaw")),
+                (vel_r, ("vx", "vy", "vz")),
+                (omg_deg_r, ("ωx", "ωy", "ωz")),
+                (acc_r, ("ax", "ay", "az")),
+                (alpha_deg_r, ("αx", "αy", "αz")),
+                (jerk_r, ("jx", "jy", "jz")),
+                (snap_r, ("sx", "sy", "sz")),
+            ]
+        colors = ("r", "g", "b")
+        for ax, (arr, names), (ttl, yl), ref_row in zip(axs[:8], series_meas, titles[:8], series_ref_rows):
+            for j in range(3):
+                ax.plot(t, arr[:, j], colors[j] + "-", lw=1.05, label=names[j])
+            if ref_row is not None:
+                if (
+                    not isinstance(ref_row, (tuple, list))
+                    or len(ref_row) < 2
+                    or ref_row[0] is None
+                    or ref_row[1] is None
+                ):
+                    pass
+                else:
+                    arr_rf, names_rf = ref_row[0], ref_row[1]
+                    if (
+                        hasattr(arr_rf, "shape")
+                        and arr_rf.ndim == 2
+                        and arr_rf.shape[0] == t.size
+                        and arr_rf.shape[1] >= 3
+                        and len(names_rf) >= 3
+                    ):
+                        for j in range(3):
+                            ax.plot(
+                                t,
+                                arr_rf[:, j],
+                                colors[j] + "--",
+                                lw=1.0,
+                                alpha=0.88,
+                                label=f"{names_rf[j]} ref",
+                            )
+            ax.set_title(ttl, fontsize=9)
+            ax.set_ylabel(yl)
             ax.set_xlabel("t [s]")
             ax.grid(True, alpha=0.3)
-            ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
+            ax.legend(loc="upper right", fontsize=5, framealpha=0.9, ncol=3)
 
-        self.fig_3d_track.clear()
-        ax3 = self.fig_3d_track.add_subplot(111, projection="3d")
-        ax3.plot(pos[:, 0], pos[:, 1], pos[:, 2], "b-", lw=1.6, label="base ref")
-        ax3.set_xlabel("X [m]")
-        ax3.set_ylabel("Y [m]")
-        ax3.set_zlabel("Z [m]")
-        ax3.set_title(f"{title_prefix} (base_link only)", fontsize=10)
-        ax3.legend(loc="upper left", fontsize=7, framealpha=0.9)
+        suf = f"{title_prefix} — base state (pos…snap)"
+        if pos_r is not None:
+            suf += " (meas solid / ref dashed)"
+        self.fig_states.suptitle(suf, fontsize=11, y=0.995)
 
-        self.fig_traj_dash.clear()
-        ad = [self.fig_traj_dash.add_subplot(3, 2, i + 1) for i in range(6)]
-        ad[0].plot(pos[:, 0], pos[:, 1], "b-", lw=1.2)
-        ad[0].set_title("XY path", fontsize=9)
-        ad[0].set_xlabel("x [m]")
-        ad[0].set_ylabel("y [m]")
-        ad[1].plot(pos[:, 0], pos[:, 2], "b-", lw=1.2)
-        ad[1].set_title("XZ path", fontsize=9)
-        ad[1].set_xlabel("x [m]")
-        ad[1].set_ylabel("z [m]")
-        speed = np.linalg.norm(vel, axis=1)
-        ad[2].plot(t, speed, "k-", lw=1.2)
-        ad[2].set_title("Speed norm", fontsize=9)
-        ad[2].set_xlabel("t [s]")
-        ad[2].set_ylabel("m/s")
-        acc_norm = np.linalg.norm(acc, axis=1)
-        jerk_norm = np.linalg.norm(jerk, axis=1)
-        ad[3].plot(t, acc_norm, "m-", lw=1.2)
-        ad[3].set_title("Acceleration norm", fontsize=9)
-        ad[3].set_xlabel("t [s]")
-        ad[3].set_ylabel("m/s²")
-        ad[4].plot(t, jerk_norm, "c-", lw=1.2)
-        ad[4].set_title("Jerk norm", fontsize=9)
-        ad[4].set_xlabel("t [s]")
-        ad[4].set_ylabel("m/s³")
-        # Control preview from plan control sequence.
+        # ── Controls tab (s500) ─────────────────────────────────────────────
+        self.fig_control.clear()
+        ax_u = self.fig_control.add_subplot(111)
+        has_u_ref = u_ref is not None and t_u_ref is not None
         if u_plan is not None:
             U = np.asarray(u_plan, dtype=float)
             if U.ndim == 2 and U.shape[0] > 0:
                 nu = int(U.shape[1])
                 tu = t[: U.shape[0]]
                 for j in range(nu):
-                    ad[5].plot(tu, U[:, j], lw=1.0, label=f"u{j+1}")
-                ad[5].legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=2)
+                    ax_u.plot(tu, U[:, j], lw=1.0, label=f"u{j+1}")
+                if has_u_ref:
+                    Ur = np.asarray(u_ref, dtype=float)
+                    tur = np.asarray(t_u_ref, dtype=float).flatten()
+                    if Ur.ndim == 2 and Ur.shape[0] == tur.size and Ur.shape[1] == nu:
+                        for j in range(nu):
+                            ax_u.plot(
+                                tu,
+                                np.interp(tu, tur, Ur[:, j]),
+                                "--",
+                                lw=0.95,
+                                alpha=0.88,
+                                label=f"u{j+1} ref",
+                            )
+                ax_u.legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=2)
             else:
-                ad[5].text(0.5, 0.5, "No control sequence", ha="center", va="center", transform=ad[5].transAxes)
+                ax_u.text(0.5, 0.5, "No u_plan", ha="center", va="center", transform=ax_u.transAxes)
         else:
-            ad[5].text(0.5, 0.5, "No control sequence", ha="center", va="center", transform=ad[5].transAxes)
-        ad[5].set_title("Control inputs", fontsize=9)
+            ax_u.text(0.5, 0.5, "No u_plan", ha="center", va="center", transform=ax_u.transAxes)
+        ctl_suf = "Control inputs (plan)"
+        if pos_r is not None and has_u_ref:
+            ctl_suf = "Control inputs (meas vs ref)"
+        elif pos_r is not None:
+            ctl_suf = "Control inputs (meas)"
+        ax_u.set_title(ctl_suf, fontsize=10)
+        ax_u.set_ylabel("u")
+        ax_u.set_xlabel("t [s]")
+        ax_u.grid(True, alpha=0.3)
+        self.fig_control.suptitle(f"{title_prefix} — s500 actuation", fontsize=11, y=0.98)
+
+        self.fig_3d_track.clear()
+        ax3 = self.fig_3d_track.add_subplot(111, projection="3d")
+        lbl3 = "tracked" if pos_r is not None else "base ref"
+        ax3.plot(pos[:, 0], pos[:, 1], pos[:, 2], "b-", lw=1.6, label=lbl3)
+        if pos_r is not None:
+            ax3.plot(
+                pos_r[:, 0],
+                pos_r[:, 1],
+                pos_r[:, 2],
+                color="tab:orange",
+                ls="--",
+                lw=1.35,
+                alpha=0.92,
+                label="reference",
+            )
+        ax3.set_xlabel("X [m]")
+        ax3.set_ylabel("Y [m]")
+        ax3.set_zlabel("Z [m]")
+        ax3.set_title(f"{title_prefix} (base_link only, equal XYZ scale)", fontsize=10)
+        ax3.legend(loc="upper left", fontsize=7, framealpha=0.9)
+        _set_mplot3d_equal_xyz(ax3, pos, pos_r)
+
+        self.fig_traj_dash.clear()
+        self.fig_traj_dash.suptitle(
+            f"{title_prefix} — tracking errors & kinematics (see Controls tab for u)",
+            fontsize=11,
+            y=0.98,
+        )
+        ad = [self.fig_traj_dash.add_subplot(4, 2, i + 1) for i in range(8)]
+        ad[0].plot(pos[:, 0], pos[:, 1], "b-", lw=1.2, label="meas")
+        if pos_r is not None:
+            ad[0].plot(pos_r[:, 0], pos_r[:, 1], color="tab:orange", ls="--", lw=1.1, alpha=0.9, label="ref")
+        ad[0].set_title("XY path", fontsize=9)
+        ad[0].set_xlabel("x [m]")
+        ad[0].set_ylabel("y [m]")
+        _xy_stack = [np.column_stack((pos[:, 0], pos[:, 1]))]
+        if pos_r is not None:
+            _xy_stack.append(np.column_stack((pos_r[:, 0], pos_r[:, 1])))
+        _set_2d_path_equal_meters(ad[0], *_xy_stack)
+        if pos_r is not None:
+            ad[0].legend(loc="best", fontsize=7)
+        ad[1].plot(pos[:, 0], pos[:, 2], "b-", lw=1.2, label="meas")
+        if pos_r is not None:
+            ad[1].plot(pos_r[:, 0], pos_r[:, 2], color="tab:orange", ls="--", lw=1.1, alpha=0.9, label="ref")
+        ad[1].set_title("XZ path", fontsize=9)
+        ad[1].set_xlabel("x [m]")
+        ad[1].set_ylabel("z [m]")
+        _xz_stack = [np.column_stack((pos[:, 0], pos[:, 2]))]
+        if pos_r is not None:
+            _xz_stack.append(np.column_stack((pos_r[:, 0], pos_r[:, 2])))
+        _set_2d_path_equal_meters(ad[1], *_xz_stack)
+        if pos_r is not None:
+            ad[1].legend(loc="best", fontsize=7)
+
+        if pos_r is not None:
+            e_p = pos - pos_r
+            for j, c in enumerate("rgb"):
+                ad[2].plot(t, e_p[:, j], color=c, lw=1.0, label=f"e_{'xyz'[j]}")
+            ad[2].plot(t, np.linalg.norm(e_p, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_p\|$")
+            ad[2].axhline(0.0, color="gray", ls=":", lw=0.7)
+            ad[2].set_title("Base position tracking error", fontsize=9)
+        else:
+            ad[2].text(0.5, 0.5, "No reference — position error N/A", ha="center", va="center", transform=ad[2].transAxes)
+            ad[2].set_title("Base position tracking error", fontsize=9)
+        ad[2].set_xlabel("t [s]")
+        ad[2].set_ylabel("m")
+        if pos_r is not None:
+            ad[2].legend(loc="best", fontsize=6, ncol=2)
+        ad[2].grid(True, alpha=0.3)
+
+        if vel_r is not None:
+            e_v = vel - vel_r
+            for j, c in enumerate("rgb"):
+                ad[3].plot(t, e_v[:, j], color=c, lw=1.0, label=f"e_v{'xyz'[j]}")
+            ad[3].plot(t, np.linalg.norm(e_v, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_v\|$")
+            ad[3].axhline(0.0, color="gray", ls=":", lw=0.7)
+            ad[3].set_title("Base velocity tracking error", fontsize=9)
+        else:
+            ad[3].text(0.5, 0.5, "No reference — velocity error N/A", ha="center", va="center", transform=ad[3].transAxes)
+            ad[3].set_title("Base velocity tracking error", fontsize=9)
+        ad[3].set_xlabel("t [s]")
+        ad[3].set_ylabel("m/s")
+        if vel_r is not None:
+            ad[3].legend(loc="best", fontsize=6, ncol=2)
+        ad[3].grid(True, alpha=0.3)
+
+        speed = np.linalg.norm(vel, axis=1)
+        ad[4].plot(t, speed, "k-", lw=1.2, label="meas")
+        if vel_r is not None:
+            ad[4].plot(t, np.linalg.norm(vel_r, axis=1), color="tab:orange", ls="--", lw=1.05, alpha=0.9, label="ref")
+        ad[4].set_title("Speed norm", fontsize=9)
+        ad[4].set_xlabel("t [s]")
+        ad[4].set_ylabel("m/s")
+        if vel_r is not None:
+            ad[4].legend(loc="best", fontsize=7)
+        ad[4].grid(True, alpha=0.3)
+        acc_norm = np.linalg.norm(acc, axis=1)
+        jerk_norm = np.linalg.norm(jerk, axis=1)
+        ad[5].plot(t, acc_norm, "m-", lw=1.2, label="meas")
+        if acc_r is not None:
+            ad[5].plot(t, np.linalg.norm(acc_r, axis=1), color="tab:orange", ls="--", lw=1.05, alpha=0.9, label="ref")
+        ad[5].set_title("Acceleration norm", fontsize=9)
         ad[5].set_xlabel("t [s]")
-        ad[5].set_ylabel("u")
-        for ax in ad:
-            ax.grid(True, alpha=0.3)
+        ad[5].set_ylabel("m/s²")
+        if acc_r is not None:
+            ad[5].legend(loc="best", fontsize=7)
+        ad[5].grid(True, alpha=0.3)
+        ad[6].plot(t, jerk_norm, "c-", lw=1.2, label="meas")
+        if jerk_r is not None:
+            ad[6].plot(t, np.linalg.norm(jerk_r, axis=1), color="tab:orange", ls="--", lw=1.05, alpha=0.9, label="ref")
+        ad[6].set_title("Jerk norm", fontsize=9)
+        ad[6].set_xlabel("t [s]")
+        ad[6].set_ylabel("m/s³")
+        if jerk_r is not None:
+            ad[6].legend(loc="best", fontsize=7)
+        ad[6].grid(True, alpha=0.3)
+
+        ms = mpc_solve if isinstance(mpc_solve, dict) else {}
+        wall = np.asarray(ms.get("wall_s", []), dtype=float).flatten()
+        nit = np.asarray(ms.get("nlp_iter", []), dtype=float).flatten().astype(int, copy=False)
+        n_t = int(t.size)
+        nw = int(wall.size)
+        if nw == 0:
+            t_u_mpc = t[:-1] if n_t > 1 else t
+        elif nw == n_t:
+            t_u_mpc = t.copy()
+        elif nw == n_t - 1:
+            t_u_mpc = t[:-1]
+        else:
+            m = min(nw, n_t)
+            t_u_mpc = t[:m]
+            wall = wall[:m]
+        L = int(wall.size)
+        if L and nit.size > L:
+            nit = nit[:L]
+        if wall.size:
+            ax_m = ad[7]
+            ax_t = ax_m.twinx()
+            ax_m.plot(t_u_mpc, wall * 1000.0, "C0-", lw=0.9, label="wall time")
+            ax_m.set_ylabel("MPC wall time [ms]", color="C0")
+            ax_m.tick_params(axis="y", labelcolor="C0")
+            if nit.size == wall.size:
+                ax_t.step(t_u_mpc, nit, where="post", color="C2", lw=0.85, label="nlp_iter")
+                ax_t.set_ylabel("SQP iterations", color="C2")
+                ax_t.tick_params(axis="y", labelcolor="C2")
+            ax_m.set_title("MPC solve (wall time + iterations)", fontsize=9)
+            ax_m.set_xlabel("t [s]")
+            ax_m.grid(True, alpha=0.3)
+        else:
+            snap_norm = np.linalg.norm(snap, axis=1)
+            ad[7].plot(t, snap_norm, color="tab:purple", lw=1.05, label=r"$\|$snap$\|$ meas")
+            if snap_r is not None:
+                ad[7].plot(t, np.linalg.norm(snap_r, axis=1), "k--", lw=0.95, alpha=0.85, label=r"$\|$snap$\|$ ref")
+            ad[7].set_title("Linear snap norm (no MPC log)", fontsize=9)
+            ad[7].set_xlabel("t [s]")
+            ad[7].set_ylabel("m/s⁴")
+            ad[7].legend(loc="best", fontsize=7)
+            ad[7].grid(True, alpha=0.3)
 
     def _render_planning_reference_full_state(self) -> None:
         """Render the full-state planning *reference* using the same dashboard framework as EE tracking GUI."""
@@ -2722,6 +3281,7 @@ class UamSuiteGUI(QMainWindow):
                 t_rel, simX, title_prefix="Planned reference", u_plan=u
             )
         else:
+            self._set_control_tab_uam_placeholder()
             # Render into the same 3 figures as the tracking GUI.
             em.render_ee_tracking_results_to_figures(
                 res_ref,
@@ -2737,6 +3297,7 @@ class UamSuiteGUI(QMainWindow):
                 traj_solver_meta=traj_meta,
             )
         self.cv_states.draw()
+        self.cv_control.draw()
         self.cv_3d_track.draw()
         self.cv_traj_dash.draw()
 
@@ -2774,10 +3335,18 @@ class UamSuiteGUI(QMainWindow):
         # Build a plotting-friendly full-state sequence (17D convention used by dashboard):
         # [x,y,z,qx,qy,qz,qw,j1,j2,vx,vy,vz,wx,wy,wz,j1dot,j2dot]
         # For s500, j* channels stay zero. Attitude/omega are reconstructed from (ddp_ref, yaw_ref).
-        if n >= 2:
-            ddp_ref = np.gradient(dp_ref, t_rel, axis=0)
+        ddp_explicit = pb.get("ddp_ref")
+        if ddp_explicit is not None:
+            ddp_ref = np.asarray(ddp_explicit, dtype=float)
+            if ddp_ref.ndim != 2 or ddp_ref.shape[0] != n or ddp_ref.shape[1] != 3:
+                ddp_ref = None
         else:
-            ddp_ref = np.zeros_like(dp_ref)
+            ddp_ref = None
+        if ddp_ref is None:
+            if n >= 2:
+                ddp_ref = np.gradient(dp_ref, t_rel, axis=0)
+            else:
+                ddp_ref = np.zeros_like(dp_ref)
 
         def _normalize(v: np.ndarray, fallback: np.ndarray) -> np.ndarray:
             nrm = float(np.linalg.norm(v))
@@ -2855,6 +3424,7 @@ class UamSuiteGUI(QMainWindow):
                 t_rel, simX, title_prefix="Planned position trajectory", u_plan=u
             )
         else:
+            self._set_control_tab_uam_placeholder()
             em.render_ee_tracking_results_to_figures(
                 res_ref,
                 self.fig_states if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_into_figure else None,
@@ -2865,6 +3435,7 @@ class UamSuiteGUI(QMainWindow):
                 states_title="Planned reference (EE-only)",
             )
         self.cv_states.draw()
+        self.cv_control.draw()
         self.cv_3d_track.draw()
         self.cv_traj_dash.draw()
 
@@ -3183,6 +3754,9 @@ class UamSuiteGUI(QMainWindow):
         self.plan_actions_group.setMaximumHeight(h)
 
     def _on_task_robot_changed(self, robot_mode: str) -> None:
+        # Robot switch must invalidate cached Pinocchio/Crocoddyl model.
+        self._lazy_pin_planner = None
+        self.planner = None
         self.task_traj_combo.blockSignals(True)
         self.task_traj_combo.clear()
         self.task_traj_combo.addItems(self._task_trajectories.get(robot_mode, []))
@@ -3280,6 +3854,8 @@ class UamSuiteGUI(QMainWindow):
         elif traj == "csv_import":
             self.plan_mode_combo.setCurrentIndex(1)
             self.ee_plan_type_combo.setCurrentIndex(4)
+        elif traj == "acc_track":
+            self.plan_mode_combo.setCurrentIndex(2)
         else:  # minimum_snap
             self.plan_mode_combo.setCurrentIndex(1)
             self.ee_plan_type_combo.setCurrentIndex(0)
@@ -3291,10 +3867,13 @@ class UamSuiteGUI(QMainWindow):
     def _generate_task_trajectory_now(self) -> None:
         # Do not re-apply task template on every Generate click.
         # Template application resets waypoint inputs to defaults and can wipe user edits.
-        if self.plan_mode_combo.currentIndex() == 0:
+        idx = int(self.plan_mode_combo.currentIndex())
+        if idx == 0:
             self._run_plan()
-        else:
+        elif idx == 1:
             self._run_ee_plan()
+        else:
+            self._run_acc_track_plan()
 
     def _refresh_plan_actuator_taus_enabled(self) -> None:
         if not hasattr(self, "method_combo"):
@@ -3326,6 +3905,14 @@ class UamSuiteGUI(QMainWindow):
         self.ee_sun_group.setVisible(idx == 2)
         self.ee_circle_group.setVisible(idx == 3)
         self.ee_csv_group.setVisible(idx == 4)
+        self._refresh_trajectory_setting_height()
+
+    def _on_acc_track_shape_changed(self) -> None:
+        if not hasattr(self, "acc_track_step_group"):
+            return
+        step = int(self.acc_track_shape_combo.currentIndex()) == 0
+        self.acc_track_step_group.setVisible(step)
+        self.acc_track_sin_group.setVisible(not step)
         self._refresh_trajectory_setting_height()
 
     def _browse_ee_csv_file(self):
@@ -3637,7 +4224,10 @@ class UamSuiteGUI(QMainWindow):
             "track_mode_index": int(self.track_mode_combo.currentIndex()),
             "reg_mode_index": int(self.reg_mode_combo.currentIndex()),
             "control_mode_track_index": int(self.control_mode_track.currentIndex()),
-            "wp_rows": self._read_wp_table(),
+            "wp_rows": [
+                list(r) + [bool(self._wp_row_zero_v(i))]
+                for i, r in enumerate(self._read_wp_table())
+            ],
             "ee_wp_rows": self._read_ee_rows(),
             "dt_plan": float(self.dt_plan.value()),
             "max_iter_plan": int(self.max_iter_plan.value()),
@@ -3689,6 +4279,23 @@ class UamSuiteGUI(QMainWindow):
             "ee_csv_z_offset_m": float(self.ee_csv_z_offset.value()),
             "ee_csv_yaw_const_deg": float(self.ee_csv_yaw_const.value()),
             "ee_csv_yaw_hold": bool(self.ee_csv_yaw_hold.isChecked()),
+            "acc_track_shape_index": int(self.acc_track_shape_combo.currentIndex()),
+            "acc_track_axis_index": int(self.acc_track_axis_combo.currentIndex()),
+            "acc_track_px": float(self.acc_track_px.value()),
+            "acc_track_py": float(self.acc_track_py.value()),
+            "acc_track_pz": float(self.acc_track_pz.value()),
+            "acc_track_yaw_deg": float(self.acc_track_yaw_deg.value()),
+            "acc_track_duration": float(self.acc_track_duration.value()),
+            "acc_track_step_time": float(self.acc_track_step_time.value()),
+            "acc_track_a_before": float(self.acc_track_a_before.value()),
+            "acc_track_a_after": float(self.acc_track_a_after.value()),
+            "acc_track_pulse_end": float(self.acc_track_pulse_end.value()),
+            "acc_track_brake_to_rest": bool(self.acc_track_brake_to_rest.isChecked()),
+            "acc_track_sin_amp": float(self.acc_track_sin_amp.value()),
+            "acc_track_sin_freq": float(self.acc_track_sin_freq.value()),
+            "acc_track_sin_phase_deg": float(self.acc_track_sin_phase_deg.value()),
+            "acc_track_rotor_dyn": bool(self.acc_track_rotor_dyn_chk.isChecked()),
+            "acc_track_rotor_tau_s": float(self.acc_track_rotor_tau.value()),
             "T_sim": float(self.T_sim.value()),
             "sim_dt": float(self.sim_dt.value()),
             "control_dt": float(self.control_dt.value()),
@@ -3988,6 +4595,30 @@ class UamSuiteGUI(QMainWindow):
             self.ee_circle_cx.setValue(float(cc[0]))
             self.ee_circle_cy.setValue(float(cc[1]))
             self.ee_circle_cz.setValue(float(cc[2]))
+        if hasattr(self, "acc_track_shape_combo"):
+            _set_combo("acc_track_shape_index", self.acc_track_shape_combo)
+            _set_combo("acc_track_axis_index", self.acc_track_axis_combo)
+            for name, spin in (
+                ("acc_track_px", self.acc_track_px),
+                ("acc_track_py", self.acc_track_py),
+                ("acc_track_pz", self.acc_track_pz),
+                ("acc_track_yaw_deg", self.acc_track_yaw_deg),
+                ("acc_track_duration", self.acc_track_duration),
+                ("acc_track_step_time", self.acc_track_step_time),
+                ("acc_track_a_before", self.acc_track_a_before),
+                ("acc_track_a_after", self.acc_track_a_after),
+                ("acc_track_pulse_end", self.acc_track_pulse_end),
+                ("acc_track_sin_amp", self.acc_track_sin_amp),
+                ("acc_track_sin_freq", self.acc_track_sin_freq),
+                ("acc_track_sin_phase_deg", self.acc_track_sin_phase_deg),
+                ("acc_track_rotor_tau_s", self.acc_track_rotor_tau),
+            ):
+                if name in p:
+                    spin.setValue(float(p[name]))
+            _set_check("acc_track_brake_to_rest", self.acc_track_brake_to_rest)
+            _set_check("acc_track_rotor_dyn", self.acc_track_rotor_dyn_chk)
+            self.acc_track_rotor_tau.setEnabled(self.acc_track_rotor_dyn_chk.isChecked())
+            self._on_acc_track_shape_changed()
         self._refresh_task_selection_ui()
         self._on_ee_plan_type_changed()
         self._on_reg_mode_changed()
@@ -4071,6 +4702,23 @@ class UamSuiteGUI(QMainWindow):
                 "ee_csv_z_offset_m",
                 "ee_csv_yaw_const_deg",
                 "ee_csv_yaw_hold",
+                "acc_track_shape_index",
+                "acc_track_axis_index",
+                "acc_track_px",
+                "acc_track_py",
+                "acc_track_pz",
+                "acc_track_yaw_deg",
+                "acc_track_duration",
+                "acc_track_step_time",
+                "acc_track_a_before",
+                "acc_track_a_after",
+                "acc_track_pulse_end",
+                "acc_track_brake_to_rest",
+                "acc_track_sin_amp",
+                "acc_track_sin_freq",
+                "acc_track_sin_phase_deg",
+                "acc_track_rotor_dyn",
+                "acc_track_rotor_tau_s",
                 "plan_croc_use_actuator_first_order",
                 "plan_tau_motor",
                 "plan_tau_joint",
@@ -4229,6 +4877,34 @@ class UamSuiteGUI(QMainWindow):
         cb.setCurrentIndex(idx if idx >= 0 else 0)
         return cb
 
+    def _make_wp_zero_v_widget(self, checked: bool = True) -> QWidget:
+        """Centered checkbox container for the wp_table 'Zero v' column."""
+        cont = QWidget()
+        lay = QHBoxLayout(cont)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setAlignment(Qt.AlignCenter)
+        cb = QCheckBox()
+        cb.setChecked(bool(checked))
+        cb.setToolTip(
+            "勾选：在该航点约束速度=0；取消：该航点速度不被约束\n"
+            "(仅在 full_state_crocoddyl 模板下生效)"
+        )
+        cont.setProperty("zero_v_checkbox", True)
+        lay.addWidget(cb)
+        cont._wp_zero_v_box = cb  # type: ignore[attr-defined]
+        return cont
+
+    def _wp_row_zero_v(self, r: int) -> bool:
+        w = self.wp_table.cellWidget(r, 8) if hasattr(self, "wp_table") else None
+        if w is None:
+            return True
+        cb = getattr(w, "_wp_zero_v_box", None)
+        if isinstance(cb, QCheckBox):
+            return bool(cb.isChecked())
+        if isinstance(w, QCheckBox):
+            return bool(w.isChecked())
+        return True
+
     def _read_wp_table(self) -> list[list]:
         rows = []
         for r in range(self.wp_table.rowCount()):
@@ -4245,12 +4921,20 @@ class UamSuiteGUI(QMainWindow):
             rows.append([mode] + nums)
         return rows
 
+    def _read_wp_zero_v_flags(self) -> list[bool]:
+        return [self._wp_row_zero_v(r) for r in range(self.wp_table.rowCount())]
+
     def _restore_wp_rows(self, rows: list) -> None:
         self.wp_table.setRowCount(max(0, len(rows)))
         for r, row in enumerate(rows):
             if not isinstance(row, (list, tuple)):
                 continue
-            if len(row) >= 8:
+            zero_v = True
+            if len(row) >= 9:
+                mode = str(row[0])
+                nums = [float(row[i]) for i in range(1, 8)]
+                zero_v = bool(row[8])
+            elif len(row) >= 8:
                 mode = str(row[0])
                 nums = [float(row[i]) for i in range(1, 8)]
             elif len(row) >= 7:
@@ -4262,6 +4946,7 @@ class UamSuiteGUI(QMainWindow):
             self.wp_table.setCellWidget(r, 0, self._make_wp_type_combo(mode))
             for c, v in enumerate(nums):
                 self.wp_table.setItem(r, c + 1, QTableWidgetItem(f"{v:g}"))
+            self.wp_table.setCellWidget(r, 8, self._make_wp_zero_v_widget(zero_v))
 
     def _add_wp_row(self):
         r = self.wp_table.rowCount()
@@ -4269,6 +4954,7 @@ class UamSuiteGUI(QMainWindow):
         self.wp_table.setCellWidget(r, 0, self._make_wp_type_combo("Base"))
         for c in range(1, 8):
             self.wp_table.setItem(r, c, QTableWidgetItem("0"))
+        self.wp_table.setCellWidget(r, 8, self._make_wp_zero_v_widget(True))
 
     def _del_wp_row(self):
         if self.wp_table.rowCount() > 2:
@@ -4333,7 +5019,7 @@ class UamSuiteGUI(QMainWindow):
         return rows
 
     def _run_plan(self):
-        if self.plan_mode_combo.currentIndex() == 1:
+        if int(self.plan_mode_combo.currentIndex()) != 0:
             return
         if self.OptimizationWorker is None or self._wp_to_state is None:
             QMessageBox.warning(self, "Error", "Unable to import trajectory_gui / solver.")
@@ -4372,11 +5058,18 @@ class UamSuiteGUI(QMainWindow):
             self._plan_worker.start()
             return
         rows = self._read_wp_table()
-        sorted_rows = sorted(rows, key=lambda x: float(x[7]))
+        zero_v_flags_raw = self._read_wp_zero_v_flags()
+        if len(zero_v_flags_raw) != len(rows):
+            zero_v_flags_raw = [True] * len(rows)
+        rows_with_flag = [list(r) + [bool(zero_v_flags_raw[i])] for i, r in enumerate(rows)]
+        sorted_rows_full = sorted(rows_with_flag, key=lambda x: float(x[7]))
+        sorted_rows = [r[:8] for r in sorted_rows_full]
+        zero_v_flags = [bool(r[8]) for r in sorted_rows_full]
         if len(sorted_rows) < 2:
             QMessageBox.warning(self, "Error", "At least 2 waypoints are required.")
             return
         self._last_plan_sorted_wp_rows = copy.deepcopy(sorted_rows)
+        self._last_plan_zero_v_flags = list(zero_v_flags)
         durs = []
         for i in range(len(sorted_rows) - 1):
             d = float(sorted_rows[i + 1][7]) - float(sorted_rows[i][7])
@@ -4397,6 +5090,7 @@ class UamSuiteGUI(QMainWindow):
         wps7 = self._mixed_rows_to_waypoints7(sorted_rows)
         params = {
             "mixed_wp_rows": sorted_rows,
+            "zero_velocity_flags": list(zero_v_flags),
             "waypoints": wps7,
             "durations": durs,
             "dt": self.dt_plan.value(),
@@ -4444,7 +5138,7 @@ class UamSuiteGUI(QMainWindow):
         if self.planner is not None and getattr(self.planner, "urdf_path", None):
             urdf_path = str(self.planner.urdf_path)
         if urdf_path is None:
-            urdf_path = str(Path(__file__).resolve().parent / "models" / "urdf" / "s500_uam_simple.urdf")
+            urdf_path = self._selected_robot_urdf_path()
         self._meshcat_worker = MeshcatPlaybackWorker(urdf_path, X, dt, traj_points=traj_points)
         self._meshcat_worker.finished.connect(self._on_meshcat_finished)
         self._meshcat_worker.start()
@@ -4468,8 +5162,17 @@ class UamSuiteGUI(QMainWindow):
             X = np.asarray(pb["x_plan"], dtype=float)
             t = np.asarray(pb["t_plan"], dtype=float).flatten()
         elif pb["kind"] == "ee_snap":
-            QMessageBox.warning(self, "Notice", "EE-only planning has no full robot state trajectory for Meshcat playback.")
-            return
+            try:
+                ep = self._full_state_ros_plan_from_ee_snap(pb)
+                X = np.asarray(ep["x_plan"], dtype=float)
+                t = np.asarray(ep["t_plan"], dtype=float).flatten()
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Notice",
+                    f"无法从 EE 参考构造全身状态用于 Meshcat：{e}",
+                )
+                return
         else:
             QMessageBox.warning(self, "Notice", "No plannable trajectory available.")
             return
@@ -4575,12 +5278,8 @@ class UamSuiteGUI(QMainWindow):
                 self._save_generated_plan_csv(self._plan_bundle)
         except Exception as e:
             self.log(f"[planning] Failed to save generated CSV: {e!r}")
-        _full_plan = (
-            self._plan_bundle is not None
-            and (
-                self._plan_bundle["kind"] in ("full_croc", "full_acados")
-                or (self._is_s500_mode() and self._plan_bundle["kind"] == "ee_snap")
-            )
+        _full_plan = self._plan_bundle is not None and (
+            self._plan_bundle["kind"] in ("full_croc", "full_acados", "ee_snap")
         )
         self.rn_launch_btn.setEnabled(_full_plan)
         self.log("Planning finished. You can run the closed loop on the \"Tracking\" tab.")
@@ -4656,6 +5355,152 @@ class UamSuiteGUI(QMainWindow):
         self._plan_worker.finished.connect(self._on_ee_plan_finished)
         self._plan_worker.start()
 
+    def _run_acc_track_plan(self) -> None:
+        """Build world-frame acceleration test reference; integrate to p,v for EE tracking."""
+        dt = float(self.dt_plan.value())
+        T = float(self.acc_track_duration.value())
+        if dt <= 1e-9 or T <= 1e-9:
+            QMessageBox.warning(self, "Error", "Sampling dt and duration must be positive.")
+            return
+        shape_idx = int(self.acc_track_shape_combo.currentIndex())
+        t_step = float(self.acc_track_step_time.value())
+        merge_list = [0.0, T, t_step]
+        t1_brake: float | None = None
+        if shape_idx == 0 and bool(self.acc_track_brake_to_rest.isChecked()):
+            t1 = float(self.acc_track_pulse_end.value())
+            t1 = max(t_step + 1e-6, min(t1, T - 1e-3))
+            if T - t1 < max(0.5 * dt, 5e-4):
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    "制动段太短：请增大总时长，或减小「脉冲结束 t₁」，使 T−t₁ 明显大于采样 dt。",
+                )
+                return
+            merge_list.append(t1)
+            t1_brake = t1
+        base_grid = np.arange(0.0, T + 0.5 * dt, dt, dtype=float)
+        t_nodes = np.unique(np.concatenate([base_grid, np.asarray(merge_list, dtype=float)]))
+        t_nodes = np.sort(t_nodes[(t_nodes >= -1e-12) & (t_nodes <= T + 1e-12)])
+        if t_nodes.size < 2:
+            t_nodes = np.array([0.0, max(T, dt)], dtype=float)
+        if float(t_nodes[-1]) < T - 1e-9:
+            t_nodes = np.unique(np.append(t_nodes, T))
+        axis = int(self.acc_track_axis_combo.currentIndex())
+        axis = max(0, min(2, axis))
+        p0 = np.array(
+            [
+                float(self.acc_track_px.value()),
+                float(self.acc_track_py.value()),
+                float(self.acc_track_pz.value()),
+            ],
+            dtype=float,
+        )
+        yaw0 = float(np.deg2rad(self.acc_track_yaw_deg.value()))
+        n = int(t_nodes.size)
+        a_w = np.zeros((n, 3), dtype=float)
+        if shape_idx == 0:
+            a_lo = float(self.acc_track_a_before.value())
+            a_hi = float(self.acc_track_a_after.value())
+            brake_on = bool(self.acc_track_brake_to_rest.isChecked())
+            if brake_on and t1_brake is not None:
+                t1 = float(t1_brake)
+                v_pulse = 0.0
+                for j in range(n - 1):
+                    ta = float(t_nodes[j])
+                    tb = float(t_nodes[j + 1])
+                    if tb <= t1 + 1e-12:
+                        mid = 0.5 * (ta + tb)
+                        ak = a_lo if mid < t_step else a_hi
+                        v_pulse += ak * (tb - ta)
+                    else:
+                        break
+                a_brake = -v_pulse / max(float(T - t1), 1e-9)
+                if abs(a_brake) > 80.0:
+                    self.log(
+                        f"[planning] Acc track step: |a_brake|={abs(a_brake):.2f} m/s² 较大，"
+                        "可延长制动段 (增大 T−t₁) 或减小阶跃加速度。"
+                    )
+                for j in range(n - 1):
+                    ta = float(t_nodes[j])
+                    tb = float(t_nodes[j + 1])
+                    mid = 0.5 * (ta + tb)
+                    if mid < t_step:
+                        a_w[j, axis] = a_lo
+                    elif mid < t1:
+                        a_w[j, axis] = a_hi
+                    else:
+                        a_w[j, axis] = a_brake
+            else:
+                for j in range(n - 1):
+                    ta = float(t_nodes[j])
+                    tb = float(t_nodes[j + 1])
+                    mid = 0.5 * (ta + tb)
+                    a_w[j, axis] = a_lo if mid < t_step else a_hi
+        else:
+            amp = float(self.acc_track_sin_amp.value())
+            f_hz = float(self.acc_track_sin_freq.value())
+            phi = float(np.deg2rad(self.acc_track_sin_phase_deg.value()))
+            w = 2.0 * np.pi * f_hz
+            a_w[:, axis] = amp * np.sin(w * t_nodes + phi)
+
+        if bool(self.acc_track_rotor_dyn_chk.isChecked()):
+            tau_act = float(self.acc_track_rotor_tau.value())
+            if tau_act > 1e-9:
+                a_cmd_w = np.asarray(a_w, dtype=float).copy()
+                a_w = _first_order_accel_response_piecewise(t_nodes, a_cmd_w, tau_act)
+                self.log(
+                    f"[planning] acc_track: 已应用旋翼/推力一阶模型 τ={tau_act:.4f} s（τ·da/dt+a=a_cmd，a(0)=0），再积分 p,v。"
+                )
+
+        if n >= 2:
+            a_w[n - 1] = a_w[n - 2]
+
+        v_w = np.zeros_like(a_w)
+        p_w = np.zeros_like(a_w)
+        p_w[0] = p0
+        for i in range(1, n):
+            dti = float(t_nodes[i] - t_nodes[i - 1])
+            if dti <= 0.0:
+                continue
+            v_w[i] = v_w[i - 1] + a_w[i - 1] * dti
+            p_w[i] = p_w[i - 1] + v_w[i - 1] * dti
+
+        yaw_ref = np.full(n, yaw0, dtype=float)
+        dyaw_ref = np.zeros(n, dtype=float)
+        self._full_plan_result = None
+        self._plan_bundle = {
+            "kind": "ee_snap",
+            "ee_track_kind": "acc_track",
+            "t_ref": t_nodes,
+            "p_ref": p_w,
+            "yaw_ref": yaw_ref,
+            "dp_ref": v_w,
+            "ddp_ref": a_w,
+            "dyaw_ref": dyaw_ref,
+            "waypoints": None,
+            "t_wp": None,
+        }
+        self._last_track_res = None
+        self._redraw_combined_views(None)
+        self._update_track_mode_enabled()
+        self.run_track_btn.setEnabled(True)
+        self.meshcat_plan_btn.setEnabled(True)
+        self.meshcat_track_btn.setEnabled(False)
+        try:
+            self._save_generated_plan_csv(self._plan_bundle)
+        except Exception as e:
+            self.log(f"[planning] Failed to save generated CSV: {e!r}")
+        self.rn_launch_btn.setEnabled(True)
+        msg = (
+            "[planning] Acc tracking reference generated (world a → integrated p,v). "
+            "建议使用 Tracking 页的 Acados EE-centric 或 Crocoddyl EE pose。"
+        )
+        if shape_idx == 0 and bool(self.acc_track_brake_to_rest.isChecked()):
+            msg += " Step：t₀ 前/后加速度脉冲，t₁ 后常值制动至终点 v≈0。"
+        if bool(self.acc_track_rotor_dyn_chk.isChecked()) and float(self.acc_track_rotor_tau.value()) > 1e-9:
+            msg += f" 一阶执行器 τ={float(self.acc_track_rotor_tau.value()):.3f} s。"
+        self.log(msg)
+
     def _on_ee_plan_finished(self, ok: bool, err: str, payload: object):
         self.task_generate_btn.setEnabled(True)
         if not ok:
@@ -4686,7 +5531,7 @@ class UamSuiteGUI(QMainWindow):
             self._save_generated_plan_csv(self._plan_bundle)
         except Exception as e:
             self.log(f"[planning] Failed to save generated CSV: {e!r}")
-        self.rn_launch_btn.setEnabled(self._is_s500_mode())
+        self.rn_launch_btn.setEnabled(True)
         if payload.get("track_kind") == "csv_import" and isinstance(payload.get("meta"), dict):
             m = payload["meta"]
             self.log(
@@ -4971,12 +5816,11 @@ class UamSuiteGUI(QMainWindow):
         except Exception as e:
             self.log(f"Failed to stop Gazebo cleanly: {e!r}")
 
-    def _s500_ros_plan_from_ee_snap(self, pb: dict) -> dict:
-        """Convert ee_snap reference to a dynamically consistent full-state plan for s500 ROS tracking."""
+    def _full_state_ros_plan_from_ee_snap(self, pb: dict) -> dict:
+        """Convert ee_snap (world p, dp, ddp, yaw) to a full-state plan for ROS / Meshcat."""
         import pinocchio as pin
 
-        root = Path(__file__).resolve().parent
-        urdf = str(root / "models" / "urdf" / "s500_simple.urdf")
+        urdf = self._selected_robot_urdf_path()
         rm = pin.buildModelFromUrdf(urdf, pin.JointModelFreeFlyer())
         nq, nv = int(rm.nq), int(rm.nv)
 
@@ -4984,7 +5828,7 @@ class UamSuiteGUI(QMainWindow):
         p_ref = np.asarray(pb.get("p_ref", []), dtype=float)
         yaw_ref = np.asarray(pb.get("yaw_ref", []), dtype=float).flatten()
         if t_ref.size == 0 or p_ref.ndim != 2 or p_ref.shape[1] != 3:
-            raise ValueError("Invalid ee_snap bundle for s500 ROS export")
+            raise ValueError("Invalid ee_snap bundle for full-state export")
         if yaw_ref.size != t_ref.size:
             yaw_ref = np.zeros_like(t_ref)
         dp_ref = np.asarray(pb.get("dp_ref"), dtype=float) if pb.get("dp_ref") is not None else None
@@ -5066,11 +5910,12 @@ class UamSuiteGUI(QMainWindow):
                 omega_ref[:, 2] = dyaw_ref
             x_plan[:, nq + 3 : nq + 6] = omega_ref
 
+        nu_pad = 4 if self._is_s500_mode() else 6
         return {
             "kind": "full_acados",
             "t_plan": t_ref,
             "x_plan": x_plan,
-            "u_plan": np.zeros((max(0, t_ref.size - 1), 4), dtype=float),
+            "u_plan": np.zeros((max(0, t_ref.size - 1), nu_pad), dtype=float),
             "ddp_plan": ddp_ref,
             "velocity_frame": "body",
         }
@@ -5205,11 +6050,11 @@ class UamSuiteGUI(QMainWindow):
             return None
         pb = self._plan_bundle
         export_pb = pb
-        if pb.get("kind") == "ee_snap" and self._is_s500_mode():
+        if pb.get("kind") == "ee_snap":
             try:
-                export_pb = self._s500_ros_plan_from_ee_snap(pb)
+                export_pb = self._full_state_ros_plan_from_ee_snap(pb)
             except Exception as e:
-                QMessageBox.warning(self, "Notice", f"s500 轨迹转换为 ROS full-state 失败：{e}")
+                QMessageBox.warning(self, "Notice", f"EE 参考转换为 ROS full-state 失败：{e}")
                 return None
         if export_pb["kind"] not in ("full_croc", "full_acados"):
             QMessageBox.warning(
@@ -5431,9 +6276,18 @@ class UamSuiteGUI(QMainWindow):
         try:
             self._render_ros_tracking_figures(filepath)
             self.log(f"[plot] Loaded and rendered: {filepath}")
+            if hasattr(self, "_right_plot_tabs"):
+                self._right_plot_tabs.setCurrentIndex(0)
         except Exception as e:
             import traceback
-            self.log(f"[plot] ERROR rendering {filepath}:\n{traceback.format_exc()}")
+
+            tb = traceback.format_exc()
+            self.log(f"[plot] ERROR rendering {filepath}:\n{tb}")
+            QMessageBox.critical(
+                self,
+                "Plot failed",
+                f"无法绘制该 npz（键名或维度需与 run_tracking_controller 录制一致）。\n\n{e}\n\n{tb[:1200]}",
+            )
 
     def _render_ros_tracking_figures(self, npz_path: str) -> None:
         """
@@ -5452,7 +6306,8 @@ class UamSuiteGUI(QMainWindow):
 
         t       = _arr("time").flatten()
         pos     = _arr("position")                   # (N,3)
-        vel     = _arr("velocity")                   # (N,3)
+        vel     = _arr("velocity")                   # (N,3) body linear v
+        omg     = _arr("angular_velocity")           # (N,3) body angular v
         ori     = _arr("orientation")                # (N,4) qx qy qz qw
         j_pos   = _arr("arm_joint_positions")        # (N,nj)
         j_vel   = _arr("arm_joint_velocities")       # (N,nj)
@@ -5461,26 +6316,70 @@ class UamSuiteGUI(QMainWindow):
         r_pos   = _arr("reference_position")         # (N,3)
         r_ori   = _arr("reference_orientation")      # (N,4)
         r_jpos  = _arr("reference_arm_positions")    # (N,nj)
+        r_vel   = _arr("reference_velocity")
+        r_omg   = _arr("reference_angular_velocity")
 
         N = len(t)
         if N < 2:
             self.log("[plot] Not enough data points to plot.")
             return
 
-        nj = j_pos.shape[1] if (j_pos.ndim == 2 and j_pos.shape[0] == N) else 0
+        nj = j_pos.shape[1] if (j_pos.ndim == 2 and j_pos.shape[0] == N and j_pos.shape[1] > 0) else 0
+        nq = 7 + nj
         nv = 6 + nj
 
-        # ── 重建完整状态矩阵 x (N, nq+nv) ─────────────────────────────────
-        q_part = np.hstack([pos, ori, j_pos[:N]]) if nj > 0 else np.hstack([pos, ori])
-        jv = j_vel[:N] if (nj > 0 and j_vel.ndim == 2 and j_vel.shape[0] >= N) else np.zeros((N, nj))
-        x_act = np.hstack([q_part, vel[:N, :3], np.zeros((N, 3)), jv])
+        if vel.ndim != 2 or vel.shape[0] != N:
+            vel = np.zeros((N, 3), dtype=float)
+        if omg.ndim != 2 or omg.shape[0] != N:
+            omg = np.zeros((N, 3), dtype=float)
 
-        # ── 重建参考状态矩阵 x_ref ─────────────────────────────────────────
+        # ── 重建完整状态 x = [q; v]，与 run_tracking_controller._record / plot_acados 约定一致 ──
+        q_part = np.hstack([pos, ori, j_pos[:N]]) if nj > 0 else np.hstack([pos, ori])
+        if j_vel.ndim == 2 and j_vel.shape[0] >= N and nj > 0:
+            jv = np.asarray(j_vel[:N, :nj], dtype=float)
+        else:
+            jv = np.zeros((N, max(0, nj)), dtype=float)
+        v_body = np.hstack([vel[:N, :3], omg[:N, :3], jv])
+        x_act = np.hstack([q_part, v_body])
+        if x_act.shape[1] != nq + nv:
+            raise ValueError(
+                f"Rebuilt state width mismatch: got {x_act.shape[1]}, expect nq+nv={nq}+{nv}={nq + nv}"
+            )
+
+        def _pad_freeflyer13_to_uam17(x_mat: np.ndarray) -> np.ndarray:
+            """plot_acados 需要 ≥15 列 twist；s500 录制为 13 维 [q7; v6]，补零关节位/速到 UAM 17 维。"""
+            x_mat = np.asarray(x_mat, dtype=float)
+            if x_mat.ndim != 2 or x_mat.shape[1] != 13:
+                return x_mat
+            nw = int(x_mat.shape[0])
+            out = np.zeros((nw, 17), dtype=float)
+            out[:, :7] = x_mat[:, :7]
+            out[:, 9:15] = x_mat[:, 7:13]
+            return out
+
+        x_act = _pad_freeflyer13_to_uam17(x_act)
+
+        # ── 参考状态（含参考速度，供 plot_acados 虚线）──────────────────────
         has_ref = r_pos.ndim == 2 and r_pos.shape[0] == N
         if has_ref:
-            qr = np.hstack([r_pos, r_ori, r_jpos[:N]]) if (nj > 0 and r_jpos.ndim == 2 and r_jpos.shape[0] >= N) \
-                 else np.hstack([r_pos, r_ori, np.zeros((N, nj))])
-            x_ref_states = np.hstack([qr, np.zeros((N, nv))])
+            if r_ori.ndim != 2 or r_ori.shape[0] != N or r_ori.shape[1] < 4:
+                r_ori = np.tile(np.array([[0.0, 0.0, 0.0, 1.0]], dtype=float), (N, 1))
+            if nj > 0 and r_jpos.ndim == 2 and r_jpos.shape[0] >= N:
+                jr = np.asarray(r_jpos[:N, :nj], dtype=float)
+            else:
+                jr = np.zeros((N, max(0, nj)), dtype=float)
+            qr = np.hstack([r_pos, r_ori, jr]) if nj > 0 else np.hstack([r_pos, r_ori])
+            if r_vel.ndim == 2 and r_vel.shape[0] == N:
+                rv_lin = r_vel[:N, :3]
+            else:
+                rv_lin = np.zeros((N, 3), dtype=float)
+            if r_omg.ndim == 2 and r_omg.shape[0] == N:
+                rv_omg = r_omg[:N, :3]
+            else:
+                rv_omg = np.zeros((N, 3), dtype=float)
+            v_ref = np.hstack([rv_lin, rv_omg, np.zeros((N, max(0, nj)), dtype=float)])
+            x_ref_states = np.hstack([qr, v_ref])
+            x_ref_states = _pad_freeflyer13_to_uam17(x_ref_states)
         else:
             x_ref_states = None
 
@@ -5494,7 +6393,8 @@ class UamSuiteGUI(QMainWindow):
             err_yaw = np.full(N, np.nan, dtype=float)
         else:
             try:
-                from s500_uam_trajectory_planner import compute_ee_kinematics_along_trajectory
+                from s500_uam_acados_trajectory_plot import compute_ee_kinematics_along_trajectory
+
                 rm, eid = self._robot_model_and_ee()
                 pin_data = rm.createData()
                 ee_act_raw, _, ee_rpy_a, _ = compute_ee_kinematics_along_trajectory(x_act, rm, pin_data, eid)
@@ -5575,11 +6475,17 @@ class UamSuiteGUI(QMainWindow):
         finally:
             self._manual_ref_overlay = old_manual
 
-        self.log(
-            f"[plot] Rendered {N} steps | "
-            f"EE err mean={err.mean():.3f} m | "
-            + (f"solve mean={t_solve.mean():.1f} ms" if t_solve.size else "no solve time")
-        )
+        if self._is_s500_mode():
+            self.log(
+                f"[plot] Rendered {N} steps (s500 base-only) | "
+                + (f"solve mean={t_solve.mean():.1f} ms" if t_solve.size else "no solve time")
+            )
+        else:
+            self.log(
+                f"[plot] Rendered {N} steps | "
+                f"EE err mean={float(np.nanmean(err)):.3f} m | "
+                + (f"solve mean={t_solve.mean():.1f} ms" if t_solve.size else "no solve time")
+            )
 
     def _run_track(self):
         if self._plan_bundle is None:
@@ -5651,8 +6557,11 @@ class UamSuiteGUI(QMainWindow):
             yaw_ref = np.asarray(pb["yaw_ref"], dtype=float).flatten()
             waypoints = pb.get("waypoints")
             t_wp = pb.get("t_wp")
-            if pb.get("ee_track_kind") == "eight":
+            ek = pb.get("ee_track_kind")
+            if ek == "eight":
                 plan_title = "EE figure-eight (plan ref)"
+            elif ek == "acc_track":
+                plan_title = "Acc tracking test (plan ref)"
             else:
                 plan_title = "EE minimum snap (plan ref)"
             x0_for_ee = self._aligned_x0_from_ee_ref(p_ref, yaw_ref, x_seed=None)
@@ -5822,7 +6731,11 @@ class UamSuiteGUI(QMainWindow):
                 transform=ax.transAxes,
             )
             ax.axis("off")
+            self.fig_control.clear()
+            axc = self.fig_control.add_subplot(111)
+            axc.axis("off")
             self.cv_states.draw()
+            self.cv_control.draw()
 
             self.fig_3d_track.clear()
             ax3 = self.fig_3d_track.add_subplot(111, projection="3d")
@@ -5907,20 +6820,73 @@ class UamSuiteGUI(QMainWindow):
             ax = self.fig_3d_track.add_subplot(111, projection="3d")
             ax.text2D(0.2, 0.5, "3D plot unavailable", transform=ax.transAxes)
         plot_res = self._s500_plot_sanitize_res(res) if self._is_s500_mode() else res
-        em.render_ee_tracking_results_to_figures(
-            plot_res,
-            fs,
-            f3,
-            self.fig_traj_dash,
-            control_mode=control_mode,
-            plan_waypoints_xyz=wp,
-            states_title="MPC closed-loop",
-            ref_time_states=ref_time_states,
-            ref_states=ref_states,
-            ref_time_controls=ref_time_controls,
-            ref_controls=ref_controls,
-        )
+        # s500：与规划页一致，仅机体 state/control + 基座 3D/摘要，不画 EE 总览图。
+        if self._is_s500_mode():
+            Xs = _ensure_uam17_for_s500_base_plot(np.asarray(plot_res["x"], dtype=float))
+            tplt = np.asarray(plot_res["t"], dtype=float).flatten()
+            if Xs.ndim == 2 and Xs.shape[0] == tplt.size:
+                uplt = np.asarray(plot_res.get("u"), dtype=float)
+                t_ref_plt = (
+                    np.asarray(ref_time_states, dtype=float).flatten()
+                    if ref_time_states is not None
+                    else None
+                )
+                x_ref_plt = np.asarray(ref_states, dtype=float) if ref_states is not None else None
+                t_u_ref_plt = (
+                    np.asarray(ref_time_controls, dtype=float).flatten()
+                    if ref_time_controls is not None
+                    else None
+                )
+                u_ref_plt = np.asarray(ref_controls, dtype=float) if ref_controls is not None else None
+                self._render_s500_base_only_planning_figures(
+                    tplt,
+                    Xs,
+                    title_prefix="MPC closed-loop",
+                    u_plan=uplt,
+                    t_ref=t_ref_plt,
+                    x_ref=x_ref_plt,
+                    t_u_ref=t_u_ref_plt,
+                    u_ref=u_ref_plt,
+                    mpc_solve=plot_res.get("mpc_solve"),
+                )
+            else:
+                self.fig_states.clear()
+                ax = self.fig_states.add_subplot(111)
+                ax.text(
+                    0.5,
+                    0.5,
+                    "s500 绘图：t 与 x 行数不一致",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
+                ax.axis("off")
+                self.fig_3d_track.clear()
+                ax3 = self.fig_3d_track.add_subplot(111, projection="3d")
+                ax3.text2D(0.2, 0.5, "—", transform=ax3.transAxes)
+                self.fig_traj_dash.clear()
+                axd = self.fig_traj_dash.add_subplot(111)
+                axd.axis("off")
+                self.fig_control.clear()
+                axc = self.fig_control.add_subplot(111)
+                axc.axis("off")
+        else:
+            self._set_control_tab_uam_placeholder()
+            em.render_ee_tracking_results_to_figures(
+                plot_res,
+                fs,
+                f3,
+                self.fig_traj_dash,
+                control_mode=control_mode,
+                plan_waypoints_xyz=wp,
+                states_title="MPC closed-loop",
+                ref_time_states=ref_time_states,
+                ref_states=ref_states,
+                ref_time_controls=ref_time_controls,
+                ref_controls=ref_controls,
+            )
         self.cv_states.draw()
+        self.cv_control.draw()
         self.cv_3d_track.draw()
         self.cv_traj_dash.draw()
         self._render_cost_analysis_figure(res)

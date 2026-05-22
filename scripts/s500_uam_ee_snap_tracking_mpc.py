@@ -86,7 +86,13 @@ except ImportError as e:
     _deps_err = e
 
 try:
-    from s500_uam_acados_trajectory import plot_acados_into_figure, plot_acados_3d_into_figure
+    # Import plotting from trajectory_plot only (no acados OCP / heavy deps).
+    # Importing via s500_uam_acados_trajectory can fail when acados is unavailable,
+    # which incorrectly disables all GUI state/control figures.
+    from s500_uam_acados_trajectory_plot import (
+        plot_acados_3d_into_figure,
+        plot_acados_into_figure,
+    )
 
     PLOT_ACADOS_GUI_STYLE = True
 except ImportError:
@@ -1047,7 +1053,10 @@ def plot_minimum_snap_reference(
     ax_xy.plot(p_ref[:, 0], p_ref[:, 1], "b-", lw=1.5, label="p_ref (xy)")
     if has_wp:
         ax_xy.scatter(W[:, 0], W[:, 1], c="crimson", s=70, zorder=5, label="waypoints")
-    ax_xy.set_aspect("equal", adjustable="box")
+    _st_xy = [np.column_stack((p_ref[:, 0], p_ref[:, 1]))]
+    if has_wp:
+        _st_xy.append(np.column_stack((W[:, 0], W[:, 1])))
+    _square_2d_axis_limits(ax_xy, *_st_xy)
     ax_xy.set_xlabel("x [m]", **tinfo)
     ax_xy.set_ylabel("y [m]", **tinfo)
     ax_xy.set_title("Horizontal (XY)", fontsize=10)
@@ -1058,6 +1067,10 @@ def plot_minimum_snap_reference(
     ax_xz.plot(p_ref[:, 0], p_ref[:, 2], "b-", lw=1.5, label="p_ref (xz)")
     if has_wp:
         ax_xz.scatter(W[:, 0], W[:, 2], c="crimson", s=70, zorder=5)
+    _st_xz = [np.column_stack((p_ref[:, 0], p_ref[:, 2]))]
+    if has_wp:
+        _st_xz.append(np.column_stack((W[:, 0], W[:, 2])))
+    _square_2d_axis_limits(ax_xz, *_st_xz)
     ax_xz.set_xlabel("x [m]", **tinfo)
     ax_xz.set_ylabel("z [m]", **tinfo)
     ax_xz.set_title("Vertical profile (XZ)", fontsize=10)
@@ -1131,6 +1144,40 @@ def _plot_wp_vlines(ax, plan_waypoint_times):
         ax.axvline(float(tv), color="gray", ls=":", lw=0.75, alpha=0.65, zorder=1)
 
 
+def _square_2d_axis_limits(ax, *xy2: np.ndarray, margin: float = 0.06) -> None:
+    """横纵轴相同米制比例（取 x/y 向包络的最大边长为正方形视域）。"""
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    for A in xy2:
+        if A is None:
+            continue
+        M = np.asarray(A, dtype=float)
+        if M.size == 0 or M.ndim != 2 or M.shape[1] < 2:
+            continue
+        xs.append(M[:, 0].ravel())
+        ys.append(M[:, 1].ravel())
+    if not xs:
+        ax.set_aspect("equal", adjustable="box")
+        return
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x = x[ok]
+    y = y[ok]
+    if x.size == 0:
+        ax.set_aspect("equal", adjustable="box")
+        return
+    xmin, xmax = float(x.min()), float(x.max())
+    ymin, ymax = float(y.min()), float(y.max())
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+    span = max(xmax - xmin, ymax - ymin, 1e-9)
+    half = 0.5 * span * (1.0 + margin)
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_aspect("equal", adjustable="box")
+
+
 def _plot_tracking_dashboard(
     fig: plt.Figure,
     res: dict,
@@ -1146,15 +1193,44 @@ def _plot_tracking_dashboard(
     ee = res["ee"]
     pref = res["p_ref"]
     err_vec = ee - pref
+    t_flat = np.asarray(t, dtype=float).flatten()
+    v_ee = np.zeros_like(ee, dtype=float)
+    v_pref = np.zeros_like(pref, dtype=float)
+    if t_flat.size >= 2:
+        for j in range(3):
+            v_ee[:, j] = np.gradient(np.asarray(ee[:, j], dtype=float), t_flat)
+            v_pref[:, j] = np.gradient(np.asarray(pref[:, j], dtype=float), t_flat)
+    ev_vec = v_ee - v_pref
     ms = res.get("mpc_solve") or {}
-    wall = np.asarray(ms.get("wall_s", []), dtype=float)
-    nit = np.asarray(ms.get("nlp_iter", []), dtype=int)
-    stat = np.asarray(ms.get("status", []), dtype=int)
-    t_u = t[:-1]
+    wall = np.asarray(ms.get("wall_s", []), dtype=float).flatten()
+    nit = np.asarray(ms.get("nlp_iter", []), dtype=float).flatten().astype(int, copy=False)
+    stat = np.asarray(ms.get("status", []), dtype=float).flatten().astype(int, copy=False)
+    n_t = int(np.asarray(t, dtype=float).size)
+    nw = int(wall.size)
+    # 仿真里 u 常为 N-1（段上常值）；ROS / 录制常为每状态一步 => N 与 t 对齐
+    if nw == 0:
+        t_u = np.asarray(t, dtype=float).flatten()[:-1] if n_t > 1 else np.asarray(t, dtype=float).flatten()
+    elif nw == n_t:
+        t_u = np.asarray(t, dtype=float).flatten()
+    elif nw == n_t - 1:
+        t_u = np.asarray(t, dtype=float).flatten()[:-1]
+    else:
+        m = min(nw, n_t)
+        t_u = np.asarray(t, dtype=float).flatten()[:m]
+        wall = wall[:m]
+        if nit.size:
+            nit = nit[:m]
+        if stat.size:
+            stat = stat[:m]
+    L = int(wall.size)
+    if L and nit.size > L:
+        nit = nit[:L]
+    if L and stat.size > L:
+        stat = stat[:L]
 
     fig.clear()
     fig.suptitle("MPC EE tracking — overview (ref vs actual, errors, solver)", fontsize=12, y=0.98)
-    gs = fig.add_gridspec(4, 3, hspace=0.4, wspace=0.32, left=0.06, right=0.98, top=0.92, bottom=0.05)
+    gs = fig.add_gridspec(5, 3, hspace=0.38, wspace=0.32, left=0.06, right=0.98, top=0.90, bottom=0.04)
     tinfo = {"fontsize": 9, "labelpad": 2}
 
     ax3 = fig.add_subplot(gs[0, 0], projection="3d")
@@ -1226,7 +1302,16 @@ def _plot_tracking_dashboard(
         ax_xy.scatter(Bwp[:, 0], Bwp[:, 1], c="tab:blue", s=55, marker="s", zorder=5, label="plan Base WP")
     if Ewp.shape[0]:
         ax_xy.scatter(Ewp[:, 0], Ewp[:, 1], c="darkorange", s=65, marker="*", zorder=6, label="plan EE WP")
-    ax_xy.set_aspect("equal", adjustable="box")
+    _dash_xy = [
+        np.column_stack((pref[:, 0], pref[:, 1])),
+        np.column_stack((ee[:, 0], ee[:, 1])),
+        np.column_stack((base[:, 0], base[:, 1])),
+    ]
+    if Bwp.shape[0]:
+        _dash_xy.append(Bwp[:, (0, 1)])
+    if Ewp.shape[0]:
+        _dash_xy.append(Ewp[:, (0, 1)])
+    _square_2d_axis_limits(ax_xy, *_dash_xy)
     ax_xy.set_xlabel("X [m]", **tinfo)
     ax_xy.set_ylabel("Y [m]", **tinfo)
     ax_xy.set_title("Horizontal (XY)", fontsize=10)
@@ -1241,6 +1326,16 @@ def _plot_tracking_dashboard(
         ax_xz.scatter(Bwp[:, 0], Bwp[:, 2], c="tab:blue", s=55, marker="s", zorder=5, label="plan Base WP")
     if Ewp.shape[0]:
         ax_xz.scatter(Ewp[:, 0], Ewp[:, 2], c="darkorange", s=65, marker="*", zorder=6, label="plan EE WP")
+    _dash_xz = [
+        np.column_stack((pref[:, 0], pref[:, 2])),
+        np.column_stack((ee[:, 0], ee[:, 2])),
+        np.column_stack((base[:, 0], base[:, 2])),
+    ]
+    if Bwp.shape[0]:
+        _dash_xz.append(Bwp[:, (0, 2)])
+    if Ewp.shape[0]:
+        _dash_xz.append(Ewp[:, (0, 2)])
+    _square_2d_axis_limits(ax_xz, *_dash_xz)
     ax_xz.set_xlabel("X [m]", **tinfo)
     ax_xz.set_ylabel("Z [m]", **tinfo)
     ax_xz.set_title("Vertical profile (XZ)", fontsize=10)
@@ -1281,7 +1376,39 @@ def _plot_tracking_dashboard(
     ax_pos.grid(True, alpha=0.3)
     _plot_wp_vlines(ax_pos, plan_waypoint_times)
 
-    ax_w = fig.add_subplot(gs[2, 0])
+    ev_norm = np.linalg.norm(ev_vec, axis=1)
+    ax_evn = fig.add_subplot(gs[2, 0])
+    ax_evn.fill_between(t_flat, 0.0, ev_norm, color="teal", alpha=0.18)
+    ax_evn.plot(t_flat, ev_norm, color="teal", lw=1.15, label=r"$\|e_v\|$")
+    _plot_wp_vlines(ax_evn, plan_waypoint_times)
+    ax_evn.set_xlabel("t [s]", **tinfo)
+    ax_evn.set_ylabel("m/s", **tinfo)
+    ax_evn.set_title("EE velocity error norm", fontsize=10)
+    ax_evn.legend(fontsize=8)
+    ax_evn.grid(True, alpha=0.3)
+
+    ax_evc = fig.add_subplot(gs[2, 1])
+    for j, c in enumerate("rgb"):
+        ax_evc.plot(t_flat, ev_vec[:, j], color=c, lw=1.0, label=f"e_v{'xyz'[j]}")
+    ax_evc.axhline(0.0, color="gray", ls=":", lw=0.8)
+    _plot_wp_vlines(ax_evc, plan_waypoint_times)
+    ax_evc.set_xlabel("t [s]", **tinfo)
+    ax_evc.set_ylabel("m/s", **tinfo)
+    ax_evc.set_title("EE velocity error components", fontsize=10)
+    ax_evc.legend(loc="best", fontsize=7)
+    ax_evc.grid(True, alpha=0.3)
+
+    ax_spd = fig.add_subplot(gs[2, 2])
+    ax_spd.plot(t_flat, np.linalg.norm(v_ee, axis=1), "m-", lw=1.1, label=r"$\|v_{\mathrm{EE}}\|$")
+    ax_spd.plot(t_flat, np.linalg.norm(v_pref, axis=1), "k--", lw=1.05, alpha=0.8, label=r"$\|v_{\mathrm{ref}}\|$")
+    _plot_wp_vlines(ax_spd, plan_waypoint_times)
+    ax_spd.set_xlabel("t [s]", **tinfo)
+    ax_spd.set_ylabel("m/s", **tinfo)
+    ax_spd.set_title("EE speed: actual vs reference", fontsize=10)
+    ax_spd.legend(loc="best", fontsize=7)
+    ax_spd.grid(True, alpha=0.3)
+
+    ax_w = fig.add_subplot(gs[3, 0])
     if wall.size:
         ax_w.plot(t_u, wall * 1000.0, "C0-", lw=0.8, label="wall time / step")
         ax_w.set_xlabel("t [s]", **tinfo)
@@ -1292,7 +1419,7 @@ def _plot_tracking_dashboard(
     else:
         ax_w.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_w.transAxes)
 
-    ax_n = fig.add_subplot(gs[2, 1])
+    ax_n = fig.add_subplot(gs[3, 1])
     if nit.size:
         ax_n.step(t_u, nit, where="post", color="C2", lw=0.9, label="nlp_iter")
         ax_n.set_xlabel("t [s]", **tinfo)
@@ -1303,7 +1430,7 @@ def _plot_tracking_dashboard(
     else:
         ax_n.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_n.transAxes)
 
-    ax_st = fig.add_subplot(gs[2, 2])
+    ax_st = fig.add_subplot(gs[3, 2])
     if stat.size:
         n_fail = int(np.sum(stat != 0))
         ax_st.bar([0, 1], [int(stat.size) - n_fail, n_fail], color=["seagreen", "salmon"], width=0.5)
@@ -1315,7 +1442,7 @@ def _plot_tracking_dashboard(
     else:
         ax_st.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_st.transAxes)
 
-    ax_y = fig.add_subplot(gs[3, :])
+    ax_y = fig.add_subplot(gs[4, :])
     cost_t = np.asarray(res.get("mpc_cost_t", []), dtype=float).flatten()
     cost_total = np.asarray(res.get("mpc_cost_total", []), dtype=float).flatten()
     cost_terms = res.get("mpc_cost_terms", {})

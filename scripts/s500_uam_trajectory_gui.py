@@ -96,16 +96,31 @@ def mixed_wp_row_kind(cell0) -> str:
     return "base"
 
 
-def wp_to_state(wp):
-    """Convert waypoint [x,y,z,j1_deg,j2_deg,yaw_deg,time] to 17-dim state."""
+def _fit_state_dim(x, nx: int):
+    """Pad/crop state vector to target dimension nx."""
+    arr = np.asarray(x, dtype=float).flatten()
+    if int(nx) <= 0:
+        return arr
+    if arr.size == int(nx):
+        return arr
+    if arr.size > int(nx):
+        return arr[: int(nx)].copy()
+    out = np.zeros(int(nx), dtype=float)
+    out[: arr.size] = arr
+    return out
+
+
+def wp_to_state(wp, nx: int = 17):
+    """Convert waypoint [x,y,z,j1_deg,j2_deg,yaw_deg,time] to state with nx dims."""
     if make_uam_state is None:
         return None
     deg2rad = np.pi / 180.0
-    return make_uam_state(
+    x = make_uam_state(
         wp[0], wp[1], wp[2],
         j1=wp[3] * deg2rad, j2=wp[4] * deg2rad,
         yaw=wp[5] * deg2rad,
     )
+    return _fit_state_dim(x, nx)
 
 
 class OptimizationWorker(QThread):
@@ -135,11 +150,12 @@ class OptimizationWorker(QThread):
         if planner is None:
             self.finished.emit(False, "Planner not initialized.", None)
             return
+        nx = int(planner.robot_model.nq + planner.robot_model.nv)
         if self.params.get("grasp"):
             planner.create_trajectory_problem(
-                start_state=self.params["start_state"],
+                start_state=_fit_state_dim(self.params["start_state"], nx),
                 grasp_position=self.params["grasp_position"],
-                target_state=self.params["target_state"],
+                target_state=_fit_state_dim(self.params["target_state"], nx),
                 durations=self.params["durations"],
                 dt=self.params["dt"],
                 grasp_ee_weight=self.params.get("grasp_ee_weight", 5000),
@@ -166,7 +182,7 @@ class OptimizationWorker(QThread):
                     x, y, z, a, b, c, t = (float(row[i]) for i in range(1, 8))
                     if rk == "base":
                         modes.append("base")
-                        st = wp_to_state([x, y, z, a, b, c, t])
+                        st = wp_to_state([x, y, z, a, b, c, t], nx=nx)
                         if st is None:
                             self.finished.emit(False, "make_uam_state not available.", None)
                             return
@@ -175,8 +191,11 @@ class OptimizationWorker(QThread):
                         ee_pose_rpy_world.append(None)
                     elif rk == "ee_pos":
                         modes.append("ee_pos")
-                        st0 = make_uam_state(
+                        st0 = _fit_state_dim(
+                            make_uam_state(
                             0.0, 0.0, 1.0, j1=a * deg2rad, j2=b * deg2rad, yaw=c * deg2rad
+                            ),
+                            nx,
                         )
                         st = planner.align_state_ee_to_world_point(
                             st0, np.array([x, y, z], dtype=float)
@@ -186,7 +205,7 @@ class OptimizationWorker(QThread):
                         ee_pose_rpy_world.append(None)
                     else:
                         modes.append("ee_pose")
-                        st0 = np.zeros(17)
+                        st0 = np.zeros(nx, dtype=float)
                         st0[2] = 1.0
                         rpy = np.array([a, b, c], dtype=float) * deg2rad
                         R = pin.rpy.rpyToMatrix(
@@ -203,6 +222,9 @@ class OptimizationWorker(QThread):
                 for i in range(len(sorted_rows) - 1):
                     d = float(sorted_rows[i + 1][7]) - float(sorted_rows[i][7])
                     durs.append(d if d > 1e-6 else 1.0)
+                zero_velocity_flags = self.params.get("zero_velocity_flags")
+                if zero_velocity_flags is not None:
+                    zero_velocity_flags = [bool(v) for v in zero_velocity_flags]
                 planner.create_trajectory_problem_mixed_waypoints(
                     modes=modes,
                     resolved_states=resolved,
@@ -226,6 +248,7 @@ class OptimizationWorker(QThread):
                     ),
                     use_actuator_first_order=self.params.get("use_actuator_first_order", False),
                     tau_cmd=self.params.get("tau_cmd"),
+                    zero_velocity_flags=zero_velocity_flags,
                 )
             else:
                 waypoints = self.params.get("waypoints", [])
@@ -233,7 +256,7 @@ class OptimizationWorker(QThread):
                 if len(waypoints) < 2:
                     self.finished.emit(False, "Need at least 2 waypoints.", None)
                     return
-                states = [wp_to_state(wp) for wp in waypoints]
+                states = [wp_to_state(wp, nx=nx) for wp in waypoints]
                 if any(s is None for s in states):
                     self.finished.emit(False, "make_uam_state not available.", None)
                     return
