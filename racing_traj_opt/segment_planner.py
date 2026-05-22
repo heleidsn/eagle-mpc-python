@@ -1,4 +1,4 @@
-from casadi import MX, DM, Function, vertcat, veccat, nlpsol, norm_2, fabs, sqrt, dot
+from casadi import MX, DM, Function, vertcat, veccat, nlpsol, norm_2, fabs, sqrt, dot, atan2
 import numpy as np
 import joblib
 
@@ -22,6 +22,8 @@ class SegmentPlanner:
             raise ValueError(f"Unsupported dynamics_model: {self.dynamics_model}")
 
         self.wp = DM(track["gates"]).T
+        self.n_gates = len(track.get("gates", []))
+        self.has_end_pos = track.get("end_pos") is not None
         if track.get("end_pos") is not None:
             from casadi import horzcat
 
@@ -74,14 +76,25 @@ class SegmentPlanner:
         self.var_slices = {}
         self.x_sol = None
         self.error_model = self.options.get("error_model", None)
+        self.error_model_type = str(self.options.get("error_model_type", "nn")).lower()
+        self.linear_error_k = float(self.options.get("linear_error_k", 0.05))
         self.error_bound = float(self.options.get("error_bound", 0.10))
         self.error_penalty = float(self.options.get("error_penalty", 5000.0))
-        self.use_error_model = self.error_model is not None
+        self.use_error_model = bool(self.options.get("use_error_model", False))
         self.nn_params = None
         if self.use_error_model:
-            if self.dynamics_model != "simple":
-                raise ValueError("NN gate-error constraint currently supports only dynamics_model='simple'")
-            self.nn_params = self._load_nn_params(self.error_model)
+            if self.error_model_type == "nn":
+                if self.error_model is None:
+                    raise ValueError("error_model_type='nn' requires a loaded error_model object")
+                self.nn_params = self._load_nn_params(self.error_model)
+            elif self.error_model_type == "linear_speed":
+                if self.linear_error_k < 0.0:
+                    raise ValueError("linear_error_k must be non-negative")
+            else:
+                raise ValueError(
+                    f"Unsupported error_model_type: {self.error_model_type}. "
+                    "Use 'nn' or 'linear_speed'."
+                )
     def _build_dynamics(self):
         if self.dynamics_model == "simple":
             x = MX.sym("x", self.NX)
@@ -169,17 +182,40 @@ class SegmentPlanner:
         window_size = int(model_obj.get("window_size", 1))
         if window_size != 1:
             raise ValueError(f"Only window_size=1 supported in optimizer constraint, got {window_size}")
+        default_features = [
+            "ep_x", "ep_y", "ep_z",
+            "ev_x", "ev_y", "ev_z",
+            "a_ref_x", "a_ref_y", "a_ref_z",
+            "j_ref_x", "j_ref_y", "j_ref_z",
+            "yaw_ref", "yaw_rate_ref",
+            "v_world_x", "v_world_y", "v_world_z",
+            "omega_x", "omega_y", "omega_z",
+            "body_z_world_x", "body_z_world_y", "body_z_world_z",
+            "u_thrust", "thrust_margin",
+        ]
+        feature_names = list(model_obj.get("feature_names_per_frame") or default_features)
+        target_names = list(
+            model_obj.get("target_names")
+            or ["ep_x", "ep_y", "ep_z", "ev_x", "ev_y", "ev_z"]
+        )
         scale = np.asarray(scaler.scale_, dtype=float).reshape(-1)
         scale = np.where(np.abs(scale) < 1e-12, 1.0, scale)
+        if len(feature_names) != int(scale.size):
+            raise ValueError(
+                "Error model feature count mismatch: "
+                f"{len(feature_names)} names vs scaler dimension {int(scale.size)}"
+            )
         return {
             "mean": np.asarray(scaler.mean_, dtype=float).reshape(-1),
             "scale": scale,
             "coefs": [np.asarray(w, dtype=float) for w in mlp.coefs_],
             "biases": [np.asarray(b, dtype=float).reshape(-1) for b in mlp.intercepts_],
+            "feature_names": feature_names,
+            "target_names": target_names,
         }
 
     def _nn_forward_ep_pred(self, x_feat):
-        # x_feat shape: (25, 1) as MX
+        # x_feat shape follows the loaded model's feature_names_per_frame.
         p = self.nn_params
         z = (x_feat - DM(p["mean"]).reshape((x_feat.shape[0], 1))) / DM(p["scale"]).reshape((x_feat.shape[0], 1))
         for i, (w, b) in enumerate(zip(p["coefs"], p["biases"])):
@@ -187,8 +223,12 @@ class SegmentPlanner:
             if i < len(p["coefs"]) - 1:
                 # Smooth ReLU to keep NLP derivatives well-behaved.
                 z = 0.5 * (z + sqrt(z * z + 1e-8))
-        # output: [ep_x, ep_y, ep_z, ev_x, ev_y, ev_z]
-        return z[0:3]
+        # Prefer named outputs when available; legacy models use [ep_x, ep_y, ep_z, ev_x, ev_y, ev_z].
+        idx = []
+        names = p.get("target_names") or []
+        for name in ("ep_x", "ep_y", "ep_z"):
+            idx.append(names.index(name) if name in names else len(idx))
+        return vertcat(z[idx[0]], z[idx[1]], z[idx[2]])
 
     def _rk4_step(self, xk, uk, dt):
         k1 = self.f(xk, uk)
@@ -196,6 +236,74 @@ class SegmentPlanner:
         k3 = self.f(xk + 0.5 * dt * k2, uk)
         k4 = self.f(xk + dt * k3, uk)
         return xk + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+    def _build_error_model_features(self, p_to, x_end, u_end):
+        # Build the feature vector requested by the loaded model. Legacy models use
+        # the original 25-D layout; model_3 uses plan-only [v_ref, a_ref, j_ref, yaw_ref, yaw_rate_ref].
+        ep = p_to - x_end[0:3]
+        v_world = x_end[3:6]
+        v_ref = v_world
+        ev = -v_world  # gate terminal reference velocity is near zero
+
+        if self.dynamics_model == "simple":
+            a_ref = u_end
+            omega = DM.zeros(3, 1)
+            body_z_world = DM([0.0, 0.0, 1.0])
+            a_norm = sqrt(dot(a_ref, a_ref) + 1e-8)
+            u_thrust = DM([0.5]) + 0.2 * a_norm / self.quad["g"]
+            thrust_margin = DM([1.0]) - u_thrust
+            yaw_ref = DM([0.0])
+            yaw_rate_ref = DM([0.0])
+        else:
+            qw, qx, qy, qz = x_end[6], x_end[7], x_end[8], x_end[9]
+            r02 = 2 * (qx * qz + qw * qy)
+            r12 = 2 * (qy * qz - qw * qx)
+            r22 = 1 - 2 * (qx * qx + qy * qy)
+            body_z_world = vertcat(r02, r12, r22)
+            thrust_total = u_end[0] + u_end[1] + u_end[2] + u_end[3]
+            a_ref = body_z_world * thrust_total / self.quad["mass"] - DM([0.0, 0.0, self.quad["g"]])
+            omega = x_end[10:13]
+            denom = max(float(self.quad.get("T_max", 1.0)) * 4.0, 1e-6)
+            u_thrust = DM([1.0 / denom]) * thrust_total
+            thrust_margin = DM([1.0]) - u_thrust
+            siny = 2 * (qw * qz + qx * qy)
+            cosy = 1 - 2 * (qy * qy + qz * qz)
+            yaw_ref = vertcat(atan2(siny, cosy))
+            # Approximate ZYX yaw rate from body rates. This keeps model_3's plan-only
+            # yaw_rate_ref feature consistent with the quaternion state used by the full dynamics.
+            sinr_cosp = 2 * (qw * qx + qy * qz)
+            cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
+            roll_den = sqrt(sinr_cosp * sinr_cosp + cosr_cosp * cosr_cosp + 1e-8)
+            sin_roll = sinr_cosp / roll_den
+            cos_roll = cosr_cosp / roll_den
+            sin_pitch = 2 * (qw * qy - qz * qx)
+            cos_pitch_sq = 1 - sin_pitch * sin_pitch
+            # Smooth max(cos_pitch_sq, 0) avoids NaNs during intermediate IPOPT
+            # iterations where the quaternion may be slightly off the unit sphere.
+            cos_pitch = sqrt(0.5 * (cos_pitch_sq + sqrt(cos_pitch_sq * cos_pitch_sq + 1e-8)) + 1e-8)
+            yaw_rate_ref = vertcat((sin_roll * omega[1] + cos_roll * omega[2]) / cos_pitch)
+
+        j_ref = DM.zeros(3, 1)
+        feature_map = {
+            "ep_x": ep[0], "ep_y": ep[1], "ep_z": ep[2],
+            "ev_x": ev[0], "ev_y": ev[1], "ev_z": ev[2],
+            "v_ref_x": v_ref[0], "v_ref_y": v_ref[1], "v_ref_z": v_ref[2],
+            "a_ref_x": a_ref[0], "a_ref_y": a_ref[1], "a_ref_z": a_ref[2],
+            "j_ref_x": j_ref[0], "j_ref_y": j_ref[1], "j_ref_z": j_ref[2],
+            "yaw_ref": yaw_ref[0], "yaw_rate_ref": yaw_rate_ref[0],
+            "v_world_x": v_world[0], "v_world_y": v_world[1], "v_world_z": v_world[2],
+            "omega_x": omega[0], "omega_y": omega[1], "omega_z": omega[2],
+            "body_z_world_x": body_z_world[0],
+            "body_z_world_y": body_z_world[1],
+            "body_z_world_z": body_z_world[2],
+            "u_thrust": u_thrust[0],
+            "thrust_margin": thrust_margin[0],
+        }
+        names = (self.nn_params or {}).get("feature_names") or []
+        missing = [name for name in names if name not in feature_map]
+        if missing:
+            raise ValueError(f"Unsupported error model feature(s): {missing}")
+        return vertcat(*[feature_map[name] for name in names])
 
     def setup(self):
         if self.planning_mode == "monolithic":
@@ -319,32 +427,15 @@ class SegmentPlanner:
 
             # Optional NN-based gate passing error bound.
             if self.use_error_model:
-                ep = p_to - Xs[-1][0:3]
-                ev = -Xs[-1][3:6]  # assume gate reference velocity is near zero
-                a_ref = Us[-1] if len(Us) > 0 else DM.zeros(3, 1)
-                j_ref = DM.zeros(3, 1)
-                yaw_ref = DM([0.0])
-                yaw_rate_ref = DM([0.0])
-                v_world = Xs[-1][3:6]
-                omega = DM.zeros(3, 1)
-                body_z_world = DM([0.0, 0.0, 1.0])
-                a_norm = sqrt(dot(a_ref, a_ref) + 1e-8)
-                u_thrust = DM([0.5]) + 0.2 * a_norm / self.quad["g"]
-                thrust_margin = DM([1.0]) - u_thrust
-                feat = vertcat(
-                    ep,
-                    ev,
-                    a_ref,
-                    j_ref,
-                    yaw_ref,
-                    yaw_rate_ref,
-                    v_world,
-                    omega,
-                    body_z_world,
-                    u_thrust,
-                    thrust_margin,
-                )
-                ep_pred = self._nn_forward_ep_pred(feat)
+                u_end = Us[-1] if len(Us) > 0 else DM.zeros(self.NU, 1)
+                feat = self._build_error_model_features(p_to, Xs[-1], u_end)
+                if self.error_model_type == "nn":
+                    ep_pred = self._nn_forward_ep_pred(feat)
+                else:
+                    # Simple baseline for debugging convergence:
+                    # assume |e_p_pred| grows linearly with speed magnitude.
+                    v_world = Xs[-1][3:6]
+                    ep_pred = DM([self.linear_error_k]) * v_world
                 ep_norm = sqrt(dot(ep_pred, ep_pred) + 1e-8)
                 # Soft gate-error constraint: ep_norm <= error_bound + slack, slack >= 0
                 Es = MX.sym(f"Eslack_{s}", 1)
@@ -650,3 +741,55 @@ class SegmentPlanner:
             np.asarray(w),
             np.asarray(u),
         )
+
+    def extract_gate_events(self):
+        """Return planned gate/end crossing events as dicts with cumulative time and xyz.
+
+        In segmented mode each segment terminal point is hard-constrained to the
+        corresponding gate/end, so cumulative segment durations give exact planned
+        crossing times. In monolithic mode, use the same nominal waypoint indices
+        used by the soft waypoint constraints.
+        """
+        if self.x_sol is None:
+            raise RuntimeError("Solve trajectory first")
+
+        events = []
+        if self.planning_mode == "monolithic":
+            Tm = float(self.get_var("T_total")[0])
+            dt = Tm / self.N_TOTAL
+            for i in range(self.NW):
+                k_i = int(round((i + 1) * self.N_TOTAL / self.NW))
+                k_i = max(1, min(self.N_TOTAL, k_i))
+                Xk = self.get_var(f"X_m_{k_i}")
+                kind = "end" if self.has_end_pos and i == self.NW - 1 else "gate"
+                idx = 0 if kind == "end" else i
+                events.append(
+                    {
+                        "kind": kind,
+                        "index": int(idx),
+                        "t": float(k_i * dt),
+                        "x": float(Xk[0]),
+                        "y": float(Xk[1]),
+                        "z": float(Xk[2]),
+                    }
+                )
+            return events
+
+        t_now = 0.0
+        for i in range(self.NW):
+            Ts = float(self.get_var(f"T_{i}")[0])
+            t_now += Ts
+            Xk = self.get_var(f"X_{i}_{self.NPS}")
+            kind = "end" if self.has_end_pos and i == self.NW - 1 else "gate"
+            idx = 0 if kind == "end" else i
+            events.append(
+                {
+                    "kind": kind,
+                    "index": int(idx),
+                    "t": float(t_now),
+                    "x": float(Xk[0]),
+                    "y": float(Xk[1]),
+                    "z": float(Xk[2]),
+                }
+            )
+        return events
