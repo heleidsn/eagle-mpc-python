@@ -1,17 +1,82 @@
 #!/usr/bin/env python3
-"""Matplotlib visualization for S500 UAM acados trajectories (4x4 GUI dashboard, 3D, CLI figure)."""
+"""Matplotlib visualization for S500 UAM acados trajectories (6x4 GUI dashboard, 3D, CLI figure)."""
 
 from __future__ import annotations
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 from pathlib import Path
+from typing import Tuple
 
-from s500_uam_trajectory_planner import (
-    compute_ee_kinematics_along_trajectory,
-    base_lin_ang_world_from_robot_state,
-)
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.lines import Line2D
+
+
+def _quat_xyzw_batch_to_R(quat: np.ndarray) -> np.ndarray:
+    """R_wb from body to world; quat (N,4) [qx,qy,qz,qw]. Same as s500_uam_trajectory_planner."""
+    quat = np.asarray(quat, dtype=float)
+    if quat.ndim == 1:
+        quat = quat.reshape(1, -1)
+    qx, qy, qz, qw = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    nn = np.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    nn = np.maximum(nn, 1e-12)
+    qx, qy, qz, qw = qx / nn, qy / nn, qz / nn, qw / nn
+    R = np.empty((len(quat), 3, 3), dtype=float)
+    R[:, 0, 0] = 1.0 - 2.0 * (qy * qy + qz * qz)
+    R[:, 0, 1] = 2.0 * (qx * qy - qw * qz)
+    R[:, 0, 2] = 2.0 * (qx * qz + qw * qy)
+    R[:, 1, 0] = 2.0 * (qx * qy + qw * qz)
+    R[:, 1, 1] = 1.0 - 2.0 * (qx * qx + qz * qz)
+    R[:, 1, 2] = 2.0 * (qy * qz - qw * qx)
+    R[:, 2, 0] = 2.0 * (qx * qz - qw * qy)
+    R[:, 2, 1] = 2.0 * (qy * qz + qw * qx)
+    R[:, 2, 2] = 1.0 - 2.0 * (qx * qx + qy * qy)
+    return R
+
+
+def base_lin_ang_world_from_robot_state(simX: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Base linear and angular velocity in world frame (duplicated to avoid importing crocoddyl)."""
+    X = np.asarray(simX, dtype=float)
+    if X.ndim == 1:
+        X = X.reshape(1, -1)
+    if X.shape[1] < 15:
+        raise ValueError(f"state needs ≥15 columns for base twist, got {X.shape[1]}")
+    quat = X[:, 3:7]
+    vb = X[:, 9:12]
+    wb = X[:, 12:15]
+    R = _quat_xyzw_batch_to_R(quat)
+    vw = np.einsum("nij,nj->ni", R, vb)
+    ww = np.einsum("nij,nj->ni", R, wb)
+    return vw, ww
+
+
+def compute_ee_kinematics_along_trajectory(
+    states: np.ndarray,
+    robot_model,
+    data,
+    ee_frame_id: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """EE frame in world (Pinocchio only; no crocoddyl)."""
+    import pinocchio as pin
+
+    n = len(states)
+    nq = int(robot_model.nq)
+    ee_pos = np.zeros((n, 3))
+    ee_v = np.zeros((n, 3))
+    ee_rpy = np.zeros((n, 3))
+    ee_w = np.zeros((n, 3))
+    rf = pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+    for i, x in enumerate(states):
+        q = np.asarray(x[:nq], dtype=float).flatten()
+        v = np.asarray(x[nq:], dtype=float).flatten()
+        pin.forwardKinematics(robot_model, data, q, v)
+        pin.updateFramePlacements(robot_model, data)
+        oMf = data.oMf[ee_frame_id]
+        ee_pos[i] = oMf.translation
+        ee_rpy[i] = pin.rpy.matrixToRpy(oMf.rotation)
+        vel = pin.getFrameVelocity(robot_model, data, ee_frame_id, rf)
+        ee_v[i] = np.array(vel.linear).flatten()
+        ee_w[i] = np.array(vel.angular).flatten()
+    return ee_pos, ee_v, ee_rpy, ee_w
 
 # Keep in sync with s500_uam_acados_trajectory.CONTROL_INPUT_*
 CONTROL_INPUT_DIRECT = "direct"
@@ -23,6 +88,18 @@ STATE_LIMITS = {
     "j_angle_max": 2.0,
     "j_vel_max": 10.0,
 }
+
+
+def _time_derivative_rows(y: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """d/dt for each column; y shape (N, k), t shape (N,)."""
+    y = np.asarray(y, dtype=float)
+    t = np.asarray(t, dtype=float).reshape(-1)
+    if y.ndim == 1:
+        y = y.reshape(-1, 1)
+    if t.size < 2 or y.shape[0] != t.size:
+        return np.zeros_like(y)
+    edge = 1 if t.size == 2 else 2
+    return np.gradient(y, t, axis=0, edge_order=edge)
 
 
 def _quat_to_euler(quat):
@@ -61,7 +138,7 @@ def plot_acados_into_figure(
     ref_time_controls=None,
     ref_controls=None,
 ):
-    """Plot acados trajectory into existing figure (4x4 layout, aligned with Crocoddyl).
+    """Plot acados trajectory into existing figure (6x4 layout: kin + acc/jerk + arm/ctrl + paths, aligned with Crocoddyl).
 
     control_layout:
       - ``direct``: simU = [T1..T4, τ1, τ2] (default)
@@ -124,6 +201,16 @@ def plot_acados_into_figure(
             v_lin_w_ref = None
             w_base_w_ref = None
 
+    a_lin_b = _time_derivative_rows(v_lin_w, time_states)
+    jerk_lin_b = _time_derivative_rows(a_lin_b, time_states)
+    alpha_lin_b = _time_derivative_rows(w_base_w, time_states)
+    a_lin_b_ref = jerk_lin_b_ref = alpha_lin_b_ref = None
+    if v_lin_w_ref is not None and np.all(np.isfinite(v_lin_w_ref)):
+        a_lin_b_ref = _time_derivative_rows(v_lin_w_ref, time_states)
+        jerk_lin_b_ref = _time_derivative_rows(a_lin_b_ref, time_states)
+    if w_base_w_ref is not None and np.all(np.isfinite(w_base_w_ref)):
+        alpha_lin_b_ref = _time_derivative_rows(w_base_w_ref, time_states)
+
     ee_pos = ee_v = ee_rpy = ee_w = None
     try:
         pm, pdata, pfid = _plot_pin_model_for_acados_fig()
@@ -157,6 +244,34 @@ def plot_acados_into_figure(
                 ee_v_ref = None
                 ee_rpy_ref = None
                 ee_w_ref = None
+
+    ee_a = _time_derivative_rows(ee_v, time_states)
+    ee_jerk = _time_derivative_rows(ee_a, time_states)
+    ee_alpha = _time_derivative_rows(ee_w, time_states)
+    ee_a_ref = ee_jerk_ref = ee_alpha_ref = None
+    if ee_v_ref is not None and np.all(np.isfinite(ee_v_ref)):
+        ee_a_ref = _time_derivative_rows(ee_v_ref, time_states)
+        ee_jerk_ref = _time_derivative_rows(ee_a_ref, time_states)
+    if ee_w_ref is not None and np.all(np.isfinite(ee_w_ref)):
+        ee_alpha_ref = _time_derivative_rows(ee_w_ref, time_states)
+
+    joint_alpha = None
+    joint_alpha_ref = None
+    if simX.shape[1] >= 17:
+        jq = simX[:, 15:17]
+        joint_alpha = _time_derivative_rows(jq, time_states)
+        if refX_interp is not None and refX_interp.shape[1] >= 17:
+            jqr = refX_interp[:, 15:17]
+            if np.all(np.isfinite(jqr)):
+                joint_alpha_ref = _time_derivative_rows(jqr, time_states)
+
+    u_rate_norm = None
+    if simU is not None and np.asarray(simU).size > 0:
+        Uu = np.asarray(simU, dtype=float)
+        tc = np.asarray(time_controls, dtype=float).reshape(-1)
+        if Uu.ndim == 2 and tc.size >= 2 and Uu.shape[0] == tc.size:
+            dU = _time_derivative_rows(Uu, tc)
+            u_rate_norm = np.linalg.norm(dU, axis=1)
 
     def add_wp_lines(ax):
         if waypoint_times is None:
@@ -211,7 +326,7 @@ def plot_acados_into_figure(
 
     positions = simX[:, :3]
     fig.clear()
-    gs = fig.add_gridspec(4, 4, hspace=0.42, wspace=0.32, left=0.05, right=0.98, top=0.93, bottom=0.05)
+    gs = fig.add_gridspec(6, 4, hspace=0.36, wspace=0.32, left=0.05, right=0.98, top=0.96, bottom=0.04)
     tinfo = {'fontsize': 9, 'labelpad': 2}
 
     # Row 0: Base
@@ -366,8 +481,127 @@ def plot_acados_into_figure(
     ax13.set_title('EE angular vel. (world)', fontsize=9)
     ax13.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-    # Row 2: Arm & controls
-    ax20 = fig.add_subplot(gs[2, 0])
+    # Row 2: Base linear acc / jerk / angular acc; EE linear acc (world)
+    ax_ba = fig.add_subplot(gs[2, 0])
+    ax_ba.plot(time_states, a_lin_b[:, 0], "r-", label="ax")
+    ax_ba.plot(time_states, a_lin_b[:, 1], "g-", label="ay")
+    ax_ba.plot(time_states, a_lin_b[:, 2], "b-", label="az")
+    if a_lin_b_ref is not None:
+        ax_ba.plot(time_states, a_lin_b_ref[:, 0], "r--", alpha=0.9, lw=1.05, label="ref ax")
+        ax_ba.plot(time_states, a_lin_b_ref[:, 1], "g--", alpha=0.9, lw=1.05, label="ref ay")
+        ax_ba.plot(time_states, a_lin_b_ref[:, 2], "b--", alpha=0.9, lw=1.05, label="ref az")
+    add_wp_lines(ax_ba)
+    ax_ba.set_xlabel("Time (s)", **tinfo)
+    ax_ba.set_ylabel("m/s²", **tinfo)
+    ax_ba.set_title("Base linear acc (world)", fontsize=9)
+    ax_ba.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_ba.grid(True, alpha=0.3)
+
+    ax_bj = fig.add_subplot(gs[2, 1])
+    ax_bj.plot(time_states, jerk_lin_b[:, 0], "r-", label="jx")
+    ax_bj.plot(time_states, jerk_lin_b[:, 1], "g-", label="jy")
+    ax_bj.plot(time_states, jerk_lin_b[:, 2], "b-", label="jz")
+    if jerk_lin_b_ref is not None:
+        ax_bj.plot(time_states, jerk_lin_b_ref[:, 0], "r--", alpha=0.9, lw=1.05, label="ref jx")
+        ax_bj.plot(time_states, jerk_lin_b_ref[:, 1], "g--", alpha=0.9, lw=1.05, label="ref jy")
+        ax_bj.plot(time_states, jerk_lin_b_ref[:, 2], "b--", alpha=0.9, lw=1.05, label="ref jz")
+    add_wp_lines(ax_bj)
+    ax_bj.set_xlabel("Time (s)", **tinfo)
+    ax_bj.set_ylabel("m/s³", **tinfo)
+    ax_bj.set_title("Base linear jerk (world)", fontsize=9)
+    ax_bj.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_bj.grid(True, alpha=0.3)
+
+    ax_baa = fig.add_subplot(gs[2, 2])
+    ax_baa.plot(time_states, np.degrees(alpha_lin_b[:, 0]), "r-", label="αx")
+    ax_baa.plot(time_states, np.degrees(alpha_lin_b[:, 1]), "g-", label="αy")
+    ax_baa.plot(time_states, np.degrees(alpha_lin_b[:, 2]), "b-", label="αz")
+    if alpha_lin_b_ref is not None:
+        ax_baa.plot(time_states, np.degrees(alpha_lin_b_ref[:, 0]), "r--", alpha=0.9, lw=1.05, label="ref αx")
+        ax_baa.plot(time_states, np.degrees(alpha_lin_b_ref[:, 1]), "g--", alpha=0.9, lw=1.05, label="ref αy")
+        ax_baa.plot(time_states, np.degrees(alpha_lin_b_ref[:, 2]), "b--", alpha=0.9, lw=1.05, label="ref αz")
+    add_wp_lines(ax_baa)
+    ax_baa.set_xlabel("Time (s)", **tinfo)
+    ax_baa.set_ylabel("deg/s²", **tinfo)
+    ax_baa.set_title("Base angular acc (world)", fontsize=9)
+    ax_baa.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_baa.grid(True, alpha=0.3)
+
+    ax_ea = fig.add_subplot(gs[2, 3])
+    ax_ea.plot(time_states, ee_a[:, 0], "r-", label="ax")
+    ax_ea.plot(time_states, ee_a[:, 1], "g-", label="ay")
+    ax_ea.plot(time_states, ee_a[:, 2], "b-", label="az")
+    if ee_a_ref is not None:
+        ax_ea.plot(time_states, ee_a_ref[:, 0], "r--", alpha=0.9, lw=1.05, label="ref ax")
+        ax_ea.plot(time_states, ee_a_ref[:, 1], "g--", alpha=0.9, lw=1.05, label="ref ay")
+        ax_ea.plot(time_states, ee_a_ref[:, 2], "b--", alpha=0.9, lw=1.05, label="ref az")
+    add_wp_lines(ax_ea)
+    ax_ea.set_xlabel("Time (s)", **tinfo)
+    ax_ea.set_ylabel("m/s²", **tinfo)
+    ax_ea.set_title("EE linear acc (world)", fontsize=9)
+    ax_ea.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_ea.grid(True, alpha=0.3)
+
+    # Row 3: EE jerk / angular acc; joint angular acc; control rate norm
+    ax_ej = fig.add_subplot(gs[3, 0])
+    ax_ej.plot(time_states, ee_jerk[:, 0], "r-", label="jx")
+    ax_ej.plot(time_states, ee_jerk[:, 1], "g-", label="jy")
+    ax_ej.plot(time_states, ee_jerk[:, 2], "b-", label="jz")
+    if ee_jerk_ref is not None:
+        ax_ej.plot(time_states, ee_jerk_ref[:, 0], "r--", alpha=0.9, lw=1.05, label="ref jx")
+        ax_ej.plot(time_states, ee_jerk_ref[:, 1], "g--", alpha=0.9, lw=1.05, label="ref jy")
+        ax_ej.plot(time_states, ee_jerk_ref[:, 2], "b--", alpha=0.9, lw=1.05, label="ref jz")
+    add_wp_lines(ax_ej)
+    ax_ej.set_xlabel("Time (s)", **tinfo)
+    ax_ej.set_ylabel("m/s³", **tinfo)
+    ax_ej.set_title("EE linear jerk (world)", fontsize=9)
+    ax_ej.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_ej.grid(True, alpha=0.3)
+
+    ax_eaa = fig.add_subplot(gs[3, 1])
+    ax_eaa.plot(time_states, np.degrees(ee_alpha[:, 0]), "r-", label="αx")
+    ax_eaa.plot(time_states, np.degrees(ee_alpha[:, 1]), "g-", label="αy")
+    ax_eaa.plot(time_states, np.degrees(ee_alpha[:, 2]), "b-", label="αz")
+    if ee_alpha_ref is not None:
+        ax_eaa.plot(time_states, np.degrees(ee_alpha_ref[:, 0]), "r--", alpha=0.9, lw=1.05, label="ref αx")
+        ax_eaa.plot(time_states, np.degrees(ee_alpha_ref[:, 1]), "g--", alpha=0.9, lw=1.05, label="ref αy")
+        ax_eaa.plot(time_states, np.degrees(ee_alpha_ref[:, 2]), "b--", alpha=0.9, lw=1.05, label="ref αz")
+    add_wp_lines(ax_eaa)
+    ax_eaa.set_xlabel("Time (s)", **tinfo)
+    ax_eaa.set_ylabel("deg/s²", **tinfo)
+    ax_eaa.set_title("EE angular acc (world)", fontsize=9)
+    ax_eaa.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_eaa.grid(True, alpha=0.3)
+
+    ax_ja = fig.add_subplot(gs[3, 2])
+    if joint_alpha is not None:
+        ax_ja.plot(time_states, np.degrees(joint_alpha[:, 0]), "r-", label="j1 ddot")
+        ax_ja.plot(time_states, np.degrees(joint_alpha[:, 1]), "g-", label="j2 ddot")
+        if joint_alpha_ref is not None:
+            ax_ja.plot(time_states, np.degrees(joint_alpha_ref[:, 0]), "r--", alpha=0.9, lw=1.05, label="ref j1 ddot")
+            ax_ja.plot(time_states, np.degrees(joint_alpha_ref[:, 1]), "g--", alpha=0.9, lw=1.05, label="ref j2 ddot")
+    else:
+        ax_ja.text(0.5, 0.5, "Joint acc N/A\n(state < 17D)", ha="center", va="center", transform=ax_ja.transAxes)
+    add_wp_lines(ax_ja)
+    ax_ja.set_xlabel("Time (s)", **tinfo)
+    ax_ja.set_ylabel("deg/s²", **tinfo)
+    ax_ja.set_title("Arm joint angular acc", fontsize=9)
+    ax_ja.legend(loc="upper right", fontsize=6, framealpha=0.9)
+    ax_ja.grid(True, alpha=0.3)
+
+    ax_ud = fig.add_subplot(gs[3, 3])
+    if u_rate_norm is not None:
+        ax_ud.plot(time_controls, u_rate_norm, "k-", lw=1.1, label="‖du/dt‖")
+        ax_ud.legend(loc="upper right", fontsize=7)
+    else:
+        ax_ud.text(0.5, 0.5, "Control rate N/A", ha="center", va="center", transform=ax_ud.transAxes)
+    ax_ud.set_xlabel("Time (s)", **tinfo)
+    ax_ud.set_ylabel("‖du/dt‖", **tinfo)
+    ax_ud.set_title("Control effort rate", fontsize=9)
+    ax_ud.grid(True, alpha=0.3)
+
+    # Row 4–5: Arm & controls, paths & solver (was rows 2–3)
+    ax20 = fig.add_subplot(gs[4, 0])
     ax20.plot(time_states, np.degrees(simX[:, 7]), 'r-', label='j1')
     ax20.plot(time_states, np.degrees(simX[:, 8]), 'g-', label='j2')
     if refX_interp is not None and refX_interp.shape[1] >= 9:
@@ -379,7 +613,7 @@ def plot_acados_into_figure(
     ax20.set_title('Arm Joint Angles', fontsize=9)
     ax20.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-    ax21 = fig.add_subplot(gs[2, 1])
+    ax21 = fig.add_subplot(gs[4, 1])
     ax21.plot(time_states, np.degrees(simX[:, 15]), 'r-', label='j1_dot')
     ax21.plot(time_states, np.degrees(simX[:, 16]), 'g-', label='j2_dot')
     if refX_interp is not None and refX_interp.shape[1] >= 17:
@@ -391,8 +625,8 @@ def plot_acados_into_figure(
     ax21.set_title('Arm joint angular velocity', fontsize=9)
     ax21.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-    ax22 = fig.add_subplot(gs[2, 2])
-    ax23 = fig.add_subplot(gs[2, 3])
+    ax22 = fig.add_subplot(gs[4, 2])
+    ax23 = fig.add_subplot(gs[4, 3])
     if control_layout == "high_level" and simU.shape[1] >= 6:
         ax22.plot(time_controls, np.degrees(simU[:, 0]), 'r-', label='ωx')
         ax22.plot(time_controls, np.degrees(simU[:, 1]), 'g-', label='ωy')
@@ -447,7 +681,7 @@ def plot_acados_into_figure(
         ax23.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
     # Row 3
-    ax30 = fig.add_subplot(gs[3, 0])
+    ax30 = fig.add_subplot(gs[5, 0])
     ax30.plot(positions[:, 0], positions[:, 1], 'b-', linewidth=1.5, label='Base')
     ax30.plot(ee_pos[:, 0], ee_pos[:, 1], 'm--', linewidth=1.2, label='EE')
     if refX_interp is not None and refX_interp.shape[1] >= 3:
@@ -469,7 +703,7 @@ def plot_acados_into_figure(
     ax30.grid(True, alpha=0.3)
     ax30.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-    ax31 = fig.add_subplot(gs[3, 1])
+    ax31 = fig.add_subplot(gs[5, 1])
     ax31.plot(positions[:, 0], positions[:, 2], 'b-', linewidth=1.5, label='Base')
     ax31.plot(ee_pos[:, 0], ee_pos[:, 2], 'm--', linewidth=1.2, label='EE')
     if refX_interp is not None and refX_interp.shape[1] >= 3:
@@ -488,8 +722,8 @@ def plot_acados_into_figure(
     ax31.grid(True, alpha=0.3)
     ax31.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
-    ax32 = fig.add_subplot(gs[3, 2])
-    ax33 = fig.add_subplot(gs[3, 3])
+    ax32 = fig.add_subplot(gs[5, 2])
+    ax33 = fig.add_subplot(gs[5, 3])
 
     def _fill_footer_traj_opt(ax_cost, ax_time, meta: dict):
         backend = str(meta.get("backend") or "")

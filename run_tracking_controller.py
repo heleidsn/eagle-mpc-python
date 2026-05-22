@@ -81,7 +81,7 @@ from mavros_msgs.msg import State, AttitudeTarget, PositionTarget
 from mavros_msgs.srv import SetMode, SetModeRequest
 from gazebo_msgs.msg import ModelStates, ModelState
 from gazebo_msgs.srv import SetModelState, GetModelState, GetModelStateRequest
-from std_srvs.srv import Trigger, TriggerResponse
+from std_srvs.srv import SetBool, SetBoolResponse, Trigger, TriggerResponse
 from eagle_mpc_msgs.msg import MpcState
 
 # ── visualization ─────────────────────────────────────────────────────────────
@@ -365,6 +365,7 @@ class SuiteTrackingController:
         self._reg_target_locked: bool = False
         self._reg_xs_guess: Optional[List[np.ndarray]] = None
         self._reg_us_guess: Optional[List[np.ndarray]] = None
+        self.control_output_enabled = bool(rospy.get_param("~control_output_enabled", True))
 
         # ── 录制数据 ─────────────────────────────────────────────────────────
         self.recording_enabled = False
@@ -863,6 +864,14 @@ class SuiteTrackingController:
         rospy.Service("reset_to_initial", Trigger, self._svc_reset_to_initial)
         rospy.Service("set_regulation_target", Trigger, self._svc_set_regulation_target)
         rospy.Service("update_controller_params", Trigger, self._svc_update_controller_params)
+        rospy.Service("set_control_output_enabled", SetBool, self._svc_set_control_output_enabled)
+
+    def _svc_set_control_output_enabled(self, req: SetBool) -> SetBoolResponse:
+        self.control_output_enabled = bool(req.data)
+        state = "enabled" if self.control_output_enabled else "disabled"
+        msg = f"Control output {state}."
+        rospy.loginfo(msg)
+        return SetBoolResponse(success=True, message=msg)
 
     # =========================================================================
     # 状态回调（与 run_controller.py 逻辑相同）
@@ -964,9 +973,10 @@ class SuiteTrackingController:
             )
             if u_cmd is not None:
                 self._u_hold = u_cmd
-            self._publish_body_rate_thrust(self._u_hold, xs_next)
-            if self.arm_enabled:
-                self._publish_arm_cmd(xs_next)
+            if self.control_output_enabled:
+                self._publish_body_rate_thrust(self._u_hold, xs_next)
+                if self.arm_enabled:
+                    self._publish_arm_cmd(xs_next)
             self._publish_debug(0.0, solve_ms, x_ref_override=self._reg_target)
             # Regulation 模式下也追加实际路径（方便观察归位过程）
             self._append_uav_actual_path_point()
@@ -989,9 +999,10 @@ class SuiteTrackingController:
             self._u_hold = u_cmd
 
         # ── 发布控制指令 ──────────────────────────────────────────────────────
-        self._publish_body_rate_thrust(self._u_hold, xs_next)
-        if self.arm_enabled:
-            self._publish_arm_cmd(xs_next)
+        if self.control_output_enabled:
+            self._publish_body_rate_thrust(self._u_hold, xs_next)
+            if self.arm_enabled:
+                self._publish_arm_cmd(xs_next)
         self._publish_debug(t_elapsed, solve_ms)
 
         # ── RViz 可视化 ───────────────────────────────────────────────────────
@@ -1297,12 +1308,14 @@ class SuiteTrackingController:
                 acc_ref = np.zeros(3, dtype=float)
 
         if self.controller_mode == "px4":
-            self._publish_mavros_setpoint_raw(pos_ref, vel_ref, acc_ref, yaw_ref, 0.0)
+            if self.control_output_enabled:
+                self._publish_mavros_setpoint_raw(pos_ref, vel_ref, acc_ref, yaw_ref, 0.0)
         elif self.controller_mode == "geometric":
-            self._publish_geometric_bodyrate_thrust(pos_ref, vel_ref, acc_ref, yaw_ref)
+            if self.control_output_enabled:
+                self._publish_geometric_bodyrate_thrust(pos_ref, vel_ref, acc_ref, yaw_ref)
 
         # 机械臂维持参考轨迹角度
-        if self.arm_enabled:
+        if self.arm_enabled and self.control_output_enabled:
             self._publish_arm_cmd(x_ref)
 
         if self._regulating:
@@ -1945,6 +1958,7 @@ class SuiteTrackingController:
         try:
             with self._thread_lock:
                 self.trajectory_name = str(rospy.get_param("~trajectory_name", self.trajectory_name))
+                self.suite_plan_path = str(rospy.get_param("~suite_plan_path", self.suite_plan_path))
                 self._load_trajectory()
                 self._build_mpc()
                 self.arm_joint_number = self.mpc.robot_model.nq - 7
@@ -1968,7 +1982,8 @@ class SuiteTrackingController:
 
             msg = (
                 f"Trajectory reloaded: {len(self.t_plan)} points, "
-                f"mode={self.controller_mode}, regulation target reset."
+                f"mode={self.controller_mode}, suite_plan_path={self.suite_plan_path}, "
+                f"regulation target reset."
             )
             rospy.loginfo(f"[update_trajectory] {msg}")
             return TriggerResponse(True, msg)
