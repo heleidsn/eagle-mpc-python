@@ -23,7 +23,7 @@ geometric        : 节点内置 geometric controller（直接输出 body_rate + 
 参考轨迹来源（~trajectory_source）
 ──────────────────────────────────
 suite_npz        : 从 GUI 导出的 last_suite_plan.npz 加载 t_plan / x_plan
-yaml             : 使用 eagle_mpc_debugger temp_trajectory.yaml 求解结果
+yaml             : 使用本包 config/yaml/trajectories/temp_trajectory.yaml 求解结果
 
 发布/订阅接口（与 run_controller.py 保持一致）
 ──────────────────────────────────────────────
@@ -40,14 +40,14 @@ yaml             : 使用 eagle_mpc_debugger temp_trajectory.yaml 求解结果
 使用示例
 ────────
 # Gazebo 仿真（从 GUI npz 加载轨迹，全状态 Crocoddyl 跟踪）
-rosrun eagle_mpc_debugger run_tracking_controller.py \\
+rosrun eagle_mpc_python run_tracking_controller.py \\
     _trajectory_source:=suite_npz \\
     _suite_plan_path:=/path/to/last_suite_plan.npz \\
     _controller_mode:=croc_full_state \\
     _odom_source:=gazebo
 
 # 实机（从 YAML 加载，EE 位姿跟踪）
-rosrun eagle_mpc_debugger run_tracking_controller.py \\
+rosrun eagle_mpc_python run_tracking_controller.py \\
     _controller_mode:=croc_ee_pose \\
     _odom_source:=mavros \\
     _dt_mpc:=0.05 \\
@@ -171,15 +171,13 @@ def _load_suite_npz(path: str) -> Dict[str, Any]:
 
 
 def _load_yaml_trajectory(dt_traj_opt_ms: int, use_squash: bool = True):
-    """Load + solve trajectory from eagle_mpc_debugger temp_trajectory.yaml."""
+    """Load + solve trajectory from this package's temp_trajectory.yaml."""
     try:
-        import rospkg
         import yaml
         import eagle_mpc
 
-        rospack = rospkg.RosPack()
-        pkg = rospack.get_path("eagle_mpc_debugger")
-        yaml_path = os.path.join(pkg, "config/yaml/trajectories/temp_trajectory.yaml")
+        root = Path(__file__).resolve().parent
+        yaml_path = str(root / "config" / "yaml" / "trajectories" / "temp_trajectory.yaml")
 
         traj = eagle_mpc.Trajectory()
         traj.autoSetup(yaml_path)

@@ -328,7 +328,7 @@ def _migrate_mixed_wp_rows_v1_to_v2(rows: list) -> list:
 
 def _predict_gazebo_spawn_sdf_path(launch_file: str, model_type: str) -> tuple[str | None, str]:
     """
-    For eagle_mpc_debugger SITL launches, resolve the SDF file that spawn_model / PX4 will use.
+    For eagle_mpc_python SITL launches, resolve the SDF file that spawn_model / PX4 will use.
     Paths follow the <arg name="sdf" / "sdf_file"> rules in those launch files.
     """
     lf = Path(launch_file).name.lower()
@@ -353,7 +353,7 @@ def _predict_gazebo_spawn_sdf_path(launch_file: str, model_type: str) -> tuple[s
         )
     try:
         proc = subprocess.run(
-            ["rospack", "find", "eagle_mpc_debugger"],
+            ["rospack", "find", "eagle_mpc_python"],
             capture_output=True,
             text=True,
             timeout=6.0,
@@ -363,7 +363,7 @@ def _predict_gazebo_spawn_sdf_path(launch_file: str, model_type: str) -> tuple[s
         return None, f"Could not run rospack ({e!r}). Source ROS workspace, then retry."
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
-        return None, f"rospack find eagle_mpc_debugger failed: {err or proc.returncode}"
+        return None, f"rospack find eagle_mpc_python failed: {err or proc.returncode}"
     root = Path(proc.stdout.strip())
     full = (root / rel).resolve()
     hint = "ok" if full.is_file() else "path computed but file not found (check package install)"
@@ -2668,8 +2668,8 @@ class UamSuiteGUI(QMainWindow):
         gz.addWidget(QLabel("Package"), 0, 0)
         self.gz_pkg_combo = QComboBox()
         self.gz_pkg_combo.setEditable(True)
-        self.gz_pkg_combo.addItems(["eagle_mpc_debugger"])
-        self.gz_pkg_combo.setCurrentText("eagle_mpc_debugger")
+        self.gz_pkg_combo.addItems(["eagle_mpc_python"])
+        self.gz_pkg_combo.setCurrentText("eagle_mpc_python")
         gz.addWidget(self.gz_pkg_combo, 0, 1)
         gz.addWidget(QLabel("Launch file"), 1, 0)
         self.gz_launch_combo = QComboBox()
@@ -2777,15 +2777,15 @@ class UamSuiteGUI(QMainWindow):
 
         # 仅依赖 Gazebo + PX4 SITL + MAVROS 的一键起飞（无需 MPC 跟踪节点）
         gz_takeoff_row = QHBoxLayout()
-        self.rn_gz_takeoff_btn = QPushButton("Takeoff 1m (OFFBOARD)")
+        self.rn_gz_takeoff_btn = QPushButton("Takeoff 1m (AUTO)")
         self.rn_gz_takeoff_btn.setStyleSheet(
             "QPushButton { font-weight: bold; background-color: #1565c0; color: white; }"
         )
         self.rn_gz_takeoff_btn.setToolTip(
             "仅需 Gazebo + PX4 SITL + MAVROS：\n"
-            "持续发布 OFFBOARD 本地位置设定点(z=1m)，自动切 OFFBOARD 并解锁，\n"
-            "起飞并悬停到当前 x,y 上方 1 米。\n"
-            "（与 MPC 跟踪节点无关，可在仅启动 Gazebo 后直接使用；Disarm 停止设定点流。）"
+            "使用 PX4 AUTO.TAKEOFF 模式一次性解锁并起飞到约 1 米后自动 LOITER 悬停。\n"
+            "不占用 OFFBOARD、不持续发流，因此不会与后续 MPC 的 OFFBOARD 接管冲突。\n"
+            "（可在仅启动 Gazebo / PX4 SITL 后直接使用。）"
         )
         self.rn_gz_takeoff_btn.clicked.connect(lambda: self._call_gazebo_takeoff(1.0))
         gz_takeoff_row.addWidget(self.rn_gz_takeoff_btn)
@@ -4708,13 +4708,13 @@ class UamSuiteGUI(QMainWindow):
             if hasattr(self, "gz_model_combo"):
                 self.gz_model_combo.setCurrentText("s500")
             if hasattr(self, "gz_pkg_combo") and not self.gz_pkg_combo.currentText().strip():
-                self.gz_pkg_combo.setCurrentText("eagle_mpc_debugger")
+                self.gz_pkg_combo.setCurrentText("eagle_mpc_python")
         else:
             self.gz_launch_combo.setCurrentText("s500_uam_sitl.launch")
             if hasattr(self, "gz_model_combo"):
                 self.gz_model_combo.setCurrentText("s500_uam")
             if hasattr(self, "gz_pkg_combo") and not self.gz_pkg_combo.currentText().strip():
-                self.gz_pkg_combo.setCurrentText("eagle_mpc_debugger")
+                self.gz_pkg_combo.setCurrentText("eagle_mpc_python")
 
     def _apply_task_to_planning(self, emit_log: bool = True) -> None:
         robot = self.task_robot_combo.currentText()
@@ -7495,8 +7495,17 @@ class UamSuiteGUI(QMainWindow):
                 "[Gazebo] Note: extra args may override the default SDF; "
                 "the path above matches the launch file defaults only."
             )
+        # 把本项目 models/ 目录加入 GAZEBO_MODEL_PATH，使 SDF 里的 model://s500_uam
+        # 等 mesh 资源能被解析，不再依赖 eagle_mpc_debugger 的环境设置。
+        gz_env = os.environ.copy()
+        models_dir = str((Path(__file__).resolve().parent / "models").resolve())
+        prev_model_path = gz_env.get("GAZEBO_MODEL_PATH", "")
+        if models_dir not in prev_model_path.split(os.pathsep):
+            gz_env["GAZEBO_MODEL_PATH"] = (
+                models_dir + (os.pathsep + prev_model_path if prev_model_path else "")
+            )
         try:
-            self._gazebo_process = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), env=os.environ.copy())
+            self._gazebo_process = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), env=gz_env)
             self.log(f"Started Gazebo: {' '.join(cmd)} (PID={self._gazebo_process.pid})")
         except Exception as e:
             QMessageBox.critical(self, "Launch failed", str(e)[:2000])
@@ -8153,20 +8162,15 @@ class UamSuiteGUI(QMainWindow):
 
             QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
 
-        # 上锁同时停止一键起飞的 OFFBOARD 设定点流（若在运行）
-        if not arm:
-            evt = getattr(self, "_offboard_stop_evt", None)
-            if evt is not None:
-                evt.set()
-
         threading.Thread(target=_call, daemon=True).start()
 
     def _call_gazebo_takeoff(self, target_z: float = 1.0) -> None:
-        """仅依赖 Gazebo + PX4 SITL + MAVROS 的一键起飞。
+        """仅依赖 Gazebo + PX4 SITL + MAVROS 的一键起飞（PX4 AUTO.TAKEOFF）。
 
-        持续发布 OFFBOARD 本地位置设定点 (z=target_z)，切 OFFBOARD 模式并解锁，
-        使无人机起飞并悬停到当前 x,y 上方 target_z 米。与 MPC 跟踪节点无关，
-        可在仅启动 Gazebo / PX4 SITL 后直接使用。Disarm 会停止设定点流。
+        使用 PX4 内置的 AUTO.TAKEOFF 模式：设定起飞高度参数 → 解锁 → 切
+        AUTO.TAKEOFF。这是一次性指令，PX4 自主爬升到目标高度后会自动转入
+        AUTO.LOITER 悬停。**不占用 OFFBOARD、不持续发布设定点流**，因此不会
+        与后续 MPC 的 OFFBOARD 接管产生冲突。可在仅启动 Gazebo / PX4 SITL 后使用。
         """
         import threading
         from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
@@ -8174,103 +8178,63 @@ class UamSuiteGUI(QMainWindow):
         def _log(msg):
             QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
 
-        # 已有起飞流在运行：仅更新目标高度，避免重复启动
-        thr = getattr(self, "_offboard_stream_thread", None)
-        if thr is not None and thr.is_alive():
-            self._offboard_target_z = float(target_z)
-            self.log(f"[takeoff] OFFBOARD 设定点流已在运行，更新目标高度为 {target_z:.2f} m。")
-            return
-
         if not self._ensure_ros_node():
             QMessageBox.warning(
                 self, "Notice", "ROS master 不可用，请先启动 Gazebo / PX4 SITL。"
             )
             return
 
-        self._offboard_target_z = float(target_z)
-        self._offboard_stop_evt = threading.Event()
-        stop_evt = self._offboard_stop_evt
-
         def _run():
             try:
                 import rospy
-                from geometry_msgs.msg import PoseStamped
-                from mavros_msgs.srv import SetMode, CommandBool
+                from mavros_msgs.srv import SetMode, CommandBool, ParamSet
+                from mavros_msgs.msg import ParamValue
             except Exception as e:
                 _log(f"[takeoff] import 失败: {e}")
                 return
 
-            # 起飞水平位置取当前 EKF 本地位置（无则 0,0）
-            tx, ty = 0.0, 0.0
-            lp = getattr(self, "_mav_local_pose", None)
-            if lp is not None:
-                tx = float(lp.pose.position.x)
-                ty = float(lp.pose.position.y)
-
-            pub = rospy.Publisher(
-                "/mavros/setpoint_position/local", PoseStamped, queue_size=10
-            )
-
-            def _make_sp():
-                sp = PoseStamped()
-                sp.header.frame_id = "map"
-                sp.header.stamp = rospy.Time.now()
-                sp.pose.position.x = tx
-                sp.pose.position.y = ty
-                sp.pose.position.z = float(self._offboard_target_z)
-                sp.pose.orientation.w = 1.0
-                return sp
-
-            rate = rospy.Rate(20.0)
-
-            # 1) 预热：切 OFFBOARD 前必须已经在持续发送设定点（PX4 要求）
-            _log(
-                f"[takeoff] 预热设定点流 (x={tx:.2f}, y={ty:.2f}, "
-                f"z={self._offboard_target_z:.2f}) ..."
-            )
-            for _ in range(40):
-                if stop_evt.is_set():
-                    return
-                pub.publish(_make_sp())
-                rate.sleep()
-
-            # 2) 切 OFFBOARD
+            # 1) 设置 PX4 起飞高度参数 MIS_TAKEOFF_ALT（米，相对起飞点）
             try:
-                rospy.wait_for_service("/mavros/set_mode", timeout=3.0)
-                set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
-                r = set_mode(base_mode=0, custom_mode="OFFBOARD")
+                rospy.wait_for_service("/mavros/param/set", timeout=3.0)
+                param_set = rospy.ServiceProxy("/mavros/param/set", ParamSet)
+                val = ParamValue(integer=0, real=float(target_z))
+                r = param_set(param_id="MIS_TAKEOFF_ALT", value=val)
                 _log(
-                    f"[takeoff] set OFFBOARD "
-                    f"{'OK' if getattr(r, 'mode_sent', False) else 'FAIL'}"
+                    f"[takeoff] set MIS_TAKEOFF_ALT={target_z:.2f}m "
+                    f"{'OK' if getattr(r, 'success', False) else 'FAIL'}"
                 )
             except Exception as e:
-                _log(f"[takeoff] set OFFBOARD ERROR: {e}")
+                _log(f"[takeoff] set MIS_TAKEOFF_ALT ERROR（忽略，继续）: {e}")
 
-            # 3) 解锁
+            # 2) 解锁
             try:
                 rospy.wait_for_service("/mavros/cmd/arming", timeout=3.0)
                 arming = rospy.ServiceProxy("/mavros/cmd/arming", CommandBool)
                 r = arming(value=True)
-                _log(
-                    f"[takeoff] arm "
-                    f"{'OK' if getattr(r, 'success', False) else 'FAIL'}"
-                )
+                if not getattr(r, "success", False):
+                    _log("[takeoff] arm FAIL（请检查是否满足解锁条件）")
+                    return
+                _log("[takeoff] arm OK")
             except Exception as e:
                 _log(f"[takeoff] arm ERROR: {e}")
+                return
 
-            _log(
-                f"[takeoff] 持续悬停于 z={self._offboard_target_z:.2f} m"
-                f"（点击 Disarm 停止设定点流）。"
-            )
+            # 3) 切 AUTO.TAKEOFF（一次性，PX4 自主爬升后自动转 LOITER）
+            try:
+                rospy.wait_for_service("/mavros/set_mode", timeout=3.0)
+                set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
+                r = set_mode(base_mode=0, custom_mode="AUTO.TAKEOFF")
+                ok = bool(getattr(r, "mode_sent", False))
+                _log(f"[takeoff] set AUTO.TAKEOFF {'OK' if ok else 'FAIL'}")
+                if ok:
+                    _log(
+                        f"[takeoff] 已触发自主起飞到约 {target_z:.2f} m，"
+                        "到达后 PX4 自动 LOITER 悬停（未占用 OFFBOARD）。"
+                    )
+            except Exception as e:
+                _log(f"[takeoff] set AUTO.TAKEOFF ERROR: {e}")
 
-            # 4) 持续发布以维持 OFFBOARD（PX4 要求 >2Hz 设定点流）
-            while not stop_evt.is_set() and not rospy.is_shutdown():
-                pub.publish(_make_sp())
-                rate.sleep()
-            _log("[takeoff] OFFBOARD 设定点流已停止。")
-
-        self._offboard_stream_thread = threading.Thread(target=_run, daemon=True)
-        self._offboard_stream_thread.start()
+        threading.Thread(target=_run, daemon=True).start()
 
     def _set_node_service_buttons_enabled(self, enabled: bool) -> None:
         """Enable/disable all ROS-node-dependent service buttons in one place."""
