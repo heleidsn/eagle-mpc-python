@@ -22,6 +22,8 @@ import sys
 import tempfile
 import traceback
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +42,7 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -58,13 +61,70 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
-DEFAULT_PARAMS_PATH = Path(__file__).resolve().with_name("uam_suite_gui_params.json")
+APP_NAME = "UAM Flight Studio"
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "uam_suite_icon.png"
+
+# Local GUI state/cache files are consolidated under a single hidden directory to
+# keep the working tree tidy. Legacy files at the repo root are migrated on first run.
+GUI_STATE_DIR = Path(__file__).resolve().parent / ".gui_state"
+
+
+def _gui_state_path(filename: str) -> Path:
+    """Return path under .gui_state/, migrating a legacy root-level file if present."""
+    GUI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    new_path = GUI_STATE_DIR / filename
+    legacy_path = Path(__file__).resolve().with_name(filename)
+    if (not new_path.exists()) and legacy_path.exists():
+        try:
+            legacy_path.replace(new_path)
+        except Exception:
+            try:
+                new_path.write_bytes(legacy_path.read_bytes())
+            except Exception:
+                return legacy_path
+    return new_path
+
+
+DEFAULT_PARAMS_PATH = _gui_state_path("uam_suite_gui_params.json")
+LAST_SESSION_PATH = _gui_state_path("uam_suite_gui_last_session.json")
+
+
+def _app_icon():
+    """Return the application QIcon if the asset exists, else None."""
+    try:
+        from PyQt5.QtGui import QIcon
+
+        if APP_ICON_PATH.exists():
+            return QIcon(str(APP_ICON_PATH))
+    except Exception:
+        pass
+    return None
+SAVED_TRAJECTORIES_DIR = Path(__file__).resolve().parent / "saved_trajectories"
+SAVED_TRAJECTORIES_INDEX = SAVED_TRAJECTORIES_DIR / "index.json"
+AUTOSAVE_TRAJECTORY_ID = "__autosave__"  # legacy single-slot id (migration only)
+
+
+def _plan_slot_autosave_id(robot: str, template_id: str) -> str:
+    """每个 robot + template 各有一个自动保存槽位。"""
+    return f"__autosave___{_safe_name_token(robot)}_{_safe_name_token(template_id)}"
+TEMPLATE_DISPLAY_NAMES_PATH = _gui_state_path("template_display_names.json")
+USER_TEMPLATES_PATH = _gui_state_path("user_templates.json")
+TEMPLATE_CONTROL_POINTS_PATH = _gui_state_path("template_control_points.json")
+# 每个 ROS tracking 控制算法各自维护一套 MPC/控制器参数（持久化，跨重启）。
+RN_CONTROLLER_PROFILES_PATH = _gui_state_path("ros_tracking_controller_profiles.json")
+
+# Matplotlib 字号倍率（4K 屏自动放大，可用 UAM_PLOT_SCALE 覆盖）
+_MPL_FONT_SCALE = 1.0
+
+# 左侧 Planning 面板：按 plan_mode 固定滚动区高度，避免切换 Trajectory template 时跳动。
+_PLAN_PATH_SCROLL_H = {0: 400, 1: 340, 2: 420}  # full-state / EE / acc
+_PLAN_OPT_SCROLL_H = {0: 380, 1: 0, 2: 180}  # 第 2 组滚动区高度（full-state / acc）
 
 TAB_PLAN = "planning"
 TAB_TRACK = "tracking"
@@ -320,6 +380,193 @@ def _safe_name_token(text: str) -> str:
             out.append("_")
     tok = "".join(out).strip("_")
     return tok or "trajectory"
+
+
+def _mpl_pt(pt: float) -> float:
+    return float(pt) * _MPL_FONT_SCALE
+
+
+def _detect_plot_font_scale(app) -> float:
+    """4K 屏自动放大绘图字号；可用环境变量 UAM_PLOT_SCALE 覆盖。"""
+    env = os.environ.get("UAM_PLOT_SCALE", "").strip()
+    if env:
+        try:
+            return max(0.8, min(3.0, float(env)))
+        except ValueError:
+            pass
+    screen = app.primaryScreen() if app is not None else None
+    if screen is None:
+        return 1.0
+    try:
+        dpr = float(screen.devicePixelRatio())
+        phys_w = screen.geometry().width() * dpr
+        if phys_w >= 3200:
+            return 1.5
+        if phys_w >= 2560:
+            return 1.35
+    except Exception:
+        pass
+    return 1.0
+
+
+def _load_saved_trajectory_index() -> dict:
+    if not SAVED_TRAJECTORIES_INDEX.is_file():
+        return {"version": 1, "last_loaded_id": None, "items": {}}
+    try:
+        data = json.loads(SAVED_TRAJECTORIES_INDEX.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("index root must be object")
+        data.setdefault("version", 1)
+        data.setdefault("last_loaded_id", None)
+        items = data.get("items")
+        if isinstance(items, list):
+            data["items"] = {str(it.get("id")): it for it in items if isinstance(it, dict) and it.get("id")}
+        elif not isinstance(items, dict):
+            data["items"] = {}
+        return data
+    except Exception:
+        return {"version": 1, "last_loaded_id": None, "items": {}}
+
+
+def _load_template_display_names() -> dict[str, str]:
+    if not TEMPLATE_DISPLAY_NAMES_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(TEMPLATE_DISPLAY_NAMES_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if v}
+    except Exception:
+        return {}
+
+
+def _write_template_display_names(names: dict[str, str]) -> None:
+    TEMPLATE_DISPLAY_NAMES_PATH.write_text(
+        json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _load_user_templates() -> dict[str, dict]:
+    if not USER_TEMPLATES_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(USER_TEMPLATES_PATH.read_text(encoding="utf-8"))
+        items = data.get("items") if isinstance(data, dict) else None
+        if isinstance(items, dict):
+            return {str(k): v for k, v in items.items() if isinstance(v, dict)}
+        return {}
+    except Exception:
+        return {}
+
+
+def _write_user_templates(items: dict[str, dict]) -> None:
+    USER_TEMPLATES_PATH.write_text(
+        json.dumps({"version": 1, "items": items}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _load_template_control_points() -> dict[str, dict]:
+    if not TEMPLATE_CONTROL_POINTS_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(TEMPLATE_CONTROL_POINTS_PATH.read_text(encoding="utf-8"))
+        items = data.get("items") if isinstance(data, dict) else None
+        if isinstance(items, dict):
+            return {str(k): v for k, v in items.items() if isinstance(v, dict)}
+        return {}
+    except Exception:
+        return {}
+
+
+def _write_template_control_points(items: dict[str, dict]) -> None:
+    TEMPLATE_CONTROL_POINTS_PATH.write_text(
+        json.dumps({"version": 1, "items": items}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _write_saved_trajectory_index(index: dict) -> None:
+    SAVED_TRAJECTORIES_DIR.mkdir(parents=True, exist_ok=True)
+    SAVED_TRAJECTORIES_INDEX.write_text(
+        json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _saved_trajectory_paths(traj_id: str) -> tuple[Path, Path]:
+    stem = SAVED_TRAJECTORIES_DIR / _safe_name_token(traj_id)
+    return stem.with_suffix(".npz"), stem.with_suffix(".meta.json")
+
+
+def _plan_bundle_meta_fields(pb: dict) -> dict:
+    meta: dict = {"kind": str(pb.get("kind", ""))}
+    for key in (
+        "velocity_frame",
+        "ee_track_kind",
+        "plan_mixed_wp_rows",
+        "waypoints",
+        "t_wp",
+    ):
+        if key in pb and pb[key] is not None:
+            meta[key] = pb[key]
+    return meta
+
+
+def _json_safe(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (float, int, str, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _write_plan_bundle_files(traj_id: str, pb: dict, entry_meta: dict) -> None:
+    SAVED_TRAJECTORIES_DIR.mkdir(parents=True, exist_ok=True)
+    npz_path, meta_path = _saved_trajectory_paths(traj_id)
+    arrays: dict[str, np.ndarray] = {}
+    for key, val in pb.items():
+        if val is None or key in ("plan_mixed_wp_rows", "waypoints", "t_wp"):
+            continue
+        if isinstance(val, np.ndarray):
+            arrays[key] = np.asarray(val)
+    np.savez_compressed(npz_path, **arrays)
+    meta = _json_safe(dict(entry_meta))
+    meta.update(_json_safe(_plan_bundle_meta_fields(pb)))
+    meta["id"] = traj_id
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _read_plan_bundle_files(traj_id: str) -> dict | None:
+    npz_path, meta_path = _saved_trajectory_paths(traj_id)
+    if not npz_path.is_file() or not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        data = np.load(npz_path, allow_pickle=False)
+        pb: dict = {}
+        for key in ("kind", "velocity_frame", "ee_track_kind"):
+            if key in meta:
+                pb[key] = meta[key]
+        for key in ("plan_mixed_wp_rows", "waypoints", "t_wp"):
+            if key in meta and meta[key] is not None:
+                val = meta[key]
+                if key == "waypoints" and isinstance(val, list):
+                    pb[key] = np.asarray(val, dtype=float)
+                elif key == "t_wp" and isinstance(val, list):
+                    pb[key] = np.asarray(val, dtype=float)
+                else:
+                    pb[key] = val
+        for key in data.files:
+            pb[key] = np.asarray(data[key])
+        if "kind" not in pb and meta.get("kind"):
+            pb["kind"] = meta["kind"]
+        return pb
+    except Exception:
+        return None
 
 
 def build_ee_ref_from_full_state(
@@ -797,6 +1044,51 @@ class TrackCrocAlongPlanWorker(QThread):
             self.finished.emit(False, traceback.format_exc(), None)
 
 
+class TrackAcadosAlongPlanWorker(QThread):
+    finished = pyqtSignal(bool, str, object)
+
+    def __init__(self, params: dict):
+        super().__init__()
+        self.params = params
+
+    def run(self):
+        try:
+            from s500_uam_acados_state_tracking_mpc import (
+                acados_closed_loop_to_ee_tracking_res,
+                run_closed_loop_track_full_state_plan_acados,
+            )
+
+            p = self.params
+            out = run_closed_loop_track_full_state_plan_acados(
+                p["x0"],
+                p["t_plan"],
+                p["x_plan"],
+                p["T_sim"],
+                p["sim_dt"],
+                p["control_dt"],
+                p["dt_mpc"],
+                p["N"],
+                w_pos=p.get("w_pos", 1.0),
+                w_att=p.get("w_att", 1.0),
+                w_joint=p.get("w_joint", 1.0),
+                w_vel=p.get("w_vel", 1.0),
+                w_omega=p.get("w_omega", 1.0),
+                w_joint_vel=p.get("w_joint_vel", 1.0),
+                w_control=p.get("w_control", 1e-3),
+                w_u_thrust=p.get("w_u_thrust", 1.0),
+                w_u_joint_torque=p.get("w_u_joint_torque", 1.0),
+                w_state_track=p.get("w_state_track", 10.0),
+                w_terminal_track=p.get("w_terminal_track", 100.0),
+                mpc_max_iter=p.get("mpc_max_iter", 40),
+                mpc_log_interval=p.get("mpc_log_interval", 0),
+                control_mode=p.get("control_mode", "direct"),
+            )
+            res = acados_closed_loop_to_ee_tracking_res(out)
+            self.finished.emit(True, "", {"out": out, "res": res, "control_mode": p.get("control_mode", "direct")})
+        except Exception:
+            self.finished.emit(False, traceback.format_exc(), None)
+
+
 class TrackEeAcadosWorker(QThread):
     finished = pyqtSignal(bool, str, object)
 
@@ -1096,6 +1388,7 @@ class UamSuiteGUI(QMainWindow):
         self._params_path: Path = DEFAULT_PARAMS_PATH
         self._last_plan_sorted_wp_rows: list | None = None
         self._gazebo_process = None
+        self._viz_process = None
         self._task_trajectories = {
             "s500_uam": [
                 "full_state_default",
@@ -1114,6 +1407,9 @@ class UamSuiteGUI(QMainWindow):
                 "acc_track",
             ],
         }
+        self._template_display_names: dict[str, str] = _load_template_display_names()
+        self._user_templates: dict[str, dict] = _load_user_templates()
+        self._template_control_points: dict[str, dict] = _load_template_control_points()
 
         try:
             from s500_uam_trajectory_gui import (
@@ -1169,6 +1465,18 @@ class UamSuiteGUI(QMainWindow):
         self._load_params_from_path(self._params_path, silent_if_missing=True)
         # Ensure UI sections match current default/loaded task selection on startup.
         self._refresh_task_selection_ui()
+        self._refresh_saved_trajectory_combo()
+        self._try_restore_last_saved_trajectory()
+        self._restore_last_session_selection()
+        self.log(
+            "Tracking: 4 modes — Croc/Acados full-state plan (需 Full state 规划), "
+            "Acados EE-centric, Croc EE pose."
+        )
+        if not self._EE_MPC_OK:
+            self.log(
+                "Acados tracking 不可用（缺 acados/pinocchio 或 DEPS）；"
+                "「Acados — full-state plan」与「Acados — EE-centric」将灰显。"
+            )
 
     def _init_croc_planner(self):
         if not self._CROCODDYL_AVAILABLE:
@@ -1223,8 +1531,12 @@ class UamSuiteGUI(QMainWindow):
         return x0
 
     def _build_ui(self):
-        self.setWindowTitle("S500 / S500-UAM — Planning + Tracking Overview")
-        self.resize(1680, 960)
+        self.setWindowTitle(f"{APP_NAME} — Plan · Track · Fly")
+        _icon = _app_icon()
+        if _icon is not None:
+            self.setWindowIcon(_icon)
+        # 初始大小不超过标准 1080p；最终会由 _fit_window_to_screen() 按屏幕再夹紧。
+        self.resize(1600, 900)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1244,7 +1556,9 @@ class UamSuiteGUI(QMainWindow):
         plan_top_layout.setContentsMargins(0, 0, 0, 0)
         plan_splitter.addWidget(plan_top)
 
-        self.task_group = QGroupBox("Task configuration")
+        # Group 1: robot + trajectory template + path editing (waypoints / curves).
+        self.task_group = QGroupBox("1. Task settings")
+        task_outer = QVBoxLayout()
         tg = QGridLayout()
         tg.addWidget(QLabel("Robot mode"), 0, 0)
         self.task_robot_combo = QComboBox()
@@ -1252,22 +1566,51 @@ class UamSuiteGUI(QMainWindow):
         self.task_robot_combo.setCurrentIndex(1)
         tg.addWidget(self.task_robot_combo, 0, 1)
         tg.addWidget(QLabel("Trajectory template"), 1, 0)
+        traj_pick_row = QHBoxLayout()
         self.task_traj_combo = QComboBox()
-        tg.addWidget(self.task_traj_combo, 1, 1)
-        tg.addWidget(QLabel("Sampling dt [s]"), 2, 0)
-        self.dt_plan = QDoubleSpinBox()
-        self.dt_plan.setRange(0.001, 0.5)
-        self.dt_plan.setValue(0.02)
-        tg.addWidget(self.dt_plan, 2, 1)
+        traj_pick_row.addWidget(self.task_traj_combo, 1)
+        self.new_template_btn = QPushButton("New")
+        self.new_template_btn.setToolTip("基于当前所有配置新建一个自定义 Trajectory template（保存当前参数快照）。")
+        self.new_template_btn.clicked.connect(self._create_template_from_current)
+        traj_pick_row.addWidget(self.new_template_btn)
+        self.rename_template_btn = QPushButton("Rename")
+        self.rename_template_btn.setToolTip("重命名当前 Trajectory template 在下拉框中的显示名称（不改变模板类型）。")
+        self.rename_template_btn.clicked.connect(self._rename_current_trajectory_template)
+        traj_pick_row.addWidget(self.rename_template_btn)
+        self.delete_template_btn = QPushButton("Delete")
+        self.delete_template_btn.setToolTip("删除当前选中的自定义 template（内置 template 不可删除）。")
+        self.delete_template_btn.clicked.connect(self._delete_current_user_template)
+        traj_pick_row.addWidget(self.delete_template_btn)
+        traj_pick_widget = QWidget()
+        traj_pick_widget.setLayout(traj_pick_row)
+        tg.addWidget(traj_pick_widget, 1, 1)
         self.task_hint_label = QLabel("")
         self.task_hint_label.setWordWrap(True)
         self.task_hint_label.setStyleSheet("color: palette(mid);")
-        tg.addWidget(self.task_hint_label, 3, 0, 1, 2)
+        tg.addWidget(self.task_hint_label, 2, 0, 1, 2)
         self.task_robot_combo.currentTextChanged.connect(self._on_task_robot_changed)
-        self.task_traj_combo.currentTextChanged.connect(self._on_task_traj_changed)
-        self.task_group.setLayout(tg)
+        self.task_traj_combo.currentIndexChanged.connect(
+            lambda _idx: self._on_task_traj_changed()
+        )
+        task_outer.addLayout(tg)
+        self.path_stack = QStackedWidget()
+        self.path_scroll = self._make_plan_panel_scroll(self.path_stack)
+        task_outer.addWidget(self.path_scroll)
+        cp_row = QHBoxLayout()
+        cp_row.addStretch(1)
+        self.save_control_points_btn = QPushButton("Save control points")
+        self.save_control_points_btn.setToolTip(
+            "保存当前 Trajectory template 的控制点参数（航点/曲线/加速度配置）。\n"
+            "下次选择该 robot + template 时自动恢复这些控制点。"
+        )
+        self.save_control_points_btn.clicked.connect(self._save_template_control_points)
+        cp_row.addWidget(self.save_control_points_btn)
+        task_outer.addLayout(cp_row)
+        self.task_group.setLayout(task_outer)
         self.task_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         plan_top_layout.addWidget(self.task_group)
+        # Backward-compatible alias (path editing stack).
+        self.plan_stack = self.path_stack
 
         self.plan_mode_combo = QComboBox()
         self.plan_mode_combo.addItems(
@@ -1276,19 +1619,24 @@ class UamSuiteGUI(QMainWindow):
         self.plan_mode_combo.setCurrentIndex(0)
         self.plan_mode_combo.currentIndexChanged.connect(self._on_plan_mode)
 
-        self.traj_group = QGroupBox("Trajectory setting")
+        # Group 2: trajectory / solver settings (dt, method, optional optimization params).
+        self.traj_group = QGroupBox("2. Trajectory setting")
         traj_layout = QVBoxLayout()
-        self.plan_stack = QStackedWidget()
-        self.plan_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        traj_layout.addWidget(self.plan_stack)
-        self.traj_group.setLayout(traj_layout)
-        plan_top_layout.addWidget(self.traj_group)
 
-        # Stack 0: full state
-        w_full = QWidget()
-        g_full = QVBoxLayout(w_full)
+        dt_row = QHBoxLayout()
+        dt_row.addWidget(QLabel("Sampling dt [s]"))
+        self.dt_plan = QDoubleSpinBox()
+        self.dt_plan.setRange(0.001, 0.5)
+        self.dt_plan.setValue(0.02)
+        dt_row.addWidget(self.dt_plan)
+        dt_row.addStretch(1)
+        traj_layout.addLayout(dt_row)
 
-        method_row = QHBoxLayout()
+        # Optimization method selector (pulled out of the full-state stack so it is
+        # always an explicit step right after the trajectory choice).
+        self.method_row_widget = QWidget()
+        method_row = QHBoxLayout(self.method_row_widget)
+        method_row.setContentsMargins(0, 0, 0, 0)
         self.method_combo = QComboBox()
         self._method_ids: list[str] = []
         if self._CROCODDYL_AVAILABLE:
@@ -1308,11 +1656,21 @@ class UamSuiteGUI(QMainWindow):
             self.method_combo.addItem("(No solver available)")
             self._method_ids.append("none")
         method_row.addWidget(QLabel("Method"))
-        method_row.addWidget(self.method_combo)
-        g_full.addLayout(method_row)
+        method_row.addWidget(self.method_combo, 1)
+        traj_layout.addWidget(self.method_row_widget)
         self.method_combo.currentIndexChanged.connect(
             self._refresh_plan_actuator_taus_enabled
         )
+
+        self.opt_stack = QStackedWidget()
+        self.opt_scroll = self._make_plan_panel_scroll(self.opt_stack)
+        traj_layout.addWidget(self.opt_scroll)
+        self.traj_group.setLayout(traj_layout)
+        plan_top_layout.addWidget(self.traj_group)
+
+        # Path stack 0: full-state waypoints
+        w_full_path = QWidget()
+        g_full = QVBoxLayout(w_full_path)
 
         self._wp_type_help_label = QLabel(
             "Columns j1/roll, j2/pitch, yaw: for Base and EEp they mean j1 deg, j2 deg, base yaw deg; "
@@ -1322,7 +1680,7 @@ class UamSuiteGUI(QMainWindow):
             "取消勾选则不约束该航点速度 (仅 full_state_crocoddyl 生效)."
         )
         self._wp_type_help_label.setWordWrap(True)
-        g_full.addWidget(self._wp_type_help_label)
+        # g_full.addWidget(self._wp_type_help_label)
         self.wp_table = QTableWidget(2, 9)
         self.wp_table.setHorizontalHeaderLabels(
             ["Type", "x", "y", "z", "j1/roll°", "j2/pitch°", "yaw°", "t [s]", "Zero v"]
@@ -1338,6 +1696,7 @@ class UamSuiteGUI(QMainWindow):
             for c, val in enumerate(row[1:], start=1):
                 self.wp_table.setItem(r, c, QTableWidgetItem(f"{float(val):g}"))
             self.wp_table.setCellWidget(r, 8, self._make_wp_zero_v_widget(True))
+        self._refresh_wp_rows_angle_enabled()
         g_full.addWidget(self.wp_table)
         wp_btn = QHBoxLayout()
         add_r = QPushButton("Add row")
@@ -1347,7 +1706,11 @@ class UamSuiteGUI(QMainWindow):
         wp_btn.addWidget(add_r)
         wp_btn.addWidget(del_r)
         g_full.addLayout(wp_btn)
+        self.path_stack.addWidget(w_full_path)
 
+        # Opt stack 0: full-state solver / cost parameters
+        w_full_opt = QWidget()
+        g_full_opt = QVBoxLayout(w_full_opt)
         cost_g = QGridLayout()
         self.max_iter_plan = QSpinBox()
         self.max_iter_plan.setRange(10, 2000)
@@ -1422,7 +1785,7 @@ class UamSuiteGUI(QMainWindow):
         cost_g.addWidget(self.ee_knot_vel_pitch_w, 6, 1)
         wg = QGroupBox("Full-state optimization parameters")
         wg.setLayout(cost_g)
-        g_full.addWidget(wg)
+        g_full_opt.addWidget(wg)
 
         wp3g = QGridLayout()
         self.wp3_mode_combo = QComboBox()
@@ -1461,12 +1824,11 @@ class UamSuiteGUI(QMainWindow):
         wp3g.addWidget(QLabel("wp2 x y z j1 j2 yaw"), 4, 0); wp3g.addWidget(self.wp3_w2x, 4, 1); wp3g.addWidget(self.wp3_w2y, 4, 2); wp3g.addWidget(self.wp3_w2z, 4, 3); wp3g.addWidget(self.wp3_w2j1, 4, 4); wp3g.addWidget(self.wp3_w2j2, 4, 5); wp3g.addWidget(self.wp3_w2yaw, 4, 6)
         self.wp3_group = QGroupBox("wp3_joint_opt settings")
         self.wp3_group.setLayout(wp3g)
-        g_full.addWidget(self.wp3_group)
-
-        self.plan_stack.addWidget(w_full)
+        g_full_opt.addWidget(self.wp3_group)
+        self.opt_stack.addWidget(w_full_opt)
         self._refresh_plan_actuator_taus_enabled()
 
-        # Stack 1: EE snap only
+        # Path stack 1: EE / position trajectory editing
         w_ee = QWidget()
         g_ee = QVBoxLayout(w_ee)
         self.ee_type_row_widget = QWidget()
@@ -1665,9 +2027,10 @@ class UamSuiteGUI(QMainWindow):
         self.dt_ee_sample = self.dt_plan
         self.ee_plan_type_combo.currentIndexChanged.connect(self._on_ee_plan_type_changed)
         self._on_ee_plan_type_changed()
-        self.plan_stack.addWidget(w_ee)
+        self.path_stack.addWidget(w_ee)
+        self.opt_stack.addWidget(QWidget())  # EE snap: no extra optimization panel
 
-        # Stack 2: world acceleration reference (step / sine), integrated to p,v for tracking
+        # Path stack 2: world acceleration reference (step / sine)
         w_acc = QWidget()
         g_acc = QVBoxLayout(w_acc)
         g_acc.addWidget(
@@ -1771,6 +2134,15 @@ class UamSuiteGUI(QMainWindow):
         self.acc_track_sin_group.setLayout(sng)
         g_acc.addWidget(self.acc_track_sin_group)
 
+        self.acc_track_shape_combo.currentIndexChanged.connect(
+            self._on_acc_track_shape_changed
+        )
+        self._on_acc_track_shape_changed()
+        self.path_stack.addWidget(w_acc)
+
+        # Opt stack 2: acc-track actuator / solver options
+        w_acc_opt = QWidget()
+        g_acc_opt = QVBoxLayout(w_acc_opt)
         self.acc_track_actuator_group = QGroupBox("Actuator dynamics (rotor 1st-order, optional)")
         ag_dyn = QGridLayout()
         self.acc_track_rotor_dyn_chk = QCheckBox(
@@ -1791,22 +2163,18 @@ class UamSuiteGUI(QMainWindow):
         ag_dyn.addWidget(QLabel("时间常数 τ [s]"), 1, 0)
         ag_dyn.addWidget(self.acc_track_rotor_tau, 1, 1)
         self.acc_track_actuator_group.setLayout(ag_dyn)
-        g_acc.addWidget(self.acc_track_actuator_group)
+        g_acc_opt.addWidget(self.acc_track_actuator_group)
 
         def _on_acc_rotor_dyn_toggled(checked: bool) -> None:
             self.acc_track_rotor_tau.setEnabled(bool(checked))
 
         self.acc_track_rotor_dyn_chk.toggled.connect(_on_acc_rotor_dyn_toggled)
         _on_acc_rotor_dyn_toggled(self.acc_track_rotor_dyn_chk.isChecked())
-
-        self.acc_track_shape_combo.currentIndexChanged.connect(
-            self._on_acc_track_shape_changed
-        )
-        self._on_acc_track_shape_changed()
-        self.plan_stack.addWidget(w_acc)
+        self.opt_stack.addWidget(w_acc_opt)
 
         self._on_task_robot_changed(self.task_robot_combo.currentText())
         self._on_plan_mode()
+        self._update_plan_panel_heights()
         self.plan_actions_group = QGroupBox("Actions")
         plan_actions = QVBoxLayout()
         self.task_generate_btn = QPushButton("Generate trajectory")
@@ -1825,9 +2193,24 @@ class UamSuiteGUI(QMainWindow):
         plan_actions_row2.addWidget(self.save_plan_params_btn)
         plan_actions_row2.addWidget(self.save_plan_params_as_btn)
         plan_actions.addLayout(plan_actions_row2)
+        saved_row = QHBoxLayout()
+        saved_row.addWidget(QLabel("Saved trajectory"))
+        self.saved_traj_combo = QComboBox()
+        self.saved_traj_combo.setMinimumWidth(160)
+        self.saved_traj_combo.setToolTip("已保存的优化轨迹；启动 GUI 时会自动加载上次使用的条目。")
+        saved_row.addWidget(self.saved_traj_combo, 1)
+        self.load_saved_traj_btn = QPushButton("Load")
+        self.load_saved_traj_btn.clicked.connect(self._load_selected_saved_trajectory)
+        self.save_saved_traj_btn = QPushButton("Save…")
+        self.save_saved_traj_btn.clicked.connect(self._save_trajectory_as_named)
+        saved_row.addWidget(self.load_saved_traj_btn)
+        saved_row.addWidget(self.save_saved_traj_btn)
+        plan_actions.addLayout(saved_row)
         self.plan_actions_group.setLayout(plan_actions)
         self.plan_actions_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         plan_top_layout.addWidget(self.plan_actions_group)
+        # 让以上几个分组靠顶部排列，避免在高栏中被均匀拉开产生空隙。
+        plan_top_layout.addStretch(1)
 
         self.plan_info_group = QGroupBox("Info")
         info_layout = QVBoxLayout()
@@ -1841,19 +2224,50 @@ class UamSuiteGUI(QMainWindow):
         plan_splitter.setStretchFactor(1, 1)
         plan_splitter.setSizes([720, 180])
 
-        # ----- Track tab -----
+        # ----- Track tab (scrollable; method selector at top) -----
         tab_track = QWidget()
-        tk = QVBoxLayout(tab_track)
-        self.left_tabs.addTab(tab_track, "Tracking")
+        track_outer = QVBoxLayout(tab_track)
+        track_outer.setContentsMargins(0, 0, 0, 0)
+        track_scroll = QScrollArea()
+        track_scroll.setWidgetResizable(True)
+        track_scroll.setFrameShape(QScrollArea.NoFrame)
+        track_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        track_inner = QWidget()
+        tk = QVBoxLayout(track_inner)
+        track_scroll.setWidget(track_inner)
+        track_outer.addWidget(track_scroll)
+        self.left_tabs.addTab(tab_track, "Sim Tracking")
 
         self.track_mode_combo = QComboBox()
-        self.track_mode_combo.addItems(
-            [
-                "Crocoddyl — track along the full-state plan",
-                "Acados — EE-centric tracking",
-                "Crocoddyl — EE pose tracking",
-            ]
+        # Let the combo follow the left panel width instead of forcing it wider.
+        self.track_mode_combo.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
         )
+        self.track_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.track_mode_combo.setMinimumContentsLength(12)
+        _track_mode_items = [
+            (
+                "Crocoddyl — full-state plan",
+                "沿 Full state 规划轨迹闭环跟踪（Crocoddyl，与下方 w_pos 等权重一致）",
+            ),
+            (
+                "Acados — full-state plan",
+                "沿 Full state 规划轨迹闭环跟踪（Acados NMPC，代价权重与 Croc 全状态跟踪共用）",
+            ),
+            (
+                "Acados — EE-centric",
+                "末端 EE 位置/航向跟踪（需 EE 类规划或 FK 参考）",
+            ),
+            (
+                "Crocoddyl — EE pose",
+                "Crocoddyl 末端位姿跟踪",
+            ),
+        ]
+        for label, tip in _track_mode_items:
+            self.track_mode_combo.addItem(label)
+            self.track_mode_combo.setItemData(
+                self.track_mode_combo.count() - 1, tip, Qt.ToolTipRole
+            )
         self.T_sim = QDoubleSpinBox()
         self.T_sim.setRange(0.5, 120.0)
         self.T_sim.setValue(8.0)
@@ -1878,7 +2292,7 @@ class UamSuiteGUI(QMainWindow):
         self.w_ee_yaw.setRange(0.0, 2000.0)
         self.w_ee_yaw.setValue(200.0)
 
-        # Crocoddyl EE pose tracking: per-term cost weights (Tracking mode index 2).
+        # Crocoddyl EE pose tracking: per-term cost weights (Tracking mode index 3).
         self.croc_ee_w_pos = QDoubleSpinBox()
         self.croc_ee_w_pos.setRange(0.0, 5000.0)
         self.croc_ee_w_pos.setValue(400.0)
@@ -2052,59 +2466,66 @@ class UamSuiteGUI(QMainWindow):
         sim_g.addWidget(self._sim_payload_label, 9, 0)
         sim_g.addWidget(self.sim_payload_enable, 9, 1)
         sim_g.addWidget(self.sim_payload_row, 10, 0, 1, 2)
-        sg = QGroupBox("Simulation parameters (closed-loop simulator; decoupled from MPC weights/horizon above)")
+        sg = QGroupBox("Simulation parameters (closed-loop simulator)")
         sg.setLayout(sim_g)
-        tk.addWidget(sg)
-        self._refresh_sim_plant_controls_state()
 
-        tk.addWidget(QLabel("Tracking method"))
-        tk.addWidget(self.track_mode_combo)
+        self._track_method_hint = QLabel(
+            "先完成 Full state 规划后，可选 Crocoddyl 或 Acados 沿规划跟踪；"
+            "Acados — full-state plan 与 Crocoddyl 共用 w_pos / w_att / w_vel 等权重。"
+        )
+        self._track_method_hint.setWordWrap(True)
+        self._track_method_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        track_method_group = QGroupBox("Tracking method")
+        tm_lay = QVBoxLayout(track_method_group)
+        tm_lay.addWidget(self._track_method_hint)
+        tm_lay.addWidget(self.track_mode_combo)
+        tk.addWidget(track_method_group)
 
-        # Algorithm-dependent parameters (single panel, dynamic visibility by algorithm)
-        algo_grid = QGridLayout()
+        # Algorithm-dependent parameters (two-column flow; dynamic visibility by algorithm)
+        self._algo_grid = QGridLayout()
+        self._algo_grid.setHorizontalSpacing(12)
+        # Two label/widget column pairs: 0=label,1=widget | 2=label,3=widget
+        self._algo_grid.setColumnStretch(1, 1)
+        self._algo_grid.setColumnStretch(3, 1)
         self._algo_rows: list[tuple[QLabel, QWidget]] = []
-        for r, (lab, w) in enumerate(
-            [
-                ("dt_mpc", self.dt_mpc),
-                ("N (horizon)", self.N_mpc),
-                ("w_ee (Acados)", self.w_ee),
-                ("w_ee_yaw (Acados)", self.w_ee_yaw),
-                ("Croc EE w_pos", self.croc_ee_w_pos),
-                ("Croc EE w_rot_rp", self.croc_ee_w_rot_rp),
-                ("Croc EE w_rot_yaw", self.croc_ee_w_rot_yaw),
-                ("Croc EE w_vel_lin", self.croc_ee_w_vel_lin),
-                ("Croc EE w_vel_ang_rp", self.croc_ee_w_vel_ang_rp),
-                ("Croc EE w_vel_ang_yaw", self.croc_ee_w_vel_ang_yaw),
-                ("Croc EE w_u (ctrl reg)", self.croc_ee_w_u),
-                ("Croc EE terminal scale", self.croc_ee_w_terminal),
-                ("mpc max_iter", self.mpc_max_iter),
-                ("mpc log ivl", self.mpc_log_iv),
-                ("Control mode", self.control_mode_track),
-                ("Croc horizon steps", self.croc_horizon),
-                ("Croc MPC max_iter", self.croc_mpc_iter),
-                ("w_state_track", self.w_state_track),
-                ("w_state_reg", self.w_state_reg),
-                ("w_control", self.w_control),
-                ("w_terminal_track", self.w_terminal_track),
-                ("w_pos", self.w_pos),
-                ("w_att", self.w_att),
-                ("w_joint", self.w_joint),
-                ("w_vel", self.w_vel),
-                ("w_omega", self.w_omega),
-                ("w_joint_vel", self.w_joint_vel),
-                ("w_u_thrust", self.w_u_thrust),
-                ("w_u_joint_torque", self.w_u_joint_torque),
-                ("use thrust constraints", self.croc_ee_use_thrust_constraints),
-            ]
-        ):
+        for lab, w in [
+            ("dt_mpc", self.dt_mpc),
+            ("N (horizon)", self.N_mpc),
+            ("w_ee (Acados)", self.w_ee),
+            ("w_ee_yaw (Acados)", self.w_ee_yaw),
+            ("Croc EE w_pos", self.croc_ee_w_pos),
+            ("Croc EE w_rot_rp", self.croc_ee_w_rot_rp),
+            ("Croc EE w_rot_yaw", self.croc_ee_w_rot_yaw),
+            ("Croc EE w_vel_lin", self.croc_ee_w_vel_lin),
+            ("Croc EE w_vel_ang_rp", self.croc_ee_w_vel_ang_rp),
+            ("Croc EE w_vel_ang_yaw", self.croc_ee_w_vel_ang_yaw),
+            ("Croc EE w_u (ctrl reg)", self.croc_ee_w_u),
+            ("Croc EE terminal scale", self.croc_ee_w_terminal),
+            ("mpc max_iter", self.mpc_max_iter),
+            ("mpc log ivl", self.mpc_log_iv),
+            ("Control mode", self.control_mode_track),
+            ("Croc horizon steps", self.croc_horizon),
+            ("Croc MPC max_iter", self.croc_mpc_iter),
+            ("w_state_track", self.w_state_track),
+            ("w_state_reg", self.w_state_reg),
+            ("w_control", self.w_control),
+            ("w_terminal_track", self.w_terminal_track),
+            ("w_pos", self.w_pos),
+            ("w_att", self.w_att),
+            ("w_joint", self.w_joint),
+            ("w_vel", self.w_vel),
+            ("w_omega", self.w_omega),
+            ("w_joint_vel", self.w_joint_vel),
+            ("w_u_thrust", self.w_u_thrust),
+            ("w_u_joint_torque", self.w_u_joint_torque),
+            ("use thrust constraints", self.croc_ee_use_thrust_constraints),
+        ]:
             lb = QLabel(lab)
-            algo_grid.addWidget(lb, r, 0)
-            algo_grid.addWidget(w, r, 1)
             self._algo_rows.append((lb, w))
 
         self.track_algo_group = QGroupBox("Algorithm parameters")
         algo_wrap = QVBoxLayout()
-        algo_wrap.addLayout(algo_grid)
+        algo_wrap.addLayout(self._algo_grid)
         self.track_algo_group.setLayout(algo_wrap)
         tk.addWidget(self.track_algo_group)
         self.track_mode_combo.currentIndexChanged.connect(self._on_track_mode_changed)
@@ -2119,6 +2540,9 @@ class UamSuiteGUI(QMainWindow):
         self.meshcat_track_btn.clicked.connect(self._visualize_tracked_meshcat)
         self.meshcat_track_btn.setEnabled(False)
         tk.addWidget(self.meshcat_track_btn)
+
+        tk.addWidget(sg)
+        self._refresh_sim_plant_controls_state()
 
         # ----- Regulation panel (embedded in Tracking tab) -----
         self.reg_group = QGroupBox("Regulation (same controllers/weights as Tracking)")
@@ -2227,6 +2651,7 @@ class UamSuiteGUI(QMainWindow):
         tab_ros_track = QWidget()
         rtt_scroll_area = QScrollArea()
         rtt_scroll_area.setWidgetResizable(True)
+        rtt_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         rtt_inner = QWidget()
         rtt = QVBoxLayout(rtt_inner)
         rtt_scroll_area.setWidget(rtt_inner)
@@ -2281,6 +2706,142 @@ class UamSuiteGUI(QMainWindow):
         gazebo_group.setLayout(gz)
         rtt.addWidget(gazebo_group)
 
+        # ── Drone status (MAVROS) + flight-mode services ─────────────────────
+        status_group = QGroupBox("Drone Status  (MAVROS)")
+        status_v = QVBoxLayout()
+        st_grid = QGridLayout()
+        st_grid.setHorizontalSpacing(10)
+        for c in (1, 3):
+            st_grid.setColumnStretch(c, 1)
+
+        def _mk_status_value(text="—"):
+            lbl = QLabel(text)
+            lbl.setStyleSheet("font-weight: bold;")
+            return lbl
+
+        st_grid.addWidget(QLabel("Connection"), 0, 0)
+        self.rn_st_conn = _mk_status_value()
+        st_grid.addWidget(self.rn_st_conn, 0, 1)
+        st_grid.addWidget(QLabel("Arming"), 0, 2)
+        self.rn_st_arm = _mk_status_value()
+        st_grid.addWidget(self.rn_st_arm, 0, 3)
+
+        st_grid.addWidget(QLabel("Flight mode"), 1, 0)
+        self.rn_st_mode = _mk_status_value()
+        st_grid.addWidget(self.rn_st_mode, 1, 1)
+        st_grid.addWidget(QLabel("Tracking"), 1, 2)
+        self.rn_st_track = _mk_status_value("node off")
+        st_grid.addWidget(self.rn_st_track, 1, 3)
+
+        self.rn_st_ekf_lbl = QLabel("EKF pos [m]")
+        st_grid.addWidget(self.rn_st_ekf_lbl, 2, 0)
+        self.rn_st_ekf = _mk_status_value()
+        st_grid.addWidget(self.rn_st_ekf, 2, 1, 1, 3)
+
+        st_grid.addWidget(QLabel("Vision pos [m]"), 3, 0)
+        self.rn_st_vision = _mk_status_value()
+        st_grid.addWidget(self.rn_st_vision, 3, 1, 1, 3)
+
+        st_grid.addWidget(QLabel("Localization"), 4, 0)
+        self.rn_st_loc = _mk_status_value()
+        self.rn_st_loc.setToolTip(
+            "EKF (/mavros/local_position/pose) 与 Vision (/mavros/vision_pose/pose) 位置之差：\n"
+            "• <10cm：OK\n"
+            "• 10~50cm：WARN（定位漂移）\n"
+            "• >50cm：UNAVAILABLE（定位不可用，请勿起飞）"
+        )
+        st_grid.addWidget(self.rn_st_loc, 4, 1, 1, 3)
+        status_v.addLayout(st_grid)
+
+        mode_btn_row = QHBoxLayout()
+        self.rn_offboard_btn = QPushButton("Set OFFBOARD")
+        self.rn_offboard_btn.setToolTip("调用 /mavros/set_mode 切换到 OFFBOARD 模式。")
+        self.rn_offboard_btn.clicked.connect(lambda: self._call_set_flight_mode("OFFBOARD"))
+        mode_btn_row.addWidget(self.rn_offboard_btn)
+
+        self.rn_posctl_btn = QPushButton("Set POSCTL")
+        self.rn_posctl_btn.setToolTip("调用 /mavros/set_mode 切换到位置控制 (POSCTL) 模式。")
+        self.rn_posctl_btn.clicked.connect(lambda: self._call_set_flight_mode("POSCTL"))
+        mode_btn_row.addWidget(self.rn_posctl_btn)
+
+        self.rn_arm_btn = QPushButton("Arm")
+        self.rn_arm_btn.setToolTip("调用 /mavros/cmd/arming 解锁。")
+        self.rn_arm_btn.clicked.connect(lambda: self._call_arm(True))
+        mode_btn_row.addWidget(self.rn_arm_btn)
+
+        self.rn_disarm_btn = QPushButton("Disarm")
+        self.rn_disarm_btn.setToolTip("调用 /mavros/cmd/arming 上锁。")
+        self.rn_disarm_btn.clicked.connect(lambda: self._call_arm(False))
+        mode_btn_row.addWidget(self.rn_disarm_btn)
+        status_v.addLayout(mode_btn_row)
+
+        # 仅依赖 Gazebo + PX4 SITL + MAVROS 的一键起飞（无需 MPC 跟踪节点）
+        gz_takeoff_row = QHBoxLayout()
+        self.rn_gz_takeoff_btn = QPushButton("Takeoff 1m (OFFBOARD)")
+        self.rn_gz_takeoff_btn.setStyleSheet(
+            "QPushButton { font-weight: bold; background-color: #1565c0; color: white; }"
+        )
+        self.rn_gz_takeoff_btn.setToolTip(
+            "仅需 Gazebo + PX4 SITL + MAVROS：\n"
+            "持续发布 OFFBOARD 本地位置设定点(z=1m)，自动切 OFFBOARD 并解锁，\n"
+            "起飞并悬停到当前 x,y 上方 1 米。\n"
+            "（与 MPC 跟踪节点无关，可在仅启动 Gazebo 后直接使用；Disarm 停止设定点流。）"
+        )
+        self.rn_gz_takeoff_btn.clicked.connect(lambda: self._call_gazebo_takeoff(1.0))
+        gz_takeoff_row.addWidget(self.rn_gz_takeoff_btn)
+        status_v.addLayout(gz_takeoff_row)
+
+        status_group.setLayout(status_v)
+        rtt.addWidget(status_group)
+
+        # ── MPC runtime stats (/suite_mpc/stats) ─────────────────────────────
+        mpc_stat_group = QGroupBox("MPC Runtime  (/suite_mpc/stats)")
+        ms_grid = QGridLayout()
+        ms_grid.setHorizontalSpacing(10)
+        for c in (1, 3):
+            ms_grid.setColumnStretch(c, 1)
+
+        ms_grid.addWidget(QLabel("Loop rate"), 0, 0)
+        self.rn_ms_hz = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_hz, 0, 1)
+        ms_grid.addWidget(QLabel("Phase / status"), 0, 2)
+        self.rn_ms_phase = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_phase, 0, 3)
+
+        ms_grid.addWidget(QLabel("Solve [ms]"), 1, 0)
+        self.rn_ms_solve = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_solve, 1, 1)
+        ms_grid.addWidget(QLabel("avg / max [ms]"), 1, 2)
+        self.rn_ms_solve_stat = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_solve_stat, 1, 3)
+
+        ms_grid.addWidget(QLabel("Iters (SQP/QP)"), 2, 0)
+        self.rn_ms_iters = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_iters, 2, 1)
+        ms_grid.addWidget(QLabel("Horizon / dt"), 2, 2)
+        self.rn_ms_horizon = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_horizon, 2, 3)
+
+        ms_grid.addWidget(QLabel("MPC cost"), 3, 0)
+        self.rn_ms_cost = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_cost, 3, 1)
+        ms_grid.addWidget(QLabel("Yaw err [deg]"), 3, 2)
+        self.rn_ms_err_yaw = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_err_yaw, 3, 3)
+
+        ms_grid.addWidget(QLabel("Pos err x/y/z [m]"), 4, 0)
+        self.rn_ms_err_xyz = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_err_xyz, 4, 1)
+        ms_grid.addWidget(QLabel("Pos err total [m]"), 4, 2)
+        self.rn_ms_err_pos = _mk_status_value()
+        ms_grid.addWidget(self.rn_ms_err_pos, 4, 3)
+        mpc_stat_group.setLayout(ms_grid)
+        rtt.addWidget(mpc_stat_group)
+
+        # 状态监听延迟到有 ROS master 时再初始化（启动 Gazebo / 节点后），
+        # 避免在没有 roscore 时 rospy.init_node 阻塞 GUI 启动。
+        self._status_monitor_inited = False
+
         # ── ROS Tracking Node (run_tracking_controller.py) ───────────────────
         ros_node_group = QGroupBox("ROS Tracking Node  (run_tracking_controller.py)")
         ros_node_layout = QVBoxLayout()
@@ -2299,10 +2860,13 @@ class UamSuiteGUI(QMainWindow):
 
         rn_grid.addWidget(QLabel("Controller mode"), 0, 0)
         self.rn_controller_combo = QComboBox()
-        self.rn_controller_combo.addItems(["croc_full_state", "croc_ee_pose", "px4", "geometric"])
+        self.rn_controller_combo.addItems(
+            ["croc_full_state", "acados_full_state", "croc_ee_pose", "px4", "geometric"]
+        )
         self.rn_controller_combo.setToolTip(
-            "croc_full_state: Crocoddyl 全状态跟踪 (build_shooting_problem_along_plan)\n"
-            "croc_ee_pose:    Crocoddyl EE 位姿跟踪 (build_shooting_problem_along_ee_ref)\n"
+            "croc_full_state:   Crocoddyl 全状态跟踪 (build_shooting_problem_along_plan)\n"
+            "acados_full_state: Acados NMPC 全状态跟踪（实时，s500 与 s500_uam 均支持）\n"
+            "croc_ee_pose:      Crocoddyl EE 位姿跟踪 (build_shooting_problem_along_ee_ref)\n"
             "px4:             run_tracking_controller 内部发送 PositionTarget 给 PX4\n"
             "geometric:       run_tracking_controller 内置 geometric（body_rate + thrust）"
         )
@@ -2337,6 +2901,19 @@ class UamSuiteGUI(QMainWindow):
         )
         rn_grid.addWidget(self.rn_use_sim_check, 4, 1)
 
+        rn_grid.addWidget(QLabel("max_thrust_total [N]"), 5, 0)
+        self.rn_max_thrust_total = QDoubleSpinBox()
+        self.rn_max_thrust_total.setRange(1.0, 500.0)
+        self.rn_max_thrust_total.setDecimals(2)
+        self.rn_max_thrust_total.setSingleStep(1.0)
+        self.rn_max_thrust_total.setValue(7.43 * 4)
+        self.rn_max_thrust_total.setToolTip(
+            "CTBR 总推力归一化的分母（全部旋翼最大推力之和，单位 N）。\n"
+            "thrust_cmd = sum(rotor_thrust_N) / max_thrust_total，再 clip 到 [0,1]。\n"
+            "需与 PX4 实际最大推力一致；启动 tracking node 前设置（在线更新不改此项）。"
+        )
+        rn_grid.addWidget(self.rn_max_thrust_total, 5, 1)
+
         ros_node_layout.addLayout(rn_grid)
 
         # ── ROS MPC Parameters ────────────────────────────────────────────────
@@ -2370,7 +2947,37 @@ class UamSuiteGUI(QMainWindow):
 
         rn_mpc_vbox.addLayout(rn_common_grid)
 
-        # ── croc_full_state 专用参数面板 ─────────────────────────────────────
+        # ── Acados 求解器选项（仅 acados_full_state）──────────────────────────
+        self._rn_acados_panel = QWidget()
+        rn_acados_grid = QGridLayout(self._rn_acados_panel)
+        rn_acados_grid.setContentsMargins(0, 0, 0, 0)
+        rn_acados_grid.setColumnStretch(1, 1)
+        rn_acados_grid.setColumnStretch(3, 1)
+        rn_acados_grid.addWidget(QLabel("solver_mode"), 0, 0)
+        self.rn_acados_solver_mode = QComboBox()
+        self.rn_acados_solver_mode.addItems(["rti", "sqp"])
+        self.rn_acados_solver_mode.setToolTip("rti: 实时迭代（推荐 100Hz）；sqp: 每步多轮 SQP（更慢更稳）")
+        rn_acados_grid.addWidget(self.rn_acados_solver_mode, 0, 1)
+        rn_acados_grid.addWidget(QLabel("integrator"), 0, 2)
+        self.rn_acados_integrator = QComboBox()
+        self.rn_acados_integrator.addItems(["ERK", "IRK"])
+        rn_acados_grid.addWidget(self.rn_acados_integrator, 0, 3)
+        rn_acados_grid.addWidget(QLabel("hpipm_mode"), 1, 0)
+        self.rn_acados_hpipm = QComboBox()
+        self.rn_acados_hpipm.addItems(["SPEED", "BALANCE", "ROBUST"])
+        rn_acados_grid.addWidget(self.rn_acados_hpipm, 1, 1)
+        rn_acados_grid.addWidget(QLabel("qp_iter_max"), 1, 2)
+        self.rn_acados_qp_iter = QSpinBox()
+        self.rn_acados_qp_iter.setRange(5, 500)
+        self.rn_acados_qp_iter.setValue(20)
+        rn_acados_grid.addWidget(self.rn_acados_qp_iter, 1, 3)
+        rn_mpc_vbox.addWidget(self._rn_acados_panel)
+
+        # ── full-state 代价权重（Crocoddyl / Acados 各一套 profile，切换算法时自动换）──
+        self.rn_fs_weights_title = QLabel("Cost weights — Crocoddyl profile")
+        self.rn_fs_weights_title.setStyleSheet("color: palette(mid); font-size: 11px;")
+        rn_mpc_vbox.addWidget(self.rn_fs_weights_title)
+
         self._rn_fs_panel = QWidget()
         rn_fs_grid = QGridLayout(self._rn_fs_panel)
         rn_fs_grid.setContentsMargins(0, 0, 0, 0)
@@ -2534,12 +3141,39 @@ class UamSuiteGUI(QMainWindow):
         rn_geo_grid.addWidget(self.rn_geo_max_tilt_deg, 2, 1)
 
         rn_mpc_vbox.addWidget(self._rn_geo_panel)
+
+        # ── 保存控制器参数（每个算法各自一套，持久化到磁盘，跨重启复用）──────
+        self.rn_save_ctrl_params_btn = QPushButton("Save controller parameters")
+        self.rn_save_ctrl_params_btn.setToolTip(
+            "将当前算法的 MPC/控制器参数保存到磁盘，并为每个 tracking 算法\n"
+            "（croc_full_state / acados_full_state / croc_ee_pose / geometric ...）\n"
+            "各自维护一套设置；下次启动 GUI 自动恢复，无需重新调参。"
+        )
+        self.rn_save_ctrl_params_btn.clicked.connect(self._rn_save_controller_profiles)
+        rn_mpc_vbox.addWidget(self.rn_save_ctrl_params_btn)
+
         rn_mpc_group.setLayout(rn_mpc_vbox)
         ros_node_layout.addWidget(rn_mpc_group)
 
-        # 初始化面板可见性（根据默认 controller mode）
-        self.rn_controller_combo.currentIndexChanged.connect(self._rn_update_mpc_panel)
-        self._rn_update_mpc_panel(0)
+        # Crocoddyl / Acados 各维护一套代价权重（切换 controller mode 时自动保存/加载）
+        self._RN_FS_WEIGHT_KEYS = (
+            "w_state_track", "w_state_reg", "w_control", "w_terminal_track",
+            "w_pos", "w_att", "w_joint", "w_vel", "w_omega", "w_joint_vel",
+            "w_u_thrust", "w_u_joint_torque", "mpc_max_iter",
+        )
+        self._RN_ACADOS_SOLVER_KEYS = (
+            "acados_solver_mode", "acados_integrator", "acados_hpipm_mode", "acados_qp_iter_max",
+        )
+        self._rn_mpc_weight_profiles: dict = {
+            "croc_full_state": {}, "acados_full_state": {},
+            "croc_ee_pose": {}, "px4": {}, "geometric": {},
+        }
+        self._rn_mpc_profile_mode: str | None = None
+        self._rn_init_mpc_weight_profiles()
+        # 从磁盘加载每个算法各自保存过的控制器参数（若有）。
+        self._rn_load_controller_profiles()
+        self.rn_controller_combo.currentIndexChanged.connect(self._rn_on_controller_mode_changed)
+        self._rn_on_controller_mode_changed(0)
 
 
         self.rn_status_label = QLabel("节点状态：未启动")
@@ -2610,8 +3244,23 @@ class UamSuiteGUI(QMainWindow):
         rn_btn_grid.addWidget(self.rn_update_traj_btn, 2, 0, 1, 2)
         ros_node_layout.addLayout(rn_btn_grid)
 
-        # 按钮行 3：Reset（MPC 控制回初始状态）
+        # 按钮行 3：Take off / Reset
         rn_btn_row3 = QHBoxLayout()
+        self.rn_takeoff_btn = QPushButton("Take off")
+        self.rn_takeoff_btn.setStyleSheet(
+            "QPushButton { background-color: #6a1b9a; color: white; font-weight: bold; }"
+        )
+        self.rn_takeoff_btn.setToolTip(
+            "一键自动起飞（需 MAVROS 已连接 PX4）：\n"
+            "1) 在当前位姿持续发 setpoint（满足 OFFBOARD 前置）\n"
+            "2) 自动切换 OFFBOARD 并解锁\n"
+            "3) 爬升到 1 m，再飞到轨迹起点 x_plan[0] 悬停\n"
+            "调用前会导出并刷新节点中的最新规划。"
+        )
+        self.rn_takeoff_btn.clicked.connect(self._call_take_off)
+        self.rn_takeoff_btn.setEnabled(False)
+        rn_btn_row3.addWidget(self.rn_takeoff_btn)
+
         self.rn_reset_svc_btn = QPushButton("rosservice: /reset_to_initial")
         self.rn_reset_svc_btn.setStyleSheet(
             "QPushButton { background-color: #e65100; color: white; font-weight: bold; }"
@@ -2664,37 +3313,40 @@ class UamSuiteGUI(QMainWindow):
         _reg_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
         reg_layout.addWidget(_reg_hint)
 
+        # 两排布局：第 0 排 x / y / z；第 1 排 yaw / j1 / j2
         reg_grid = QGridLayout()
+        for c in (1, 3, 5):
+            reg_grid.setColumnStretch(c, 1)
 
         reg_grid.addWidget(QLabel("x [m]"), 0, 0)
         self.rn_reg_x = QDoubleSpinBox()
         self.rn_reg_x.setRange(-50.0, 50.0); self.rn_reg_x.setSingleStep(0.1); self.rn_reg_x.setValue(0.0)
         reg_grid.addWidget(self.rn_reg_x, 0, 1)
 
-        reg_grid.addWidget(QLabel("y [m]"), 1, 0)
+        reg_grid.addWidget(QLabel("y [m]"), 0, 2)
         self.rn_reg_y = QDoubleSpinBox()
         self.rn_reg_y.setRange(-50.0, 50.0); self.rn_reg_y.setSingleStep(0.1); self.rn_reg_y.setValue(0.0)
-        reg_grid.addWidget(self.rn_reg_y, 1, 1)
+        reg_grid.addWidget(self.rn_reg_y, 0, 3)
 
-        reg_grid.addWidget(QLabel("z [m]"), 2, 0)
+        reg_grid.addWidget(QLabel("z [m]"), 0, 4)
         self.rn_reg_z = QDoubleSpinBox()
         self.rn_reg_z.setRange(0.0, 20.0); self.rn_reg_z.setSingleStep(0.05); self.rn_reg_z.setValue(1.0)
-        reg_grid.addWidget(self.rn_reg_z, 2, 1)
+        reg_grid.addWidget(self.rn_reg_z, 0, 5)
 
-        reg_grid.addWidget(QLabel("yaw [°]"), 3, 0)
+        reg_grid.addWidget(QLabel("yaw [°]"), 1, 0)
         self.rn_reg_yaw = QDoubleSpinBox()
         self.rn_reg_yaw.setRange(-180.0, 180.0); self.rn_reg_yaw.setSingleStep(5.0); self.rn_reg_yaw.setValue(0.0)
-        reg_grid.addWidget(self.rn_reg_yaw, 3, 1)
+        reg_grid.addWidget(self.rn_reg_yaw, 1, 1)
 
-        reg_grid.addWidget(QLabel("j1 [°]"), 4, 0)
+        reg_grid.addWidget(QLabel("j1 [°]"), 1, 2)
         self.rn_reg_j1 = QDoubleSpinBox()
         self.rn_reg_j1.setRange(-180.0, 180.0); self.rn_reg_j1.setSingleStep(5.0); self.rn_reg_j1.setValue(0.0)
-        reg_grid.addWidget(self.rn_reg_j1, 4, 1)
+        reg_grid.addWidget(self.rn_reg_j1, 1, 3)
 
-        reg_grid.addWidget(QLabel("j2 [°]"), 5, 0)
+        reg_grid.addWidget(QLabel("j2 [°]"), 1, 4)
         self.rn_reg_j2 = QDoubleSpinBox()
         self.rn_reg_j2.setRange(-180.0, 180.0); self.rn_reg_j2.setSingleStep(5.0); self.rn_reg_j2.setValue(0.0)
-        reg_grid.addWidget(self.rn_reg_j2, 5, 1)
+        reg_grid.addWidget(self.rn_reg_j2, 1, 5)
 
         reg_layout.addLayout(reg_grid)
 
@@ -2734,7 +3386,9 @@ class UamSuiteGUI(QMainWindow):
             return fig, cv
 
         self.fig_states, self.cv_states = embed_fig("States", (12, 12))
-        self.fig_control, self.cv_control = embed_fig("Controls", (10, 6))
+        self.fig_control, self.cv_control = embed_fig("Control", (12, 11))
+        # CTBR/feedback 与控制输入合并到同一个 "Control" 标签页（别名复用）。
+        self.fig_ctbr, self.cv_ctbr = self.fig_control, self.cv_control
         self.fig_3d_track, self.cv_3d_track = embed_fig("Base 3D", (10, 8))
         self.fig_traj_dash, self.cv_traj_dash = embed_fig("Tracking / MPC", (12, 11))
         self.fig_cost_analysis, self.cv_cost_analysis = embed_fig("Cost analysis", (12, 10))
@@ -2949,7 +3603,7 @@ class UamSuiteGUI(QMainWindow):
                                 alpha=0.88,
                                 label=f"{names_rf[j]} ref",
                             )
-            ax.set_title(ttl, fontsize=9)
+            ax.set_title(ttl, fontsize=_mpl_pt(9))
             ax.set_ylabel(yl)
             ax.set_xlabel("t [s]")
             ax.grid(True, alpha=0.3)
@@ -2984,7 +3638,7 @@ class UamSuiteGUI(QMainWindow):
                                 alpha=0.88,
                                 label=f"u{j+1} ref",
                             )
-                ax_u.legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=2)
+                ax_u.legend(loc="upper right", fontsize=_mpl_pt(7), framealpha=0.9, ncol=2)
             else:
                 ax_u.text(0.5, 0.5, "No u_plan", ha="center", va="center", transform=ax_u.transAxes)
         else:
@@ -2994,7 +3648,7 @@ class UamSuiteGUI(QMainWindow):
             ctl_suf = "Control inputs (meas vs ref)"
         elif pos_r is not None:
             ctl_suf = "Control inputs (meas)"
-        ax_u.set_title(ctl_suf, fontsize=10)
+        ax_u.set_title(ctl_suf, fontsize=_mpl_pt(10))
         ax_u.set_ylabel("u")
         ax_u.set_xlabel("t [s]")
         ax_u.grid(True, alpha=0.3)
@@ -3018,8 +3672,8 @@ class UamSuiteGUI(QMainWindow):
         ax3.set_xlabel("X [m]")
         ax3.set_ylabel("Y [m]")
         ax3.set_zlabel("Z [m]")
-        ax3.set_title(f"{title_prefix} (base_link only, equal XYZ scale)", fontsize=10)
-        ax3.legend(loc="upper left", fontsize=7, framealpha=0.9)
+        ax3.set_title(f"{title_prefix} (base_link only, equal XYZ scale)", fontsize=_mpl_pt(10))
+        ax3.legend(loc="upper left", fontsize=_mpl_pt(7), framealpha=0.9)
         _set_mplot3d_equal_xyz(ax3, pos, pos_r)
 
         self.fig_traj_dash.clear()
@@ -3032,7 +3686,7 @@ class UamSuiteGUI(QMainWindow):
         ad[0].plot(pos[:, 0], pos[:, 1], "b-", lw=1.2, label="meas")
         if pos_r is not None:
             ad[0].plot(pos_r[:, 0], pos_r[:, 1], color="tab:orange", ls="--", lw=1.1, alpha=0.9, label="ref")
-        ad[0].set_title("XY path", fontsize=9)
+        ad[0].set_title("XY path", fontsize=_mpl_pt(9))
         ad[0].set_xlabel("x [m]")
         ad[0].set_ylabel("y [m]")
         _xy_stack = [np.column_stack((pos[:, 0], pos[:, 1]))]
@@ -3040,11 +3694,11 @@ class UamSuiteGUI(QMainWindow):
             _xy_stack.append(np.column_stack((pos_r[:, 0], pos_r[:, 1])))
         _set_2d_path_equal_meters(ad[0], *_xy_stack)
         if pos_r is not None:
-            ad[0].legend(loc="best", fontsize=7)
+            ad[0].legend(loc="best", fontsize=_mpl_pt(7))
         ad[1].plot(pos[:, 0], pos[:, 2], "b-", lw=1.2, label="meas")
         if pos_r is not None:
             ad[1].plot(pos_r[:, 0], pos_r[:, 2], color="tab:orange", ls="--", lw=1.1, alpha=0.9, label="ref")
-        ad[1].set_title("XZ path", fontsize=9)
+        ad[1].set_title("XZ path", fontsize=_mpl_pt(9))
         ad[1].set_xlabel("x [m]")
         ad[1].set_ylabel("z [m]")
         _xz_stack = [np.column_stack((pos[:, 0], pos[:, 2]))]
@@ -3052,7 +3706,7 @@ class UamSuiteGUI(QMainWindow):
             _xz_stack.append(np.column_stack((pos_r[:, 0], pos_r[:, 2])))
         _set_2d_path_equal_meters(ad[1], *_xz_stack)
         if pos_r is not None:
-            ad[1].legend(loc="best", fontsize=7)
+            ad[1].legend(loc="best", fontsize=_mpl_pt(7))
 
         if pos_r is not None:
             e_p = pos - pos_r
@@ -3060,10 +3714,10 @@ class UamSuiteGUI(QMainWindow):
                 ad[2].plot(t, e_p[:, j], color=c, lw=1.0, label=f"e_{'xyz'[j]}")
             ad[2].plot(t, np.linalg.norm(e_p, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_p\|$")
             ad[2].axhline(0.0, color="gray", ls=":", lw=0.7)
-            ad[2].set_title("Base position tracking error", fontsize=9)
+            ad[2].set_title("Base position tracking error", fontsize=_mpl_pt(9))
         else:
             ad[2].text(0.5, 0.5, "No reference — position error N/A", ha="center", va="center", transform=ad[2].transAxes)
-            ad[2].set_title("Base position tracking error", fontsize=9)
+            ad[2].set_title("Base position tracking error", fontsize=_mpl_pt(9))
         ad[2].set_xlabel("t [s]")
         ad[2].set_ylabel("m")
         if pos_r is not None:
@@ -3076,10 +3730,10 @@ class UamSuiteGUI(QMainWindow):
                 ad[3].plot(t, e_v[:, j], color=c, lw=1.0, label=f"e_v{'xyz'[j]}")
             ad[3].plot(t, np.linalg.norm(e_v, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_v\|$")
             ad[3].axhline(0.0, color="gray", ls=":", lw=0.7)
-            ad[3].set_title("Base velocity tracking error", fontsize=9)
+            ad[3].set_title("Base velocity tracking error", fontsize=_mpl_pt(9))
         else:
             ad[3].text(0.5, 0.5, "No reference — velocity error N/A", ha="center", va="center", transform=ad[3].transAxes)
-            ad[3].set_title("Base velocity tracking error", fontsize=9)
+            ad[3].set_title("Base velocity tracking error", fontsize=_mpl_pt(9))
         ad[3].set_xlabel("t [s]")
         ad[3].set_ylabel("m/s")
         if vel_r is not None:
@@ -3090,31 +3744,31 @@ class UamSuiteGUI(QMainWindow):
         ad[4].plot(t, speed, "k-", lw=1.2, label="meas")
         if vel_r is not None:
             ad[4].plot(t, np.linalg.norm(vel_r, axis=1), color="tab:orange", ls="--", lw=1.05, alpha=0.9, label="ref")
-        ad[4].set_title("Speed norm", fontsize=9)
+        ad[4].set_title("Speed norm", fontsize=_mpl_pt(9))
         ad[4].set_xlabel("t [s]")
         ad[4].set_ylabel("m/s")
         if vel_r is not None:
-            ad[4].legend(loc="best", fontsize=7)
+            ad[4].legend(loc="best", fontsize=_mpl_pt(7))
         ad[4].grid(True, alpha=0.3)
         acc_norm = np.linalg.norm(acc, axis=1)
         jerk_norm = np.linalg.norm(jerk, axis=1)
         ad[5].plot(t, acc_norm, "m-", lw=1.2, label="meas")
         if acc_r is not None:
             ad[5].plot(t, np.linalg.norm(acc_r, axis=1), color="tab:orange", ls="--", lw=1.05, alpha=0.9, label="ref")
-        ad[5].set_title("Acceleration norm", fontsize=9)
+        ad[5].set_title("Acceleration norm", fontsize=_mpl_pt(9))
         ad[5].set_xlabel("t [s]")
         ad[5].set_ylabel("m/s²")
         if acc_r is not None:
-            ad[5].legend(loc="best", fontsize=7)
+            ad[5].legend(loc="best", fontsize=_mpl_pt(7))
         ad[5].grid(True, alpha=0.3)
         ad[6].plot(t, jerk_norm, "c-", lw=1.2, label="meas")
         if jerk_r is not None:
             ad[6].plot(t, np.linalg.norm(jerk_r, axis=1), color="tab:orange", ls="--", lw=1.05, alpha=0.9, label="ref")
-        ad[6].set_title("Jerk norm", fontsize=9)
+        ad[6].set_title("Jerk norm", fontsize=_mpl_pt(9))
         ad[6].set_xlabel("t [s]")
         ad[6].set_ylabel("m/s³")
         if jerk_r is not None:
-            ad[6].legend(loc="best", fontsize=7)
+            ad[6].legend(loc="best", fontsize=_mpl_pt(7))
         ad[6].grid(True, alpha=0.3)
 
         ms = mpc_solve if isinstance(mpc_solve, dict) else {}
@@ -3145,7 +3799,7 @@ class UamSuiteGUI(QMainWindow):
                 ax_t.step(t_u_mpc, nit, where="post", color="C2", lw=0.85, label="nlp_iter")
                 ax_t.set_ylabel("SQP iterations", color="C2")
                 ax_t.tick_params(axis="y", labelcolor="C2")
-            ax_m.set_title("MPC solve (wall time + iterations)", fontsize=9)
+            ax_m.set_title("MPC solve (wall time + iterations)", fontsize=_mpl_pt(9))
             ax_m.set_xlabel("t [s]")
             ax_m.grid(True, alpha=0.3)
         else:
@@ -3153,10 +3807,10 @@ class UamSuiteGUI(QMainWindow):
             ad[7].plot(t, snap_norm, color="tab:purple", lw=1.05, label=r"$\|$snap$\|$ meas")
             if snap_r is not None:
                 ad[7].plot(t, np.linalg.norm(snap_r, axis=1), "k--", lw=0.95, alpha=0.85, label=r"$\|$snap$\|$ ref")
-            ad[7].set_title("Linear snap norm (no MPC log)", fontsize=9)
+            ad[7].set_title("Linear snap norm (no MPC log)", fontsize=_mpl_pt(9))
             ad[7].set_xlabel("t [s]")
             ad[7].set_ylabel("m/s⁴")
-            ad[7].legend(loc="best", fontsize=7)
+            ad[7].legend(loc="best", fontsize=_mpl_pt(7))
             ad[7].grid(True, alpha=0.3)
 
     def _render_planning_reference_full_state(self) -> None:
@@ -3453,7 +4107,7 @@ class UamSuiteGUI(QMainWindow):
                 ha="center",
                 va="center",
                 transform=ax.transAxes,
-                fontsize=12,
+                fontsize=_mpl_pt(12),
             )
             ax.axis("off")
             return
@@ -3523,7 +4177,7 @@ class UamSuiteGUI(QMainWindow):
         def _style_leg(ax):
             ax.legend(loc="upper right", fontsize=6, framealpha=0.88, ncol=2)
             ax.grid(True, alpha=0.3)
-            ax.tick_params(axis="both", labelsize=8)
+            ax.tick_params(axis="both", labelsize=_mpl_pt(8))
 
         # 0: base position
         ax = axes[0]
@@ -3537,7 +4191,7 @@ class UamSuiteGUI(QMainWindow):
             ax.plot(t_m, base_m[:, 2], "b-", lw=1.1, label="real z")
         ax.set_xlabel("t [s]", **tinfo)
         ax.set_ylabel("m", **tinfo)
-        ax.set_title("Base position", fontsize=9)
+        ax.set_title("Base position", fontsize=_mpl_pt(9))
         _style_leg(ax)
 
         # 1: base euler
@@ -3554,7 +4208,7 @@ class UamSuiteGUI(QMainWindow):
             ax.plot(t_m, em[:, 2], "b-", lw=1.1, label="real yaw")
         ax.set_xlabel("t [s]", **tinfo)
         ax.set_ylabel("deg", **tinfo)
-        ax.set_title("Base orientation (Euler ZYX)", fontsize=9)
+        ax.set_title("Base orientation (Euler ZYX)", fontsize=_mpl_pt(9))
         _style_leg(ax)
 
         # 2: EE position (or base linear velocity in s500 mode)
@@ -3579,7 +4233,7 @@ class UamSuiteGUI(QMainWindow):
                 ax.plot(t_m, ee_m[:, 2], "b-", lw=1.1, label="real z")
         ax.set_xlabel("t [s]", **tinfo)
         ax.set_ylabel("m/s" if s500_mode else "m", **tinfo)
-        ax.set_title("Base linear velocity" if s500_mode else "EE position (FK ref / meas. real)", fontsize=9)
+        ax.set_title("Base linear velocity" if s500_mode else "EE position (FK ref / meas. real)", fontsize=_mpl_pt(9))
         _style_leg(ax)
 
         # 3: arm joints (or control inputs in s500 mode)
@@ -3616,7 +4270,7 @@ class UamSuiteGUI(QMainWindow):
                 ax.plot(t_m, np.degrees(X_m[:, 8]), "g-", lw=1.1, label="real j2")
         ax.set_xlabel("t [s]", **tinfo)
         ax.set_ylabel("u" if s500_mode else "deg", **tinfo)
-        ax.set_title("Control inputs" if s500_mode else "Arm joints", fontsize=9)
+        ax.set_title("Control inputs" if s500_mode else "Arm joints", fontsize=_mpl_pt(9))
         _style_leg(ax)
 
         # 3D
@@ -3673,7 +4327,7 @@ class UamSuiteGUI(QMainWindow):
         ax3d.set_xlabel("X [m]", **tinfo)
         ax3d.set_ylabel("Y [m]", **tinfo)
         ax3d.set_zlabel("Z [m]", **tinfo)
-        ax3d.set_title("3D: ref (dashed) · real (solid)", fontsize=10)
+        ax3d.set_title("3D: ref (dashed) · real (solid)", fontsize=_mpl_pt(10))
         ax3d.legend(loc="upper left", fontsize=6, framealpha=0.9)
         try:
             pts = []
@@ -3693,36 +4347,115 @@ class UamSuiteGUI(QMainWindow):
             pass
 
         for ax in axes:
-            ax.tick_params(axis="both", labelsize=8)
-        ax3d.tick_params(axis="both", labelsize=8)
+            ax.tick_params(axis="both", labelsize=_mpl_pt(8))
+        ax3d.tick_params(axis="both", labelsize=_mpl_pt(8))
         subt = "(only ref)" if not has_real else "(ref + real)"
-        fig.suptitle(f"Plan ref (dashed) · closed-loop real (solid) {subt}", fontsize=12, y=0.98)
+        fig.suptitle(f"Plan ref (dashed) · closed-loop real (solid) {subt}", fontsize=_mpl_pt(12), y=0.98)
 
-    def _on_plan_mode(self):
-        self.plan_stack.setCurrentIndex(self.plan_mode_combo.currentIndex())
-        self._refresh_trajectory_setting_height()
-        self._refresh_actions_height()
+    def _make_plan_panel_scroll(self, stack: QStackedWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(stack)
+        scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        return scroll
+
+    def _schedule_plan_panel_height_refresh(self) -> None:
+        """布局/显隐变更后延迟一帧再定高，避免 sizeHint 未更新导致第 2 组高度跳动。"""
+        if not hasattr(self, "_plan_height_timer"):
+            self._plan_height_timer = QTimer(self)
+            self._plan_height_timer.setSingleShot(True)
+            self._plan_height_timer.timeout.connect(self._update_plan_panel_heights)
+        self._plan_height_timer.start(0)
+
+    def _update_plan_panel_heights(self) -> None:
+        idx = 0
+        if hasattr(self, "plan_mode_combo"):
+            idx = int(self.plan_mode_combo.currentIndex())
+        path_h = int(_PLAN_PATH_SCROLL_H.get(idx, 360))
+        opt_h = int(_PLAN_OPT_SCROLL_H.get(idx, 0))
+
+        if hasattr(self, "path_scroll"):
+            self.path_scroll.setFixedHeight(path_h)
+        if hasattr(self, "opt_scroll"):
+            show_opt = idx != 1
+            self.opt_scroll.setVisible(show_opt)
+            self.opt_scroll.setFixedHeight(opt_h if show_opt else 0)
+
+        if hasattr(self, "task_group"):
+            self.task_group.setMaximumHeight(16777215)
+        if hasattr(self, "traj_group"):
+            self.traj_group.setMaximumHeight(16777215)
 
     def _refresh_trajectory_setting_height(self) -> None:
-        if not hasattr(self, "plan_stack"):
-            return
-        w = self.plan_stack.currentWidget()
-        if w is None:
-            return
-        # Keep trajectory setting height adaptive to current content.
-        h = int(max(180, min(900, w.sizeHint().height() + 24)))
-        self.plan_stack.setMaximumHeight(h)
-        if hasattr(self, "traj_group"):
-            self.traj_group.setMaximumHeight(h + 36)
+        self._schedule_plan_panel_height_refresh()
+
+    def _on_plan_mode(self):
+        idx = self.plan_mode_combo.currentIndex()
+        if hasattr(self, "path_stack"):
+            self.path_stack.setCurrentIndex(idx)
+        if hasattr(self, "opt_stack"):
+            self.opt_stack.setCurrentIndex(idx)
+        # Method 选择仅对 full-state 优化有意义（位置/EE 与 acc 测试使用各自的求解器）。
+        if hasattr(self, "method_row_widget"):
+            self.method_row_widget.setVisible(idx == 0)
+        self._schedule_plan_panel_height_refresh()
+        self._refresh_actions_height()
 
     def _refresh_task_selection_ui(self) -> None:
         """Apply current robot/trajectory selection to the planning panes."""
         if not hasattr(self, "task_robot_combo") or not hasattr(self, "task_traj_combo"):
             return
+        # Startup/param-restore: keep the already-selected trajectory rather than
+        # forcing the robot's first one (that reset only applies to manual robot switches).
+        desired = self._current_trajectory_template_id()
         self._on_task_robot_changed(self.task_robot_combo.currentText())
+        if desired and self.task_traj_combo.findData(desired) >= 0:
+            i = self.task_traj_combo.findData(desired)
+            if i != self.task_traj_combo.currentIndex():
+                self.task_traj_combo.setCurrentIndex(i)
         self._apply_task_to_planning(emit_log=False)
-        self._refresh_task_config_height()
-        self._on_plan_mode()
+
+    def _restore_last_session_selection(self) -> None:
+        """Restore the last-used Robot mode and Trajectory template across launches.
+
+        Matches by robot name and trajectory template id (robust to index/order
+        changes); falls back silently if the file is missing or invalid.
+        """
+        try:
+            if not LAST_SESSION_PATH.exists():
+                return
+            data = json.loads(LAST_SESSION_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        robot = data.get("robot_mode")
+        traj_id = data.get("traj_template_id")
+        if robot:
+            i = self.task_robot_combo.findText(str(robot))
+            if i >= 0 and i != self.task_robot_combo.currentIndex():
+                self.task_robot_combo.setCurrentIndex(i)
+                self._refresh_task_selection_ui()
+        if traj_id:
+            j = self.task_traj_combo.findData(str(traj_id))
+            if j >= 0 and j != self.task_traj_combo.currentIndex():
+                self.task_traj_combo.setCurrentIndex(j)
+
+    def _save_last_session_selection(self) -> None:
+        try:
+            payload = {
+                "robot_mode": self.task_robot_combo.currentText(),
+                "traj_template_id": self._current_trajectory_template_id(),
+            }
+            LAST_SESSION_PATH.write_text(
+                json.dumps(payload, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        self._save_last_session_selection()
+        super().closeEvent(event)
 
     def _is_s500_mode(self) -> bool:
         return hasattr(self, "task_robot_combo") and self.task_robot_combo.currentText() == "s500"
@@ -3742,10 +4475,7 @@ class UamSuiteGUI(QMainWindow):
         return out
 
     def _refresh_task_config_height(self) -> None:
-        if not hasattr(self, "task_group"):
-            return
-        h = int(max(120, min(320, self.task_group.sizeHint().height() + 12)))
-        self.task_group.setMaximumHeight(h)
+        self._refresh_trajectory_setting_height()
 
     def _refresh_actions_height(self) -> None:
         if not hasattr(self, "plan_actions_group"):
@@ -3753,14 +4483,180 @@ class UamSuiteGUI(QMainWindow):
         h = int(max(110, min(280, self.plan_actions_group.sizeHint().height() + 10)))
         self.plan_actions_group.setMaximumHeight(h)
 
+    def _template_label(self, template_id: str) -> str:
+        tid = str(template_id)
+        if tid in self._user_templates:
+            return str(self._user_templates[tid].get("name", tid))
+        return self._template_display_names.get(tid, tid)
+
+    def _is_user_template(self, template_id: str) -> bool:
+        return str(template_id) in self._user_templates
+
+    def _template_base_kind(self, template_id: str) -> str:
+        tid = str(template_id)
+        ud = self._user_templates.get(tid)
+        if isinstance(ud, dict):
+            return str(ud.get("base_template", "minimum_snap"))
+        return tid
+
+    def _user_template_ids_for_robot(self, robot_mode: str) -> list[str]:
+        out = []
+        for tid, ud in self._user_templates.items():
+            if not isinstance(ud, dict):
+                continue
+            if str(ud.get("robot", "")) == str(robot_mode):
+                out.append(tid)
+        out.sort(key=lambda t: str(self._user_templates[t].get("created_at", "")))
+        return out
+
+    def _current_trajectory_template_id(self) -> str:
+        if not hasattr(self, "task_traj_combo"):
+            return ""
+        data = self.task_traj_combo.currentData()
+        if data is not None and str(data).strip():
+            return str(data)
+        return self.task_traj_combo.currentText()
+
+    def _populate_task_traj_combo(self, robot_mode: str, select_id: str | None = None) -> None:
+        if not hasattr(self, "task_traj_combo"):
+            return
+        if select_id is None:
+            select_id = self._current_trajectory_template_id()
+        ids = list(self._task_trajectories.get(robot_mode, []))
+        ids += self._user_template_ids_for_robot(robot_mode)
+        self.task_traj_combo.blockSignals(True)
+        self.task_traj_combo.clear()
+        for tid in ids:
+            self.task_traj_combo.addItem(self._template_label(tid), tid)
+        if select_id and self.task_traj_combo.findData(select_id) >= 0:
+            self.task_traj_combo.setCurrentIndex(self.task_traj_combo.findData(select_id))
+        elif ids:
+            self.task_traj_combo.setCurrentIndex(0)
+        self.task_traj_combo.blockSignals(False)
+
+    def _rename_current_trajectory_template(self) -> None:
+        tid = self._current_trajectory_template_id()
+        if not tid:
+            QMessageBox.information(self, "Rename template", "请先选择一个 Trajectory template。")
+            return
+        old_label = self._template_label(tid)
+        is_user = self._is_user_template(tid)
+        hint = f"基础模板：{self._template_base_kind(tid)}" if is_user else f"模板类型：{tid}"
+        new_label, ok = QInputDialog.getText(
+            self,
+            "Rename trajectory template",
+            f"{hint}\n显示名称：",
+            text=old_label,
+        )
+        if not ok:
+            return
+        new_label = str(new_label).strip()
+        if not new_label:
+            QMessageBox.warning(self, "Rename template", "显示名称不能为空。")
+            return
+        try:
+            if is_user:
+                self._user_templates[tid]["name"] = new_label
+                _write_user_templates(self._user_templates)
+            else:
+                if new_label == tid:
+                    self._template_display_names.pop(tid, None)
+                else:
+                    self._template_display_names[tid] = new_label
+                _write_template_display_names(self._template_display_names)
+        except Exception as e:
+            QMessageBox.critical(self, "Rename template", f"保存名称失败：{e!r}")
+            return
+        robot = self.task_robot_combo.currentText() if hasattr(self, "task_robot_combo") else "s500"
+        self._populate_task_traj_combo(robot, select_id=tid)
+        self._refresh_saved_trajectory_combo()
+        self.log(f"[template] Renamed “{tid}”: “{old_label}” → “{new_label}”")
+
+    def _create_template_from_current(self) -> None:
+        cur_id = self._current_trajectory_template_id()
+        if not cur_id:
+            QMessageBox.information(self, "New template", "请先选择一个基础 Trajectory template。")
+            return
+        base = self._template_base_kind(cur_id)
+        robot = self.task_robot_combo.currentText() if hasattr(self, "task_robot_combo") else "s500"
+        default_name = f"{self._template_label(cur_id)} (copy)"
+        name, ok = QInputDialog.getText(
+            self,
+            "New trajectory template",
+            f"基于当前配置新建模板\n机器人：{robot}    基础模板：{base}\n模板名称：",
+            text=default_name,
+        )
+        if not ok:
+            return
+        name = str(name).strip()
+        if not name:
+            QMessageBox.warning(self, "New template", "模板名称不能为空。")
+            return
+        try:
+            params = self._collect_params()
+        except Exception as e:
+            QMessageBox.critical(self, "New template", f"读取当前配置失败：{e!r}")
+            return
+        tid = "user_" + uuid.uuid4().hex[:10]
+        self._user_templates[tid] = {
+            "id": tid,
+            "name": name,
+            "robot": robot,
+            "base_template": base,
+            "params": params,
+            "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        }
+        try:
+            _write_user_templates(self._user_templates)
+        except Exception as e:
+            self._user_templates.pop(tid, None)
+            QMessageBox.critical(self, "New template", f"保存模板失败：{e!r}")
+            return
+        self._populate_task_traj_combo(robot, select_id=tid)
+        self._on_task_traj_changed()
+        self.log(f"[template] Created custom template “{name}” (base={base}, robot={robot})")
+
+    def _delete_current_user_template(self) -> None:
+        tid = self._current_trajectory_template_id()
+        if not self._is_user_template(tid):
+            QMessageBox.information(self, "Delete template", "内置 template 不可删除，仅能删除自定义 template。")
+            return
+        name = self._template_label(tid)
+        if (
+            QMessageBox.question(
+                self,
+                "Delete template",
+                f"确定删除自定义模板 “{name}” 吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        self._user_templates.pop(tid, None)
+        try:
+            _write_user_templates(self._user_templates)
+        except Exception as e:
+            QMessageBox.critical(self, "Delete template", f"保存失败：{e!r}")
+            return
+        robot = self.task_robot_combo.currentText() if hasattr(self, "task_robot_combo") else "s500"
+        self._populate_task_traj_combo(robot)
+        self._on_task_traj_changed()
+        self.log(f"[template] Deleted custom template “{name}”")
+
     def _on_task_robot_changed(self, robot_mode: str) -> None:
         # Robot switch must invalidate cached Pinocchio/Crocoddyl model.
         self._lazy_pin_planner = None
         self.planner = None
-        self.task_traj_combo.blockSignals(True)
-        self.task_traj_combo.clear()
-        self.task_traj_combo.addItems(self._task_trajectories.get(robot_mode, []))
-        self.task_traj_combo.blockSignals(False)
+        # 每个 robot 拥有独立的轨迹集合：切换 robot 后回到该 robot 的第一个默认轨迹。
+        builtin = self._task_trajectories.get(robot_mode, [])
+        first_id = builtin[0] if builtin else None
+        self._populate_task_traj_combo(robot_mode, select_id=first_id)
+        self._apply_robot_mode_ui_labels(robot_mode)
+        self._on_task_traj_changed()
+        self._sync_gazebo_launch_with_task()
+
+    def _apply_robot_mode_ui_labels(self, robot_mode: str) -> None:
         # s500 has no arm EE-tracking semantics in UI wording.
         if robot_mode == "s500":
             self.plan_mode_combo.setItemText(1, "Position trajectory")
@@ -3778,10 +4674,9 @@ class UamSuiteGUI(QMainWindow):
                 self.ee_wp_label.setText("EE waypoints (x,y,z m, yaw°, time s) — consistent with the EE tracking GUI")
             if hasattr(self, "ee_type_row_widget"):
                 self.ee_type_row_widget.setVisible(True)
-        self._on_task_traj_changed(self.task_traj_combo.currentText())
-        self._sync_gazebo_launch_with_task()
 
-    def _on_task_traj_changed(self, traj_name: str) -> None:
+    def _on_task_traj_changed(self) -> None:
+        traj_name = self._current_trajectory_template_id()
         hints = {
             "full_state_default": "全状态航点轨迹（使用 Planning 页 Full-state OCP）",
             "full_state_crocoddyl": "全状态航点轨迹（s500 + Crocoddyl）",
@@ -3792,10 +4687,17 @@ class UamSuiteGUI(QMainWindow):
             "circle": "圆形轨迹（Circle）",
             "csv_import": "从 CSV 导入位置/速度轨迹，并按速度上限自动时间缩放",
         }
-        self.task_hint_label.setText(hints.get(str(traj_name), ""))
+        if self._is_user_template(traj_name):
+            base = self._template_base_kind(traj_name)
+            self.task_hint_label.setText(
+                hints.get(base, f"自定义模板（基于 {base}）")
+            )
+        else:
+            self.task_hint_label.setText(hints.get(str(traj_name), ""))
         # Selection should immediately drive the parameter panel below.
         self._apply_task_to_planning(emit_log=False)
-        self._refresh_task_config_height()
+        self._schedule_plan_panel_height_refresh()
+        self._sync_plots_for_task_selection()
 
     def _sync_gazebo_launch_with_task(self) -> None:
         robot = self.task_robot_combo.currentText() if hasattr(self, "task_robot_combo") else "s500_uam"
@@ -3816,7 +4718,9 @@ class UamSuiteGUI(QMainWindow):
 
     def _apply_task_to_planning(self, emit_log: bool = True) -> None:
         robot = self.task_robot_combo.currentText()
-        traj = self.task_traj_combo.currentText()
+        traj_id = self._current_trajectory_template_id()
+        user_def = self._user_templates.get(traj_id)
+        traj = self._template_base_kind(traj_id)
         if robot == "s500":
             if self.wp_table.rowCount() >= 1:
                 self.wp_table.setItem(0, 4, QTableWidgetItem("0.0"))
@@ -3859,10 +4763,153 @@ class UamSuiteGUI(QMainWindow):
         else:  # minimum_snap
             self.plan_mode_combo.setCurrentIndex(1)
             self.ee_plan_type_combo.setCurrentIndex(0)
+        # User-defined templates restore their saved parameter snapshot on top of the base.
+        if isinstance(user_def, dict) and isinstance(user_def.get("params"), dict):
+            self._apply_plan_template_snapshot(user_def["params"])
+        # Per-template saved control points (highest priority user-edited override).
+        saved_cp = self._template_control_points.get(
+            self._template_config_key(robot, traj_id)
+        )
+        if isinstance(saved_cp, dict):
+            self._apply_plan_template_snapshot(saved_cp)
         self._on_plan_mode()
         self._refresh_plan_actuator_taus_enabled()
+        self._schedule_plan_panel_height_refresh()
         if emit_log:
-            self.log(f"Task applied: robot={robot}, trajectory={traj}")
+            self.log(f"Task applied: robot={robot}, trajectory={self._template_label(traj_id)}")
+
+    def _template_config_key(self, robot: str, template_id: str) -> str:
+        return f"{robot}::{template_id}"
+
+    def _save_template_control_points(self) -> None:
+        robot = self.task_robot_combo.currentText() if hasattr(self, "task_robot_combo") else "s500"
+        tid = self._current_trajectory_template_id()
+        if not tid:
+            QMessageBox.information(self, "Save control points", "请先选择一个 Trajectory template。")
+            return
+        try:
+            params = self._collect_params()
+        except Exception as e:
+            QMessageBox.critical(self, "Save control points", f"读取当前配置失败：{e!r}")
+            return
+        # _read_wp_table already returns v2-format angle columns (j1,j2,yaw); tag the
+        # snapshot as v2 so restore does not re-run the v1->v2 column swap.
+        params["version"] = 2
+        key = self._template_config_key(robot, tid)
+        self._template_control_points[key] = params
+        try:
+            _write_template_control_points(self._template_control_points)
+        except Exception as e:
+            QMessageBox.critical(self, "Save control points", f"保存失败：{e!r}")
+            return
+        self.log(
+            f"[template] Saved control points for {robot} / {self._template_label(tid)}."
+        )
+
+    def _apply_plan_template_snapshot(self, p: dict) -> None:
+        """Apply only the planning-related widgets from a saved param snapshot."""
+        if not isinstance(p, dict):
+            return
+        if isinstance(p.get("wp_rows"), list):
+            rows = p["wp_rows"]
+            if int(p.get("version", 1)) < 2:
+                rows = _migrate_mixed_wp_rows_v1_to_v2(rows)
+            self._restore_wp_rows(rows)
+        if isinstance(p.get("ee_wp_rows"), list):
+            self._set_table_from_rows(self.ee_wp_table, p["ee_wp_rows"], 5)
+
+        plan_spins = {
+            "dt_plan": self.dt_plan,
+            "max_iter_plan": self.max_iter_plan,
+            "state_w": self.state_w,
+            "ctrl_w": self.ctrl_w,
+            "wp_mult": self.wp_mult,
+            "ee_knot_w": self.ee_knot_w,
+            "ee_knot_state_reg_w": self.ee_knot_state_reg_w,
+            "ee_knot_rot_w": self.ee_knot_rot_w,
+            "ee_knot_vel_w": self.ee_knot_vel_w,
+            "ee_knot_vel_pitch_w": self.ee_knot_vel_pitch_w,
+            "dt_ee_sample": self.dt_ee_sample,
+            "ee_eight_a": self.ee_eight_a,
+            "ee_eight_period": self.ee_eight_period,
+            "ee_eight_tdur": self.ee_eight_tdur,
+            "ee_sun_vmax": self.ee_sun_vmax,
+            "ee_sun_amax": self.ee_sun_amax,
+            "ee_sun_n": self.ee_sun_n,
+            "ee_sun_loops": self.ee_sun_loops,
+            "ee_sun_yaw_const_deg": self.ee_sun_yaw_const,
+            "ee_sun_buffer_s": self.ee_sun_buffer,
+            "ee_circle_r": self.ee_circle_r,
+            "ee_circle_period": self.ee_circle_period,
+            "ee_circle_loops": self.ee_circle_loops,
+            "ee_circle_tdur": self.ee_circle_tdur,
+            "ee_circle_yaw_const_deg": self.ee_circle_yaw_const,
+            "ee_circle_buffer_s": self.ee_circle_buffer,
+            "ee_csv_vmax_limit": self.ee_csv_vmax_limit,
+            "ee_csv_z_offset_m": self.ee_csv_z_offset,
+            "ee_csv_yaw_const_deg": self.ee_csv_yaw_const,
+            "plan_tau_motor": self.plan_tau_motor,
+            "plan_tau_joint": self.plan_tau_joint,
+            "acc_track_px": self.acc_track_px,
+            "acc_track_py": self.acc_track_py,
+            "acc_track_pz": self.acc_track_pz,
+            "acc_track_yaw_deg": self.acc_track_yaw_deg,
+            "acc_track_duration": self.acc_track_duration,
+            "acc_track_step_time": self.acc_track_step_time,
+            "acc_track_a_before": self.acc_track_a_before,
+            "acc_track_a_after": self.acc_track_a_after,
+            "acc_track_pulse_end": self.acc_track_pulse_end,
+            "acc_track_sin_amp": self.acc_track_sin_amp,
+            "acc_track_sin_freq": self.acc_track_sin_freq,
+            "acc_track_sin_phase_deg": self.acc_track_sin_phase_deg,
+            "acc_track_rotor_tau_s": self.acc_track_rotor_tau,
+        }
+        for key, widget in plan_spins.items():
+            if key in p:
+                try:
+                    widget.setValue(p[key])
+                except Exception:
+                    pass
+
+        for key, widgets in (
+            ("ee_eight_center", (self.ee_eight_cx, self.ee_eight_cy, self.ee_eight_cz)),
+            ("ee_sun_center", (self.ee_sun_cx, self.ee_sun_cy, self.ee_sun_cz)),
+            ("ee_circle_center", (self.ee_circle_cx, self.ee_circle_cy, self.ee_circle_cz)),
+        ):
+            v = p.get(key)
+            if isinstance(v, list) and len(v) >= 3:
+                for w, val in zip(widgets, v):
+                    w.setValue(float(val))
+
+        for key, chk in (
+            ("ee_sun_yaw_hold", self.ee_sun_yaw_hold),
+            ("ee_circle_yaw_hold", self.ee_circle_yaw_hold),
+            ("ee_csv_yaw_hold", self.ee_csv_yaw_hold),
+            ("acc_track_brake_to_rest", self.acc_track_brake_to_rest),
+            ("acc_track_rotor_dyn", self.acc_track_rotor_dyn_chk),
+            ("plan_croc_use_actuator_first_order", self.plan_croc_use_actuator_first_order),
+        ):
+            if key in p:
+                chk.setChecked(bool(p[key]))
+
+        if "ee_csv_path" in p:
+            self.ee_csv_path.setText(str(p["ee_csv_path"]))
+
+        for key, combo in (
+            ("method_index", self.method_combo),
+            ("ee_plan_type_index", self.ee_plan_type_combo),
+            ("ee_sun_plane_index", self.ee_sun_plane_combo),
+            ("acc_track_shape_index", self.acc_track_shape_combo),
+            ("acc_track_axis_index", self.acc_track_axis_combo),
+        ):
+            if key in p:
+                idx = int(p[key])
+                if 0 <= idx < combo.count():
+                    combo.setCurrentIndex(idx)
+
+        self.acc_track_rotor_tau.setEnabled(self.acc_track_rotor_dyn_chk.isChecked())
+        self._on_ee_plan_type_changed()
+        self._on_acc_track_shape_changed()
 
     def _generate_task_trajectory_now(self) -> None:
         # Do not re-apply task template on every Generate click.
@@ -3897,6 +4944,7 @@ class UamSuiteGUI(QMainWindow):
             self.plan_tau_joint.setEnabled(is_croc and use_lag)
         if hasattr(self, "wp3_group"):
             self.wp3_group.setVisible(method == "acados_wp3_joint_opt")
+        self._schedule_plan_panel_height_refresh()
 
     def _on_ee_plan_type_changed(self):
         idx = int(self.ee_plan_type_combo.currentIndex())
@@ -3926,8 +4974,302 @@ class UamSuiteGUI(QMainWindow):
         if filepath:
             self.ee_csv_path.setText(filepath)
 
+    def _plan_bundle_snapshot_meta(self, pb: dict | None = None) -> dict:
+        pb = pb if pb is not None else self._plan_bundle
+        robot = self.task_robot_combo.currentText() if hasattr(self, "task_robot_combo") else ""
+        traj = self._current_trajectory_template_id()
+        traj_label = (
+            self.task_traj_combo.currentText() if hasattr(self, "task_traj_combo") else traj
+        )
+        kind = str(pb.get("kind", "")) if isinstance(pb, dict) else ""
+        now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        return {
+            "robot": robot,
+            "trajectory_template": traj,
+            "trajectory_template_label": traj_label,
+            "kind": kind,
+            "updated_at": now,
+        }
+
+    def _refresh_saved_trajectory_combo(self) -> None:
+        if not hasattr(self, "saved_traj_combo"):
+            return
+        index = _load_saved_trajectory_index()
+        items: dict = index.get("items") or {}
+        rows = sorted(
+            items.values(),
+            key=lambda it: str(it.get("updated_at", it.get("created_at", ""))),
+            reverse=True,
+        )
+        cur_id = self.saved_traj_combo.currentData()
+        self.saved_traj_combo.blockSignals(True)
+        self.saved_traj_combo.clear()
+        for it in rows:
+            tid = str(it.get("id", ""))
+            if not tid:
+                continue
+            label = str(it.get("name", tid))
+            robot = it.get("robot", "")
+            tmpl = it.get("trajectory_template", "")
+            tmpl_label = it.get("trajectory_template_label") or tmpl
+            if robot or tmpl_label:
+                label = f"{label}  ({robot}/{tmpl_label})"
+            self.saved_traj_combo.addItem(label, tid)
+        if cur_id is not None:
+            i = self.saved_traj_combo.findData(cur_id)
+            if i >= 0:
+                self.saved_traj_combo.setCurrentIndex(i)
+        elif index.get("last_loaded_id"):
+            i = self.saved_traj_combo.findData(index.get("last_loaded_id"))
+            if i >= 0:
+                self.saved_traj_combo.setCurrentIndex(i)
+        self.saved_traj_combo.blockSignals(False)
+
+    def _apply_plan_bundle_to_gui(self, pb: dict, *, log_msg: str | None = None) -> bool:
+        if not isinstance(pb, dict) or not pb.get("kind"):
+            return False
+        self._plan_bundle = pb
+        self._last_track_res = None
+        # Planning tab may call this before Tracking widgets (sim_dt, etc.) exist.
+        if hasattr(self, "fig_states") and hasattr(self, "sim_dt"):
+            self._redraw_combined_views(None)
+        self._update_track_mode_enabled()
+        has_plan = True
+        self.run_track_btn.setEnabled(has_plan)
+        self.meshcat_plan_btn.setEnabled(has_plan)
+        self.meshcat_track_btn.setEnabled(False)
+        _full_plan = pb.get("kind") in ("full_croc", "full_acados", "ee_snap")
+        if hasattr(self, "rn_launch_btn"):
+            self.rn_launch_btn.setEnabled(_full_plan)
+        if log_msg:
+            self.log(log_msg)
+        return True
+
+    def _persist_plan_bundle(
+        self,
+        pb: dict,
+        *,
+        traj_id: str,
+        display_name: str,
+        created_at: str | None = None,
+    ) -> None:
+        index = _load_saved_trajectory_index()
+        items: dict = index.setdefault("items", {})
+        prev = items.get(traj_id, {}) if isinstance(items.get(traj_id), dict) else {}
+        entry = dict(prev)
+        entry.update(self._plan_bundle_snapshot_meta(pb))
+        entry["id"] = traj_id
+        entry["name"] = display_name
+        entry.setdefault("created_at", created_at or entry.get("created_at") or entry["updated_at"])
+        items[traj_id] = entry
+        index["last_loaded_id"] = traj_id
+        _write_plan_bundle_files(traj_id, pb, entry)
+        _write_saved_trajectory_index(index)
+        self._refresh_saved_trajectory_combo()
+        i = self.saved_traj_combo.findData(traj_id)
+        if i >= 0:
+            self.saved_traj_combo.setCurrentIndex(i)
+
+    def _autosave_plan_bundle(self, pb: dict) -> None:
+        if not isinstance(pb, dict) or not pb.get("kind"):
+            return
+        robot = self.task_robot_combo.currentText() if hasattr(self, "task_robot_combo") else "s500"
+        tmpl = self._current_trajectory_template_id()
+        slot_id = _plan_slot_autosave_id(robot, tmpl)
+        name = self._current_trajectory_save_name()
+        try:
+            self._persist_plan_bundle(
+                pb,
+                traj_id=slot_id,
+                display_name=f"{name} (auto)",
+            )
+        except Exception as e:
+            self.log(f"[trajectory] Autosave failed: {e!r}")
+
+    def _find_saved_plan_entry_for_selection(self) -> str | None:
+        """查找与当前 robot + template 匹配的已保存轨迹（优先该槽位 autosave）。"""
+        if not hasattr(self, "task_robot_combo") or not hasattr(self, "task_traj_combo"):
+            return None
+        robot = str(self.task_robot_combo.currentText())
+        tmpl = str(self._current_trajectory_template_id())
+        if not robot or not tmpl:
+            return None
+        slot_id = _plan_slot_autosave_id(robot, tmpl)
+        if _read_plan_bundle_files(slot_id) is not None:
+            return slot_id
+        index = _load_saved_trajectory_index()
+        best_id: str | None = None
+        best_ts = ""
+        for tid, entry in (index.get("items") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("robot", "")) != robot:
+                continue
+            if str(entry.get("trajectory_template", "")) != tmpl:
+                continue
+            if str(tid) == AUTOSAVE_TRAJECTORY_ID:
+                continue
+            ts = str(entry.get("updated_at", entry.get("created_at", "")))
+            if ts >= best_ts:
+                best_ts = ts
+                best_id = str(tid)
+        if best_id and _read_plan_bundle_files(best_id) is not None:
+            return best_id
+        # 兼容旧版单一 autosave（仅当 robot/template 一致时）
+        legacy = (index.get("items") or {}).get(AUTOSAVE_TRAJECTORY_ID)
+        if isinstance(legacy, dict):
+            if (
+                str(legacy.get("robot", "")) == robot
+                and str(legacy.get("trajectory_template", "")) == tmpl
+                and _read_plan_bundle_files(AUTOSAVE_TRAJECTORY_ID) is not None
+            ):
+                return AUTOSAVE_TRAJECTORY_ID
+        return None
+
+    def _clear_plan_plots(self) -> None:
+        """无已保存轨迹时清空右侧绘图与 plan bundle。"""
+        if not hasattr(self, "fig_states"):
+            self._plan_bundle = None
+            self._full_plan_result = None
+            self._last_track_res = None
+            return
+        self._plan_bundle = None
+        self._full_plan_result = None
+        self._last_track_res = None
+        for fig, cv in (
+            (self.fig_states, self.cv_states),
+            (self.fig_control, self.cv_control),
+            (self.fig_3d_track, self.cv_3d_track),
+            (self.fig_traj_dash, self.cv_traj_dash),
+            (self.fig_cost_analysis, self.cv_cost_analysis),
+        ):
+            if fig is not None:
+                fig.clear()
+            if cv is not None:
+                cv.draw()
+        self._update_track_mode_enabled()
+        if hasattr(self, "run_track_btn"):
+            self.run_track_btn.setEnabled(False)
+        if hasattr(self, "meshcat_plan_btn"):
+            self.meshcat_plan_btn.setEnabled(False)
+        if hasattr(self, "meshcat_track_btn"):
+            self.meshcat_track_btn.setEnabled(False)
+        if hasattr(self, "rn_launch_btn"):
+            self.rn_launch_btn.setEnabled(False)
+
+    def _sync_plots_for_task_selection(self, *, log_if_loaded: bool = False) -> None:
+        """切换 robot / template 后：有保存结果则显示，否则清空绘图。"""
+        if not hasattr(self, "fig_states"):
+            return
+        tid = self._find_saved_plan_entry_for_selection()
+        if tid:
+            pb = _read_plan_bundle_files(tid)
+            if pb is not None:
+                msg = None
+                if log_if_loaded:
+                    index = _load_saved_trajectory_index()
+                    entry = (index.get("items") or {}).get(tid, {})
+                    name = entry.get("name", tid) if isinstance(entry, dict) else tid
+                    msg = f"[trajectory] Restored plot data for “{name}”."
+                self._apply_plan_bundle_to_gui(pb, log_msg=msg)
+                if hasattr(self, "saved_traj_combo"):
+                    self._refresh_saved_trajectory_combo()
+                    i = self.saved_traj_combo.findData(tid)
+                    if i >= 0:
+                        self.saved_traj_combo.blockSignals(True)
+                        self.saved_traj_combo.setCurrentIndex(i)
+                        self.saved_traj_combo.blockSignals(False)
+                return
+        self._clear_plan_plots()
+
+    def _save_trajectory_as_named(self) -> None:
+        if self._plan_bundle is None:
+            QMessageBox.information(self, "Save trajectory", "请先生成一条轨迹（Generate trajectory）。")
+            return
+        default = self._current_trajectory_save_name()
+        name, ok = QInputDialog.getText(
+            self,
+            "Save trajectory",
+            "轨迹名称（可含中文/空格，将显示在下拉列表中）：",
+            text=default,
+        )
+        if not ok:
+            return
+        name = str(name).strip()
+        if not name:
+            QMessageBox.warning(self, "Save trajectory", "名称不能为空。")
+            return
+        traj_id = uuid.uuid4().hex[:12]
+        try:
+            self._persist_plan_bundle(self._plan_bundle, traj_id=traj_id, display_name=name)
+            self.log(f"[trajectory] Saved as “{name}” (id={traj_id})")
+        except Exception as e:
+            QMessageBox.critical(self, "Save trajectory", f"保存失败：{e!r}")
+
+    def _load_selected_saved_trajectory(self) -> None:
+        traj_id = self.saved_traj_combo.currentData()
+        if not traj_id:
+            QMessageBox.information(self, "Load trajectory", "请先选择一条已保存轨迹。")
+            return
+        self._load_saved_trajectory_by_id(str(traj_id))
+
+    def _load_saved_trajectory_by_id(self, traj_id: str) -> bool:
+        pb = _read_plan_bundle_files(traj_id)
+        if pb is None:
+            QMessageBox.warning(self, "Load trajectory", f"无法读取轨迹文件：{traj_id}")
+            return False
+        index = _load_saved_trajectory_index()
+        entry = (index.get("items") or {}).get(traj_id, {})
+        robot = entry.get("robot") if isinstance(entry, dict) else None
+        tmpl = entry.get("trajectory_template") if isinstance(entry, dict) else None
+        if robot and hasattr(self, "task_robot_combo"):
+            self.task_robot_combo.blockSignals(True)
+            i = self.task_robot_combo.findText(str(robot))
+            if i >= 0 and i != self.task_robot_combo.currentIndex():
+                self.task_robot_combo.setCurrentIndex(i)
+                self._lazy_pin_planner = None
+                self.planner = None
+            self.task_robot_combo.blockSignals(False)
+            self._apply_robot_mode_ui_labels(str(robot))
+            self._populate_task_traj_combo(str(robot), select_id=str(tmpl) if tmpl else None)
+        if tmpl and hasattr(self, "task_traj_combo"):
+            self.task_traj_combo.blockSignals(True)
+            i = self.task_traj_combo.findData(str(tmpl))
+            if i < 0:
+                i = self.task_traj_combo.findText(str(tmpl))
+            if i >= 0:
+                self.task_traj_combo.setCurrentIndex(i)
+            self.task_traj_combo.blockSignals(False)
+        self._apply_task_to_planning(emit_log=False)
+        self._schedule_plan_panel_height_refresh()
+        name = entry.get("name", traj_id) if isinstance(entry, dict) else traj_id
+        ok = self._apply_plan_bundle_to_gui(
+            pb,
+            log_msg=f"[trajectory] Loaded “{name}” from library.",
+        )
+        if ok:
+            index["last_loaded_id"] = traj_id
+            _write_saved_trajectory_index(index)
+            self._refresh_saved_trajectory_combo()
+            i = self.saved_traj_combo.findData(traj_id)
+            if i >= 0:
+                self.saved_traj_combo.setCurrentIndex(i)
+        return ok
+
+    def _try_restore_last_saved_trajectory(self) -> None:
+        """启动后按当前 robot + template 恢复绘图（无则留空）。"""
+        self._sync_plots_for_task_selection(log_if_loaded=True)
+
     def _current_trajectory_save_name(self) -> str:
-        name = self.task_traj_combo.currentText() if hasattr(self, "task_traj_combo") else "trajectory"
+        tid = self._current_trajectory_template_id() or "trajectory"
+        if self._is_user_template(tid):
+            name = self._template_label(tid)
+        else:
+            name = tid
+            if hasattr(self, "task_traj_combo"):
+                label = self.task_traj_combo.currentText().strip()
+                if label and label != name:
+                    name = f"{name}_{label}"
         if str(name) == "csv_import":
             p = self.ee_csv_path.text().strip() if hasattr(self, "ee_csv_path") else ""
             if p:
@@ -4002,16 +5344,39 @@ class UamSuiteGUI(QMainWindow):
         self.reg_ee_pose_label.setVisible(not full)
         self.reg_ee_pose_table.setVisible(not full)
 
+    def _relayout_algo_grid(self, visible_widgets) -> None:
+        """Pack only the visible (label, widget) pairs into a compact 2-column flow."""
+        grid = getattr(self, "_algo_grid", None)
+        if grid is None:
+            return
+        # Detach everything from the grid first (widgets keep their parent).
+        while grid.count():
+            item = grid.takeAt(0)
+            wdg = item.widget()
+            if wdg is not None:
+                wdg.hide()
+        i = 0
+        for lb, w in getattr(self, "_algo_rows", []):
+            if w not in visible_widgets:
+                lb.hide()
+                w.hide()
+                continue
+            row = i // 2
+            col = (i % 2) * 2
+            grid.addWidget(lb, row, col)
+            grid.addWidget(w, row, col + 1)
+            lb.show()
+            w.show()
+            i += 1
+
     def _on_track_mode_changed(self):
         idx = int(self.track_mode_combo.currentIndex())
         if not hasattr(self, "track_algo_group"):
             return
         visible_widgets = {self.dt_mpc}
-        if idx == 0:
+        if idx in (0, 1):
             visible_widgets.update(
                 {
-                    self.croc_horizon,
-                    self.croc_mpc_iter,
                     self.w_state_track,
                     self.w_state_reg,
                     self.w_control,
@@ -4026,7 +5391,20 @@ class UamSuiteGUI(QMainWindow):
                     self.w_u_joint_torque,
                 }
             )
-        elif idx == 1:
+            if idx == 0:
+                visible_widgets.update(
+                    {self.croc_horizon, self.croc_mpc_iter}
+                )
+            else:
+                visible_widgets.update(
+                    {
+                        self.N_mpc,
+                        self.mpc_max_iter,
+                        self.mpc_log_iv,
+                        self.control_mode_track,
+                    }
+                )
+        elif idx == 2:
             visible_widgets.update(
                 {
                     self.N_mpc,
@@ -4055,15 +5433,16 @@ class UamSuiteGUI(QMainWindow):
                     self.croc_ee_use_thrust_constraints,
                 }
             )
-        for lb, w in getattr(self, "_algo_rows", []):
-            show = w in visible_widgets
-            lb.setVisible(show)
-            w.setVisible(show)
+        self._relayout_algo_grid(visible_widgets)
         if idx == 0:
             self.track_algo_group.setTitle(
                 "Algorithm parameters (Crocoddyl full-state tracking)"
             )
         elif idx == 1:
+            self.track_algo_group.setTitle(
+                "Algorithm parameters (Acados full-state tracking; shared cost weights with Croc)"
+            )
+        elif idx == 2:
             self.track_algo_group.setTitle(
                 "Algorithm parameters (Acados EE-centric tracking)"
             )
@@ -4076,7 +5455,7 @@ class UamSuiteGUI(QMainWindow):
     def _refresh_sim_plant_controls_state(self) -> None:
         """Enable/disable plant-only simulator widgets (u lag, payload) by tracking mode."""
         idx = int(self.track_mode_combo.currentIndex()) if hasattr(self, "track_mode_combo") else 0
-        croc_plant_lag = idx in (0, 2)
+        croc_plant_lag = idx in (0, 3)
         use_lag = (
             bool(self.croc_use_actuator_first_order.isChecked())
             if hasattr(self, "croc_use_actuator_first_order")
@@ -4104,7 +5483,7 @@ class UamSuiteGUI(QMainWindow):
             self.px4_rate_Kp_track.setEnabled(croc_plant_lag and px4_on)
         if hasattr(self, "px4_rate_Kd_track"):
             self.px4_rate_Kd_track.setEnabled(croc_plant_lag and px4_on)
-        croc_payload = idx in (0, 2)
+        croc_payload = idx in (0, 3)
         if hasattr(self, "sim_payload_enable"):
             self.sim_payload_enable.setEnabled(croc_payload)
         if hasattr(self, "sim_payload_row"):
@@ -4215,6 +5594,10 @@ class UamSuiteGUI(QMainWindow):
         return x_uam
 
     def _collect_params(self) -> dict:
+        if hasattr(self, "_rn_mpc_weight_profiles"):
+            m = self.rn_controller_combo.currentText()
+            if m in self._rn_mpc_weight_profiles:
+                self._rn_mpc_weight_profiles[m] = self._rn_mpc_weight_snapshot()
         return {
             "version": 1,
             "task_robot_index": int(self.task_robot_combo.currentIndex()),
@@ -4222,6 +5605,7 @@ class UamSuiteGUI(QMainWindow):
             "plan_mode_index": int(self.plan_mode_combo.currentIndex()),
             "method_index": int(self.method_combo.currentIndex()),
             "track_mode_index": int(self.track_mode_combo.currentIndex()),
+            "track_mode_layout_version": 2,
             "reg_mode_index": int(self.reg_mode_combo.currentIndex()),
             "control_mode_track_index": int(self.control_mode_track.currentIndex()),
             "wp_rows": [
@@ -4346,6 +5730,7 @@ class UamSuiteGUI(QMainWindow):
             "reg_ee_xref": self._read_reg_state_table_row(self.reg_ee_state_table, 1),
             "reg_ee_target_pose": self._read_reg_ee_pose_table_row(),
             # ── ROS Tracking 独立 MPC 参数 ──────────────────────────────────
+            "rn_max_thrust_total": float(self.rn_max_thrust_total.value()),
             "rn_dt_mpc": float(self.rn_dt_mpc.value()),
             "rn_horizon": int(self.rn_horizon.value()),
             "rn_mpc_max_iter": int(self.rn_mpc_max_iter.value()),
@@ -4361,6 +5746,13 @@ class UamSuiteGUI(QMainWindow):
             "rn_w_joint_vel": float(self.rn_w_joint_vel.value()),
             "rn_w_u_thrust": float(self.rn_w_u_thrust.value()),
             "rn_w_u_joint_torque": float(self.rn_w_u_joint_torque.value()),
+            "rn_mpc_weight_profiles": {
+                k: dict(v) for k, v in self._rn_mpc_weight_profiles.items()
+            },
+            "rn_acados_solver_mode": self.rn_acados_solver_mode.currentText(),
+            "rn_acados_integrator": self.rn_acados_integrator.currentText(),
+            "rn_acados_hpipm_mode": self.rn_acados_hpipm.currentText(),
+            "rn_acados_qp_iter_max": int(self.rn_acados_qp_iter.value()),
             "rn_ee_w_pos": float(self.rn_ee_w_pos.value()),
             "rn_ee_w_rot_rp": float(self.rn_ee_w_rot_rp.value()),
             "rn_ee_w_rot_yaw": float(self.rn_ee_w_rot_yaw.value()),
@@ -4503,6 +5895,7 @@ class UamSuiteGUI(QMainWindow):
             self.croc_ee_w_rot_yaw.setValue(float(p["w_ee_yaw"]))
 
         # ── ROS Tracking 独立 MPC 参数 ────────────────────────────────────────
+        _set_spin("rn_max_thrust_total", self.rn_max_thrust_total)
         _set_spin("rn_dt_mpc", self.rn_dt_mpc)
         _set_spin("rn_horizon", self.rn_horizon)
         _set_spin("rn_mpc_max_iter", self.rn_mpc_max_iter)
@@ -4531,6 +5924,21 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("rn_geo_kR", self.rn_geo_kR)
         _set_spin("rn_geo_kOmega", self.rn_geo_kOmega)
         _set_spin("rn_geo_max_tilt_deg", self.rn_geo_max_tilt_deg)
+        if isinstance(p.get("rn_mpc_weight_profiles"), dict) and hasattr(
+            self, "_rn_mpc_weight_profiles"
+        ):
+            for mk, prof in p["rn_mpc_weight_profiles"].items():
+                if mk in self._rn_mpc_weight_profiles and isinstance(prof, dict):
+                    self._rn_mpc_weight_profiles[mk] = dict(prof)
+            self._rn_on_controller_mode_changed(self.rn_controller_combo.currentIndex())
+        else:
+            if "rn_acados_solver_mode" in p:
+                self.rn_acados_solver_mode.setCurrentText(str(p["rn_acados_solver_mode"]))
+            if "rn_acados_integrator" in p:
+                self.rn_acados_integrator.setCurrentText(str(p["rn_acados_integrator"]))
+            if "rn_acados_hpipm_mode" in p:
+                self.rn_acados_hpipm.setCurrentText(str(p["rn_acados_hpipm_mode"]))
+            _set_spin("rn_acados_qp_iter_max", self.rn_acados_qp_iter)
         _set_combo_text("gz_pkg", self.gz_pkg_combo)
         _set_combo_text("gz_launch_file", self.gz_launch_combo)
         _set_combo_text("gz_model", self.gz_model_combo)
@@ -4554,7 +5962,16 @@ class UamSuiteGUI(QMainWindow):
         _set_combo("ee_plan_type_index", self.ee_plan_type_combo)
         _set_combo("ee_sun_plane_index", self.ee_sun_plane_combo)
         _set_combo("method_index", self.method_combo)
-        _set_combo("track_mode_index", self.track_mode_combo)
+        if "track_mode_index" in p:
+            idx = int(p["track_mode_index"])
+            if int(p.get("track_mode_layout_version", 1)) < 2:
+                # v1: 0=croc full, 1=ee acados, 2=croc ee → v2 inserts acados full at index 1
+                if idx == 1:
+                    idx = 2
+                elif idx == 2:
+                    idx = 3
+            if 0 <= idx < self.track_mode_combo.count():
+                self.track_mode_combo.setCurrentIndex(idx)
         _set_combo("reg_mode_index", self.reg_mode_combo)
         _set_combo("control_mode_track_index", self.control_mode_track)
         _set_combo("track_sim_control_stack_index", self.track_sim_control_stack)
@@ -4727,6 +6144,7 @@ class UamSuiteGUI(QMainWindow):
             return {
                 "version",
                 "track_mode_index",
+                "track_mode_layout_version",
                 "reg_mode_index",
                 "control_mode_track_index",
                 "T_sim",
@@ -4779,6 +6197,7 @@ class UamSuiteGUI(QMainWindow):
         if tab_id == TAB_ROS:
             return {
                 "version",
+                "rn_max_thrust_total",
                 "rn_dt_mpc",
                 "rn_horizon",
                 "rn_mpc_max_iter",
@@ -4871,11 +6290,52 @@ class UamSuiteGUI(QMainWindow):
 
     def _make_wp_type_combo(self, type_value: str = "Base") -> QComboBox:
         cb = QComboBox()
-        cb.addItems(["Base", "EE", "EEp"])
-        label = _normalize_wp_type_for_combo(type_value)
-        idx = cb.findText(label)
+        # Display label + canonical value (data). EEp gets a clearer, explicit label.
+        cb.addItem("Base", "Base")
+        cb.addItem("EE (位姿: 位置+姿态)", "EE")
+        cb.addItem("EEp (仅位置, 不约束姿态)", "EEp")
+        cb.setItemData(0, "基座位姿 + 关节角", Qt.ToolTipRole)
+        cb.setItemData(1, "末端执行器位置 + 姿态(roll/pitch/yaw)", Qt.ToolTipRole)
+        cb.setItemData(2, "仅约束末端执行器位置；姿态不约束，角度列禁用", Qt.ToolTipRole)
+        canon = _normalize_wp_type_for_combo(type_value)
+        idx = cb.findData(canon)
         cb.setCurrentIndex(idx if idx >= 0 else 0)
+        cb.currentIndexChanged.connect(self._refresh_wp_rows_angle_enabled)
         return cb
+
+    def _wp_combo_value(self, cb: QComboBox) -> str:
+        data = cb.currentData() if cb is not None else None
+        if data:
+            return str(data)
+        return cb.currentText() if cb is not None else "Base"
+
+    def _refresh_wp_rows_angle_enabled(self) -> None:
+        """EEp 行不约束姿态：禁用并灰显 j1/roll, j2/pitch, yaw 三列。"""
+        if not hasattr(self, "wp_table"):
+            return
+        from PyQt5.QtGui import QColor
+
+        for r in range(self.wp_table.rowCount()):
+            w0 = self.wp_table.cellWidget(r, 0)
+            kind = _normalize_wp_type_for_combo(
+                self._wp_combo_value(w0) if isinstance(w0, QComboBox) else "Base"
+            )
+            disable = kind == "EEp"
+            for c in (4, 5, 6):
+                it = self.wp_table.item(r, c)
+                if it is None:
+                    it = QTableWidgetItem("0")
+                    self.wp_table.setItem(r, c, it)
+                if disable:
+                    it.setFlags(Qt.ItemIsSelectable)
+                    it.setBackground(QColor(225, 225, 225))
+                    it.setToolTip("EEp 仅约束位置，姿态不可输入")
+                else:
+                    it.setFlags(
+                        Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
+                    )
+                    it.setBackground(QColor(255, 255, 255))
+                    it.setToolTip("")
 
     def _make_wp_zero_v_widget(self, checked: bool = True) -> QWidget:
         """Centered checkbox container for the wp_table 'Zero v' column."""
@@ -4910,7 +6370,7 @@ class UamSuiteGUI(QMainWindow):
         for r in range(self.wp_table.rowCount()):
             w0 = self.wp_table.cellWidget(r, 0)
             if isinstance(w0, QComboBox):
-                mode = (w0.currentText().strip() if w0 else "Base") or "Base"
+                mode = self._wp_combo_value(w0) or "Base"
             else:
                 it0 = self.wp_table.item(r, 0)
                 mode = (it0.text().strip() if it0 else "Base") or "Base"
@@ -4947,6 +6407,7 @@ class UamSuiteGUI(QMainWindow):
             for c, v in enumerate(nums):
                 self.wp_table.setItem(r, c + 1, QTableWidgetItem(f"{v:g}"))
             self.wp_table.setCellWidget(r, 8, self._make_wp_zero_v_widget(zero_v))
+        self._refresh_wp_rows_angle_enabled()
 
     def _add_wp_row(self):
         r = self.wp_table.rowCount()
@@ -4955,6 +6416,7 @@ class UamSuiteGUI(QMainWindow):
         for c in range(1, 8):
             self.wp_table.setItem(r, c, QTableWidgetItem("0"))
         self.wp_table.setCellWidget(r, 8, self._make_wp_zero_v_widget(True))
+        self._refresh_wp_rows_angle_enabled()
 
     def _del_wp_row(self):
         if self.wp_table.rowCount() > 2:
@@ -5276,6 +6738,7 @@ class UamSuiteGUI(QMainWindow):
         try:
             if self._plan_bundle is not None:
                 self._save_generated_plan_csv(self._plan_bundle)
+                self._autosave_plan_bundle(self._plan_bundle)
         except Exception as e:
             self.log(f"[planning] Failed to save generated CSV: {e!r}")
         _full_plan = self._plan_bundle is not None and (
@@ -5488,6 +6951,7 @@ class UamSuiteGUI(QMainWindow):
         self.meshcat_track_btn.setEnabled(False)
         try:
             self._save_generated_plan_csv(self._plan_bundle)
+            self._autosave_plan_bundle(self._plan_bundle)
         except Exception as e:
             self.log(f"[planning] Failed to save generated CSV: {e!r}")
         self.rn_launch_btn.setEnabled(True)
@@ -5529,6 +6993,7 @@ class UamSuiteGUI(QMainWindow):
         self.meshcat_track_btn.setEnabled(False)
         try:
             self._save_generated_plan_csv(self._plan_bundle)
+            self._autosave_plan_bundle(self._plan_bundle)
         except Exception as e:
             self.log(f"[planning] Failed to save generated CSV: {e!r}")
         self.rn_launch_btn.setEnabled(True)
@@ -5552,13 +7017,16 @@ class UamSuiteGUI(QMainWindow):
             it = self.track_mode_combo.model().item(0)
             if it is not None:
                 it.setEnabled(full)
-            it2 = self.track_mode_combo.model().item(2)
+            it_acados_full = self.track_mode_combo.model().item(1)
+            if it_acados_full is not None:
+                it_acados_full.setEnabled(full and self._EE_MPC_OK)
+            it2 = self.track_mode_combo.model().item(3)
             if it2 is not None:
                 it2.setEnabled(self._CROC_EE_OK)
         except Exception:
             pass
-        if not full and self.track_mode_combo.currentIndex() == 0:
-            self.track_mode_combo.setCurrentIndex(1)
+        if not full and self.track_mode_combo.currentIndex() in (0, 1):
+            self.track_mode_combo.setCurrentIndex(2)
         self._on_track_mode_changed()
 
     def _run_regulation(self):
@@ -5686,20 +7154,314 @@ class UamSuiteGUI(QMainWindow):
         self._track_worker.finished.connect(self._on_track_croc_ee_finished)
         self._track_worker.start()
 
+    def _rn_fs_weight_widgets(self) -> dict:
+        return {
+            "w_state_track": self.rn_w_state_track,
+            "w_state_reg": self.rn_w_state_reg,
+            "w_control": self.rn_w_control,
+            "w_terminal_track": self.rn_w_terminal_track,
+            "w_pos": self.rn_w_pos,
+            "w_att": self.rn_w_att,
+            "w_joint": self.rn_w_joint,
+            "w_vel": self.rn_w_vel,
+            "w_omega": self.rn_w_omega,
+            "w_joint_vel": self.rn_w_joint_vel,
+            "w_u_thrust": self.rn_w_u_thrust,
+            "w_u_joint_torque": self.rn_w_u_joint_torque,
+            "mpc_max_iter": self.rn_mpc_max_iter,
+        }
+
+    def _rn_acados_solver_snapshot(self) -> dict:
+        return {
+            "acados_solver_mode": self.rn_acados_solver_mode.currentText(),
+            "acados_integrator": self.rn_acados_integrator.currentText(),
+            "acados_hpipm_mode": self.rn_acados_hpipm.currentText(),
+            "acados_qp_iter_max": int(self.rn_acados_qp_iter.value()),
+        }
+
+    def _rn_extra_param_widgets(self) -> dict:
+        """除 full-state 权重/acados 选项外，每个算法各自维护的其它控制器参数。"""
+        return {
+            "dt_mpc": self.rn_dt_mpc,
+            "horizon": self.rn_horizon,
+            "control_rate": self.rn_control_rate,
+            "max_thrust_total": self.rn_max_thrust_total,
+            "ee_w_pos": self.rn_ee_w_pos,
+            "ee_w_rot_rp": self.rn_ee_w_rot_rp,
+            "ee_w_rot_yaw": self.rn_ee_w_rot_yaw,
+            "ee_w_vel_lin": self.rn_ee_w_vel_lin,
+            "ee_w_vel_ang_rp": self.rn_ee_w_vel_ang_rp,
+            "ee_w_vel_ang_yaw": self.rn_ee_w_vel_ang_yaw,
+            "ee_w_u": self.rn_ee_w_u,
+            "ee_w_terminal": self.rn_ee_w_terminal,
+            "geo_kp_pos": self.rn_geo_kp_pos,
+            "geo_kd_vel": self.rn_geo_kd_vel,
+            "geo_kR": self.rn_geo_kR,
+            "geo_kOmega": self.rn_geo_kOmega,
+            "geo_max_tilt_deg": self.rn_geo_max_tilt_deg,
+        }
+
+    def _rn_mpc_weight_snapshot(self) -> dict:
+        snap = {}
+        for k, w in self._rn_fs_weight_widgets().items():
+            snap[k] = (
+                int(w.value()) if isinstance(w, QSpinBox) else float(w.value())
+            )
+        snap.update(self._rn_acados_solver_snapshot())
+        for k, w in self._rn_extra_param_widgets().items():
+            snap[k] = (
+                int(w.value()) if isinstance(w, QSpinBox) else float(w.value())
+            )
+        return snap
+
+    def _rn_set_spin_value(self, widget, val) -> None:
+        if isinstance(widget, QSpinBox):
+            widget.setValue(int(round(float(val))))
+        else:
+            widget.setValue(float(val))
+
+    def _rn_mpc_weight_apply(self, data: dict) -> None:
+        extra = self._rn_extra_param_widgets()
+        widgets = list(self._rn_fs_weight_widgets().values())
+        widgets += [
+            self.rn_acados_solver_mode, self.rn_acados_integrator, self.rn_acados_hpipm,
+            self.rn_acados_qp_iter,
+        ]
+        widgets += list(extra.values())
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            for k, w in self._rn_fs_weight_widgets().items():
+                if k in data:
+                    self._rn_set_spin_value(w, data[k])
+            if "acados_solver_mode" in data:
+                self.rn_acados_solver_mode.setCurrentText(str(data["acados_solver_mode"]))
+            if "acados_integrator" in data:
+                self.rn_acados_integrator.setCurrentText(str(data["acados_integrator"]))
+            if "acados_hpipm_mode" in data:
+                self.rn_acados_hpipm.setCurrentText(str(data["acados_hpipm_mode"]))
+            if "acados_qp_iter_max" in data:
+                self.rn_acados_qp_iter.setValue(int(data["acados_qp_iter_max"]))
+            for k, w in extra.items():
+                if k in data:
+                    self._rn_set_spin_value(w, data[k])
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+    def _rn_init_mpc_weight_profiles(self) -> None:
+        croc = self._rn_mpc_weight_snapshot()
+        self._rn_mpc_weight_profiles["croc_full_state"] = dict(croc)
+        acados = dict(croc)
+        acados["w_terminal_track"] = 100.0
+        acados["mpc_max_iter"] = 40
+        acados["acados_solver_mode"] = "rti"
+        acados["acados_integrator"] = "ERK"
+        acados["acados_hpipm_mode"] = "SPEED"
+        acados["acados_qp_iter_max"] = 20
+        self._rn_mpc_weight_profiles["acados_full_state"] = acados
+
+    def _rn_save_controller_profiles(self) -> None:
+        """将每个算法各自的控制器参数持久化到磁盘（跨重启复用，无需重新调参）。"""
+        # 先把当前算法的最新设置存入内存 profile。
+        cur = self.rn_controller_combo.currentText()
+        if cur in self._rn_mpc_weight_profiles:
+            self._rn_mpc_weight_profiles[cur] = self._rn_mpc_weight_snapshot()
+        try:
+            import json as _json
+
+            payload = {
+                "version": 1,
+                "profiles": {
+                    k: dict(v) for k, v in self._rn_mpc_weight_profiles.items() if v
+                },
+            }
+            RN_CONTROLLER_PROFILES_PATH.write_text(
+                _json.dumps(payload, indent=2), encoding="utf-8"
+            )
+            self.log(
+                f"[controller params] 已保存各算法控制器参数 → "
+                f"{RN_CONTROLLER_PROFILES_PATH.name}（当前算法：{cur}）"
+            )
+            if hasattr(self, "rn_save_ctrl_params_btn"):
+                self.rn_save_ctrl_params_btn.setText("Save controller parameters ✓")
+                QTimer.singleShot(
+                    1500,
+                    lambda: self.rn_save_ctrl_params_btn.setText(
+                        "Save controller parameters"
+                    ),
+                )
+        except Exception as e:
+            self.log(f"[controller params] 保存失败: {e}")
+            QMessageBox.warning(self, "Save failed", f"无法保存控制器参数：\n{e}")
+
+    def _rn_load_controller_profiles(self) -> None:
+        """启动时从磁盘加载各算法控制器参数到内存 profile（不直接应用）。"""
+        try:
+            if not RN_CONTROLLER_PROFILES_PATH.exists():
+                return
+            import json as _json
+
+            data = _json.loads(RN_CONTROLLER_PROFILES_PATH.read_text(encoding="utf-8"))
+            profiles = data.get("profiles", {}) if isinstance(data, dict) else {}
+            n = 0
+            for mode, prof in profiles.items():
+                if mode in self._rn_mpc_weight_profiles and isinstance(prof, dict):
+                    self._rn_mpc_weight_profiles[mode].update(prof)
+                    n += 1
+            if n:
+                self.log(
+                    f"[controller params] 已加载 {n} 个算法的已保存控制器参数 "
+                    f"({RN_CONTROLLER_PROFILES_PATH.name})"
+                )
+        except Exception as e:
+            self.log(f"[controller params] 加载失败（忽略）: {e}")
+
+    def _rn_on_controller_mode_changed(self, index: int = 0) -> None:
+        """切换算法时保存当前 profile 并加载对应 Crocoddyl/Acados 权重。"""
+        new_mode = self.rn_controller_combo.currentText()
+        prev = self._rn_mpc_profile_mode
+        if prev in self._rn_mpc_weight_profiles:
+            self._rn_mpc_weight_profiles[prev] = self._rn_mpc_weight_snapshot()
+        if new_mode in self._rn_mpc_weight_profiles:
+            self._rn_mpc_weight_apply(self._rn_mpc_weight_profiles[new_mode])
+        self._rn_mpc_profile_mode = new_mode
+        if new_mode == "acados_full_state":
+            self.rn_fs_weights_title.setText("Cost weights — Acados profile")
+        elif new_mode == "croc_full_state":
+            self.rn_fs_weights_title.setText("Cost weights — Crocoddyl profile")
+        else:
+            self.rn_fs_weights_title.setText("Cost weights (full-state MPC)")
+        self._rn_update_mpc_panel(index)
+
     def _rn_update_mpc_panel(self, _index: int = 0) -> None:
         """根据 controller mode 切换 full-state / EE 参数面板可见性。"""
         mode = self.rn_controller_combo.currentText()
-        is_full = mode == "croc_full_state"
+        is_full = mode in ("croc_full_state", "acados_full_state")
         is_ee = mode == "croc_ee_pose"
         is_geo = mode == "geometric"
+        is_acados = mode == "acados_full_state"
         self._rn_fs_panel.setVisible(is_full)
+        self._rn_acados_panel.setVisible(is_acados)
+        self.rn_fs_weights_title.setVisible(is_full)
         self._rn_ee_panel.setVisible(is_ee)
         self._rn_geo_panel.setVisible(is_geo)
         # px4 / geometric 模式不使用此处 MPC 参数
-        use_mpc_params = mode in ("croc_full_state", "croc_ee_pose")
+        use_mpc_params = mode in ("croc_full_state", "acados_full_state", "croc_ee_pose")
         self.rn_dt_mpc.setEnabled(use_mpc_params)
         self.rn_horizon.setEnabled(use_mpc_params)
         self.rn_mpc_max_iter.setEnabled(use_mpc_params)
+        # 切换模式后刷新依赖节点的服务按钮可用性（仅在节点运行时启用）
+        if hasattr(self, "rn_start_svc_btn"):
+            running = self._rn_process is not None and self._rn_process.poll() is None
+            self._set_node_service_buttons_enabled(bool(running))
+
+    def _start_rviz_viz_node(self) -> None:
+        """Launch the standalone robot/EE RViz visualizer (decoupled from MPC node)."""
+        if self._viz_process is not None and self._viz_process.poll() is None:
+            return
+        root = Path(__file__).resolve().parent
+        script = root / "suite_rviz_state_node.py"
+        if not script.exists():
+            self.log(f"[viz] visualization node not found: {script}")
+            return
+        is_s500 = self._is_s500_mode()
+        robot_name = (
+            self.gz_model_combo.currentText().strip()
+            if hasattr(self, "gz_model_combo") and self.gz_model_combo.currentText().strip()
+            else self.task_robot_combo.currentText()
+        )
+        odom_src = (
+            self.rn_odom_combo.currentText() if hasattr(self, "rn_odom_combo") else "gazebo"
+        )
+        use_sim = (
+            "true"
+            if (hasattr(self, "rn_use_sim_check") and self.rn_use_sim_check.isChecked())
+            else "false"
+        )
+        cmd = [
+            sys.executable,
+            str(script),
+            "__name:=suite_rviz_state_node",
+            f"_urdf_path:={self._selected_robot_urdf_path()}",
+            f"_robot_name:={robot_name}",
+            f"_arm_enabled:={'false' if is_s500 else 'true'}",
+            f"_odom_source:={odom_src}",
+            f"_use_simulation:={use_sim}",
+        ]
+        try:
+            self._viz_process = subprocess.Popen(
+                cmd, cwd=str(root), env=os.environ.copy()
+            )
+            self.log(
+                f"[viz] RViz robot/EE visualizer started (PID={self._viz_process.pid}) "
+                f"-> /suite_mpc/robot_markers, /suite_mpc/ee_axes"
+            )
+        except Exception as e:
+            self.log(f"[viz] failed to start visualizer: {e!r}")
+
+    def _restart_rviz_viz_node(self) -> None:
+        """重启 viz 节点并 DELETEALL，清除 tracking 曾留下的 latched marker。"""
+        self._stop_rviz_viz_node()
+        self._start_rviz_viz_node()
+
+    def _current_gazebo_robot_name(self) -> str:
+        if hasattr(self, "gz_model_combo") and self.gz_model_combo.currentText().strip():
+            return self.gz_model_combo.currentText().strip()
+        return self.task_robot_combo.currentText().strip() or "s500_uam"
+
+    def _ensure_gazebo_state_subscription(self) -> None:
+        """订阅 /gazebo/model_states，用于 Drone Status 与（可选）尽早启动显示。"""
+        if getattr(self, "_gazebo_states_subscribed", False):
+            if not getattr(self, "_status_monitor_inited", False):
+                self._init_drone_status_monitor()
+            return
+        if not self._ensure_ros_node():
+            return
+        try:
+            import time as _time
+            import rospy
+            from gazebo_msgs.msg import ModelStates
+
+            robot_name = self._current_gazebo_robot_name()
+
+            def _gz_cb(msg):
+                try:
+                    idx = msg.name.index(robot_name)
+                except ValueError:
+                    return
+                p = msg.pose[idx].position
+                self._gazebo_pose = (float(p.x), float(p.y), float(p.z))
+                self._gazebo_pose_t = _time.monotonic()
+                if not getattr(self, "_status_monitor_inited", False):
+                    self._init_drone_status_monitor()
+
+            rospy.Subscriber(
+                "/gazebo/model_states", ModelStates, _gz_cb, queue_size=10
+            )
+            self._gazebo_states_subscribed = True
+            self.log(
+                f"[status] 已订阅 /gazebo/model_states（模型 '{robot_name}'）"
+            )
+            self._init_drone_status_monitor()
+        except Exception as e:
+            self.log(f"[status] gazebo/model_states 订阅失败: {e}")
+
+    def _stop_rviz_viz_node(self) -> None:
+        if self._viz_process is None:
+            return
+        try:
+            self._viz_process.terminate()
+            self._viz_process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                self._viz_process.kill()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            self._viz_process = None
 
     def _start_ros_gazebo(self) -> None:
         pkg = self.gz_pkg_combo.currentText().strip() if hasattr(self, "gz_pkg_combo") else ""
@@ -5739,9 +7501,26 @@ class UamSuiteGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Launch failed", str(e)[:2000])
             self.log(f"Gazebo launch failed: {e!r}")
+            return
+        # Gazebo 位姿 + RViz 可视化：model_states 可用后即订阅/显示（不依赖 tracking node）
+        for _delay in (1500, 3000, 5000):
+            QTimer.singleShot(_delay, self._ensure_gazebo_state_subscription)
+        QTimer.singleShot(2000, self._start_rviz_viz_node)
 
     def _stop_ros_gazebo(self) -> None:
         try:
+            self._gazebo_states_subscribed = False
+            self._gazebo_pose = None
+            self._gazebo_pose_t = 0.0
+            # 0) 关闭独立 RViz 可视化节点
+            self._stop_rviz_viz_node()
+            subprocess.run(
+                ["rosnode", "kill", "/suite_rviz_state_node"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
             # 1) 优先关闭当前 GUI 记录的 roslaunch 进程
             if self._gazebo_process is not None:
                 try:
@@ -5987,6 +7766,7 @@ class UamSuiteGUI(QMainWindow):
             f"_control_rate:={ctrl_rate}",
             f"_arm_control_mode:={arm_mode}",
             f"_use_simulation:={use_sim}",
+            f"_max_thrust:={self.rn_max_thrust_total.value()}",
             # ── ROS-specific MPC parameters (independent from Tracking tab) ──
             f"_dt_mpc:={self.rn_dt_mpc.value()}",
             f"_horizon:={self.rn_horizon.value()}",
@@ -6003,6 +7783,10 @@ class UamSuiteGUI(QMainWindow):
             f"_w_joint_vel:={self.rn_w_joint_vel.value()}",
             f"_w_u_thrust:={self.rn_w_u_thrust.value()}",
             f"_w_u_joint_torque:={self.rn_w_u_joint_torque.value()}",
+            f"_acados_solver_mode:={self.rn_acados_solver_mode.currentText()}",
+            f"_acados_integrator:={self.rn_acados_integrator.currentText()}",
+            f"_acados_hpipm_mode:={self.rn_acados_hpipm.currentText()}",
+            f"_acados_qp_iter_max:={self.rn_acados_qp_iter.value()}",
             f"_ee_w_pos:={self.rn_ee_w_pos.value()}",
             f"_ee_w_rot_rp:={self.rn_ee_w_rot_rp.value()}",
             f"_ee_w_rot_yaw:={self.rn_ee_w_rot_yaw.value()}",
@@ -6016,7 +7800,14 @@ class UamSuiteGUI(QMainWindow):
             f"_geo_kR:={self.rn_geo_kR.value()}",
             f"_geo_kOmega:={self.rn_geo_kOmega.value()}",
             f"_geo_max_tilt_deg:={self.rn_geo_max_tilt_deg.value()}",
+            "_viz_robot_markers:=false",
+            "_viz_ee_axes:=false",
         ]
+        # RViz 机器人/EE 始终由 suite_rviz_state_node 根据 Gazebo 发布；
+        # tracking node 关闭 mesh/axes 发布，避免 Kill 后 latched 旧位姿卡住 RViz。
+        self._ensure_gazebo_state_subscription()
+        if self._viz_process is None or self._viz_process.poll() is not None:
+            QTimer.singleShot(500, self._start_rviz_viz_node)
         try:
             self._rn_process = subprocess.Popen(
                 cmd, cwd=str(root), env=os.environ.copy()
@@ -6029,18 +7820,12 @@ class UamSuiteGUI(QMainWindow):
         self.rn_status_label.setText(f"节点状态：运行中  (PID {self._rn_process.pid})")
         self.rn_status_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
         self.rn_kill_btn.setEnabled(True)
-        self.rn_start_svc_btn.setEnabled(True)
-        self.rn_stop_svc_btn.setEnabled(True)
-        self.rn_save_svc_btn.setEnabled(True)
-        self.rn_update_ctrl_btn.setEnabled(True)
-        self.rn_update_traj_btn.setEnabled(True)
-        support_reg_services = ctrl_mode in ("croc_full_state", "croc_ee_pose", "px4", "geometric")
-        self.rn_reset_svc_btn.setEnabled(support_reg_services)
-        self.rn_set_reg_btn.setEnabled(support_reg_services)
+        self._set_node_service_buttons_enabled(True)
+        self._init_drone_status_monitor()
         self.log(
             f"Launched run_tracking_controller.py | PID={self._rn_process.pid} | "
             f"mode={ctrl_mode} odom={odom_src} rate={ctrl_rate}Hz | plan={npz_path}\n"
-            "节点就绪后，切换 OFFBOARD 并解锁，再点击 /start_tracking 开始跟踪。"
+            "节点就绪后，可点 Take off 自动 OFFBOARD+解锁+归位起点，或手动 OFFBOARD 解锁后点 /start_tracking。"
         )
 
     def _prepare_ros_export_plan_bundle(self) -> dict | None:
@@ -6081,14 +7866,433 @@ class UamSuiteGUI(QMainWindow):
         self.rn_status_label.setText("节点状态：已停止")
         self.rn_status_label.setStyleSheet("color: gray;")
         self.rn_kill_btn.setEnabled(False)
-        self.rn_start_svc_btn.setEnabled(False)
-        self.rn_stop_svc_btn.setEnabled(False)
-        self.rn_save_svc_btn.setEnabled(False)
-        self.rn_update_ctrl_btn.setEnabled(False)
-        self.rn_update_traj_btn.setEnabled(False)
-        self.rn_reset_svc_btn.setEnabled(False)
-        self.rn_set_reg_btn.setEnabled(False)
+        self._set_node_service_buttons_enabled(False)
         self.log("ROS tracking process terminated.")
+        # 确保 Gazebo 驱动的 RViz 可视化仍在运行（重启 viz 以 DELETEALL 旧 latched marker）
+        if self._gazebo_process is not None and self._gazebo_process.poll() is None:
+            self._ensure_gazebo_state_subscription()
+            QTimer.singleShot(200, self._restart_rviz_viz_node)
+
+    def _ensure_ros_node(self) -> bool:
+        """Initialize a rospy node once (for subscribers/status). Safe to call repeatedly.
+
+        Returns False (without blocking) when no ROS master is reachable.
+        """
+        if getattr(self, "_ros_node_inited", False):
+            return True
+        try:
+            import rosgraph
+
+            if not rosgraph.is_master_online():
+                return False
+        except Exception:
+            return False
+        try:
+            import rospy
+
+            rospy.init_node(
+                "uam_flight_studio_gui", anonymous=True, disable_signals=True
+            )
+            self._ros_node_inited = True
+            return True
+        except Exception as e:
+            self.log(f"[mavros] rospy init failed: {e}")
+            return False
+
+    def _init_drone_status_monitor(self) -> None:
+        """Subscribe to MAVROS state/pose topics and refresh the status labels periodically.
+
+        No-op (retryable) if there is no ROS master yet.
+        """
+        if getattr(self, "_status_monitor_inited", False):
+            return
+        self._mav_state = None
+        self._mav_local_pose = None
+        self._mav_vision_pose = None
+        self._gazebo_pose = getattr(self, "_gazebo_pose", None)
+        self._gazebo_pose_t = getattr(self, "_gazebo_pose_t", 0.0)
+        self._mav_state_t = 0.0
+        self._mav_local_t = 0.0
+        self._mav_vision_t = 0.0
+        self._mpc_stats = None
+        self._mpc_stats_t = 0.0
+        if not self._ensure_ros_node():
+            return
+        try:
+            import time as _time
+            import json as _json
+            import rospy
+            from mavros_msgs.msg import State
+            from geometry_msgs.msg import PoseStamped
+            from std_msgs.msg import String as _StringMsg
+
+            def _state_cb(msg):
+                self._mav_state = msg
+                self._mav_state_t = _time.monotonic()
+
+            def _local_cb(msg):
+                self._mav_local_pose = msg
+                self._mav_local_t = _time.monotonic()
+
+            def _vision_cb(msg):
+                self._mav_vision_pose = msg
+                self._mav_vision_t = _time.monotonic()
+
+            def _stats_cb(msg):
+                try:
+                    self._mpc_stats = _json.loads(msg.data)
+                    self._mpc_stats_t = _time.monotonic()
+                except Exception:
+                    pass
+
+            rospy.Subscriber("/mavros/state", State, _state_cb, queue_size=5)
+            rospy.Subscriber(
+                "/mavros/local_position/pose", PoseStamped, _local_cb, queue_size=5
+            )
+            rospy.Subscriber(
+                "/mavros/vision_pose/pose", PoseStamped, _vision_cb, queue_size=5
+            )
+            rospy.Subscriber(
+                "/suite_mpc/stats", _StringMsg, _stats_cb, queue_size=5
+            )
+        except Exception as e:
+            self.log(f"[mavros] status subscribe failed: {e}")
+            return
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self._update_drone_status)
+        self._status_timer.start(300)
+        self._status_monitor_inited = True
+        self.log("[mavros] drone status monitor active.")
+
+    def _update_drone_status(self) -> None:
+        import time as _time
+
+        now = _time.monotonic()
+        # 超过该时长未收到对应话题，视为数据失效（链路断开 / Gazebo 已停止）。
+        # /mavros/state 默认 1Hz，阈值放宽；位姿话题高频，阈值收紧。
+        STATE_STALE = 3.0
+        POSE_STALE = 1.5
+
+        def _pos_str(ps, t_recv):
+            if ps is None or (now - t_recv) > POSE_STALE:
+                return "—"
+            p = ps.pose.position
+            return f"{p.x:+.2f}, {p.y:+.2f}, {p.z:+.2f}"
+
+        st = self._mav_state
+        state_fresh = st is not None and (now - self._mav_state_t) <= STATE_STALE
+        if not state_fresh:
+            self.rn_st_conn.setText("no link")
+            self.rn_st_conn.setStyleSheet("font-weight: bold; color: #b71c1c;")
+            self.rn_st_arm.setText("—")
+            self.rn_st_arm.setStyleSheet("font-weight: bold; color: gray;")
+            self.rn_st_mode.setText("—")
+        else:
+            conn = bool(getattr(st, "connected", False))
+            armed = bool(getattr(st, "armed", False))
+            self.rn_st_conn.setText("connected" if conn else "no link")
+            self.rn_st_conn.setStyleSheet(
+                "font-weight: bold; color: %s;" % ("#2e7d32" if conn else "#b71c1c")
+            )
+            self.rn_st_arm.setText("ARMED" if armed else "disarmed")
+            self.rn_st_arm.setStyleSheet(
+                "font-weight: bold; color: %s;" % ("#e65100" if armed else "gray")
+            )
+            self.rn_st_mode.setText(str(getattr(st, "mode", "—")) or "—")
+
+        # EKF pose 来自 MAVROS /mavros/local_position/pose（PX4 EKF2 融合输出）。
+        # Vision pose 来自 /mavros/vision_pose/pose；仿真下 vision = Gazebo 真值，
+        # 因此定位一致性始终比较 EKF vs Vision。
+        ekf_fresh = (
+            self._mav_local_pose is not None
+            and (now - self._mav_local_t) <= POSE_STALE
+        )
+        vis_fresh = (
+            self._mav_vision_pose is not None
+            and (now - self._mav_vision_t) <= POSE_STALE
+        )
+        self.rn_st_ekf.setText(_pos_str(self._mav_local_pose, self._mav_local_t))
+        self.rn_st_ekf.setStyleSheet("font-weight: bold;")
+        self.rn_st_vision.setText(_pos_str(self._mav_vision_pose, self._mav_vision_t))
+
+        # ── Localization：EKF vs Vision 一致性 ──────────────────────────────
+        if not ekf_fresh and not vis_fresh:
+            self.rn_st_loc.setText("no data")
+            self.rn_st_loc.setStyleSheet("font-weight: bold; color: gray;")
+        elif not ekf_fresh:
+            self.rn_st_loc.setText("UNAVAILABLE (no EKF)")
+            self.rn_st_loc.setStyleSheet("font-weight: bold; color: #b71c1c;")
+        elif not vis_fresh:
+            self.rn_st_loc.setText("UNAVAILABLE (no Vision)")
+            self.rn_st_loc.setStyleSheet("font-weight: bold; color: #b71c1c;")
+        else:
+            pe = self._mav_local_pose.pose.position
+            pv = self._mav_vision_pose.pose.position
+            err = (
+                (float(pe.x) - float(pv.x)) ** 2
+                + (float(pe.y) - float(pv.y)) ** 2
+                + (float(pe.z) - float(pv.z)) ** 2
+            ) ** 0.5
+            if err > 0.50:
+                self.rn_st_loc.setText(f"UNAVAILABLE  err={err*100:.0f} cm")
+                self.rn_st_loc.setStyleSheet("font-weight: bold; color: #b71c1c;")
+            elif err > 0.10:
+                self.rn_st_loc.setText(f"WARNING  err={err*100:.0f} cm")
+                self.rn_st_loc.setStyleSheet("font-weight: bold; color: #e65100;")
+            else:
+                self.rn_st_loc.setText(f"OK  err={err*100:.1f} cm")
+                self.rn_st_loc.setStyleSheet("font-weight: bold; color: #2e7d32;")
+
+        # ── MPC runtime stats ────────────────────────────────────────────────
+        ms = getattr(self, "_mpc_stats", None)
+        ms_fresh = ms is not None and (now - self._mpc_stats_t) <= 1.0
+        if not ms_fresh:
+            for lbl in (
+                self.rn_ms_hz, self.rn_ms_phase, self.rn_ms_solve,
+                self.rn_ms_solve_stat, self.rn_ms_iters, self.rn_ms_horizon,
+                self.rn_ms_cost, self.rn_ms_err_yaw, self.rn_ms_err_xyz,
+                self.rn_ms_err_pos,
+            ):
+                lbl.setText("—")
+                lbl.setStyleSheet("font-weight: bold; color: gray;")
+        else:
+            hz = float(ms.get("loop_hz", 0.0))
+            tgt = float(ms.get("target_hz", 0.0))
+            self.rn_ms_hz.setText(f"{hz:.1f} / {tgt:.0f} Hz")
+            ok_hz = tgt <= 0 or hz >= 0.8 * tgt
+            self.rn_ms_hz.setStyleSheet(
+                "font-weight: bold; color: %s;" % ("#2e7d32" if ok_hz else "#e65100")
+            )
+            status = int(ms.get("status", 0))
+            status_ok = status in (0, 2)
+            self.rn_ms_phase.setText(f"{ms.get('mode', '?')} · {ms.get('phase', '?')} · s{status}")
+            self.rn_ms_phase.setStyleSheet(
+                "font-weight: bold; color: %s;" % ("#2e7d32" if status_ok else "#b71c1c")
+            )
+            self.rn_ms_solve.setText(f"{float(ms.get('solve_ms', 0.0)):.2f}")
+            self.rn_ms_solve.setStyleSheet("font-weight: bold;")
+            self.rn_ms_solve_stat.setText(
+                f"{float(ms.get('solve_ms_avg', 0.0)):.2f} / {float(ms.get('solve_ms_max', 0.0)):.2f}"
+            )
+            self.rn_ms_solve_stat.setStyleSheet("font-weight: bold;")
+            self.rn_ms_iters.setText(f"{int(ms.get('iters', 0))} / {int(ms.get('qp_iters', 0))}")
+            self.rn_ms_iters.setStyleSheet("font-weight: bold;")
+            self.rn_ms_horizon.setText(
+                f"N={int(ms.get('horizon', 0))}, dt={float(ms.get('dt_mpc', 0.0)):.3f}s"
+            )
+            self.rn_ms_horizon.setStyleSheet("font-weight: bold;")
+
+            cost = ms.get("cost", None)
+            self.rn_ms_cost.setText("—" if cost is None else f"{float(cost):.3g}")
+            self.rn_ms_cost.setStyleSheet("font-weight: bold;")
+
+            yaw_err = float(ms.get("err_yaw_deg", 0.0))
+            self.rn_ms_err_yaw.setText(f"{yaw_err:+.2f}")
+            self.rn_ms_err_yaw.setStyleSheet(
+                "font-weight: bold; color: %s;"
+                % ("#2e7d32" if abs(yaw_err) <= 5.0 else "#e65100")
+            )
+
+            ex = float(ms.get("err_x", 0.0))
+            ey = float(ms.get("err_y", 0.0))
+            ez = float(ms.get("err_z", 0.0))
+            self.rn_ms_err_xyz.setText(f"{ex:+.3f}, {ey:+.3f}, {ez:+.3f}")
+            self.rn_ms_err_xyz.setStyleSheet("font-weight: bold;")
+
+            epos = float(ms.get("err_pos", 0.0))
+            self.rn_ms_err_pos.setText(f"{epos:.3f}")
+            self.rn_ms_err_pos.setStyleSheet(
+                "font-weight: bold; color: %s;"
+                % ("#2e7d32" if epos <= 0.10 else ("#e65100" if epos <= 0.30 else "#b71c1c"))
+            )
+        running = self._rn_process is not None and self._rn_process.poll() is None
+        self.rn_st_track.setText("node on" if running else "node off")
+        self.rn_st_track.setStyleSheet(
+            "font-weight: bold; color: %s;" % ("#2e7d32" if running else "gray")
+        )
+
+    def _call_set_flight_mode(self, mode: str) -> None:
+        """调用 /mavros/set_mode 切换 PX4 飞行模式（OFFBOARD / POSCTL ...）。"""
+        import threading
+
+        def _call():
+            try:
+                import rospy
+                from mavros_msgs.srv import SetMode
+
+                rospy.wait_for_service("/mavros/set_mode", timeout=3.0)
+                svc = rospy.ServiceProxy("/mavros/set_mode", SetMode)
+                resp = svc(base_mode=0, custom_mode=mode)
+                ok = bool(getattr(resp, "mode_sent", False))
+                msg = f"[set_mode {mode}] {'OK' if ok else 'FAIL'}"
+            except Exception as e:
+                msg = f"[set_mode {mode}] ERROR: {e}"
+            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        threading.Thread(target=_call, daemon=True).start()
+
+    def _call_arm(self, arm: bool) -> None:
+        """调用 /mavros/cmd/arming 解锁/上锁。"""
+        import threading
+
+        def _call():
+            try:
+                import rospy
+                from mavros_msgs.srv import CommandBool
+
+                rospy.wait_for_service("/mavros/cmd/arming", timeout=3.0)
+                svc = rospy.ServiceProxy("/mavros/cmd/arming", CommandBool)
+                resp = svc(value=bool(arm))
+                ok = bool(getattr(resp, "success", False))
+                msg = f"[{'arm' if arm else 'disarm'}] {'OK' if ok else 'FAIL'}"
+            except Exception as e:
+                msg = f"[{'arm' if arm else 'disarm'}] ERROR: {e}"
+            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        # 上锁同时停止一键起飞的 OFFBOARD 设定点流（若在运行）
+        if not arm:
+            evt = getattr(self, "_offboard_stop_evt", None)
+            if evt is not None:
+                evt.set()
+
+        threading.Thread(target=_call, daemon=True).start()
+
+    def _call_gazebo_takeoff(self, target_z: float = 1.0) -> None:
+        """仅依赖 Gazebo + PX4 SITL + MAVROS 的一键起飞。
+
+        持续发布 OFFBOARD 本地位置设定点 (z=target_z)，切 OFFBOARD 模式并解锁，
+        使无人机起飞并悬停到当前 x,y 上方 target_z 米。与 MPC 跟踪节点无关，
+        可在仅启动 Gazebo / PX4 SITL 后直接使用。Disarm 会停止设定点流。
+        """
+        import threading
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _log(msg):
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        # 已有起飞流在运行：仅更新目标高度，避免重复启动
+        thr = getattr(self, "_offboard_stream_thread", None)
+        if thr is not None and thr.is_alive():
+            self._offboard_target_z = float(target_z)
+            self.log(f"[takeoff] OFFBOARD 设定点流已在运行，更新目标高度为 {target_z:.2f} m。")
+            return
+
+        if not self._ensure_ros_node():
+            QMessageBox.warning(
+                self, "Notice", "ROS master 不可用，请先启动 Gazebo / PX4 SITL。"
+            )
+            return
+
+        self._offboard_target_z = float(target_z)
+        self._offboard_stop_evt = threading.Event()
+        stop_evt = self._offboard_stop_evt
+
+        def _run():
+            try:
+                import rospy
+                from geometry_msgs.msg import PoseStamped
+                from mavros_msgs.srv import SetMode, CommandBool
+            except Exception as e:
+                _log(f"[takeoff] import 失败: {e}")
+                return
+
+            # 起飞水平位置取当前 EKF 本地位置（无则 0,0）
+            tx, ty = 0.0, 0.0
+            lp = getattr(self, "_mav_local_pose", None)
+            if lp is not None:
+                tx = float(lp.pose.position.x)
+                ty = float(lp.pose.position.y)
+
+            pub = rospy.Publisher(
+                "/mavros/setpoint_position/local", PoseStamped, queue_size=10
+            )
+
+            def _make_sp():
+                sp = PoseStamped()
+                sp.header.frame_id = "map"
+                sp.header.stamp = rospy.Time.now()
+                sp.pose.position.x = tx
+                sp.pose.position.y = ty
+                sp.pose.position.z = float(self._offboard_target_z)
+                sp.pose.orientation.w = 1.0
+                return sp
+
+            rate = rospy.Rate(20.0)
+
+            # 1) 预热：切 OFFBOARD 前必须已经在持续发送设定点（PX4 要求）
+            _log(
+                f"[takeoff] 预热设定点流 (x={tx:.2f}, y={ty:.2f}, "
+                f"z={self._offboard_target_z:.2f}) ..."
+            )
+            for _ in range(40):
+                if stop_evt.is_set():
+                    return
+                pub.publish(_make_sp())
+                rate.sleep()
+
+            # 2) 切 OFFBOARD
+            try:
+                rospy.wait_for_service("/mavros/set_mode", timeout=3.0)
+                set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
+                r = set_mode(base_mode=0, custom_mode="OFFBOARD")
+                _log(
+                    f"[takeoff] set OFFBOARD "
+                    f"{'OK' if getattr(r, 'mode_sent', False) else 'FAIL'}"
+                )
+            except Exception as e:
+                _log(f"[takeoff] set OFFBOARD ERROR: {e}")
+
+            # 3) 解锁
+            try:
+                rospy.wait_for_service("/mavros/cmd/arming", timeout=3.0)
+                arming = rospy.ServiceProxy("/mavros/cmd/arming", CommandBool)
+                r = arming(value=True)
+                _log(
+                    f"[takeoff] arm "
+                    f"{'OK' if getattr(r, 'success', False) else 'FAIL'}"
+                )
+            except Exception as e:
+                _log(f"[takeoff] arm ERROR: {e}")
+
+            _log(
+                f"[takeoff] 持续悬停于 z={self._offboard_target_z:.2f} m"
+                f"（点击 Disarm 停止设定点流）。"
+            )
+
+            # 4) 持续发布以维持 OFFBOARD（PX4 要求 >2Hz 设定点流）
+            while not stop_evt.is_set() and not rospy.is_shutdown():
+                pub.publish(_make_sp())
+                rate.sleep()
+            _log("[takeoff] OFFBOARD 设定点流已停止。")
+
+        self._offboard_stream_thread = threading.Thread(target=_run, daemon=True)
+        self._offboard_stream_thread.start()
+
+    def _set_node_service_buttons_enabled(self, enabled: bool) -> None:
+        """Enable/disable all ROS-node-dependent service buttons in one place."""
+        ctrl_mode = (
+            self.rn_controller_combo.currentText()
+            if hasattr(self, "rn_controller_combo")
+            else ""
+        )
+        support_reg = ctrl_mode in (
+            "croc_full_state", "acados_full_state", "croc_ee_pose", "px4", "geometric"
+        )
+        for name in (
+            "rn_start_svc_btn", "rn_stop_svc_btn", "rn_save_svc_btn",
+            "rn_update_ctrl_btn", "rn_update_traj_btn",
+        ):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(enabled)
+        for name in ("rn_takeoff_btn", "rn_reset_svc_btn", "rn_set_reg_btn"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(enabled and support_reg)
 
     def _call_tracking_service(self, srv_name: str):
         """在后台线程中调用一个无参数的 ROS Trigger 服务，结果通过日志反馈。"""
@@ -6138,6 +8342,7 @@ class UamSuiteGUI(QMainWindow):
             export_suite_plan_npz(npz_path, export_pb, dt_plan_fallback_s=float(self.dt_plan.value()))
             traj_name = self._current_trajectory_save_name()
             rospy.set_param("/suite_tracking_controller/trajectory_name", traj_name)
+            rospy.set_param("/suite_tracking_controller/suite_plan_path", str(npz_path))
             self.log(f"[update_trajectory] 已导出最新规划到 {npz_path}")
             self.log(f"[update_trajectory] trajectory_name 已更新为: {traj_name}")
         except Exception as e:
@@ -6149,16 +8354,83 @@ class UamSuiteGUI(QMainWindow):
     def _call_reset_to_initial_service(self):
         self._call_tracking_service("/reset_to_initial")
 
-    def _call_update_controller_params(self):
-        """
-        将当前 ROS Tracking 参数写入节点私有参数后，
-        调用 /update_controller_params 在线更新控制器。
-        """
-        import threading
+    def _call_take_off(self):
+        """导出最新规划、刷新节点轨迹，再调用 /take_off 执行两阶段起飞悬停。"""
+        if self._rn_process is None or self._rn_process.poll() is not None:
+            QMessageBox.warning(self, "Notice", "ROS Tracking Node 未运行，无法 Take off。")
+            return
+        export_pb = self._prepare_ros_export_plan_bundle()
+        if export_pb is None:
+            return
 
-        cfg = {
-            "controller_mode": self.rn_controller_combo.currentText(),
+        import threading
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _run():
+            try:
+                import rospy
+                from std_srvs.srv import Trigger
+                from suite_plan_export import export_suite_plan_npz
+
+                root = Path(__file__).resolve().parent
+                export_dir = root / ".suite_ros_export"
+                export_dir.mkdir(exist_ok=True)
+                npz_path = export_dir / "last_suite_plan.npz"
+                export_suite_plan_npz(
+                    npz_path, export_pb, dt_plan_fallback_s=float(self.dt_plan.value())
+                )
+                traj_name = self._current_trajectory_save_name()
+                rospy.set_param("/suite_tracking_controller/trajectory_name", traj_name)
+                rospy.set_param("/suite_tracking_controller/suite_plan_path", str(npz_path))
+
+                if self._rn_process is None or self._rn_process.poll() is not None:
+                    msg = "[/take_off] ERROR: tracking 节点已退出，请重新 Launch"
+                    QMetaObject.invokeMethod(
+                        self, "log", Qt.QueuedConnection, Q_ARG(str, msg)
+                    )
+                    return
+
+                # 快速重载轨迹（节点内默认不重建 acados，避免数秒编译导致崩溃）
+                rospy.wait_for_service("/update_trajectory", timeout=10.0)
+                upd = rospy.ServiceProxy("/update_trajectory", Trigger)
+                upd_resp = upd()
+                if not upd_resp.success:
+                    msg = f"[/update_trajectory] FAIL: {upd_resp.message}"
+                    QMetaObject.invokeMethod(
+                        self, "log", Qt.QueuedConnection, Q_ARG(str, msg)
+                    )
+                    return
+
+                if self._rn_process.poll() is not None:
+                    msg = "[/take_off] ERROR: update_trajectory 后节点已退出（请查看终端日志）"
+                    QMetaObject.invokeMethod(
+                        self, "log", Qt.QueuedConnection, Q_ARG(str, msg)
+                    )
+                    return
+
+                rospy.wait_for_service("/take_off", timeout=10.0)
+                to_resp = rospy.ServiceProxy("/take_off", Trigger)()
+                msg = (
+                    f"[/take_off] {'OK' if to_resp.success else 'FAIL'}: {to_resp.message}"
+                )
+            except Exception as e:
+                msg = f"[/take_off] ERROR: {e}"
+                if self._rn_process is not None and self._rn_process.poll() is not None:
+                    msg += "（tracking 节点已退出，请查看 Launch 终端）"
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        self.log("[take_off] 导出规划并刷新轨迹，随后启动起飞序列…")
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _build_ros_controller_update_cfg(self) -> dict:
+        """组装 /update_controller_params 所需配置（含当前 Croc/Acados profile）。"""
+        mode = self.rn_controller_combo.currentText()
+        if hasattr(self, "_rn_mpc_weight_profiles") and mode in self._rn_mpc_weight_profiles:
+            self._rn_mpc_weight_profiles[mode] = self._rn_mpc_weight_snapshot()
+        return {
+            "controller_mode": mode,
             "control_rate": float(self.rn_control_rate.value()),
+            "max_thrust": float(self.rn_max_thrust_total.value()),
             "dt_mpc": float(self.rn_dt_mpc.value()),
             "horizon": int(self.rn_horizon.value()),
             "mpc_max_iter": int(self.rn_mpc_max_iter.value()),
@@ -6174,6 +8446,10 @@ class UamSuiteGUI(QMainWindow):
             "w_joint_vel": float(self.rn_w_joint_vel.value()),
             "w_u_thrust": float(self.rn_w_u_thrust.value()),
             "w_u_joint_torque": float(self.rn_w_u_joint_torque.value()),
+            "acados_solver_mode": self.rn_acados_solver_mode.currentText(),
+            "acados_integrator": self.rn_acados_integrator.currentText(),
+            "acados_hpipm_mode": self.rn_acados_hpipm.currentText(),
+            "acados_qp_iter_max": int(self.rn_acados_qp_iter.value()),
             "ee_w_pos": float(self.rn_ee_w_pos.value()),
             "ee_w_rot_rp": float(self.rn_ee_w_rot_rp.value()),
             "ee_w_rot_yaw": float(self.rn_ee_w_rot_yaw.value()),
@@ -6189,16 +8465,33 @@ class UamSuiteGUI(QMainWindow):
             "geo_max_tilt_deg": float(self.rn_geo_max_tilt_deg.value()),
         }
 
+    def _call_update_controller_params(self):
+        """
+        将当前 ROS Tracking 参数写入节点私有参数后，
+        调用 /update_controller_params 在线更新控制器。
+        """
+        import threading
+
+        cfg = self._build_ros_controller_update_cfg()
+
         def _run():
             try:
                 import rospy
                 from std_srvs.srv import Trigger
 
+                if not self._ensure_ros_node():
+                    log_msg = "[update_controller_params] ERROR: ROS master 不可用"
+                    from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+                    QMetaObject.invokeMethod(
+                        self, "log", Qt.QueuedConnection, Q_ARG(str, log_msg)
+                    )
+                    return
+
                 param_path = "/suite_tracking_controller/controller_update_data"
                 rospy.set_param(param_path, cfg)
 
                 svc_name = "/update_controller_params"
-                rospy.wait_for_service(svc_name, timeout=3.0)
+                rospy.wait_for_service(svc_name, timeout=60.0)
                 svc = rospy.ServiceProxy(svc_name, Trigger)
                 resp = svc()
                 if resp.success:
@@ -6318,6 +8611,8 @@ class UamSuiteGUI(QMainWindow):
         r_jpos  = _arr("reference_arm_positions")    # (N,nj)
         r_vel   = _arr("reference_velocity")
         r_omg   = _arr("reference_angular_velocity")
+        brate   = _arr("body_rate_commands")          # (N,3) CTBR body-rate cmd [rad/s]
+        thr_cmd = _arr("thrust_command").flatten()    # (N,) normalized thrust cmd
 
         N = len(t)
         if N < 2:
@@ -6475,6 +8770,19 @@ class UamSuiteGUI(QMainWindow):
         finally:
             self._manual_ref_overlay = old_manual
 
+        # ── CTBR / Feedback 专用图：实际 vs 规划电机力、CTBR 指令、角速度反馈 ──
+        try:
+            self._render_ctbr_feedback_figure(
+                t=t,
+                u_mpc=u_out,
+                omg=omg[:N] if omg.ndim == 2 and omg.shape[0] >= N else None,
+                r_omg=r_omg[:N] if r_omg.ndim == 2 and r_omg.shape[0] >= N else None,
+                brate=brate[:N] if brate.ndim == 2 and brate.shape[0] >= N else None,
+                thr_cmd=thr_cmd[:N] if thr_cmd.size >= N else None,
+            )
+        except Exception:
+            self.log(f"[plot] CTBR/feedback figure failed:\n{_tb.format_exc()}")
+
         if self._is_s500_mode():
             self.log(
                 f"[plot] Rendered {N} steps (s500 base-only) | "
@@ -6486,6 +8794,136 @@ class UamSuiteGUI(QMainWindow):
                 f"EE err mean={float(np.nanmean(err)):.3f} m | "
                 + (f"solve mean={t_solve.mean():.1f} ms" if t_solve.size else "no solve time")
             )
+
+    def _render_ctbr_feedback_figure(
+        self,
+        *,
+        t: np.ndarray,
+        u_mpc: np.ndarray,
+        omg: Optional[np.ndarray],
+        r_omg: Optional[np.ndarray],
+        brate: Optional[np.ndarray],
+        thr_cmd: Optional[np.ndarray],
+    ) -> None:
+        """Control 图（合并控制输入 + CTBR/反馈，2 列 3 行）。
+
+        布局（行优先）：
+          1) 电机力：MPC 实际输出 vs 规划      2) CTBR 推力指令（归一化）
+          3) roll rate p：指令/反馈/参考       4) pitch rate q：指令/反馈/参考
+          5) yaw rate r：指令/反馈/参考        6) 角速度跟踪误差（指令 - 反馈）
+        """
+        fig = self.fig_control
+        fig.clear()
+        t = np.asarray(t, dtype=float).flatten()
+        N = t.size
+        if N < 2:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+            ax.axis("off")
+            self.cv_control.draw()
+            return
+
+        # 规划电机力（从当前 plan bundle 重采样到记录时间轴）
+        u_plan_interp = None
+        pb = self._plan_bundle
+        try:
+            if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+                up = np.asarray(pb.get("u_plan"), dtype=float)
+                tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                if up.ndim == 2 and up.shape[0] >= 1 and tp.size >= 2:
+                    tpc = tp[: up.shape[0]] - tp[0]
+                    nrot = min(4, up.shape[1])
+                    u_plan_interp = np.column_stack([
+                        np.interp(t, tpc, up[: tpc.size, j]) for j in range(nrot)
+                    ])
+        except Exception:
+            u_plan_interp = None
+
+        u_mpc = np.asarray(u_mpc, dtype=float)
+        n_rot = min(4, u_mpc.shape[1]) if u_mpc.ndim == 2 and u_mpc.shape[0] > 0 else 0
+        t_u = t[: u_mpc.shape[0]] if (u_mpc.ndim == 2 and u_mpc.shape[0] <= N) else t
+
+        # 2 列 3 行（行优先索引：1..6）
+        axes = [fig.add_subplot(3, 2, i + 1) for i in range(6)]
+        colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+
+        # ── 面板 1：电机力（实际 vs 规划）────────────────────────────────────
+        ax = axes[0]
+        if n_rot > 0:
+            for j in range(n_rot):
+                ax.plot(t_u, u_mpc[: t_u.size, j], color=colors[j], lw=1.1,
+                        label=f"MPC rotor {j+1}")
+            if u_plan_interp is not None:
+                for j in range(min(n_rot, u_plan_interp.shape[1])):
+                    ax.plot(t, u_plan_interp[:, j], color=colors[j], lw=1.0,
+                            ls="--", alpha=0.7,
+                            label=f"plan rotor {j+1}" if j == 0 else None)
+        ax.set_title("Rotor forces — MPC (solid) vs plan (dashed)", fontsize=_mpl_pt(9))
+        ax.set_ylabel("force [N]")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=2)
+
+        # ── 面板 2：CTBR 推力指令 ────────────────────────────────────────────
+        ax = axes[1]
+        if thr_cmd is not None and np.asarray(thr_cmd).size >= 2:
+            tc = np.asarray(thr_cmd, dtype=float).flatten()
+            ax.plot(t[: tc.size], tc[: t.size], color="k", lw=1.1, label="CTBR thrust cmd")
+        ax.set_title("CTBR normalized thrust command (→ PX4)", fontsize=_mpl_pt(9))
+        ax.set_ylabel("thrust [0..1]")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=_mpl_pt(6))
+
+        # ── 面板 3-5：三轴角速度（指令 vs 反馈 vs 参考）─────────────────────
+        labels = ["roll rate p", "pitch rate q", "yaw rate r"]
+        for k in range(3):
+            ax = axes[2 + k]
+            if brate is not None and np.asarray(brate).ndim == 2:
+                br = np.asarray(brate, dtype=float)
+                ax.plot(t[: br.shape[0]], br[: t.size, k], color="tab:red", lw=1.2,
+                        label="CTBR cmd")
+            if omg is not None and np.asarray(omg).ndim == 2:
+                ow = np.asarray(omg, dtype=float)
+                ax.plot(t[: ow.shape[0]], ow[: t.size, k], color="tab:blue", lw=1.1,
+                        label="feedback")
+            if r_omg is not None and np.asarray(r_omg).ndim == 2:
+                rw = np.asarray(r_omg, dtype=float)
+                ax.plot(t[: rw.shape[0]], rw[: t.size, k], color="tab:green", lw=1.0,
+                        ls="--", alpha=0.8, label="reference")
+            ax.set_title(f"Angular velocity — {labels[k]} [rad/s]", fontsize=_mpl_pt(9))
+            ax.set_ylabel("[rad/s]")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=3)
+
+        # ── 面板 6：角速度跟踪误差（CTBR 指令 - 反馈），直观体现 PX4 延迟 ──────
+        ax = axes[5]
+        if (
+            brate is not None and np.asarray(brate).ndim == 2
+            and omg is not None and np.asarray(omg).ndim == 2
+        ):
+            br = np.asarray(brate, dtype=float)
+            ow = np.asarray(omg, dtype=float)
+            n = min(br.shape[0], ow.shape[0], t.size)
+            err_labels = ["p", "q", "r"]
+            err_colors = ["tab:blue", "tab:orange", "tab:green"]
+            for k in range(3):
+                ax.plot(t[:n], br[:n, k] - ow[:n, k], color=err_colors[k], lw=1.0,
+                        label=f"{err_labels[k]} err")
+            ax.axhline(0.0, color="gray", lw=0.6, alpha=0.6)
+        ax.set_title("Body-rate tracking error (CTBR cmd − feedback)", fontsize=_mpl_pt(9))
+        ax.set_ylabel("[rad/s]")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=3)
+
+        for ax in (axes[4], axes[5]):
+            ax.set_xlabel("t [s]")
+
+        fig.suptitle("Control — rotor forces, CTBR commands & body-rate feedback",
+                     fontsize=_mpl_pt(11), y=0.995)
+        try:
+            fig.tight_layout(rect=(0, 0, 1, 0.98))
+        except Exception:
+            pass
+        self.cv_control.draw()
 
     def _run_track(self):
         if self._plan_bundle is None:
@@ -6549,6 +8987,49 @@ class UamSuiteGUI(QMainWindow):
             self._track_worker.start()
             return
 
+        if mode == 1:
+            if not self._EE_MPC_OK:
+                QMessageBox.warning(self, "Error", "Acados MPC is unavailable.")
+                return
+            pb = self._plan_bundle
+            x0 = np.asarray(pb["x_plan"][0], dtype=float).flatten()
+            cm = (
+                "direct"
+                if self.control_mode_track.currentIndex() == 0
+                else "actuator_first_order"
+            )
+            params = {
+                "x0": x0,
+                "t_plan": pb["t_plan"],
+                "x_plan": pb["x_plan"],
+                "T_sim": self.T_sim.value(),
+                "sim_dt": self.sim_dt.value(),
+                "control_dt": self.control_dt.value(),
+                "dt_mpc": self.dt_mpc.value(),
+                "N": self.N_mpc.value(),
+                "mpc_max_iter": self.mpc_max_iter.value(),
+                "mpc_log_interval": self.mpc_log_iv.value(),
+                "control_mode": cm,
+                "w_state_track": self.w_state_track.value(),
+                "w_state_reg": self.w_state_reg.value(),
+                "w_control": self.w_control.value(),
+                "w_terminal_track": self.w_terminal_track.value(),
+                "w_pos": self.w_pos.value(),
+                "w_att": self.w_att.value(),
+                "w_joint": self.w_joint.value(),
+                "w_vel": self.w_vel.value(),
+                "w_omega": self.w_omega.value(),
+                "w_joint_vel": self.w_joint_vel.value(),
+                "w_u_thrust": self.w_u_thrust.value(),
+                "w_u_joint_torque": self.w_u_joint_torque.value(),
+            }
+            self.run_track_btn.setEnabled(False)
+            self.log("Acados closed-loop tracking along the plan (shared Croc cost weights)…")
+            self._track_worker = TrackAcadosAlongPlanWorker(params)
+            self._track_worker.finished.connect(self._on_track_acados_full_finished)
+            self._track_worker.start()
+            return
+
         pb = self._plan_bundle
         sim_dt = self.sim_dt.value()
         if pb["kind"] == "ee_snap":
@@ -6582,7 +9063,7 @@ class UamSuiteGUI(QMainWindow):
                 p_ref, yaw_ref, x_seed=np.asarray(pb["x_plan"][0], dtype=float).flatten()[:17]
             )
 
-        if mode == 2:
+        if mode == 3:
             if not self._CROC_EE_OK or self._croc_ee_mpc is None:
                 QMessageBox.warning(self, "Error", "Crocoddyl EE pose tracking is unavailable.")
                 return
@@ -6663,6 +9144,24 @@ class UamSuiteGUI(QMainWindow):
         self._track_worker = TrackEeAcadosWorker(params)
         self._track_worker.finished.connect(self._on_track_ee_finished)
         self._track_worker.start()
+
+    def _on_track_acados_full_finished(self, ok: bool, err: str, payload: object):
+        self.run_track_btn.setEnabled(True)
+        if hasattr(self, "reg_run_btn"):
+            self.reg_run_btn.setEnabled(True)
+        if not ok:
+            self.log(err)
+            QMessageBox.critical(self, "Error", err[:2000])
+            return
+        assert isinstance(payload, dict)
+        res = payload["res"]
+        cm = payload.get("control_mode", "direct")
+        self._render_tracking_figures(res, cm, payload.get("out"))
+        self.log(
+            f"Acados full-state tracking finished | EE error (final) {res['err'][-1]:.4f} m | "
+            f"yaw err {res['err_yaw'][-1]:.4f} rad"
+        )
+        self.meshcat_track_btn.setEnabled(True)
 
     def _on_track_croc_finished(self, ok: bool, err: str, payload: object):
         self.run_track_btn.setEnabled(True)
@@ -6931,7 +9430,7 @@ class UamSuiteGUI(QMainWindow):
             ax = axes[idx]
             idx += 1
             ax.plot(t, total, "k-", lw=1.3)
-            ax.set_title("total", fontsize=10)
+            ax.set_title("total", fontsize=_mpl_pt(10))
             ax.set_xlabel("t [s]")
             ax.set_ylabel("cost")
             ax.grid(True, alpha=0.3)
@@ -6942,22 +9441,99 @@ class UamSuiteGUI(QMainWindow):
             ax.plot(t, v, lw=1.0, color="tab:orange")
             w = float(weights.get(key, float("nan"))) if isinstance(weights, dict) else float("nan")
             if np.isfinite(w):
-                ax.set_title(f"{key} (w={w:g})", fontsize=10)
+                ax.set_title(f"{key} (w={w:g})", fontsize=_mpl_pt(10))
             else:
-                ax.set_title(str(key), fontsize=10)
+                ax.set_title(str(key), fontsize=_mpl_pt(10))
             ax.set_xlabel("t [s]")
             ax.set_ylabel("cost")
             ax.grid(True, alpha=0.3)
 
-        fig.suptitle("MPC cost analysis (total + weighted term costs)", fontsize=12, y=0.99)
+        fig.suptitle("MPC cost analysis (total + weighted term costs)", fontsize=_mpl_pt(12), y=0.99)
         fig.tight_layout(rect=[0, 0, 1, 0.97])
         self.cv_cost_analysis.draw()
 
 
+def _apply_display_scaling(app) -> float:
+    """界面字体与 matplotlib 绘图字号缩放。
+
+    Qt 控件默认 scale=1（可用 UAM_GUI_SCALE 覆盖）。
+    绘图在 4K 屏上自动放大（可用 UAM_PLOT_SCALE 覆盖）。
+    """
+    global _MPL_FONT_SCALE
+
+    env_scale = os.environ.get("UAM_GUI_SCALE", "").strip()
+    if env_scale:
+        try:
+            gui_scale = max(0.8, min(3.0, float(env_scale)))
+        except ValueError:
+            gui_scale = 1.0
+    else:
+        gui_scale = 1.0
+
+    plot_scale = _detect_plot_font_scale(app)
+    _MPL_FONT_SCALE = plot_scale
+
+    base_pt = 10.0
+    f = app.font()
+    f.setPointSizeF(base_pt * gui_scale)
+    app.setFont(f)
+
+    try:
+        import matplotlib
+
+        matplotlib.rcParams.update(
+            {
+                "font.size": 10.0 * plot_scale,
+                "axes.titlesize": 11.0 * plot_scale,
+                "axes.labelsize": 10.0 * plot_scale,
+                "xtick.labelsize": 9.5 * plot_scale,
+                "ytick.labelsize": 9.5 * plot_scale,
+                "legend.fontsize": 9.0 * plot_scale,
+            }
+        )
+    except Exception:
+        pass
+
+    return gui_scale
+
+
+def _fit_window_to_screen(app, w) -> None:
+    """让初始窗口不超过标准 1080p，并适配当前屏幕可用区域后居中显示。"""
+    screen = app.primaryScreen()
+    if screen is None:
+        w.resize(1600, 900)
+        return
+    avail = screen.availableGeometry()
+    # 逻辑像素上限：标准 1080p 显示器。
+    cap_w, cap_h = 1920, 1080
+    target_w = min(1600, cap_w, int(avail.width() * 0.96))
+    target_h = min(900, cap_h, int(avail.height() * 0.94))
+    w.setMaximumSize(min(avail.width(), cap_w), min(avail.height(), cap_h))
+    w.resize(target_w, target_h)
+    fg = w.frameGeometry()
+    fg.moveCenter(avail.center())
+    w.move(fg.topLeft())
+
+
 def main():
+    # High-DPI 适配必须在创建 QApplication 之前设置。
+    try:
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    except Exception:
+        pass
+    os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    _icon = _app_icon()
+    if _icon is not None:
+        app.setWindowIcon(_icon)
     app.setStyle("Fusion")
+    _apply_display_scaling(app)
     w = UamSuiteGUI()
+    _fit_window_to_screen(app, w)
     w.show()
     sys.exit(app.exec_())
 

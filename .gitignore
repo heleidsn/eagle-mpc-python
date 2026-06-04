@@ -63,7 +63,17 @@ s500_uam_ocp.json
 
 # Generated tracking and benchmark outputs
 tracking_results/
+saved_trajectories/
 acados_mpc_quad_bench.json
+
+# GUI local state / template configs (consolidated under .gui_state/)
+.gui_state/
+# legacy root-level files (kept ignored for backward compatibility)
+uam_suite_gui_params.json
+uam_suite_gui_last_session.json
+user_templates.json
+template_display_names.json
+template_control_points.json
 
 # Racing trajectory optimization outputs
 racing_traj_opt/results/

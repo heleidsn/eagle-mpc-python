@@ -1180,9 +1180,11 @@ class S500UAMTrajectoryPlanner:
                     if slot is not None and float(ee_knot_rotation_weight) > 0.0:
                         rpy_des = np.asarray(slot, dtype=float).reshape(3)
                         rot_w = float(ee_knot_rotation_weight)
-                    if zero_v_i:
-                        vel_w = float(ee_knot_velocity_weight)
-                        vel_pitch_w = float(ee_knot_velocity_pitch_weight)
+                # Zero-v 在 EE 模式下约束 EE 笛卡尔速度为 0：ee_pose 与 ee_pos 均适用。
+                # （ee_pos 无状态正则速度项，必须靠 EE FrameVelocity 残差才能让 zero_v 生效。）
+                if zero_v_i:
+                    vel_w = float(ee_knot_velocity_weight)
+                    vel_pitch_w = float(ee_knot_velocity_pitch_weight)
                 waypoint_cost = self.create_cost_model_augmented(
                     state_nd,
                     target_state=start_state,
@@ -1398,9 +1400,11 @@ class S500UAMTrajectoryPlanner:
                     if slot is not None and float(ee_knot_rotation_weight) > 0.0:
                         rpy_des = np.asarray(slot, dtype=float).reshape(3)
                         rot_w = float(ee_knot_rotation_weight)
-                    if zero_v_i:
-                        vel_w = float(ee_knot_velocity_weight)
-                        vel_pitch_w = float(ee_knot_velocity_pitch_weight)
+                # Zero-v 在 EE 模式下约束 EE 笛卡尔速度为 0：ee_pose 与 ee_pos 均适用。
+                # （ee_pos 无状态正则速度项，必须靠 EE FrameVelocity 残差才能让 zero_v 生效。）
+                if zero_v_i:
+                    vel_w = float(ee_knot_velocity_weight)
+                    vel_pitch_w = float(ee_knot_velocity_pitch_weight)
                 waypoint_cost = self.create_cost_model(
                     target_state=start_state,
                     grasp_position=np.asarray(ee_targets[i], dtype=float).reshape(3),
