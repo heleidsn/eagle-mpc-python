@@ -3142,6 +3142,161 @@ class UamSuiteGUI(QMainWindow):
 
         rn_mpc_vbox.addWidget(self._rn_geo_panel)
 
+        # ── L1 自适应增广（与任意 baseline 叠加：u = u_b + u_ac）────────────────
+        self._rn_l1_group = QGroupBox("L1 Adaptive Augmentation  (u = u_baseline + u_ac)")
+        rn_l1_vbox = QVBoxLayout(self._rn_l1_group)
+        rn_l1_row0 = QHBoxLayout()
+        self.rn_l1_enabled = QCheckBox("Enable L1 (launch / update_controller_params)")
+        self.rn_l1_enabled.setToolTip(
+            "勾选后节点启动或「在线更新参数」时启用 L1 扰动估计与补偿。\n"
+            "可与 croc / acados / geometric / px4 任意 baseline 组合。"
+        )
+        rn_l1_row0.addWidget(self.rn_l1_enabled)
+        self.rn_l1_svc_on_btn = QPushButton("rosservice: /set_l1_enabled ON")
+        self.rn_l1_svc_on_btn.setToolTip(
+            "节点运行中立即开启 L1（std_srvs/SetBool data=true），无需重启。"
+        )
+        self.rn_l1_svc_on_btn.clicked.connect(lambda: self._call_set_l1_enabled_service(True))
+        self.rn_l1_svc_on_btn.setEnabled(False)
+        rn_l1_row0.addWidget(self.rn_l1_svc_on_btn)
+        self.rn_l1_svc_off_btn = QPushButton("OFF")
+        self.rn_l1_svc_off_btn.setToolTip("节点运行中立即关闭 L1（SetBool data=false）。")
+        self.rn_l1_svc_off_btn.clicked.connect(lambda: self._call_set_l1_enabled_service(False))
+        self.rn_l1_svc_off_btn.setEnabled(False)
+        rn_l1_row0.addWidget(self.rn_l1_svc_off_btn)
+        rn_l1_vbox.addLayout(rn_l1_row0)
+
+        self.rn_l1_status_label = QLabel("L1: —")
+        self.rn_l1_status_label.setStyleSheet("color: gray; font-size: 11px;")
+        rn_l1_vbox.addWidget(self.rn_l1_status_label)
+
+        # 实时估计的扰动力（世界系，N）= m·σ̂
+        self.rn_l1_force_label = QLabel("F_est: —")
+        self.rn_l1_force_label.setToolTip(
+            "L1 估计的集总扰动力（世界系，N）= m·σ̂。\n"
+            "Fx/Fy/Fz 为各轴分量，|F| 为模长；反映未建模外力/推力不匹配/负载等。"
+        )
+        self.rn_l1_force_label.setStyleSheet("color: gray; font-size: 11px;")
+        rn_l1_vbox.addWidget(self.rn_l1_force_label)
+
+        rn_l1_grid = QGridLayout()
+        rn_l1_grid.setColumnStretch(1, 1)
+        rn_l1_grid.setColumnStretch(3, 1)
+
+        rn_l1_grid.addWidget(QLabel("l1_as_gain"), 0, 0)
+        self.rn_l1_as_gain = QDoubleSpinBox()
+        self.rn_l1_as_gain.setRange(0.5, 50.0)
+        self.rn_l1_as_gain.setDecimals(2)
+        self.rn_l1_as_gain.setValue(8.0)
+        self.rn_l1_as_gain.setToolTip("状态预测器速率 a_s（越大收敛越快，对噪声更敏感）")
+        rn_l1_grid.addWidget(self.rn_l1_as_gain, 0, 1)
+
+        rn_l1_grid.addWidget(QLabel("l1_wc_xy"), 0, 2)
+        self.rn_l1_wc_xy = QDoubleSpinBox()
+        self.rn_l1_wc_xy.setRange(0.0, 50.0)
+        self.rn_l1_wc_xy.setDecimals(2)
+        self.rn_l1_wc_xy.setValue(6.0)
+        self.rn_l1_wc_xy.setToolTip("水平补偿低通截止频率 (rad/s)")
+        rn_l1_grid.addWidget(self.rn_l1_wc_xy, 0, 3)
+
+        rn_l1_grid.addWidget(QLabel("l1_wc_z"), 1, 0)
+        self.rn_l1_wc_z = QDoubleSpinBox()
+        self.rn_l1_wc_z.setRange(0.0, 50.0)
+        self.rn_l1_wc_z.setDecimals(2)
+        self.rn_l1_wc_z.setValue(6.0)
+        rn_l1_grid.addWidget(self.rn_l1_wc_z, 1, 1)
+
+        rn_l1_grid.addWidget(QLabel("l1_tilt_gain"), 1, 2)
+        self.rn_l1_tilt_gain = QDoubleSpinBox()
+        self.rn_l1_tilt_gain.setRange(0.0, 20.0)
+        self.rn_l1_tilt_gain.setDecimals(2)
+        self.rn_l1_tilt_gain.setValue(3.0)
+        self.rn_l1_tilt_gain.setToolTip("将横向补偿加速度映射为体角速度修正的增益")
+        rn_l1_grid.addWidget(self.rn_l1_tilt_gain, 1, 3)
+
+        rn_l1_grid.addWidget(QLabel("l1_max_accel_xy"), 2, 0)
+        self.rn_l1_max_accel_xy = QDoubleSpinBox()
+        self.rn_l1_max_accel_xy.setRange(0.0, 30.0)
+        self.rn_l1_max_accel_xy.setDecimals(2)
+        self.rn_l1_max_accel_xy.setValue(6.0)
+        rn_l1_grid.addWidget(self.rn_l1_max_accel_xy, 2, 1)
+
+        rn_l1_grid.addWidget(QLabel("l1_max_accel_z"), 2, 2)
+        self.rn_l1_max_accel_z = QDoubleSpinBox()
+        self.rn_l1_max_accel_z.setRange(0.0, 30.0)
+        self.rn_l1_max_accel_z.setDecimals(2)
+        self.rn_l1_max_accel_z.setValue(6.0)
+        rn_l1_grid.addWidget(self.rn_l1_max_accel_z, 2, 3)
+
+        rn_l1_grid.addWidget(QLabel("l1_max_sigma"), 3, 0)
+        self.rn_l1_max_sigma = QDoubleSpinBox()
+        self.rn_l1_max_sigma.setRange(0.0, 100.0)
+        self.rn_l1_max_sigma.setDecimals(2)
+        self.rn_l1_max_sigma.setValue(25.0)
+        self.rn_l1_max_sigma.setToolTip("扰动估计 σ̂ 幅值上限 (m/s²)")
+        rn_l1_grid.addWidget(self.rn_l1_max_sigma, 3, 1)
+
+        rn_l1_vbox.addLayout(rn_l1_grid)
+
+        # 位置误差积分增广（兜底消除补偿残差的稳态位置误差）
+        self.rn_l1_pos_fb = QCheckBox("Position-error integral (eliminate residual steady-state error)")
+        self.rn_l1_pos_fb.setToolTip(
+            "在 L1 扰动补偿之外并联一个对跟踪位置误差的积分通道：\n"
+            "a_ac += -k_i·∫(p - p_ref)。\n"
+            "当 σ̂ 因带宽/姿态滞后无法完全收敛时，用于消除残留稳态位置误差。"
+        )
+        rn_l1_vbox.addWidget(self.rn_l1_pos_fb)
+
+        rn_l1_grid2 = QGridLayout()
+        rn_l1_grid2.setColumnStretch(1, 1)
+        rn_l1_grid2.setColumnStretch(3, 1)
+        rn_l1_grid2.addWidget(QLabel("l1_k_pos_i_xy"), 0, 0)
+        self.rn_l1_k_pos_i_xy = QDoubleSpinBox()
+        self.rn_l1_k_pos_i_xy.setRange(0.0, 10.0)
+        self.rn_l1_k_pos_i_xy.setDecimals(3)
+        self.rn_l1_k_pos_i_xy.setValue(0.6)
+        self.rn_l1_k_pos_i_xy.setToolTip("水平位置误差积分增益 (1/s²)")
+        rn_l1_grid2.addWidget(self.rn_l1_k_pos_i_xy, 0, 1)
+
+        rn_l1_grid2.addWidget(QLabel("l1_k_pos_i_z"), 0, 2)
+        self.rn_l1_k_pos_i_z = QDoubleSpinBox()
+        self.rn_l1_k_pos_i_z.setRange(0.0, 10.0)
+        self.rn_l1_k_pos_i_z.setDecimals(3)
+        self.rn_l1_k_pos_i_z.setValue(0.8)
+        self.rn_l1_k_pos_i_z.setToolTip("竖直位置误差积分增益 (1/s²)")
+        rn_l1_grid2.addWidget(self.rn_l1_k_pos_i_z, 0, 3)
+
+        rn_l1_grid2.addWidget(QLabel("l1_max_pos_integral"), 1, 0)
+        self.rn_l1_max_pos_integral = QDoubleSpinBox()
+        self.rn_l1_max_pos_integral.setRange(0.0, 20.0)
+        self.rn_l1_max_pos_integral.setDecimals(2)
+        self.rn_l1_max_pos_integral.setValue(1.5)
+        self.rn_l1_max_pos_integral.setToolTip("位置误差积分量 anti-windup 上限 (m·s)")
+        rn_l1_grid2.addWidget(self.rn_l1_max_pos_integral, 1, 1)
+
+        rn_l1_vbox.addLayout(rn_l1_grid2)
+
+        self.rn_l1_sim_btn = QPushButton("Run offline L1 compare (matplotlib)")
+        self.rn_l1_sim_btn.setToolTip(
+            "运行 scripts/example/l1_geometric_tracking_sim.py：\n"
+            "固定扰动（阻力+常值风+质量阶跃）下对比 baseline / baseline+L1，\n"
+            "结果保存到 results/l1_geometric_tracking_compare.png"
+        )
+        self.rn_l1_sim_btn.clicked.connect(self._run_l1_offline_compare)
+        rn_l1_vbox.addWidget(self.rn_l1_sim_btn)
+
+        self.rn_l1_acados_sim_btn = QPushButton("Run acados hover + mass-jump L1 test")
+        self.rn_l1_acados_sim_btn.setToolTip(
+            "运行 scripts/example/l1_acados_hover_mass_jump_sim.py：\n"
+            "acados 悬停 NMPC + 质量突变，对比 MPC only / MPC+L1，\n"
+            "验证 L1 能否估计附加质量并让悬停误差归零。\n"
+            "结果保存到 results/l1_acados_hover_mass_jump.png（需 eagle_mpc 环境）"
+        )
+        self.rn_l1_acados_sim_btn.clicked.connect(self._run_l1_acados_hover_test)
+        rn_l1_vbox.addWidget(self.rn_l1_acados_sim_btn)
+
+        rn_mpc_vbox.addWidget(self._rn_l1_group)
+
         # ── 保存控制器参数（每个算法各自一套，持久化到磁盘，跨重启复用）──────
         self.rn_save_ctrl_params_btn = QPushButton("Save controller parameters")
         self.rn_save_ctrl_params_btn.setToolTip(
@@ -5766,6 +5921,18 @@ class UamSuiteGUI(QMainWindow):
             "rn_geo_kR": float(self.rn_geo_kR.value()),
             "rn_geo_kOmega": float(self.rn_geo_kOmega.value()),
             "rn_geo_max_tilt_deg": float(self.rn_geo_max_tilt_deg.value()),
+            "rn_l1_enabled": bool(self.rn_l1_enabled.isChecked()),
+            "rn_l1_as_gain": float(self.rn_l1_as_gain.value()),
+            "rn_l1_wc_xy": float(self.rn_l1_wc_xy.value()),
+            "rn_l1_wc_z": float(self.rn_l1_wc_z.value()),
+            "rn_l1_tilt_gain": float(self.rn_l1_tilt_gain.value()),
+            "rn_l1_max_accel_xy": float(self.rn_l1_max_accel_xy.value()),
+            "rn_l1_max_accel_z": float(self.rn_l1_max_accel_z.value()),
+            "rn_l1_max_sigma": float(self.rn_l1_max_sigma.value()),
+            "rn_l1_pos_fb": bool(self.rn_l1_pos_fb.isChecked()),
+            "rn_l1_k_pos_i_xy": float(self.rn_l1_k_pos_i_xy.value()),
+            "rn_l1_k_pos_i_z": float(self.rn_l1_k_pos_i_z.value()),
+            "rn_l1_max_pos_integral": float(self.rn_l1_max_pos_integral.value()),
             "gz_pkg": self.gz_pkg_combo.currentText().strip(),
             "gz_launch_file": self.gz_launch_combo.currentText().strip(),
             "gz_model": self.gz_model_combo.currentText().strip(),
@@ -5924,6 +6091,20 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("rn_geo_kR", self.rn_geo_kR)
         _set_spin("rn_geo_kOmega", self.rn_geo_kOmega)
         _set_spin("rn_geo_max_tilt_deg", self.rn_geo_max_tilt_deg)
+        if "rn_l1_enabled" in p:
+            self.rn_l1_enabled.setChecked(bool(p["rn_l1_enabled"]))
+        _set_spin("rn_l1_as_gain", self.rn_l1_as_gain)
+        _set_spin("rn_l1_wc_xy", self.rn_l1_wc_xy)
+        _set_spin("rn_l1_wc_z", self.rn_l1_wc_z)
+        _set_spin("rn_l1_tilt_gain", self.rn_l1_tilt_gain)
+        _set_spin("rn_l1_max_accel_xy", self.rn_l1_max_accel_xy)
+        _set_spin("rn_l1_max_accel_z", self.rn_l1_max_accel_z)
+        _set_spin("rn_l1_max_sigma", self.rn_l1_max_sigma)
+        if "rn_l1_pos_fb" in p:
+            self.rn_l1_pos_fb.setChecked(bool(p["rn_l1_pos_fb"]))
+        _set_spin("rn_l1_k_pos_i_xy", self.rn_l1_k_pos_i_xy)
+        _set_spin("rn_l1_k_pos_i_z", self.rn_l1_k_pos_i_z)
+        _set_spin("rn_l1_max_pos_integral", self.rn_l1_max_pos_integral)
         if isinstance(p.get("rn_mpc_weight_profiles"), dict) and hasattr(
             self, "_rn_mpc_weight_profiles"
         ):
@@ -6226,6 +6407,18 @@ class UamSuiteGUI(QMainWindow):
                 "rn_geo_kR",
                 "rn_geo_kOmega",
                 "rn_geo_max_tilt_deg",
+                "rn_l1_enabled",
+                "rn_l1_as_gain",
+                "rn_l1_wc_xy",
+                "rn_l1_wc_z",
+                "rn_l1_tilt_gain",
+                "rn_l1_max_accel_xy",
+                "rn_l1_max_accel_z",
+                "rn_l1_max_sigma",
+                "rn_l1_pos_fb",
+                "rn_l1_k_pos_i_xy",
+                "rn_l1_k_pos_i_z",
+                "rn_l1_max_pos_integral",
                 "gz_pkg",
                 "gz_launch_file",
                 "gz_model",
@@ -7809,6 +8002,18 @@ class UamSuiteGUI(QMainWindow):
             f"_geo_kR:={self.rn_geo_kR.value()}",
             f"_geo_kOmega:={self.rn_geo_kOmega.value()}",
             f"_geo_max_tilt_deg:={self.rn_geo_max_tilt_deg.value()}",
+            f"_l1_enabled:={'true' if self.rn_l1_enabled.isChecked() else 'false'}",
+            f"_l1_as_gain:={self.rn_l1_as_gain.value()}",
+            f"_l1_wc_xy:={self.rn_l1_wc_xy.value()}",
+            f"_l1_wc_z:={self.rn_l1_wc_z.value()}",
+            f"_l1_tilt_gain:={self.rn_l1_tilt_gain.value()}",
+            f"_l1_max_accel_xy:={self.rn_l1_max_accel_xy.value()}",
+            f"_l1_max_accel_z:={self.rn_l1_max_accel_z.value()}",
+            f"_l1_max_sigma:={self.rn_l1_max_sigma.value()}",
+            f"_l1_use_pos_feedback:={'true' if self.rn_l1_pos_fb.isChecked() else 'false'}",
+            f"_l1_k_pos_i_xy:={self.rn_l1_k_pos_i_xy.value()}",
+            f"_l1_k_pos_i_z:={self.rn_l1_k_pos_i_z.value()}",
+            f"_l1_max_pos_integral:={self.rn_l1_max_pos_integral.value()}",
             "_viz_robot_markers:=false",
             "_viz_ee_axes:=false",
         ]
@@ -8114,6 +8319,38 @@ class UamSuiteGUI(QMainWindow):
                 "font-weight: bold; color: %s;"
                 % ("#2e7d32" if epos <= 0.10 else ("#e65100" if epos <= 0.30 else "#b71c1c"))
             )
+
+        if hasattr(self, "rn_l1_status_label"):
+            if not ms_fresh:
+                self.rn_l1_status_label.setText("L1: —")
+                self.rn_l1_status_label.setStyleSheet("color: gray; font-size: 11px;")
+            elif ms.get("l1_enabled"):
+                sig = float(ms.get("l1_sigma_norm", 0.0))
+                ac = float(ms.get("l1_a_ac_norm", 0.0))
+                self.rn_l1_status_label.setText(
+                    f"L1 ON  |σ̂|={sig:.2f} m/s²  |a_ac|={ac:.2f} m/s²"
+                )
+                self.rn_l1_status_label.setStyleSheet("color: #2e7d32; font-size: 11px;")
+            else:
+                self.rn_l1_status_label.setText("L1 OFF")
+                self.rn_l1_status_label.setStyleSheet("color: gray; font-size: 11px;")
+
+        if hasattr(self, "rn_l1_force_label"):
+            if ms_fresh and ms.get("l1_enabled"):
+                fx = float(ms.get("l1_force_x", 0.0))
+                fy = float(ms.get("l1_force_y", 0.0))
+                fz = float(ms.get("l1_force_z", 0.0))
+                fn = float(ms.get("l1_force_norm", 0.0))
+                self.rn_l1_force_label.setText(
+                    f"F_est: Fx={fx:+.2f}  Fy={fy:+.2f}  Fz={fz:+.2f}  |F|={fn:.2f} N"
+                )
+                self.rn_l1_force_label.setStyleSheet(
+                    "color: #1565c0; font-size: 11px; font-weight: bold;"
+                )
+            else:
+                self.rn_l1_force_label.setText("F_est: —")
+                self.rn_l1_force_label.setStyleSheet("color: gray; font-size: 11px;")
+
         running = self._rn_process is not None and self._rn_process.poll() is None
         self.rn_st_track.setText("node on" if running else "node off")
         self.rn_st_track.setStyleSheet(
@@ -8249,6 +8486,7 @@ class UamSuiteGUI(QMainWindow):
         for name in (
             "rn_start_svc_btn", "rn_stop_svc_btn", "rn_save_svc_btn",
             "rn_update_ctrl_btn", "rn_update_traj_btn",
+            "rn_l1_svc_on_btn", "rn_l1_svc_off_btn",
         ):
             btn = getattr(self, name, None)
             if btn is not None:
@@ -8278,6 +8516,158 @@ class UamSuiteGUI(QMainWindow):
             QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
 
         threading.Thread(target=_call, daemon=True).start()
+
+    def _run_l1_offline_compare(self):
+        """子进程运行 L1 几何跟踪对比仿真并打开/保存对比图。"""
+        import subprocess
+
+        root = Path(__file__).resolve().parent
+        script = root / "scripts" / "example" / "l1_geometric_tracking_sim.py"
+        if not script.exists():
+            QMessageBox.warning(self, "Notice", f"未找到仿真脚本:\n{script}")
+            return
+        out_png = root / "results" / "l1_geometric_tracking_compare.png"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--no-show",
+            "--save",
+            str(out_png),
+            f"--l1-as={self.rn_l1_as_gain.value()}",
+            f"--l1-wc={self.rn_l1_wc_xy.value()}",
+            f"--l1-kpi={self.rn_l1_k_pos_i_xy.value()}",
+            f"--k-drag=0.35",
+        ]
+        self.log("[L1 sim] 运行离线对比仿真…")
+        try:
+            proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=120)
+            if proc.stdout:
+                self.log(proc.stdout.strip()[:2000])
+            if proc.returncode != 0:
+                self.log(f"[L1 sim] FAIL (code {proc.returncode}): {proc.stderr[:1500]}")
+                QMessageBox.critical(self, "L1 sim failed", (proc.stderr or proc.stdout)[:2000])
+                return
+            self.log(f"[L1 sim] 完成，图已保存: {out_png}")
+            if out_png.exists():
+                try:
+                    from PyQt5.QtGui import QPixmap
+                    from PyQt5.QtWidgets import QDialog, QLabel, QVBoxLayout
+
+                    dlg = QDialog(self)
+                    dlg.setWindowTitle("L1 tracking comparison")
+                    lay = QVBoxLayout(dlg)
+                    lbl = QLabel()
+                    lbl.setPixmap(QPixmap(str(out_png)).scaled(900, 700, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    lay.addWidget(lbl)
+                    dlg.resize(920, 720)
+                    dlg.exec_()
+                except Exception as e:
+                    self.log(f"[L1 sim] 无法弹窗显示图片: {e}")
+        except Exception as e:
+            QMessageBox.critical(self, "L1 sim failed", str(e)[:2000])
+
+    def _run_l1_acados_hover_test(self):
+        """子进程运行 acados 悬停 + 质量突变 + L1 验证仿真并显示对比图。"""
+        import subprocess
+
+        root = Path(__file__).resolve().parent
+        script = root / "scripts" / "example" / "l1_acados_hover_mass_jump_sim.py"
+        if not script.exists():
+            QMessageBox.warning(self, "Notice", f"未找到仿真脚本:\n{script}")
+            return
+        out_png = root / "results" / "l1_acados_hover_mass_jump.png"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--no-show",
+            "--save",
+            str(out_png),
+            f"--l1-as={self.rn_l1_as_gain.value()}",
+            f"--l1-wc={self.rn_l1_wc_z.value()}",
+            f"--dt-mpc={self.rn_dt_mpc.value()}",
+            f"--horizon={int(self.rn_horizon.value())}",
+            "--delta-m=0.3",
+            "--t-step=8.0",
+        ]
+        self.log("[L1 acados] 编译/运行 acados 悬停质量突变仿真（首次需编译，请稍候）…")
+
+        import threading
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _run():
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=str(root), capture_output=True, text=True, timeout=900
+                )
+                tail = "\n".join((proc.stdout or "").strip().splitlines()[-12:])
+                if proc.returncode != 0:
+                    msg = f"[L1 acados] FAIL: {(proc.stderr or proc.stdout)[-1500:]}"
+                else:
+                    msg = f"[L1 acados] 完成:\n{tail}"
+            except Exception as e:
+                msg = f"[L1 acados] ERROR: {e}"
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+            if out_png.exists():
+                QMetaObject.invokeMethod(
+                    self, "_show_image_dialog", Qt.QueuedConnection,
+                    Q_ARG(str, str(out_png)), Q_ARG(str, "Acados hover + mass-jump L1"),
+                )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    from PyQt5.QtCore import pyqtSlot as _pyqtSlot_img
+
+    @_pyqtSlot_img(str, str)
+    def _show_image_dialog(self, png_path: str, title: str):
+        try:
+            from PyQt5.QtGui import QPixmap
+            from PyQt5.QtWidgets import QDialog, QLabel, QVBoxLayout
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle(title)
+            lay = QVBoxLayout(dlg)
+            lbl = QLabel()
+            lbl.setPixmap(
+                QPixmap(png_path).scaled(960, 720, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            lay.addWidget(lbl)
+            dlg.resize(980, 740)
+            dlg.exec_()
+        except Exception as e:
+            self.log(f"[image] 无法显示 {png_path}: {e}")
+
+    def _call_set_l1_enabled_service(self, enabled: bool):
+        """调用 /set_l1_enabled (std_srvs/SetBool) 在线开关 L1 增广。"""
+        import threading
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _run():
+            try:
+                import rospy
+                from std_srvs.srv import SetBool
+
+                if not self._ensure_ros_node():
+                    msg = "[/set_l1_enabled] ERROR: ROS master 不可用"
+                else:
+                    rospy.wait_for_service("/set_l1_enabled", timeout=5.0)
+                    resp = rospy.ServiceProxy("/set_l1_enabled", SetBool)(bool(enabled))
+                    state = "ON" if enabled else "OFF"
+                    msg = (
+                        f"[/set_l1_enabled {state}] "
+                        f"{'OK' if resp.success else 'FAIL'}: {resp.message}"
+                    )
+                    if resp.success:
+                        QMetaObject.invokeMethod(
+                            self.rn_l1_enabled,
+                            "setChecked",
+                            Qt.QueuedConnection,
+                            Q_ARG(bool, bool(enabled)),
+                        )
+            except Exception as e:
+                msg = f"[/set_l1_enabled] ERROR: {e}"
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _call_start_tracking_service(self):
         self._call_tracking_service("/start_tracking")
@@ -8427,6 +8817,18 @@ class UamSuiteGUI(QMainWindow):
             "geo_kR": float(self.rn_geo_kR.value()),
             "geo_kOmega": float(self.rn_geo_kOmega.value()),
             "geo_max_tilt_deg": float(self.rn_geo_max_tilt_deg.value()),
+            "l1_enabled": bool(self.rn_l1_enabled.isChecked()),
+            "l1_as_gain": float(self.rn_l1_as_gain.value()),
+            "l1_wc_xy": float(self.rn_l1_wc_xy.value()),
+            "l1_wc_z": float(self.rn_l1_wc_z.value()),
+            "l1_tilt_gain": float(self.rn_l1_tilt_gain.value()),
+            "l1_max_accel_xy": float(self.rn_l1_max_accel_xy.value()),
+            "l1_max_accel_z": float(self.rn_l1_max_accel_z.value()),
+            "l1_max_sigma": float(self.rn_l1_max_sigma.value()),
+            "l1_use_pos_feedback": bool(self.rn_l1_pos_fb.isChecked()),
+            "l1_k_pos_i_xy": float(self.rn_l1_k_pos_i_xy.value()),
+            "l1_k_pos_i_z": float(self.rn_l1_k_pos_i_z.value()),
+            "l1_max_pos_integral": float(self.rn_l1_max_pos_integral.value()),
         }
 
     def _call_update_controller_params(self):

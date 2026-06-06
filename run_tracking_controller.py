@@ -59,6 +59,13 @@ rosservice call /start_tracking  # 开始跟踪
 rosservice call /stop_tracking   # 停止跟踪（悬停）
 rosservice call /take_off        # 自动：发 setpoint -> OFFBOARD -> 解锁 -> 爬升 1m -> x_plan[0] 悬停
 rosservice call /save_data       # 保存录制数据
+
+L1 自适应增广（与任意 baseline 叠加，u = u_b + u_ac）
+────────────────────────────────────────────────────
+rosservice call /set_l1_enabled "data: true"   # 运行时开启 L1
+rosservice call /set_l1_enabled "data: false"  # 运行时关闭 L1
+# 参数：~l1_enabled, ~l1_as_gain, ~l1_wc_xy, ~l1_wc_z, ~l1_tilt_gain, ...
+# 调试：/suite_mpc/l1_debug (JSON), /suite_mpc/stats 含 l1_sigma_norm 等
 """
 
 from __future__ import annotations
@@ -125,6 +132,7 @@ from s500_uam_trajectory_planner import (
     S500UAMTrajectoryPlanner,
     compute_ee_kinematics_along_trajectory,
 )
+from l1_adaptive import L1AdaptiveAugmentation, L1Params
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,6 +314,40 @@ class SuiteTrackingController:
         self.geo_kR = float(rospy.get_param("~geo_kR", 4.0))
         self.geo_kOmega = float(rospy.get_param("~geo_kOmega", 0.35))
         self.geo_max_tilt_deg = float(rospy.get_param("~geo_max_tilt_deg", 35.0))
+
+        # L1 自适应增广（与 baseline 控制器叠加：u = u_b + u_ac）
+        self.l1_enabled = bool(rospy.get_param("~l1_enabled", False))
+        self.l1_as_gain = float(rospy.get_param("~l1_as_gain", 8.0))
+        self.l1_wc_xy = float(rospy.get_param("~l1_wc_xy", 6.0))
+        self.l1_wc_z = float(rospy.get_param("~l1_wc_z", 6.0))
+        self.l1_tilt_gain = float(rospy.get_param("~l1_tilt_gain", 3.0))
+        self.l1_max_accel_xy = float(rospy.get_param("~l1_max_accel_xy", 6.0))
+        self.l1_max_accel_z = float(rospy.get_param("~l1_max_accel_z", 6.0))
+        self.l1_max_sigma = float(rospy.get_param("~l1_max_sigma", 25.0))
+        # 位置误差积分增广（消除 L1 补偿残差导致的稳态位置误差）
+        self.l1_use_pos_feedback = bool(rospy.get_param("~l1_use_pos_feedback", False))
+        self.l1_k_pos_i_xy = float(rospy.get_param("~l1_k_pos_i_xy", 0.6))
+        self.l1_k_pos_i_z = float(rospy.get_param("~l1_k_pos_i_z", 0.8))
+        self.l1_max_pos_integral = float(rospy.get_param("~l1_max_pos_integral", 1.5))
+        self._l1 = L1AdaptiveAugmentation(
+            L1Params(
+                enabled=self.l1_enabled,
+                as_gain=self.l1_as_gain,
+                wc_xy=self.l1_wc_xy,
+                wc_z=self.l1_wc_z,
+                tilt_gain=self.l1_tilt_gain,
+                max_accel_xy=self.l1_max_accel_xy,
+                max_accel_z=self.l1_max_accel_z,
+                max_sigma=self.l1_max_sigma,
+                use_pos_feedback=self.l1_use_pos_feedback,
+                k_pos_i_xy=self.l1_k_pos_i_xy,
+                k_pos_i_z=self.l1_k_pos_i_z,
+                max_pos_integral_xy=self.l1_max_pos_integral,
+                max_pos_integral_z=self.l1_max_pos_integral,
+            )
+        )
+        self._l1_last_a_applied = np.zeros(3, dtype=float)
+        self._l1_last_debug_pub_t = 0.0
 
         # 轨迹来源参数
         self.suite_plan_path = rospy.get_param("~suite_plan_path", "")
@@ -1005,6 +1047,9 @@ class SuiteTrackingController:
         self.mpc_stats_pub = rospy.Publisher(
             "/suite_mpc/stats", _StringMsg, queue_size=5
         )
+        self.l1_debug_pub = rospy.Publisher(
+            "/suite_mpc/l1_debug", _StringMsg, queue_size=5
+        )
 
         # ── RViz 路径话题（与 run_controller.py 相同名称） ────────────────────
         # 参考轨迹（整条，固定）
@@ -1078,6 +1123,20 @@ class SuiteTrackingController:
         rospy.Service("set_regulation_target", Trigger, self._svc_set_regulation_target)
         rospy.Service("update_controller_params", Trigger, self._svc_update_controller_params)
         rospy.Service("set_control_output_enabled", SetBool, self._svc_set_control_output_enabled)
+        rospy.Service("set_l1_enabled", SetBool, self._svc_set_l1_enabled)
+
+    def _svc_set_l1_enabled(self, req: SetBool) -> SetBoolResponse:
+        """运行时开启/关闭 L1 自适应增广（不影响 baseline 控制器模式）。"""
+        self.l1_enabled = bool(req.data)
+        self._l1.set_enabled(self.l1_enabled)
+        if self.l1_enabled:
+            v_w = self._linear_vel_world_from_state(self.state)
+            self._l1.reset(v_w)
+            self._l1_last_a_applied = np.zeros(3, dtype=float)
+        state = "enabled" if self.l1_enabled else "disabled"
+        msg = f"L1 adaptive augmentation {state}."
+        rospy.loginfo(msg)
+        return SetBoolResponse(success=True, message=msg)
 
     def _svc_set_control_output_enabled(self, req: SetBool) -> SetBoolResponse:
         self.control_output_enabled = bool(req.data)
@@ -1202,6 +1261,7 @@ class SuiteTrackingController:
             )
             if u_cmd is not None:
                 self._u_hold = u_cmd
+            self._step_l1_adaptive(ref_pos_world=np.asarray(self._reg_target[0:3], dtype=float))
             if self.control_output_enabled:
                 self._publish_body_rate_thrust(self._u_hold, xs_next)
                 if self.arm_enabled:
@@ -1229,6 +1289,13 @@ class SuiteTrackingController:
             self._u_hold = u_cmd
 
         # ── 发布控制指令 ──────────────────────────────────────────────────────
+        l1_ref_pos = None
+        if self.l1_enabled:
+            try:
+                l1_ref_pos = self._sample_ref_kinematics(t_elapsed)[0]
+            except Exception:
+                l1_ref_pos = None
+        self._step_l1_adaptive(ref_pos_world=l1_ref_pos)
         if self.control_output_enabled:
             self._publish_body_rate_thrust(self._u_hold, xs_next)
             if self.arm_enabled:
@@ -1611,9 +1678,16 @@ class SuiteTrackingController:
                 vel_ref = np.zeros(3, dtype=float)
                 acc_ref = np.zeros(3, dtype=float)
 
+        self._step_l1_adaptive(ref_pos_world=np.asarray(pos_ref, dtype=float))
+
         if self.controller_mode == "px4":
+            acc_out = np.asarray(acc_ref, dtype=float).copy()
+            if self.l1_enabled:
+                # px4 模式直接以加速度命令注入：u_cmd = acc_ref + a_ac（含补偿）。
+                acc_out = acc_out + self._l1.a_ac
+                self._l1_last_a_applied = np.asarray(acc_out, dtype=float).reshape(3)
             if self.control_output_enabled:
-                self._publish_mavros_setpoint_raw(pos_ref, vel_ref, acc_ref, yaw_ref, 0.0)
+                self._publish_mavros_setpoint_raw(pos_ref, vel_ref, acc_out, yaw_ref, 0.0)
         elif self.controller_mode == "geometric":
             if self.control_output_enabled:
                 self._publish_geometric_bodyrate_thrust(pos_ref, vel_ref, acc_ref, yaw_ref)
@@ -1642,6 +1716,234 @@ class SuiteTrackingController:
             if self.controller_mode == "px4":
                 self.recorded_data["body_rate_commands"].append([0.0, 0.0, 0.0])
                 self.recorded_data["thrust_command"].append(0.0)
+
+    # =========================================================================
+    # L1 自适应增广（u = u_baseline + u_ac）
+    # =========================================================================
+
+    def _robot_mass(self) -> float:
+        return float(pin.computeTotalMass(self.mpc.robot_model))
+
+    def _body_to_world_vel(self) -> np.ndarray:
+        """世界系平动速度 (3,)。"""
+        nq = self.mpc.nq
+        v_body = np.asarray(self.state[nq : nq + 3], dtype=float)
+        quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        return R @ v_body
+
+    def _l1_predictor_accel(
+        self,
+        thrust_baseline_N: float,
+        a_ac: np.ndarray,
+    ) -> np.ndarray:
+        """L1 预测器输入：名义模型下“实际施加的比力加速度”（世界系, m/s²）。
+
+            a_applied = (T_actual / m) · b3_meas - g·e3
+
+        其中 T_actual = thrust_baseline_N + m·(a_ac·b3) 为 L1 竖直注入后的实际总
+        推力，b3_meas 为**当前测量姿态**的机体 z 轴。
+
+        为什么不再显式 “+ a_ac”（修复 xy 漂移/左右不对称的关键）
+        ────────────────────────────────────────────────────────
+        水平补偿 a_ac_xy 是靠**倾转机体**实现的，其效果已体现在测量姿态 b3_meas
+        里。若再显式 + a_ac，则水平通道被重复计入 → σ̂_xy 退化为自由积分器、失去
+        可观性，悬停时漂移且依赖飞行历史（左右不对称）。竖直注入推力不含在
+        baseline 推力中，故通过 T_actual 计入。如此 σ = a_real - a_applied 恰为
+        真实外部扰动，xy / z 通道一致且均可观。
+        """
+        quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        b3 = R[:, 2]
+        mass = max(self._robot_mass(), 1e-3)
+        a_ac = np.asarray(a_ac, dtype=float).reshape(3)
+        thrust_actual_N = float(thrust_baseline_N) + mass * float(np.dot(a_ac, b3))
+        return (thrust_actual_N / mass) * b3 - np.array([0.0, 0.0, 9.81], dtype=float)
+
+    def _baseline_accel_world(
+        self,
+        thrust_N: float,
+        quat: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Baseline 名义比力加速度（世界系, m/s²），**不含** L1 补偿：
+            a_nom = (T_b/m_nom)·b3 - g·e3
+        用于 L1 预测器；必须把 u_ac 与 u_b 分开，否则会把补偿误当作模型的一部分。
+        """
+        if quat is None:
+            quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        mass = max(self._robot_mass(), 1e-3)
+        return (float(thrust_N) / mass) * R[:, 2] - np.array(
+            [0.0, 0.0, 9.81], dtype=float
+        )
+
+    def _thrust_N_from_u(self, u: np.ndarray) -> float:
+        return float(np.sum(np.asarray(u[: self._n_rotors], dtype=float)))
+
+    def _thrust_N_from_normalized(self, thrust_norm: float) -> float:
+        return float(thrust_norm) * float(self.max_thrust_total)
+
+    def _body_to_attitude_target(
+        self,
+        roll_rate: float,
+        pitch_rate: float,
+        yaw_rate: float,
+        thrust_normalized: float,
+    ) -> AttitudeTarget:
+        att_msg = AttitudeTarget()
+        att_msg.header.stamp = rospy.Time.now()
+        att_msg.type_mask = AttitudeTarget.IGNORE_ATTITUDE
+        att_msg.body_rate = Vector3(
+            float(roll_rate), float(pitch_rate), float(yaw_rate)
+        )
+        att_msg.thrust = float(thrust_normalized)
+        return att_msg
+
+    def _l1_augment_attitude_target(
+        self,
+        att_msg: AttitudeTarget,
+        a_ac_world: np.ndarray,
+    ) -> AttitudeTarget:
+        """
+        将 L1 补偿加速度 a_ac（世界系）映射到 CTBR 指令：
+          • 推力增量 ΔT = m · a_ac_z_world（沿当前机体 z 轴在世界系的投影）
+          • 体角速度增量：由 a_ac 的横向分量驱动期望比力方向修正
+        """
+        if not self.l1_enabled or a_ac_world is None:
+            return att_msg
+        a_ac = np.asarray(a_ac_world, dtype=float).reshape(3)
+        if not np.any(np.abs(a_ac) > 1e-9):
+            return att_msg
+
+        quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        mass = self._robot_mass()
+        b3 = R[:, 2]
+
+        thrust_N = self._thrust_N_from_normalized(float(att_msg.thrust))
+        thrust_N += float(mass * np.dot(a_ac, b3))
+        thrust_norm = float(
+            np.clip(
+                thrust_N / self.max_thrust_total,
+                self.min_thrust_cmd,
+                self.max_thrust_cmd,
+            )
+        )
+
+        a_des = a_ac.copy()
+        a_des[2] += 9.81
+        n_des = np.linalg.norm(a_des)
+        if n_des < 1e-6:
+            return self._body_to_attitude_target(
+                att_msg.body_rate.x,
+                att_msg.body_rate.y,
+                att_msg.body_rate.z,
+                thrust_norm,
+            )
+        b3_des = a_des / n_des
+        e_tilt = np.cross(b3, b3_des)
+        tilt_gain = float(self._l1.params.tilt_gain)
+        d_rate = tilt_gain * e_tilt
+        d_rate = np.clip(d_rate, -self.max_angular_velocity, self.max_angular_velocity)
+
+        return self._body_to_attitude_target(
+            float(att_msg.body_rate.x) + float(d_rate[0]),
+            float(att_msg.body_rate.y) + float(d_rate[1]),
+            float(att_msg.body_rate.z) + float(d_rate[2]),
+            thrust_norm,
+        )
+
+    def _step_l1_adaptive(self, ref_pos_world: Optional[np.ndarray] = None) -> None:
+        """
+        每个控制周期调用：更新扰动估计并缓存 a_ac。
+
+        ref_pos_world : 当前参考位置（世界系），用于位置误差积分通道。
+                        预测器输入 _l1_last_a_applied 必须是上一拍“名义施加
+                        加速度”u_cmd =(T/m_nom)·b3 - g·e3 + a_ac（含 L1 补偿），
+                        否则会产生欠补偿（σ̂ 只收敛到真实扰动的一半）。
+        """
+        if not self.l1_enabled:
+            return
+        v_world = self._body_to_world_vel()
+        pos_err = None
+        if ref_pos_world is not None:
+            pos_err = np.asarray(self.state[0:3], dtype=float) - np.asarray(
+                ref_pos_world, dtype=float
+            ).reshape(3)
+        a_ac = self._l1.step(
+            self.dt_control, v_world, self._l1_last_a_applied, pos_err_world=pos_err
+        )
+        self._publish_l1_debug(a_ac)
+
+    def _publish_l1_debug(self, a_ac_world: np.ndarray) -> None:
+        try:
+            from std_msgs.msg import String as _StringMsg
+
+            now = time.perf_counter()
+            if now - self._l1_last_debug_pub_t < 0.05:
+                return
+            self._l1_last_debug_pub_t = now
+            mass = self._robot_mass()
+            sig = self._l1.sigma_hat
+            payload = {
+                "enabled": bool(self.l1_enabled),
+                "sigma_x": round(float(sig[0]), 4),
+                "sigma_y": round(float(sig[1]), 4),
+                "sigma_z": round(float(sig[2]), 4),
+                "sigma_norm": round(float(np.linalg.norm(sig)), 4),
+                "a_ac_x": round(float(a_ac_world[0]), 4),
+                "a_ac_y": round(float(a_ac_world[1]), 4),
+                "a_ac_z": round(float(a_ac_world[2]), 4),
+                "a_ac_norm": round(float(np.linalg.norm(a_ac_world)), 4),
+                "dist_force_N": round(float(mass * np.linalg.norm(sig)), 4),
+                "est_added_mass_kg": round(float(self._l1.estimated_added_mass(mass)), 4),
+                "as_gain": float(self._l1.params.as_gain),
+                "wc_xy": float(self._l1.params.wc_xy),
+                "wc_z": float(self._l1.params.wc_z),
+                "pos_fb": bool(self._l1.params.use_pos_feedback),
+                "a_pos_norm": round(float(np.linalg.norm(self._l1.a_pos)), 4),
+                "pos_int_norm": round(float(np.linalg.norm(self._l1.pos_integral)), 4),
+            }
+            self.l1_debug_pub.publish(_StringMsg(data=json.dumps(payload)))
+        except Exception as e:
+            rospy.logdebug_throttle(5.0, f"[l1_debug] publish error: {e}")
+
+    def _apply_l1_params_from_dict(self, cfg: dict) -> None:
+        """从 controller_update_data 或 ROS param 更新 L1 增益。"""
+        if "l1_enabled" in cfg:
+            self.l1_enabled = bool(cfg["l1_enabled"])
+        if "l1_use_pos_feedback" in cfg:
+            self.l1_use_pos_feedback = bool(cfg["l1_use_pos_feedback"])
+        self._l1.update_params(
+            enabled=self.l1_enabled,
+            as_gain=cfg.get("l1_as_gain", self.l1_as_gain),
+            wc_xy=cfg.get("l1_wc_xy", self.l1_wc_xy),
+            wc_z=cfg.get("l1_wc_z", self.l1_wc_z),
+            tilt_gain=cfg.get("l1_tilt_gain", self.l1_tilt_gain),
+            max_accel_xy=cfg.get("l1_max_accel_xy", self.l1_max_accel_xy),
+            max_accel_z=cfg.get("l1_max_accel_z", self.l1_max_accel_z),
+            max_sigma=cfg.get("l1_max_sigma", self.l1_max_sigma),
+            use_pos_feedback=self.l1_use_pos_feedback,
+            k_pos_i_xy=cfg.get("l1_k_pos_i_xy", self.l1_k_pos_i_xy),
+            k_pos_i_z=cfg.get("l1_k_pos_i_z", self.l1_k_pos_i_z),
+            max_pos_integral_xy=cfg.get("l1_max_pos_integral", self.l1_max_pos_integral),
+            max_pos_integral_z=cfg.get("l1_max_pos_integral", self.l1_max_pos_integral),
+        )
+        p = self._l1.params
+        self.l1_as_gain = p.as_gain
+        self.l1_wc_xy = p.wc_xy
+        self.l1_wc_z = p.wc_z
+        self.l1_tilt_gain = p.tilt_gain
+        self.l1_max_accel_xy = p.max_accel_xy
+        self.l1_max_accel_z = p.max_accel_z
+        self.l1_max_sigma = p.max_sigma
+        self.l1_k_pos_i_xy = p.k_pos_i_xy
+        self.l1_k_pos_i_z = p.k_pos_i_z
+        self.l1_max_pos_integral = p.max_pos_integral_xy
+        if self.l1_enabled:
+            self._l1.reset(self._body_to_world_vel())
+            self._l1_last_a_applied = np.zeros(3, dtype=float)
 
     # =========================================================================
     # 发布控制指令
@@ -1690,15 +1992,21 @@ class SuiteTrackingController:
         pitch_rate = float(np.clip(pitch_rate, -self.max_angular_velocity, self.max_angular_velocity))
         yaw_rate = float(np.clip(yaw_rate, -self.max_angular_velocity, self.max_angular_velocity))
 
-        att_msg = AttitudeTarget()
-        att_msg.header.stamp = rospy.Time.now()
-        att_msg.type_mask = AttitudeTarget.IGNORE_ATTITUDE
-        att_msg.body_rate = Vector3(roll_rate, pitch_rate, yaw_rate)
-        att_msg.thrust = thrust_normalized
+        att_msg = self._body_to_attitude_target(
+            roll_rate, pitch_rate, yaw_rate, thrust_normalized
+        )
+        thrust_baseline_N = self._thrust_N_from_normalized(thrust_normalized)
+        a_ac = self._l1.a_ac if self.l1_enabled else np.zeros(3, dtype=float)
+        # 预测器输入 = 测量姿态 + 实际总推力算出的比力（水平 a_ac 已体现在姿态里，
+        # 不再显式 + a_ac，避免水平通道重复计入导致 σ̂_xy 漂移/左右不对称）。
+        self._l1_last_a_applied = self._l1_predictor_accel(thrust_baseline_N, a_ac)
+        att_msg = self._l1_augment_attitude_target(att_msg, a_ac)
 
         if self.recording_enabled:
-            self.recorded_data["body_rate_commands"].append([roll_rate, pitch_rate, yaw_rate])
-            self.recorded_data["thrust_command"].append(thrust_normalized)
+            self.recorded_data["body_rate_commands"].append(
+                [float(att_msg.body_rate.x), float(att_msg.body_rate.y), float(att_msg.body_rate.z)]
+            )
+            self.recorded_data["thrust_command"].append(float(att_msg.thrust))
 
         self.body_rate_thrust_pub.publish(att_msg)
 
@@ -1798,17 +2106,24 @@ class SuiteTrackingController:
             np.clip(thrust_N / self.max_thrust_total, self.min_thrust_cmd, self.max_thrust_cmd)
         )
 
-        att_msg = AttitudeTarget()
-        att_msg.header.stamp = rospy.Time.now()
-        att_msg.type_mask = AttitudeTarget.IGNORE_ATTITUDE
-        att_msg.body_rate = Vector3(float(rate_cmd[0]), float(rate_cmd[1]), float(rate_cmd[2]))
-        att_msg.thrust = thrust_cmd
+        att_msg = self._body_to_attitude_target(
+            float(rate_cmd[0]), float(rate_cmd[1]), float(rate_cmd[2]), thrust_cmd
+        )
+        thrust_baseline_N = self._thrust_N_from_normalized(thrust_cmd)
+        a_ac = self._l1.a_ac if self.l1_enabled else np.zeros(3, dtype=float)
+        # 预测器输入 = 测量姿态 + 实际总推力算出的比力（水平 a_ac 已体现在姿态里，
+        # 不再显式 + a_ac，避免水平通道重复计入导致 σ̂_xy 漂移/左右不对称）。
+        self._l1_last_a_applied = self._l1_predictor_accel(thrust_baseline_N, a_ac)
+        att_msg = self._l1_augment_attitude_target(att_msg, a_ac)
+
         self.body_rate_thrust_pub.publish(att_msg)
         self._publish_reference_yaw(float(yaw_ref))
 
         if self.recording_enabled:
-            self.recorded_data["body_rate_commands"].append(rate_cmd.tolist())
-            self.recorded_data["thrust_command"].append(thrust_cmd)
+            self.recorded_data["body_rate_commands"].append(
+                [float(att_msg.body_rate.x), float(att_msg.body_rate.y), float(att_msg.body_rate.z)]
+            )
+            self.recorded_data["thrust_command"].append(float(att_msg.thrust))
 
     def _publish_arm_cmd(self, xs_next: Optional[np.ndarray]):
         """
@@ -1925,7 +2240,17 @@ class SuiteTrackingController:
                 "err_z": round(float(self._track_err_xyz[2]), 4),
                 "err_pos": round(float(self._track_err_pos), 4),
                 "err_yaw_deg": round(float(self._track_err_yaw_deg), 2),
+                "l1_enabled": bool(self.l1_enabled),
+                "l1_sigma_norm": round(float(np.linalg.norm(self._l1.sigma_hat)), 4),
+                "l1_a_ac_norm": round(float(np.linalg.norm(self._l1.a_ac)), 4),
             }
+            # 估计的扰动力（世界系，N）= m·σ̂；供 GUI 实时显示力误差分量。
+            _l1_mass = self._robot_mass()
+            _l1_sig = self._l1.sigma_hat
+            payload["l1_force_x"] = round(float(_l1_mass * _l1_sig[0]), 3)
+            payload["l1_force_y"] = round(float(_l1_mass * _l1_sig[1]), 3)
+            payload["l1_force_z"] = round(float(_l1_mass * _l1_sig[2]), 3)
+            payload["l1_force_norm"] = round(float(_l1_mass * np.linalg.norm(_l1_sig)), 3)
             self.mpc_stats_pub.publish(_StringMsg(data=json.dumps(payload)))
         except Exception as e:
             rospy.logdebug_throttle(5.0, f"[mpc_stats] publish error: {e}")
@@ -2688,6 +3013,39 @@ class SuiteTrackingController:
     # ROS 服务
     # =========================================================================
 
+    def _prime_tracking_warm_start(self, iters: int = 8) -> None:
+        """开始跟踪前预热 MPC warm-start，消除首拍冷启动导致的起步掉高。
+
+        用当前状态在轨迹起点 t_plan[0] 反复求解，使求解器 warm-start 收敛到
+        起点附近的稳定解；不发布任何指令。期间用 _mpc_rebuilding 守卫挡住
+        控制定时器回调（_control_callback 顶部会改为发布 hold），避免与本函数
+        并发调用同一个非可重入求解器。
+        """
+        if self.mpc is None:
+            return
+        x0 = self.state.copy()
+        prev_rebuilding = getattr(self, "_mpc_rebuilding", False)
+        self._mpc_rebuilding = True
+        try:
+            if self.controller_mode == "acados_full_state" and hasattr(self.mpc, "warmup"):
+                self.mpc.warmup(x0, self.t_plan, self.x_plan, iters=iters)
+                self._xs_guess = getattr(self.mpc, "last_xs", None)
+            else:
+                # croc / 其它：用 _solve_mpc 在 t_elapsed=0 反复求解，建立
+                # 控制器级 _xs_guess / _us_guess。
+                for _ in range(max(1, int(iters))):
+                    u_cmd, _ = self._solve_mpc(x0, 0.0)
+                    if u_cmd is not None:
+                        self._u_hold = u_cmd
+            rospy.loginfo(
+                f"[start_tracking] warm-start primed ({iters} iters, "
+                f"mode={self.controller_mode})."
+            )
+        except Exception as e:
+            rospy.logwarn(f"[start_tracking] warm-start priming failed: {e}")
+        finally:
+            self._mpc_rebuilding = prev_rebuilding
+
     def _svc_start_tracking(self, req) -> TriggerResponse:
         if self.px4_state.mode != "OFFBOARD":
             return TriggerResponse(False, "Must be in OFFBOARD mode")
@@ -2700,16 +3058,28 @@ class SuiteTrackingController:
         # 退出 regulation 模式，切换到轨迹跟踪
         self._regulating = False
         self._reg_target_locked = False
-        self.trajectory_started = True
         self.traj_finished = False
-        self.controller_start_time = rospy.Time.now()
         self.trajectory_name = str(rospy.get_param("~trajectory_name", self.trajectory_name))
+        # 丢弃旧 warm-start，并在“正式计时之前”用当前状态在轨迹起点预热求解器，
+        # 否则首拍是冷启动（horizon 猜成 x_now+u_hover），RTI 解质量差 → 起步掉高。
         self._xs_guess = None
         self._us_guess = None
+        if hasattr(self.mpc, "reset_warm_start"):
+            self.mpc.reset_warm_start()
+        self._prime_tracking_warm_start()
+        # 预热完成后才置位跟踪并启动计时，使 t_elapsed 从 0 开始且首拍已是热启动。
+        self.trajectory_started = True
+        self.controller_start_time = rospy.Time.now()
         self._clear_recorded_data()
         self._active_tracking_tag = self._compose_tracking_file_tag()
         self.recording_enabled = True
         self._clear_actual_paths()   # 重置实际路径，使实际轨迹从跟踪起点开始
+        if self.l1_enabled:
+            # 软重置：保留 regulation 期间已收敛的扰动估计/补偿（推力不匹配、
+            # 负载等在切换前后不变），仅对齐预测器速度。硬 reset 会清零补偿，
+            # 导致刚切到 tracking 时系统重新掉落、L1 从头收敛而带偏轨迹。
+            # _l1_last_a_applied 沿用上一拍（regulation）的名义加速度，保持连续。
+            self._l1.reseed_predictor(self._body_to_world_vel())
         rospy.loginfo("Tracking started! (regulation mode off)")
         return TriggerResponse(True, "Tracking started")
 
@@ -3008,6 +3378,8 @@ class SuiteTrackingController:
                     if new_max_thrust > 0:
                         self.max_thrust_total = new_max_thrust
 
+                    self._apply_l1_params_from_dict(cfg)
+
                     if self.controller_mode in ("croc_full_state", "acados_full_state", "croc_ee_pose"):
                         if self.controller_mode == "croc_ee_pose":
                             self._build_ee_ref_from_full_state()
@@ -3030,7 +3402,8 @@ class SuiteTrackingController:
             msg = (
                 f"Controller params updated: mode={self.controller_mode}, "
                 f"dt_mpc={self.dt_mpc:.3f}, H={self.horizon}, iter={self.mpc_max_iter}, "
-                f"rate={self.control_rate:.1f}Hz. {mpc_detail}"
+                f"rate={self.control_rate:.1f}Hz, l1={'on' if self.l1_enabled else 'off'}. "
+                f"{mpc_detail}"
             )
             rospy.loginfo(f"[update_controller_params] {msg}")
             return TriggerResponse(True, msg)
