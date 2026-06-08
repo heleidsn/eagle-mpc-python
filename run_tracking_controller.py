@@ -273,11 +273,23 @@ class SuiteTrackingController:
         self.dt_mpc = rospy.get_param("~dt_mpc", 0.05)       # s
         self.horizon = rospy.get_param("~horizon", 25)
         self.mpc_max_iter = rospy.get_param("~mpc_max_iter", 60)
+        # CTBR 体角速度前瞻：发布的 body rate 取自 MPC 解 horizon 中
+        # t = bodyrate_lookahead_ms 处（按 dt_mpc 离散点线性插值），与 dt_mpc 解耦。
+        # 默认 = dt_mpc（即原行为：取 xs[1]，约 50ms 后）。0 → 取当前步 xs[0]。
+        self.bodyrate_lookahead_ms = float(
+            rospy.get_param("~bodyrate_lookahead_ms", self.dt_mpc * 1000.0)
+        )
+        self.bodyrate_lookahead_s = max(0.0, self.bodyrate_lookahead_ms / 1000.0)
         # acados 实时求解器配置（默认面向高频控制：RTI + ERK + HPIPM SPEED）
         self.acados_solver_mode = str(rospy.get_param("~acados_solver_mode", "rti"))
         self.acados_integrator = str(rospy.get_param("~acados_integrator", "ERK"))
         self.acados_hpipm_mode = str(rospy.get_param("~acados_hpipm_mode", "SPEED"))
         self.acados_qp_iter_max = int(rospy.get_param("~acados_qp_iter_max", 20))
+        # 实时/精度细调（见 s500_uam_acados_realtime_mpc._build_solver）
+        self.acados_qp_warm_start = int(rospy.get_param("~acados_qp_warm_start", 1))
+        self.acados_sim_num_stages = int(rospy.get_param("~acados_sim_num_stages", 4))
+        self.acados_sim_num_steps = int(rospy.get_param("~acados_sim_num_steps", 1))
+        self.acados_as_rti_iter = int(rospy.get_param("~acados_as_rti_iter", 0))
 
         # 全状态跟踪权重
         self.w_state_track = rospy.get_param("~w_state_track", 10.0)
@@ -349,6 +361,32 @@ class SuiteTrackingController:
         self._l1_last_a_applied = np.zeros(3, dtype=float)
         self._l1_last_debug_pub_t = 0.0
 
+        # ── Gazebo 气动阻力“真值”同步重建（用于与 L1 扰动估计对比）──────────────
+        # Gazebo gazebo_motor_model 逐电机施加转子阻力：
+        #     air_drag_i = -|ω_i| · Cd · V_perp
+        # 求和后世界系总阻力 F_drag = -Cd·(Σ|ω_i|)·V_perp，其中
+        #     V_perp   = (v - wind) 在机体 z 轴(转子轴)垂直平面上的分量
+        #     Σ|ω_i|   由总推力反推：T=Σ kf·ω_i² ⇒ Σ|ω| = sqrt(n·T/kf)（等分近似）
+        # 默认参数取自 s500_uam SDF（rotorDragCoefficient=1.75e-4, motorConstant=8.548e-6）。
+        self.aero_drag_record = bool(rospy.get_param("~aero_drag_record", True))
+        self.aero_rotor_drag_coeff = float(
+            rospy.get_param("~aero_rotor_drag_coeff", 1.75e-4)
+        )
+        self.aero_motor_constant = float(
+            rospy.get_param("~aero_motor_constant", 8.548e-6)
+        )
+        _wind = rospy.get_param("~aero_wind_world", [0.0, 0.0, 0.0])
+        try:
+            self.aero_wind_world = np.asarray(_wind, dtype=float).reshape(3)
+        except Exception:
+            self.aero_wind_world = np.zeros(3, dtype=float)
+        # 真值阻力前馈补偿（与 L1 互斥的对照实验）：不开 L1，直接用解析重建的
+        # 阻力真值 -F_drag/m 作为补偿加速度 a_ac，注入与 L1 相同的 CTBR 增广通道，
+        # 用于检验“若扰动估计完全准确，补偿后的跟踪效果如何”。
+        self.drag_ff_enabled = bool(rospy.get_param("~drag_ff_enabled", False))
+        if self.l1_enabled and self.drag_ff_enabled:
+            self.drag_ff_enabled = False  # 互斥：L1 优先
+
         # 轨迹来源参数
         self.suite_plan_path = rospy.get_param("~suite_plan_path", "")
         self.dt_traj_opt_ms = rospy.get_param("~dt_traj_opt_ms", 50)
@@ -419,6 +457,9 @@ class SuiteTrackingController:
         self._xs_guess: Optional[List[np.ndarray]] = None
         self._us_guess: Optional[List[np.ndarray]] = None
         self._u_hold = self._hover_thrust_cmd()
+        # 最近一次求解的完整 horizon 状态序列 [x(0), x(1), ..., x(N)]（按 dt_mpc 等间隔），
+        # 供 body rate 前瞻插值用；与 warm-start 缓存分开，避免 croc 平移猜测带来的歧义。
+        self._mpc_xs_horizon: Optional[List[np.ndarray]] = None
 
         # ── Regulation 模式（MPC 镇定到用户设定目标） ─────────────────────────
         # 节点启动时默认处于 regulation 模式，目标 = x_plan[0]
@@ -468,6 +509,12 @@ class SuiteTrackingController:
             "arm_joint_commands": [], "reference_position": [],
             "reference_orientation": [], "reference_velocity": [],
             "reference_angular_velocity": [], "reference_arm_positions": [],
+            # L1 扰动估计 vs Gazebo 气动阻力真值（世界系）
+            "l1_sigma_world": [],        # L1 估计扰动加速度 σ̂ (m/s²)
+            "l1_force_world": [],        # L1 估计扰动力 m·σ̂ (N)
+            "l1_a_ac_world": [],         # L1 补偿加速度 a_ac (m/s²)
+            "aero_drag_force_world": [], # Gazebo 转子阻力真值 (N)
+            "aero_drag_accel_world": [], # 阻力真值除以质量 (m/s²)，与 σ̂ 同量纲
         }
         self._active_tracking_tag: Optional[str] = None
         self.solve_times: deque = deque(maxlen=200)
@@ -709,6 +756,8 @@ class SuiteTrackingController:
         omega_ref = np.asarray(self.recorded_data.get("reference_angular_velocity", []), dtype=float)
         quat_ref = np.asarray(self.recorded_data.get("reference_orientation", []), dtype=float)
         solve_ms = np.asarray(self.recorded_data.get("mpc_solve_time", []), dtype=float).reshape(-1)
+        l1_force = np.asarray(self.recorded_data.get("l1_force_world", []), dtype=float)
+        drag_force = np.asarray(self.recorded_data.get("aero_drag_force_world", []), dtype=float)
         n = int(t.size)
         with csv_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -725,6 +774,8 @@ class SuiteTrackingController:
                 "u0", "u1", "u2", "u3", "u4", "u5",
                 "cmd_wx", "cmd_wy", "cmd_wz", "cmd_thrust_norm",
                 "solve_ms",
+                "l1_fx", "l1_fy", "l1_fz",
+                "drag_fx", "drag_fy", "drag_fz",
             ]
             w.writerow(header)
             for i in range(n):
@@ -745,6 +796,8 @@ class SuiteTrackingController:
                 row.extend(bcmd[i].tolist() if bcmd.ndim == 2 and i < bcmd.shape[0] else [float("nan")] * 3)
                 row.append(float(thrust_cmd[i]) if i < thrust_cmd.size else float("nan"))
                 row.append(float(solve_ms[i]) if i < solve_ms.size else float("nan"))
+                row.extend(l1_force[i].tolist() if l1_force.ndim == 2 and i < l1_force.shape[0] else [float("nan")] * 3)
+                row.extend(drag_force[i].tolist() if drag_force.ndim == 2 and i < drag_force.shape[0] else [float("nan")] * 3)
                 w.writerow(row)
 
         stats = self._compute_tracking_stats()
@@ -782,6 +835,10 @@ class SuiteTrackingController:
             bool(self.arm_enabled),
             str(self.acados_integrator),
             str(self.acados_solver_mode),
+            int(self.acados_qp_warm_start),
+            int(self.acados_sim_num_stages),
+            int(self.acados_sim_num_steps),
+            int(self.acados_as_rti_iter),
         )
 
     def _apply_cfg_weights_from_dict(self, cfg: dict) -> None:
@@ -806,6 +863,14 @@ class SuiteTrackingController:
             self.acados_hpipm_mode = str(cfg["acados_hpipm_mode"])
         if "acados_qp_iter_max" in cfg:
             self.acados_qp_iter_max = int(cfg["acados_qp_iter_max"])
+        if "acados_qp_warm_start" in cfg:
+            self.acados_qp_warm_start = int(cfg["acados_qp_warm_start"])
+        if "acados_sim_num_stages" in cfg:
+            self.acados_sim_num_stages = int(cfg["acados_sim_num_stages"])
+        if "acados_sim_num_steps" in cfg:
+            self.acados_sim_num_steps = int(cfg["acados_sim_num_steps"])
+        if "acados_as_rti_iter" in cfg:
+            self.acados_as_rti_iter = int(cfg["acados_as_rti_iter"])
 
     def _rebuild_mpc_after_param_update(self, cfg: dict, prev_sig: tuple) -> str:
         """按模式重建或热更新 MPC。返回简短说明供服务响应。"""
@@ -911,6 +976,10 @@ class SuiteTrackingController:
                 integrator_type=self.acados_integrator,
                 hpipm_mode=self.acados_hpipm_mode,
                 qp_iter_max=self.acados_qp_iter_max,
+                qp_warm_start=self.acados_qp_warm_start,
+                sim_num_stages=self.acados_sim_num_stages,
+                sim_num_steps=self.acados_sim_num_steps,
+                as_rti_iter=self.acados_as_rti_iter,
             )
             # acados full-state solver也用于 regulation（常值参考）
             self.mpc_reg = self.mpc
@@ -1124,6 +1193,7 @@ class SuiteTrackingController:
         rospy.Service("update_controller_params", Trigger, self._svc_update_controller_params)
         rospy.Service("set_control_output_enabled", SetBool, self._svc_set_control_output_enabled)
         rospy.Service("set_l1_enabled", SetBool, self._svc_set_l1_enabled)
+        rospy.Service("set_drag_ff_enabled", SetBool, self._svc_set_drag_ff_enabled)
 
     def _svc_set_l1_enabled(self, req: SetBool) -> SetBoolResponse:
         """运行时开启/关闭 L1 自适应增广（不影响 baseline 控制器模式）。"""
@@ -1133,8 +1203,25 @@ class SuiteTrackingController:
             v_w = self._linear_vel_world_from_state(self.state)
             self._l1.reset(v_w)
             self._l1_last_a_applied = np.zeros(3, dtype=float)
+            if self.drag_ff_enabled:
+                # L1 与真值前馈互斥，开 L1 时自动关掉真值前馈。
+                self.drag_ff_enabled = False
+                rospy.loginfo("Drag-truth feedforward auto-disabled (L1 takes priority).")
         state = "enabled" if self.l1_enabled else "disabled"
         msg = f"L1 adaptive augmentation {state}."
+        rospy.loginfo(msg)
+        return SetBoolResponse(success=True, message=msg)
+
+    def _svc_set_drag_ff_enabled(self, req: SetBool) -> SetBoolResponse:
+        """运行时开启/关闭“真值阻力前馈补偿”（与 L1 互斥的对照实验）。
+        开启时若 L1 在运行则先关闭 L1。"""
+        self.drag_ff_enabled = bool(req.data)
+        if self.drag_ff_enabled and self.l1_enabled:
+            self.l1_enabled = False
+            self._l1.set_enabled(False)
+            rospy.loginfo("L1 auto-disabled (drag-truth feedforward takes over).")
+        state = "enabled" if self.drag_ff_enabled else "disabled"
+        msg = f"Drag-truth feedforward compensation {state}."
         rospy.loginfo(msg)
         return SetBoolResponse(success=True, message=msg)
 
@@ -1348,10 +1435,12 @@ class SuiteTrackingController:
                 self._last_mpc_cost = float(getattr(self.mpc, "last_cost", float("nan")))
                 # expose full solved horizon for planned-path visualization (RViz)
                 self._xs_guess = getattr(self.mpc, "last_xs", None)
+                self._mpc_xs_horizon = getattr(self.mpc, "last_xs", None)
                 return u_opt, x_next
             except Exception as e:
                 rospy.logwarn_throttle(1.0, f"Acados MPC solve failed: {e}")
                 self.mpc.reset_warm_start()
+                self._mpc_xs_horizon = None
                 return None, None
 
         try:
@@ -1413,6 +1502,9 @@ class SuiteTrackingController:
                 + [np.array(solver.us[-1], dtype=float).copy()]
             )
 
+            # 完整 horizon（未平移）供 body rate 前瞻插值
+            self._mpc_xs_horizon = [np.array(x, dtype=float).copy() for x in solver.xs]
+
             xs_next = np.array(solver.xs[1], dtype=float).copy()
             return u_opt, xs_next
 
@@ -1420,6 +1512,7 @@ class SuiteTrackingController:
             rospy.logwarn_throttle(1.0, f"MPC solve failed: {e}")
             self._xs_guess = None
             self._us_guess = None
+            self._mpc_xs_horizon = None
             return None, None
 
     def _regulation_reference(self, x_now: np.ndarray) -> np.ndarray:
@@ -1474,10 +1567,12 @@ class SuiteTrackingController:
                 self._last_mpc_cost = float(getattr(self.mpc, "last_cost", float("nan")))
                 # expose full solved horizon for planned-path visualization (RViz)
                 self._reg_xs_guess = getattr(self.mpc, "last_xs", None)
+                self._mpc_xs_horizon = getattr(self.mpc, "last_xs", None)
                 return u_opt, x_next
             except Exception as e:
                 rospy.logwarn_throttle(1.0, f"Acados regulate solve failed: {e}")
                 self.mpc.reset_warm_start()
+                self._mpc_xs_horizon = None
                 return None, None
 
         try:
@@ -1526,6 +1621,8 @@ class SuiteTrackingController:
                 + [np.array(solver.us[-1], dtype=float).copy()]
             )
 
+            self._mpc_xs_horizon = [np.array(x, dtype=float).copy() for x in solver.xs]
+
             xs_next = np.array(solver.xs[1], dtype=float).copy()
             return u_opt, xs_next
 
@@ -1533,6 +1630,7 @@ class SuiteTrackingController:
             rospy.logwarn_throttle(1.0, f"Regulate MPC solve failed: {e}")
             self._reg_xs_guess = None
             self._reg_us_guess = None
+            self._mpc_xs_horizon = None
             return None, None
 
     def _make_reg_target(
@@ -1682,9 +1780,12 @@ class SuiteTrackingController:
 
         if self.controller_mode == "px4":
             acc_out = np.asarray(acc_ref, dtype=float).copy()
-            if self.l1_enabled:
+            if self.l1_enabled or self.drag_ff_enabled:
                 # px4 模式直接以加速度命令注入：u_cmd = acc_ref + a_ac（含补偿）。
-                acc_out = acc_out + self._l1.a_ac
+                # 推力基线用悬停推力近似（px4 不直接给总推力 N）。
+                thrust_hover_N = max(self._robot_mass(), 1e-6) * 9.81
+                a_ac = self._compensation_accel_world(thrust_hover_N)
+                acc_out = acc_out + a_ac
                 self._l1_last_a_applied = np.asarray(acc_out, dtype=float).reshape(3)
             if self.control_output_enabled:
                 self._publish_mavros_setpoint_raw(pos_ref, vel_ref, acc_out, yaw_ref, 0.0)
@@ -1760,6 +1861,43 @@ class SuiteTrackingController:
         thrust_actual_N = float(thrust_baseline_N) + mass * float(np.dot(a_ac, b3))
         return (thrust_actual_N / mass) * b3 - np.array([0.0, 0.0, 9.81], dtype=float)
 
+    def _compute_true_aero_drag(self, thrust_total_N: float) -> np.ndarray:
+        """重建 Gazebo gazebo_motor_model 的转子阻力真值（世界系, N）。
+
+            F_drag = -Cd · (Σ|ω_i|) · V_perp
+            Σ|ω_i| = sqrt(n · T / kf)         （n 个转子等分总推力的近似）
+            V_perp = (v_world - wind) - ((v_world - wind)·b3) b3
+
+        b3 为当前机体 z 轴（转子轴）在世界系的方向。这是平动气动扰动，
+        与 L1 估计的 σ̂（外部比力加速度）可直接对比。
+        """
+        v_world = self._body_to_world_vel()
+        v_rel = np.asarray(v_world, dtype=float).reshape(3) - self.aero_wind_world
+        quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        b3 = R[:, 2]
+        v_perp = v_rel - float(np.dot(v_rel, b3)) * b3
+        n_rot = max(int(self._n_rotors), 1)
+        kf = max(self.aero_motor_constant, 1e-12)
+        thrust = max(float(thrust_total_N), 0.0)
+        sum_omega = math.sqrt(n_rot * thrust / kf)
+        return -self.aero_rotor_drag_coeff * sum_omega * v_perp
+
+    def _compensation_accel_world(self, thrust_baseline_N: float) -> np.ndarray:
+        """统一的补偿加速度 a_ac（世界系, m/s²），注入 CTBR：
+          • L1 开启          → 用 L1 自适应估计 self._l1.a_ac；
+          • 否则若真值前馈开启 → 用解析阻力真值 -F_drag/m（对照实验）；
+          • 都不开            → 0。
+        L1 与真值前馈互斥；L1 优先。
+        """
+        if self.l1_enabled:
+            return np.asarray(self._l1.a_ac, dtype=float).reshape(3)
+        if self.drag_ff_enabled:
+            mass = max(self._robot_mass(), 1e-6)
+            f_drag = self._compute_true_aero_drag(float(thrust_baseline_N))
+            return -np.asarray(f_drag, dtype=float).reshape(3) / mass
+        return np.zeros(3, dtype=float)
+
     def _baseline_accel_world(
         self,
         thrust_N: float,
@@ -1810,7 +1948,7 @@ class SuiteTrackingController:
           • 推力增量 ΔT = m · a_ac_z_world（沿当前机体 z 轴在世界系的投影）
           • 体角速度增量：由 a_ac 的横向分量驱动期望比力方向修正
         """
-        if not self.l1_enabled or a_ac_world is None:
+        if (not self.l1_enabled and not self.drag_ff_enabled) or a_ac_world is None:
             return att_msg
         a_ac = np.asarray(a_ac_world, dtype=float).reshape(3)
         if not np.any(np.abs(a_ac) > 1e-9):
@@ -1913,6 +2051,11 @@ class SuiteTrackingController:
         """从 controller_update_data 或 ROS param 更新 L1 增益。"""
         if "l1_enabled" in cfg:
             self.l1_enabled = bool(cfg["l1_enabled"])
+        if "drag_ff_enabled" in cfg:
+            self.drag_ff_enabled = bool(cfg["drag_ff_enabled"])
+        # L1 与真值前馈互斥：L1 优先
+        if self.l1_enabled and self.drag_ff_enabled:
+            self.drag_ff_enabled = False
         if "l1_use_pos_feedback" in cfg:
             self.l1_use_pos_feedback = bool(cfg["l1_use_pos_feedback"])
         self._l1.update_params(
@@ -1949,6 +2092,46 @@ class SuiteTrackingController:
     # 发布控制指令
     # =========================================================================
 
+    def _bodyrate_from_horizon(
+        self, xs_next: Optional[np.ndarray]
+    ) -> Optional[np.ndarray]:
+        """按 bodyrate_lookahead 从已解 MPC horizon 插值得到体角速度指令 (3,)。
+
+        horizon 状态在时间 0, dt_mpc, 2·dt_mpc, ... 处；取 t = bodyrate_lookahead_s
+        处的体角速度，按相邻离散点线性插值。lookahead = dt_mpc 时退化为 xs[1]
+        （原行为）；lookahead = 0 取 xs[0]（当前步）。MPC 本身（dt_mpc/horizon）不变。
+
+        horizon 不可用时回退到 xs_next（即 xs[1]）；再不行返回 None 交由上层用参考态。
+        """
+        nq = self.mpc.nq
+
+        def _rates(x: np.ndarray) -> np.ndarray:
+            return np.array(
+                [float(x[nq + 3]), float(x[nq + 4]), float(x[nq + 5])], dtype=float
+            )
+
+        xs = self._mpc_xs_horizon
+        dt = float(self.dt_mpc)
+        look = float(self.bodyrate_lookahead_s)
+
+        if xs is None or len(xs) < 2 or dt <= 1e-9:
+            if xs_next is not None and xs_next.size >= nq + 6:
+                return _rates(xs_next)
+            return None
+
+        n_seg = len(xs) - 1                      # 离散段数 N
+        s = look / dt                            # 连续索引（lookahead 对应的格点位置）
+        s = min(max(s, 0.0), float(n_seg))
+        i0 = int(math.floor(s))
+        if i0 >= n_seg:
+            i0 = n_seg - 1
+        frac = s - float(i0)
+        if xs[i0].size < nq + 6 or xs[i0 + 1].size < nq + 6:
+            if xs_next is not None and xs_next.size >= nq + 6:
+                return _rates(xs_next)
+            return None
+        return (1.0 - frac) * _rates(xs[i0]) + frac * _rates(xs[i0 + 1])
+
     def _publish_body_rate_thrust(
         self,
         u: np.ndarray,
@@ -1969,12 +2152,14 @@ class SuiteTrackingController:
             self.max_thrust_cmd,
         )
 
-        # ── Body angular rate（来自 MPC xs[1]） ───────────────────────────
-        # s500: nq+nv = 13, and body rates are at [nq+3 : nq+6], so equality is valid.
-        if xs_next is not None and xs_next.size >= nq + 6:
-            roll_rate = float(xs_next[nq + 3])
-            pitch_rate = float(xs_next[nq + 4])
-            yaw_rate = float(xs_next[nq + 5])
+        # ── Body angular rate（按 bodyrate_lookahead 从 MPC horizon 插值）─────
+        # s500: nq+nv = 13, body rates 在 [nq+3 : nq+6]。lookahead 默认 = dt_mpc，
+        # 退化为原来的 xs[1]；可经参数调小以减小前瞻相位（MPC 本身不变）。
+        rates = self._bodyrate_from_horizon(xs_next)
+        if rates is not None:
+            roll_rate = float(rates[0])
+            pitch_rate = float(rates[1])
+            yaw_rate = float(rates[2])
         else:
             # 若 MPC 求解失败，用上一次的参考状态估算
             t_query = 0.0
@@ -1996,7 +2181,7 @@ class SuiteTrackingController:
             roll_rate, pitch_rate, yaw_rate, thrust_normalized
         )
         thrust_baseline_N = self._thrust_N_from_normalized(thrust_normalized)
-        a_ac = self._l1.a_ac if self.l1_enabled else np.zeros(3, dtype=float)
+        a_ac = self._compensation_accel_world(thrust_baseline_N)
         # 预测器输入 = 测量姿态 + 实际总推力算出的比力（水平 a_ac 已体现在姿态里，
         # 不再显式 + a_ac，避免水平通道重复计入导致 σ̂_xy 漂移/左右不对称）。
         self._l1_last_a_applied = self._l1_predictor_accel(thrust_baseline_N, a_ac)
@@ -2110,7 +2295,7 @@ class SuiteTrackingController:
             float(rate_cmd[0]), float(rate_cmd[1]), float(rate_cmd[2]), thrust_cmd
         )
         thrust_baseline_N = self._thrust_N_from_normalized(thrust_cmd)
-        a_ac = self._l1.a_ac if self.l1_enabled else np.zeros(3, dtype=float)
+        a_ac = self._compensation_accel_world(thrust_baseline_N)
         # 预测器输入 = 测量姿态 + 实际总推力算出的比力（水平 a_ac 已体现在姿态里，
         # 不再显式 + a_ac，避免水平通道重复计入导致 σ̂_xy 漂移/左右不对称）。
         self._l1_last_a_applied = self._l1_predictor_accel(thrust_baseline_N, a_ac)
@@ -2230,6 +2415,7 @@ class SuiteTrackingController:
                 "status": int(self._last_mpc_status),
                 "horizon": int(self.horizon),
                 "dt_mpc": float(self.dt_mpc),
+                "bodyrate_lookahead_ms": round(float(self.bodyrate_lookahead_ms), 2),
                 "cost": (
                     round(float(self._last_mpc_cost), 4)
                     if np.isfinite(self._last_mpc_cost)
@@ -2241,6 +2427,7 @@ class SuiteTrackingController:
                 "err_pos": round(float(self._track_err_pos), 4),
                 "err_yaw_deg": round(float(self._track_err_yaw_deg), 2),
                 "l1_enabled": bool(self.l1_enabled),
+                "drag_ff_enabled": bool(self.drag_ff_enabled),
                 "l1_sigma_norm": round(float(np.linalg.norm(self._l1.sigma_hat)), 4),
                 "l1_a_ac_norm": round(float(np.linalg.norm(self._l1.a_ac)), 4),
             }
@@ -2251,6 +2438,12 @@ class SuiteTrackingController:
             payload["l1_force_y"] = round(float(_l1_mass * _l1_sig[1]), 3)
             payload["l1_force_z"] = round(float(_l1_mass * _l1_sig[2]), 3)
             payload["l1_force_norm"] = round(float(_l1_mass * np.linalg.norm(_l1_sig)), 3)
+            # 真值阻力前馈补偿时，实时显示当前真值阻力力（世界系，N）
+            if self.drag_ff_enabled:
+                _f_drag = self._compute_true_aero_drag(_l1_mass * 9.81)
+                payload["drag_force_x"] = round(float(_f_drag[0]), 3)
+                payload["drag_force_y"] = round(float(_f_drag[1]), 3)
+                payload["drag_force_z"] = round(float(_f_drag[2]), 3)
             self.mpc_stats_pub.publish(_StringMsg(data=json.dumps(payload)))
         except Exception as e:
             rospy.logdebug_throttle(5.0, f"[mpc_stats] publish error: {e}")
@@ -3009,6 +3202,24 @@ class SuiteTrackingController:
         self.recorded_data["reference_angular_velocity"].append(x_ref[nq + 3 : nq + 6].tolist())
         self.recorded_data["reference_arm_positions"].append(x_ref[7 : 7 + nj].tolist())
 
+        # ── L1 扰动估计 vs Gazebo 气动阻力真值 ──────────────────────────────
+        mass = max(self._robot_mass(), 1e-6)
+        sigma = np.asarray(self._l1.sigma_hat, dtype=float).reshape(3)
+        thrust_total_N = self._thrust_N_from_u(u)
+        if not (thrust_total_N > 0.0):
+            thrust_total_N = mass * 9.81  # px4 模式下 u 非推力时退回悬停推力
+        # 实际注入的补偿加速度（L1 或真值前馈）
+        a_ac = self._compensation_accel_world(thrust_total_N)
+        self.recorded_data["l1_sigma_world"].append(sigma.tolist())
+        self.recorded_data["l1_force_world"].append((mass * sigma).tolist())
+        self.recorded_data["l1_a_ac_world"].append(a_ac.tolist())
+        if self.aero_drag_record:
+            f_drag = self._compute_true_aero_drag(thrust_total_N)
+        else:
+            f_drag = np.zeros(3, dtype=float)
+        self.recorded_data["aero_drag_force_world"].append(f_drag.tolist())
+        self.recorded_data["aero_drag_accel_world"].append((f_drag / mass).tolist())
+
     # =========================================================================
     # ROS 服务
     # =========================================================================
@@ -3344,6 +3555,11 @@ class SuiteTrackingController:
                     self.dt_mpc = max(1e-3, self.dt_mpc)
                     self.horizon = max(2, self.horizon)
                     self.mpc_max_iter = max(1, self.mpc_max_iter)
+                    # CTBR 体角速度前瞻（ms）；与 dt_mpc 解耦，可在线调整。
+                    self.bodyrate_lookahead_ms = float(
+                        cfg.get("bodyrate_lookahead_ms", self.bodyrate_lookahead_ms)
+                    )
+                    self.bodyrate_lookahead_s = max(0.0, self.bodyrate_lookahead_ms / 1000.0)
 
                     self._apply_cfg_weights_from_dict(cfg)
 

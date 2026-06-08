@@ -19,47 +19,14 @@ from pathlib import Path
 
 import casadi as ca
 import numpy as np
-from acados_template import AcadosOcp, AcadosOcpSolver
 import pinocchio as pin
 from pinocchio import casadi as cpin
 
+from acados_runtime import ensure_acados_source_dir, preload_acados_shared_libs
 
-def _preload_acados_shared_libs():
-    """在加载 libacados 之前用绝对路径预载 qpOASES/hpipm/blasfeo（与 s500_uam_acados_trajectory 相同）。"""
-    if os.name == "nt":
-        return
-    try:
-        from ctypes import CDLL
-    except ImportError:
-        return
-    root = os.environ.get("ACADOS_SOURCE_DIR")
-    if not root:
-        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "acados"))
-    libdir = os.path.join(root, "lib")
-    if not os.path.isdir(libdir):
-        return
-    for name in ("libblasfeo.so.0", "libqpOASES_e.so", "libhpipm.so"):
-        path = os.path.join(libdir, name)
-        if os.path.isfile(path):
-            CDLL(path)
-
-
-def _ensure_acados_source_dir_env():
-    """如果未设置 ACADOS_SOURCE_DIR，则按本仓库常见布局自动补齐，避免 acados_template 重复告警。"""
-    if os.environ.get("ACADOS_SOURCE_DIR"):
-        return
-    candidates = [
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "acados")),
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "acados")),
-    ]
-    for root in candidates:
-        if os.path.isdir(os.path.join(root, "lib")) and os.path.isdir(os.path.join(root, "interfaces")):
-            os.environ["ACADOS_SOURCE_DIR"] = root
-            return
-
-
-_preload_acados_shared_libs()
-_ensure_acados_source_dir_env()
+preload_acados_shared_libs()
+ensure_acados_source_dir()
+from acados_template import AcadosOcp, AcadosOcpSolver
 
 import matplotlib.pyplot as plt
 

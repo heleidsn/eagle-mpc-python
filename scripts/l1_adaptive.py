@@ -249,7 +249,46 @@ class L1AdaptiveAugmentation:
         self.a_l1[1] += alpha_xy * (target[1] - self.a_l1[1])
         self.a_l1[2] += alpha_z * (target[2] - self.a_l1[2])
 
-        # ── (5) 位置误差积分通道（并联，消除补偿残差的稳态位置误差）────────
+        # ── (5) 位置误差积分通道 + 合成总补偿（与 oracle 共用同一管线）──────
+        return self._compose_a_ac(dt, pos_err_world)
+
+    # ──────────────────────────────────────────────────────────────────────
+    def step_oracle(
+        self,
+        dt: float,
+        sigma_true_world: np.ndarray,
+        pos_err_world: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Oracle 补偿：假设可**精确测量**扰动（绕过预测器与 LPF）。
+
+        把 σ̂ 直接置为扰动真值（世界系加速度），补偿 a_l1 = -σ̂ 当拍生效（无估计
+        误差、无估计/滤波滞后）；其余补偿管线（dFz/tilt、CTBR、位置误差通道、限幅）
+        与自适应 step() 完全一致。用于把「估计质量」与「补偿环节质量」解耦评估。
+
+        参数：
+            sigma_true_world : 扰动真值（世界系加速度, m/s^2）= F_dist_world / m。
+        """
+        p = self.params
+        if not p.enabled or dt <= 0.0:
+            return self.a_ac.copy()
+        sigma = np.asarray(sigma_true_world, dtype=float).reshape(3)
+        self.sigma_hat = sigma.copy()
+        if p.max_sigma > 0.0:
+            self.sigma_hat = np.clip(self.sigma_hat, -p.max_sigma, p.max_sigma)
+        # 完美测量：补偿直接等于 -σ̂，不经预测器/低通。
+        self.a_l1 = -self.sigma_hat.copy()
+        self._initialized = True
+        return self._compose_a_ac(dt, pos_err_world)
+
+    # ──────────────────────────────────────────────────────────────────────
+    def _compose_a_ac(
+        self, dt: float, pos_err_world: Optional[np.ndarray]
+    ) -> np.ndarray:
+        """位置误差积分通道（并联）+ 合成总补偿 a_ac = a_l1 + a_pos 并限幅。
+
+        self.a_l1 须由调用方先行写入（自适应：LPF(-σ̂)；oracle：-σ̂）。
+        """
+        p = self.params
         self.a_pos = np.zeros(3, dtype=float)
         if p.use_pos_feedback and pos_err_world is not None:
             e_p = np.asarray(pos_err_world, dtype=float).reshape(3)

@@ -37,35 +37,13 @@ import yaml
 from pathlib import Path
 
 
-def _preload_acados_shared_libs():
-    """Load qpOASES/hpipm/blasfeo before libacados. Runtime changes to LD_LIBRARY_PATH do not
-    affect dlopen from an already-started Python process; absolute-path preload fixes OSError
-    on libqpOASES_e.so when ACADOS_SOURCE_DIR is not set in the shell.
-    """
-    if os.name == "nt":
-        return
-    try:
-        from ctypes import CDLL
-    except ImportError:
-        return
-    root = os.environ.get("ACADOS_SOURCE_DIR")
-    if not root:
-        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "acados"))
-    libdir = os.path.join(root, "lib")
-    if not os.path.isdir(libdir):
-        return
-    # Order follows NEEDED chain (blasfeo <- hpipm; qpOASES standalone; then libacados).
-    for name in ("libblasfeo.so.0", "libqpOASES_e.so", "libhpipm.so"):
-        path = os.path.join(libdir, name)
-        if os.path.isfile(path):
-            CDLL(path)
-
-
 try:
+    from acados_runtime import preload_acados_shared_libs
+
+    preload_acados_shared_libs()
     from acados_template import AcadosOcp, AcadosOcpSolver
 
     ACADOS_AVAILABLE = True
-    _preload_acados_shared_libs()
 except ImportError:
     ACADOS_AVAILABLE = False
 

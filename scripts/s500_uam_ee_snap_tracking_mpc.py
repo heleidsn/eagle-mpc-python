@@ -62,6 +62,9 @@ TRACK_TRAJECTORY_ALIASES = {
 # Optional imports (fail with clear message)
 # -----------------------------------------------------------------------------
 try:
+    from acados_runtime import preload_acados_shared_libs
+
+    preload_acados_shared_libs()
     from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
     ACADOS_AVAILABLE = True
 except ImportError:

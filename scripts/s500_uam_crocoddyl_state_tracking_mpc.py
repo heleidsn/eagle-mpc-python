@@ -38,7 +38,11 @@ from s500_uam_trajectory_planner import (
     make_uam_state,
 )
 
-from s500_uam_px4_style_rate_sim import px4_rate_compute_plant_u
+from s500_uam_px4_style_rate_sim import (
+    px4_rate_compute_plant_u,
+    bodyrate_from_horizon,
+    ctbr_rate_pid_mix,
+)
 
 
 def _apply_first_order_actuator(
@@ -1188,16 +1192,40 @@ def run_closed_loop_track_full_state_plan(
     sim_control_stack: str = "direct",
     px4_rate_Kp: float = 12.0,
     px4_rate_Kd: float = 1.5,
+    ctbr: Optional[Dict[str, Any]] = None,
     s500_yaml_path: Optional[str] = None,
     urdf_path: Optional[str] = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """
     Track a planned full-state trajectory (t_plan, x_plan) with Crocoddyl receding-horizon tracking; the reference within the horizon is sampled with a time shift.
+
+    ``sim_control_stack="ctbr"``：取 MPC horizon 在 lookahead 处的规划角速度做设定点，
+    经角速度 PID（rp/yaw 分组）+ 四旋翼混控 + 电机一阶滞后施加到 plant（参数见 ``ctbr``）。
     """
     sim_control_stack = str(sim_control_stack).strip().lower()
-    if sim_control_stack not in ("direct", "px4_rate"):
+    if sim_control_stack not in ("direct", "px4_rate", "ctbr"):
         raise ValueError(f"unknown sim_control_stack: {sim_control_stack!r}")
+
+    # CTBR 内环配置（与 acados/几何 共用同一组参数语义）。
+    ctbr_cfg = dict(ctbr) if ctbr else {}
+    ctbr_lookahead_s = float(ctbr_cfg.get("lookahead_ms", dt_mpc * 1000.0)) / 1000.0
+    ctbr_kp = np.array([
+        float(ctbr_cfg.get("kp_rp", 12.0)), float(ctbr_cfg.get("kp_rp", 12.0)),
+        float(ctbr_cfg.get("kp_yaw", 4.0)),
+    ], dtype=float)
+    ctbr_ki = np.array([
+        float(ctbr_cfg.get("ki_rp", 0.0)), float(ctbr_cfg.get("ki_rp", 0.0)),
+        float(ctbr_cfg.get("ki_yaw", 0.0)),
+    ], dtype=float)
+    ctbr_kd = np.array([
+        float(ctbr_cfg.get("kd_rp", 0.0)), float(ctbr_cfg.get("kd_rp", 0.0)),
+        float(ctbr_cfg.get("kd_yaw", 0.0)),
+    ], dtype=float)
+    ctbr_max_rate = float(ctbr_cfg.get("max_rate", 8.0))
+    ctbr_max_torque = float(ctbr_cfg.get("max_torque", 0.0))
+    ctbr_motor_tau = float(ctbr_cfg.get("motor_tau", 0.02))
+    ctbr_int_limit = float(ctbr_cfg.get("int_limit", 2.0))
 
     t_plan = np.asarray(t_plan, dtype=float).flatten()
     x_plan = np.asarray(x_plan, dtype=float)
@@ -1263,6 +1291,12 @@ def run_closed_loop_track_full_state_plan(
     nq = mpc.robot_model.nq
     act_data = mpc.actuation.createData()
     omega_sp = np.asarray(x0, dtype=float).reshape(-1)[nq + 3 : nq + 6].copy()
+    # CTBR 内环状态。
+    xs_horizon: Optional[List[np.ndarray]] = None
+    ctbr_int = np.zeros(3, dtype=float)
+    ctbr_prev_err: Optional[np.ndarray] = None
+    u_motor = u_cmd_hold.copy()
+    ctbr_rate_sp_data: List[np.ndarray] = []
 
     for step in range(n_total):
         t = step * sim_dt
@@ -1331,7 +1365,9 @@ def run_closed_loop_track_full_state_plan(
             us_guess = [solver.us[i + 1].copy() for i in range(horizon - 1)] + [
                 solver.us[-1].copy()
             ]
+            xs_horizon = [np.asarray(s, dtype=float).copy() for s in solver.xs]
 
+        ctbr_used = False
         if sim_control_stack == "px4_rate":
             u_plant, omega_sp = px4_rate_compute_plant_u(
                 mpc,
@@ -1344,11 +1380,39 @@ def run_closed_loop_track_full_state_plan(
                 rate_Kd=px4_rate_Kd,
             )
             u_after_stack = u_plant
+        elif sim_control_stack == "ctbr":
+            # 规划角速度设定点（horizon 在 lookahead 处插值）。
+            omega_sp_plan = bodyrate_from_horizon(
+                xs_horizon, ctbr_lookahead_s, dt_mpc, nq
+            )
+            if omega_sp_plan is None:
+                omega_sp_plan = x[nq + 3 : nq + 6].copy()
+            if ctbr_max_rate > 0.0:
+                omega_sp_plan = np.clip(omega_sp_plan, -ctbr_max_rate, ctbr_max_rate)
+            ctbr_rate_sp_data.append(np.asarray(omega_sp_plan, dtype=float).copy())
+            u_plant, ctbr_int, ctbr_prev_err, _M_des = ctbr_rate_pid_mix(
+                mpc, act_data, x, u_cmd_hold, omega_sp_plan,
+                kp=ctbr_kp, ki=ctbr_ki, kd=ctbr_kd,
+                integ=ctbr_int, prev_err=ctbr_prev_err, dt=sim_dt,
+                int_limit=ctbr_int_limit, max_torque=ctbr_max_torque,
+            )
+            # 电机一阶滞后（仅旋翼；机械臂关节直通）。
+            alpha_m = (
+                1.0 - np.exp(-sim_dt / max(ctbr_motor_tau, 1e-9))
+                if ctbr_motor_tau > 1e-9 else 1.0
+            )
+            u_motor[:4] = u_motor[:4] + alpha_m * (u_plant[:4] - u_motor[:4])
+            if u_motor.size > 4:
+                u_motor[4:] = u_plant[4:]
+            u_act = u_motor.copy()
+            ctbr_used = True
         else:
             u_after_stack = u_cmd_hold
 
         # Update the first-order actuator response (ZOH: u_cmd_hold stays constant within n_inner)
-        if use_actuator_first_order:
+        if ctbr_used:
+            pass  # CTBR 已含电机一阶，直接用 u_act
+        elif use_actuator_first_order:
             u_act = _apply_first_order_actuator(
                 u_act,
                 u_after_stack,
@@ -1371,6 +1435,10 @@ def run_closed_loop_track_full_state_plan(
         "sim_control_stack": sim_control_stack,
         "px4_rate_Kp": float(px4_rate_Kp),
         "px4_rate_Kd": float(px4_rate_Kd),
+        "ctbr_active": sim_control_stack == "ctbr",
+        "ctbr_rate_sp": (
+            np.array(ctbr_rate_sp_data) if ctbr_rate_sp_data else None
+        ),
         "t_plan": t_plan.copy(),
         "x_plan": x_plan.copy(),
         "x_nom": np.asarray(x_nom, dtype=float).copy(),
@@ -1411,9 +1479,34 @@ def crocoddyl_closed_loop_to_ee_tracking_res(out: Dict[str, Any]) -> Dict[str, A
 
     data = mpc.robot_model.createData()
     fid = mpc._planner.ee_frame_id
-    ee_pos, _, ee_rpy, _ = compute_ee_kinematics_along_trajectory(
-        X, mpc.robot_model, data, fid
+    nframes = len(mpc.robot_model.frames)
+    # s500 (no gripper frame) has nq<=7: there is no end-effector, so EE channels
+    # fall back to the floating-base origin pose (position + yaw) instead of FK.
+    use_base_pose = (
+        fid is None
+        or int(mpc.robot_model.nq) <= 7
+        or not (0 <= int(fid) < nframes)
     )
+
+    def _pos_rpy(states: np.ndarray):
+        states = np.asarray(states, dtype=float)
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        if use_base_pose:
+            pos = states[:, 0:3].copy()
+            rpy = np.zeros((states.shape[0], 3), dtype=float)
+            for i in range(states.shape[0]):
+                qx, qy, qz, qw = states[i, 3], states[i, 4], states[i, 5], states[i, 6]
+                siny = 2.0 * (qw * qz + qx * qy)
+                cosy = 1.0 - 2.0 * (qy**2 + qz**2)
+                rpy[i, 2] = np.arctan2(siny, cosy)
+            return pos, rpy
+        p, _, rpy, _ = compute_ee_kinematics_along_trajectory(
+            states, mpc.robot_model, data, fid
+        )
+        return p, rpy
+
+    ee_pos, ee_rpy = _pos_rpy(X)
 
     if out.get("track_mode") == "full_state_trajectory":
         t_plan = np.asarray(out["t_plan"], dtype=float).flatten()
@@ -1424,16 +1517,12 @@ def crocoddyl_closed_loop_to_ee_tracking_res(out: Dict[str, Any]) -> Dict[str, A
                 for ti in t
             ]
         )
-        p_ref, _, prpy_ref, _ = compute_ee_kinematics_along_trajectory(
-            Xr, mpc.robot_model, data, fid
-        )
+        p_ref, prpy_ref = _pos_rpy(Xr)
         yaw_ref = prpy_ref[:, 2].astype(float)
     else:
         x_ref = np.asarray(out["x_ref"], dtype=float).flatten()
         xr = x_ref.reshape(1, -1)
-        pref0, _, prpy0, _ = compute_ee_kinematics_along_trajectory(
-            xr, mpc.robot_model, data, fid
-        )
+        pref0, prpy0 = _pos_rpy(xr)
         p_ref = np.repeat(pref0, n_t, axis=0)
         yaw_ref_val = float(prpy0[0, 2])
         yaw_ref = np.full(n_t, yaw_ref_val, dtype=float)

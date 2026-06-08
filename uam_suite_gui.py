@@ -569,6 +569,34 @@ def _read_plan_bundle_files(traj_id: str) -> dict | None:
         return None
 
 
+def _resolve_ee_frame_id(robot_model, ee_frame_id=None) -> int:
+    """Return a valid frame index for FK (gripper on UAM, base_link on s500)."""
+    nframes = len(robot_model.frames)
+    if ee_frame_id is not None:
+        fid = int(ee_frame_id)
+        if 0 <= fid < nframes:
+            return fid
+    for name in ("gripper_link", "base_link", "root_joint", "universe"):
+        fid = int(robot_model.getFrameId(name))
+        if 0 <= fid < nframes:
+            return fid
+    return 0
+
+
+def _base_pose_ref_from_states(states: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Base origin position + yaw [rad] from full states (s500 fallback when no EE frame)."""
+    X = np.asarray(states, dtype=float)
+    n = X.shape[0]
+    p_ref = X[:, 0:3].copy()
+    yaw = np.zeros(n, dtype=float)
+    for i in range(n):
+        qx, qy, qz, qw = X[i, 3], X[i, 4], X[i, 5], X[i, 6]
+        siny = 2.0 * (qw * qz + qx * qy)
+        cosy = 1.0 - 2.0 * (qy**2 + qz**2)
+        yaw[i] = np.arctan2(siny, cosy)
+    return p_ref, np.unwrap(yaw)
+
+
 def build_ee_ref_from_full_state(
     t_plan: np.ndarray,
     x_plan: np.ndarray,
@@ -578,10 +606,8 @@ def build_ee_ref_from_full_state(
     sim_dt: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Sample an EE reference along a full-state plan over [0, T_sim]; time starts at 0 (consistent with run_closed_loop)."""
-    from s500_uam_crocoddyl_state_tracking_mpc import (
-        compute_ee_kinematics_along_trajectory,
-        interp_full_state_piecewise,
-    )
+    from s500_uam_crocoddyl_state_tracking_mpc import interp_full_state_piecewise
+    from s500_uam_trajectory_planner import compute_ee_kinematics_along_trajectory
 
     dt_ref = min(0.02, float(sim_dt) * 0.5)
     t0 = float(t_plan[0])
@@ -591,11 +617,15 @@ def build_ee_ref_from_full_state(
     X = np.array(
         [interp_full_state_piecewise(float(tt), t_plan, x_plan, robot_model) for tt in t_abs]
     )
-    data = robot_model.createData()
-    p_ee, _, rpy, _ = compute_ee_kinematics_along_trajectory(
-        X, robot_model, data, ee_frame_id
-    )
-    yaw = np.unwrap(rpy[:, 2].astype(float))
+    if int(robot_model.nq) <= 7:
+        p_ee, yaw = _base_pose_ref_from_states(X)
+    else:
+        fid = _resolve_ee_frame_id(robot_model, ee_frame_id)
+        data = robot_model.createData()
+        p_ee, _, rpy, _ = compute_ee_kinematics_along_trajectory(
+            X, robot_model, data, fid
+        )
+        yaw = np.unwrap(rpy[:, 2].astype(float))
     return tau, p_ee, yaw
 
 
@@ -1034,6 +1064,7 @@ class TrackCrocAlongPlanWorker(QThread):
                 sim_control_stack=p.get("sim_control_stack", "direct"),
                 px4_rate_Kp=p.get("px4_rate_Kp", 12.0),
                 px4_rate_Kd=p.get("px4_rate_Kd", 1.5),
+                ctbr=p.get("ctbr"),
                 s500_yaml_path=p.get("s500_yaml_path"),
                 urdf_path=p.get("urdf_path"),
                 verbose=False,
@@ -1046,6 +1077,7 @@ class TrackCrocAlongPlanWorker(QThread):
 
 class TrackAcadosAlongPlanWorker(QThread):
     finished = pyqtSignal(bool, str, object)
+    progress = pyqtSignal(int, int, float)  # done_steps, total_steps, fps
 
     def __init__(self, params: dict):
         super().__init__()
@@ -1053,10 +1085,25 @@ class TrackAcadosAlongPlanWorker(QThread):
 
     def run(self):
         try:
+            import time as _time
+
             from s500_uam_acados_state_tracking_mpc import (
                 acados_closed_loop_to_ee_tracking_res,
                 run_closed_loop_track_full_state_plan_acados,
             )
+
+            # 进度/FPS 回调：按 wall-clock 节流（~0.1s），FPS = 仿真步/真实秒。
+            state = {"t0": _time.perf_counter(), "k0": 0, "tlast": 0.0}
+
+            def _progress(done: int, total: int) -> None:
+                now = _time.perf_counter() - state["t0"]
+                if done < total and (now - state["tlast"]) < 0.1:
+                    return
+                dt = now - state["tlast"]
+                fps = (done - state["k0"]) / dt if dt > 1e-6 else 0.0
+                state["tlast"] = now
+                state["k0"] = done
+                self.progress.emit(int(done), int(total), float(fps))
 
             p = self.params
             out = run_closed_loop_track_full_state_plan_acados(
@@ -1082,6 +1129,14 @@ class TrackAcadosAlongPlanWorker(QThread):
                 mpc_max_iter=p.get("mpc_max_iter", 40),
                 mpc_log_interval=p.get("mpc_log_interval", 0),
                 control_mode=p.get("control_mode", "direct"),
+                urdf_path=p.get("urdf_path"),
+                state_limits=p.get("state_limits"),
+                disturbance=p.get("disturbance"),
+                l1=p.get("l1"),
+                ctbr=p.get("ctbr"),
+                baseline=p.get("baseline", "acados"),
+                geometric=p.get("geometric"),
+                progress_cb=_progress,
             )
             res = acados_closed_loop_to_ee_tracking_res(out)
             self.finished.emit(True, "", {"out": out, "res": res, "control_mode": p.get("control_mode", "direct")})
@@ -1507,7 +1562,8 @@ class UamSuiteGUI(QMainWindow):
                 urdf_path=self._selected_robot_urdf_path()
             )
         pl = self._lazy_pin_planner
-        return pl.robot_model, pl.ee_frame_id
+        fid = _resolve_ee_frame_id(pl.robot_model, pl.ee_frame_id)
+        return pl.robot_model, fid
 
     def _aligned_x0_from_ee_ref(
         self, p_ref: np.ndarray, yaw_ref: np.ndarray, x_seed: np.ndarray | None = None
@@ -1520,14 +1576,41 @@ class UamSuiteGUI(QMainWindow):
         if p_ref.ndim != 2 or p_ref.shape[1] != 3 or len(p_ref) == 0:
             raise ValueError("p_ref must have shape (N,3), N>=1")
         yaw0 = float(yaw_ref[0]) if len(yaw_ref) > 0 else 0.0
+        rm, eid = self._robot_model_and_ee()
+        nx = int(rm.nq + rm.nv)
         if x_seed is None:
-            x0 = np.asarray(make_uam_state(0.0, 0.0, 1.0, j1=0.0, j2=0.0, yaw=yaw0), dtype=float)
+            if self._is_s500_mode():
+                x0 = np.zeros(nx, dtype=float)
+                x0[2] = 1.0
+                x0[6] = 1.0
+            else:
+                x0 = np.asarray(
+                    make_uam_state(0.0, 0.0, 1.0, j1=0.0, j2=0.0, yaw=yaw0), dtype=float
+                )
         else:
-            x0 = np.asarray(x_seed, dtype=float).flatten()[:17].copy()
-        rm, _ = self._robot_model_and_ee()
-        x0 = align_uam_state_ee_to_world_position(
-            x0, rm, np.asarray(p_ref[0], dtype=float).reshape(3), nq=rm.nq, nv=rm.nv
+            x0 = np.asarray(x_seed, dtype=float).flatten().copy()
+            if x0.size < nx:
+                pad = np.zeros(nx, dtype=float)
+                pad[: x0.size] = x0
+                x0 = pad
+            else:
+                x0 = x0[:nx]
+        pl = self._lazy_pin_planner
+        has_gripper = (
+            pl is not None
+            and pl.ee_frame_id is not None
+            and int(pl.ee_frame_id) >= 0
+            and int(pl.ee_frame_id) < len(rm.frames)
         )
+        p_tgt = np.asarray(p_ref[0], dtype=float).reshape(3)
+        if has_gripper:
+            x0 = align_uam_state_ee_to_world_position(
+                x0, rm, p_tgt, nq=rm.nq, nv=rm.nv
+            )
+        else:
+            x0[0:3] = p_tgt
+            half = 0.5 * yaw0
+            x0[3:7] = [0.0, 0.0, np.sin(half), np.cos(half)]
         return x0
 
     def _build_ui(self):
@@ -1631,6 +1714,27 @@ class UamSuiteGUI(QMainWindow):
         dt_row.addWidget(self.dt_plan)
         dt_row.addStretch(1)
         traj_layout.addLayout(dt_row)
+
+        # 轨迹前/后各追加一段悬停（保持首/末状态静止），0 表示不追加。
+        hover_row = QHBoxLayout()
+        hover_row.addWidget(QLabel("Hover before [s]"))
+        self.plan_hover_pre = QDoubleSpinBox()
+        self.plan_hover_pre.setRange(0.0, 30.0)
+        self.plan_hover_pre.setDecimals(2)
+        self.plan_hover_pre.setSingleStep(0.5)
+        self.plan_hover_pre.setValue(1.0)
+        self.plan_hover_pre.setToolTip("轨迹开始前追加的悬停时长 [s]（保持首航点状态；0=不追加）")
+        hover_row.addWidget(self.plan_hover_pre)
+        hover_row.addWidget(QLabel("Hover after [s]"))
+        self.plan_hover_post = QDoubleSpinBox()
+        self.plan_hover_post.setRange(0.0, 30.0)
+        self.plan_hover_post.setDecimals(2)
+        self.plan_hover_post.setSingleStep(0.5)
+        self.plan_hover_post.setValue(1.0)
+        self.plan_hover_post.setToolTip("轨迹结束后追加的悬停时长 [s]（保持末航点状态；0=不追加）")
+        hover_row.addWidget(self.plan_hover_post)
+        hover_row.addStretch(1)
+        traj_layout.addLayout(hover_row)
 
         # Optimization method selector (pulled out of the full-state stack so it is
         # always an explicit step right after the trajectory choice).
@@ -2245,22 +2349,29 @@ class UamSuiteGUI(QMainWindow):
         )
         self.track_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.track_mode_combo.setMinimumContentsLength(12)
+        # track_mode_combo 现作为「Baseline controller」选择器（内部规范状态）：
+        #   0=Crocoddyl, 1=Acados, 2/3=EE 模式(已隐藏/弃用), 4=geometric。
+        # 可见项仅 0/1/4；控制方案(direct/CTBR)由 scheme_combo 决定。
         _track_mode_items = [
             (
-                "Crocoddyl — full-state plan",
-                "沿 Full state 规划轨迹闭环跟踪（Crocoddyl，与下方 w_pos 等权重一致）",
+                "Crocoddyl",
+                "Crocoddyl NMPC（沿 Full state 规划闭环跟踪，与下方 w_pos 等权重一致）",
             ),
             (
-                "Acados — full-state plan",
-                "沿 Full state 规划轨迹闭环跟踪（Acados NMPC，代价权重与 Croc 全状态跟踪共用）",
+                "Acados",
+                "Acados NMPC（沿 Full state 规划闭环跟踪，代价权重与 Croc 全状态跟踪共用）",
             ),
             (
                 "Acados — EE-centric",
-                "末端 EE 位置/航向跟踪（需 EE 类规划或 FK 参考）",
+                "末端 EE 位置/航向跟踪（已隐藏）",
             ),
             (
                 "Crocoddyl — EE pose",
-                "Crocoddyl 末端位姿跟踪",
+                "Crocoddyl 末端位姿跟踪（已隐藏）",
+            ),
+            (
+                "Geometric controller",
+                "SE3 几何控制器（机体 s500，仅 CTBR 内环；由 x_plan 参考生成总推力+角速度设定点）",
             ),
         ]
         for label, tip in _track_mode_items:
@@ -2268,6 +2379,24 @@ class UamSuiteGUI(QMainWindow):
             self.track_mode_combo.setItemData(
                 self.track_mode_combo.count() - 1, tip, Qt.ToolTipRole
             )
+        # 隐藏 EE 两项（保留索引/旧代码路径，但不再对用户暴露）。
+        try:
+            _view = self.track_mode_combo.view()
+            for _ee_i in (2, 3):
+                _view.setRowHidden(_ee_i, True)
+                _it = self.track_mode_combo.model().item(_ee_i)
+                if _it is not None:
+                    _it.setEnabled(False)
+        except Exception:
+            pass
+
+        # 控制方案选择器：direct（规划四旋翼力/力矩，仅优化方法）或 CTBR（总推力+前瞻角速度内环，所有算法）。
+        self.scheme_combo = QComboBox()
+        self.scheme_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.scheme_combo.addItem("direct（规划旋翼力/力矩）")
+        self.scheme_combo.setItemData(0, "直接施加 MPC 求解的四旋翼力（+机械臂力矩），仅 Crocoddyl/Acados 可用", Qt.ToolTipRole)
+        self.scheme_combo.addItem("CTBR（总推力+角速度内环）")
+        self.scheme_combo.setItemData(1, "取总推力与前瞻规划角速度做设定点，经角速度 PID+混控+电机一阶；适用于所有 baseline", Qt.ToolTipRole)
         self.T_sim = QDoubleSpinBox()
         self.T_sim.setRange(0.5, 120.0)
         self.T_sim.setValue(8.0)
@@ -2328,6 +2457,29 @@ class UamSuiteGUI(QMainWindow):
         self.mpc_log_iv.setValue(0)
         self.control_mode_track = QComboBox()
         self.control_mode_track.addItems(["direct (thrust + τ)", "actuator_first_order (ω, T, θ)"])
+
+        # Geometric controller (baseline=geometric, 仅 CTBR) 增益。
+        # 级联带宽分离（位置≪姿态≪角速度内环≈12rad/s）：位置 ωn≈2、姿态≈6 rad/s。
+        self.geo_kp_pos = QDoubleSpinBox()
+        self.geo_kp_pos.setRange(0.0, 50.0); self.geo_kp_pos.setDecimals(2)
+        self.geo_kp_pos.setSingleStep(0.5); self.geo_kp_pos.setValue(4.0)
+        self.geo_kp_pos.setToolTip("位置 P 增益 kp_pos（位置环 ωn=√kp_pos≈2 rad/s）")
+        self.geo_kd_vel = QDoubleSpinBox()
+        self.geo_kd_vel.setRange(0.0, 50.0); self.geo_kd_vel.setDecimals(2)
+        self.geo_kd_vel.setSingleStep(0.5); self.geo_kd_vel.setValue(3.6)
+        self.geo_kd_vel.setToolTip("速度 D 增益 kd_vel（≈2·ζ·√kp_pos，ζ≈0.9 临界阻尼附近）")
+        self.geo_kR = QDoubleSpinBox()
+        self.geo_kR.setRange(0.0, 50.0); self.geo_kR.setDecimals(2)
+        self.geo_kR.setSingleStep(0.5); self.geo_kR.setValue(6.0)
+        self.geo_kR.setToolTip("姿态误差增益 kR → 体角速度指令（姿态环带宽≈kR≈6 rad/s，低于内环 12）")
+        self.geo_kOmega = QDoubleSpinBox()
+        self.geo_kOmega.setRange(0.0, 10.0); self.geo_kOmega.setDecimals(3)
+        self.geo_kOmega.setSingleStep(0.05); self.geo_kOmega.setValue(0.4)
+        self.geo_kOmega.setToolTip("角速度阻尼 kOmega")
+        self.geo_max_tilt = QDoubleSpinBox()
+        self.geo_max_tilt.setRange(1.0, 80.0); self.geo_max_tilt.setDecimals(1)
+        self.geo_max_tilt.setSingleStep(1.0); self.geo_max_tilt.setValue(30.0)
+        self.geo_max_tilt.setToolTip("最大倾角限制 [deg]")
 
         # τ for Crocoddyl closed-loop plant lag (full-state + EE-pose modes when "Plant u first-order lag" is on).
         self.tau_thrust_track = QDoubleSpinBox()
@@ -2396,6 +2548,31 @@ class UamSuiteGUI(QMainWindow):
         self.w_vel = QDoubleSpinBox(); self.w_vel.setRange(0.0, 1e5); self.w_vel.setValue(1.0)
         self.w_omega = QDoubleSpinBox(); self.w_omega.setRange(0.0, 1e5); self.w_omega.setValue(1.0)
         self.w_joint_vel = QDoubleSpinBox(); self.w_joint_vel.setRange(0.0, 1e5); self.w_joint_vel.setValue(1.0)
+        # Acados full-state MPC state box limits (see s500_uam_acados_state_tracking_mpc.STATE_LIMITS).
+        self.track_v_max = QDoubleSpinBox()
+        self.track_v_max.setRange(0.1, 50.0)
+        self.track_v_max.setDecimals(2)
+        self.track_v_max.setSingleStep(0.1)
+        self.track_v_max.setValue(1.0)
+        self.track_v_max.setToolTip("MPC 状态约束：线速度 |v| 上限 [m/s]（Acados OCP lbx/ubx）")
+        self.track_omega_max = QDoubleSpinBox()
+        self.track_omega_max.setRange(0.1, 50.0)
+        self.track_omega_max.setDecimals(2)
+        self.track_omega_max.setSingleStep(0.1)
+        self.track_omega_max.setValue(2.0)
+        self.track_omega_max.setToolTip("MPC 状态约束：机体角速度 |ω| 上限 [rad/s]")
+        self.track_j_angle_max = QDoubleSpinBox()
+        self.track_j_angle_max.setRange(0.1, 10.0)
+        self.track_j_angle_max.setDecimals(2)
+        self.track_j_angle_max.setSingleStep(0.1)
+        self.track_j_angle_max.setValue(2.0)
+        self.track_j_angle_max.setToolTip("MPC 状态约束：机械臂关节角上限 [rad]（仅 s500_uam）")
+        self.track_j_vel_max = QDoubleSpinBox()
+        self.track_j_vel_max.setRange(0.1, 100.0)
+        self.track_j_vel_max.setDecimals(1)
+        self.track_j_vel_max.setSingleStep(0.5)
+        self.track_j_vel_max.setValue(10.0)
+        self.track_j_vel_max.setToolTip("MPC 状态约束：机械臂关节角速度上限 [rad/s]（仅 s500_uam）")
         self.w_u_thrust = QDoubleSpinBox(); self.w_u_thrust.setRange(0.0, 1e5); self.w_u_thrust.setValue(1.0)
         self.w_u_joint_torque = QDoubleSpinBox(); self.w_u_joint_torque.setRange(0.0, 1e5); self.w_u_joint_torque.setValue(1.0)
         self.croc_use_actuator_first_order = QCheckBox("Enable")
@@ -2444,7 +2621,21 @@ class UamSuiteGUI(QMainWindow):
         self._track_sim_actuator_hint.setWordWrap(True)
         self._track_sim_actuator_hint.setStyleSheet("color: palette(mid);")
 
-        sim_g = QGridLayout()
+        # ============================================================
+        # Region 1: Trajectory tracking
+        #   Settings are split into three sub-tabs:
+        #     1) Simulation   2) Drone / model & limits   3) Algorithm
+        # ============================================================
+        self.track_settings_tabs = QTabWidget()
+
+        # ---- Sub-tab 1: Simulation parameters (closed-loop simulator) ----
+        sim_tab = QWidget()
+        sim_outer = QVBoxLayout(sim_tab)
+        # 顶部快捷开关占位（在 L1/Disturbance 子标签构建后填充，以便复用其控件状态）。
+        self._sim_quick_holder = QVBoxLayout()
+        sim_outer.addLayout(self._sim_quick_holder)
+        _sim_grid_w = QWidget()
+        sim_g = QGridLayout(_sim_grid_w)
         sim_g.addWidget(QLabel("T_sim [s]"), 0, 0)
         sim_g.addWidget(self.T_sim, 0, 1)
         sim_g.addWidget(QLabel("sim_dt"), 1, 0)
@@ -2454,10 +2645,16 @@ class UamSuiteGUI(QMainWindow):
         sim_g.addWidget(self._track_sim_actuator_hint, 3, 0, 1, 2)
         sim_g.addWidget(QLabel("Plant: u first-order lag"), 4, 0)
         sim_g.addWidget(self.croc_use_actuator_first_order, 4, 1)
-        sim_g.addWidget(QLabel("Sim control stack"), 5, 0)
+        # 旧「Sim control stack / PX4-style rate PD」已被 Tracking 页的
+        # Control scheme(direct/CTBR) 选择器取代，隐藏以避免重复/混淆。
+        _stack_lbl = QLabel("Sim control stack")
+        _px4_lbl = QLabel("PX4-style rate PD")
+        sim_g.addWidget(_stack_lbl, 5, 0)
         sim_g.addWidget(self.track_sim_control_stack, 5, 1)
-        sim_g.addWidget(QLabel("PX4-style rate PD"), 6, 0)
+        sim_g.addWidget(_px4_lbl, 6, 0)
         sim_g.addWidget(self._px4_gain_row, 6, 1)
+        for _w in (_stack_lbl, self.track_sim_control_stack, _px4_lbl, self._px4_gain_row):
+            _w.setVisible(False)
         sim_g.addWidget(QLabel("τ_thrust [s]"), 7, 0)
         sim_g.addWidget(self.tau_thrust_track, 7, 1)
         sim_g.addWidget(QLabel("τ_θ [s]"), 8, 0)
@@ -2466,22 +2663,64 @@ class UamSuiteGUI(QMainWindow):
         sim_g.addWidget(self._sim_payload_label, 9, 0)
         sim_g.addWidget(self.sim_payload_enable, 9, 1)
         sim_g.addWidget(self.sim_payload_row, 10, 0, 1, 2)
-        sg = QGroupBox("Simulation parameters (closed-loop simulator)")
-        sg.setLayout(sim_g)
+        sim_g.setRowStretch(11, 1)
+        sim_outer.addWidget(_sim_grid_w)
+        self.track_settings_tabs.addTab(sim_tab, "Simulation")
 
+        # ---- Sub-tab 1b: L1 / Disturbance (sim-only plant disturbances + L1) ----
+        self._build_l1_disturbance_subtab()
+        # 在 Simulation 页顶部放置常用快捷开关（算法/L1/各扰动），与详细控件双向同步。
+        self._build_sim_quick_controls()
+
+        # ---- Sub-tab 2: Drone / model & state-box limits ----
+        drone_tab = QWidget()
+        drone_g = QGridLayout(drone_tab)
+        self.track_robot_label = QLabel("-")
+        self.track_robot_label.setStyleSheet("font-weight: bold;")
+        drone_g.addWidget(QLabel("Robot model"), 0, 0)
+        drone_g.addWidget(self.track_robot_label, 0, 1)
+        _drone_hint = QLabel(
+            "MPC 状态箱约束（Acados full-state 的 lbx/ubx）。修改后重新运行跟踪生效。"
+        )
+        _drone_hint.setWordWrap(True)
+        _drone_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        drone_g.addWidget(_drone_hint, 1, 0, 1, 2)
+        drone_g.addWidget(QLabel("v_max [m/s]"), 2, 0)
+        drone_g.addWidget(self.track_v_max, 2, 1)
+        drone_g.addWidget(QLabel("ω_max [rad/s]"), 3, 0)
+        drone_g.addWidget(self.track_omega_max, 3, 1)
+        self._track_j_angle_label = QLabel("j_angle_max [rad]")
+        drone_g.addWidget(self._track_j_angle_label, 4, 0)
+        drone_g.addWidget(self.track_j_angle_max, 4, 1)
+        self._track_j_vel_label = QLabel("j_vel_max [rad/s]")
+        drone_g.addWidget(self._track_j_vel_label, 5, 0)
+        drone_g.addWidget(self.track_j_vel_max, 5, 1)
+        drone_g.addWidget(QLabel("Use thrust constraints"), 6, 0)
+        drone_g.addWidget(self.croc_ee_use_thrust_constraints, 6, 1)
+        drone_g.setRowStretch(7, 1)
+        self.track_settings_tabs.addTab(drone_tab, "Drone / limits")
+
+        # ---- Sub-tab: Tracking (tracking method + cost-function params) ----
+        algo_tab = QWidget()
+        algo_v = QVBoxLayout(algo_tab)
         self._track_method_hint = QLabel(
-            "先完成 Full state 规划后，可选 Crocoddyl 或 Acados 沿规划跟踪；"
-            "Acados — full-state plan 与 Crocoddyl 共用 w_pos / w_att / w_vel 等权重。"
+            "先完成 Full state 规划。Baseline：Crocoddyl / Acados / Geometric；"
+            "Control scheme：direct(直接施加规划旋翼力，仅 Croc/Acados) 或 "
+            "CTBR(总推力+前瞻角速度→角速度PID→混控+电机一阶，适用所有 baseline)。"
+            "Geometric 仅机体 s500、只支持 CTBR；CTBR 参数见 \"Disturbance/L1\" 旁的 CTBR 组。"
         )
         self._track_method_hint.setWordWrap(True)
         self._track_method_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-        track_method_group = QGroupBox("Tracking method")
-        tm_lay = QVBoxLayout(track_method_group)
-        tm_lay.addWidget(self._track_method_hint)
-        tm_lay.addWidget(self.track_mode_combo)
-        tk.addWidget(track_method_group)
+        _sel_grid = QGridLayout()
+        _sel_grid.addWidget(QLabel("Baseline controller"), 0, 0)
+        _sel_grid.addWidget(self.track_mode_combo, 0, 1)
+        _sel_grid.addWidget(QLabel("Control scheme"), 1, 0)
+        _sel_grid.addWidget(self.scheme_combo, 1, 1)
+        _sel_grid.setColumnStretch(1, 1)
+        algo_v.addLayout(_sel_grid)
+        algo_v.addWidget(self._track_method_hint)
 
-        # Algorithm-dependent parameters (two-column flow; dynamic visibility by algorithm)
+        # Cost-function params (two-column flow; dynamic visibility by tracking method)
         self._algo_grid = QGridLayout()
         self._algo_grid.setHorizontalSpacing(12)
         # Two label/widget column pairs: 0=label,1=widget | 2=label,3=widget
@@ -2504,6 +2743,11 @@ class UamSuiteGUI(QMainWindow):
             ("mpc max_iter", self.mpc_max_iter),
             ("mpc log ivl", self.mpc_log_iv),
             ("Control mode", self.control_mode_track),
+            ("Geo kp_pos", self.geo_kp_pos),
+            ("Geo kd_vel", self.geo_kd_vel),
+            ("Geo kR", self.geo_kR),
+            ("Geo kOmega", self.geo_kOmega),
+            ("Geo max_tilt [deg]", self.geo_max_tilt),
             ("Croc horizon steps", self.croc_horizon),
             ("Croc MPC max_iter", self.croc_mpc_iter),
             ("w_state_track", self.w_state_track),
@@ -2518,33 +2762,66 @@ class UamSuiteGUI(QMainWindow):
             ("w_joint_vel", self.w_joint_vel),
             ("w_u_thrust", self.w_u_thrust),
             ("w_u_joint_torque", self.w_u_joint_torque),
-            ("use thrust constraints", self.croc_ee_use_thrust_constraints),
         ]:
             lb = QLabel(lab)
             self._algo_rows.append((lb, w))
 
-        self.track_algo_group = QGroupBox("Algorithm parameters")
+        self.track_algo_group = QGroupBox("Cost-function parameters")
         algo_wrap = QVBoxLayout()
         algo_wrap.addLayout(self._algo_grid)
         self.track_algo_group.setLayout(algo_wrap)
-        tk.addWidget(self.track_algo_group)
-        self.track_mode_combo.currentIndexChanged.connect(self._on_track_mode_changed)
-        self._on_track_mode_changed()
+        algo_v.addWidget(self.track_algo_group)
+        algo_v.addStretch(1)
+        self.track_settings_tabs.addTab(algo_tab, "Tracking")
+
+        # 目标标签顺序：Simulation, Tracking, Disturbance, L1, Drone / limits。
+        # 当前 add 顺序为 Simulation, Disturbance, L1, Drone, Tracking → 把 Tracking 移到第 2 位。
+        _bar = self.track_settings_tabs.tabBar()
+        _track_idx = next(
+            (i for i in range(self.track_settings_tabs.count())
+             if self.track_settings_tabs.tabText(i) == "Tracking"),
+            -1,
+        )
+        if _track_idx > 1:
+            _bar.moveTab(_track_idx, 1)
+
+        # ---- Region-1 container: settings tabs + action buttons ----
+        track_region = QGroupBox("Trajectory tracking")
+        tr_lay = QVBoxLayout(track_region)
+        tr_lay.addWidget(self.track_settings_tabs)
 
         self.run_track_btn = QPushButton("Run closed-loop tracking")
         self.run_track_btn.clicked.connect(self._run_track)
         self.run_track_btn.setEnabled(False)
-        tk.addWidget(self.run_track_btn)
-
         self.meshcat_track_btn = QPushButton("Visualize closed-loop trajectory (Meshcat)")
         self.meshcat_track_btn.clicked.connect(self._visualize_tracked_meshcat)
         self.meshcat_track_btn.setEnabled(False)
-        tk.addWidget(self.meshcat_track_btn)
+        _tr_run_row = QHBoxLayout()
+        _tr_run_row.addWidget(self.run_track_btn)
+        _tr_run_row.addWidget(self.meshcat_track_btn)
+        tr_lay.addLayout(_tr_run_row)
 
-        tk.addWidget(sg)
+        track_param_btns = QHBoxLayout()
+        self.save_track_params_btn = QPushButton("Save Tracking parameters")
+        self.save_track_params_btn.clicked.connect(lambda: self._save_tab_params(TAB_TRACK))
+        self.save_track_params_as_btn = QPushButton("Save Tracking parameters as")
+        self.save_track_params_as_btn.clicked.connect(lambda: self._save_tab_params_as(TAB_TRACK))
+        track_param_btns.addWidget(self.save_track_params_btn)
+        track_param_btns.addWidget(self.save_track_params_as_btn)
+        tr_lay.addLayout(track_param_btns)
+
+        tk.addWidget(track_region)
+
+        self.track_mode_combo.currentIndexChanged.connect(self._on_track_mode_changed)
+        self.scheme_combo.currentIndexChanged.connect(self._on_track_scheme_changed)
+        self._on_track_mode_changed()
+        self._on_track_scheme_changed()
+        self._refresh_track_drone_panel()
         self._refresh_sim_plant_controls_state()
 
-        # ----- Regulation panel (embedded in Tracking tab) -----
+        # ============================================================
+        # Region 2: Regulation (set target pose, then run)
+        # ============================================================
         self.reg_group = QGroupBox("Regulation (same controllers/weights as Tracking)")
         reg = QVBoxLayout()
 
@@ -2633,15 +2910,6 @@ class UamSuiteGUI(QMainWindow):
         self.reg_mode_combo.currentIndexChanged.connect(self._on_reg_mode_changed)
         self._on_reg_mode_changed()
 
-        track_param_btns = QHBoxLayout()
-        self.save_track_params_btn = QPushButton("Save Tracking parameters")
-        self.save_track_params_btn.clicked.connect(lambda: self._save_tab_params(TAB_TRACK))
-        self.save_track_params_as_btn = QPushButton("Save Tracking parameters as")
-        self.save_track_params_as_btn.clicked.connect(lambda: self._save_tab_params_as(TAB_TRACK))
-        track_param_btns.addWidget(self.save_track_params_btn)
-        track_param_btns.addWidget(self.save_track_params_as_btn)
-        tk.addLayout(track_param_btns)
-
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(140)
@@ -2665,36 +2933,52 @@ class UamSuiteGUI(QMainWindow):
 
         gazebo_group = QGroupBox("Gazebo")
         gz = QGridLayout()
+        gz.setColumnStretch(1, 1)
+        gz.setColumnStretch(3, 1)
+
+        # 两列布局：左列 (label col0 / widget col1)，右列 (label col2 / widget col3)
         gz.addWidget(QLabel("Package"), 0, 0)
         self.gz_pkg_combo = QComboBox()
         self.gz_pkg_combo.setEditable(True)
         self.gz_pkg_combo.addItems(["eagle_mpc_python"])
         self.gz_pkg_combo.setCurrentText("eagle_mpc_python")
         gz.addWidget(self.gz_pkg_combo, 0, 1)
-        gz.addWidget(QLabel("Launch file"), 1, 0)
+
+        gz.addWidget(QLabel("Launch file"), 0, 2)
         self.gz_launch_combo = QComboBox()
         self.gz_launch_combo.setEditable(True)
         self.gz_launch_combo.addItems(["s500_uam_sitl.launch", "s500_sitl.launch"])
         self.gz_launch_combo.setCurrentText("s500_uam_sitl.launch")
-        gz.addWidget(self.gz_launch_combo, 1, 1)
-        gz.addWidget(QLabel("Model"), 2, 0)
+        gz.addWidget(self.gz_launch_combo, 0, 3)
+
+        gz.addWidget(QLabel("Model"), 1, 0)
         self.gz_model_combo = QComboBox()
         self.gz_model_combo.addItems(["s500_uam", "s500"])
-        gz.addWidget(self.gz_model_combo, 2, 1)
-        gz.addWidget(QLabel("Model type"), 3, 0)
+        gz.addWidget(self.gz_model_combo, 1, 1)
+
+        gz.addWidget(QLabel("Model type"), 1, 2)
         self.gz_model_type_combo = QComboBox()
         self.gz_model_type_combo.addItems(["real", "ideal"])
         self.gz_model_type_combo.setCurrentText("real")
-        gz.addWidget(self.gz_model_type_combo, 3, 1)
-        gz.addWidget(QLabel("Environment"), 4, 0)
+        gz.addWidget(self.gz_model_type_combo, 1, 3)
+
+        gz.addWidget(QLabel("Environment"), 2, 0)
         self.gz_world_combo = QComboBox()
         self.gz_world_combo.setEditable(True)
         self.gz_world_combo.addItems(["table_beer_with_stand", "empty", "warehouse"])
         self.gz_world_combo.setCurrentText("table_beer_with_stand")
-        gz.addWidget(self.gz_world_combo, 4, 1)
-        gz.addWidget(QLabel("Extra args"), 5, 0)
-        self.gz_args_edit = QLineEdit("")
-        gz.addWidget(self.gz_args_edit, 5, 1)
+        gz.addWidget(self.gz_world_combo, 2, 1)
+
+        # 是否启动 Gazebo 客户端 GUI 窗口（gzclient）。物理(gzserver)始终运行；
+        # 多数情况下用 RViz 观察即可，关掉 GUI 可显著省资源/提速。
+        self.gz_enable_gui = QCheckBox("Launch Gazebo GUI (gzclient)")
+        self.gz_enable_gui.setChecked(True)
+        self.gz_enable_gui.setToolTip(
+            "勾选：启动 Gazebo 图形窗口 gzclient（gui:=true）。\n"
+            "取消：仅运行物理引擎 gzserver（gui:=false），用 RViz 观察即可，更省资源。"
+        )
+        gz.addWidget(self.gz_enable_gui, 2, 2, 1, 2)
+
         gz_btn_row = QHBoxLayout()
         self.gz_start_btn = QPushButton("Start Gazebo")
         self.gz_start_btn.clicked.connect(self._start_ros_gazebo)
@@ -2702,7 +2986,7 @@ class UamSuiteGUI(QMainWindow):
         self.gz_stop_btn.clicked.connect(self._stop_ros_gazebo)
         gz_btn_row.addWidget(self.gz_start_btn)
         gz_btn_row.addWidget(self.gz_stop_btn)
-        gz.addLayout(gz_btn_row, 6, 0, 1, 2)
+        gz.addLayout(gz_btn_row, 3, 0, 1, 4)
         gazebo_group.setLayout(gz)
         rtt.addWidget(gazebo_group)
 
@@ -2945,6 +3229,19 @@ class UamSuiteGUI(QMainWindow):
         self.rn_mpc_max_iter.setValue(60)
         rn_common_grid.addWidget(self.rn_mpc_max_iter, 1, 1)
 
+        rn_common_grid.addWidget(QLabel("bodyrate_lookahead [ms]"), 1, 2)
+        self.rn_bodyrate_lookahead_ms = QDoubleSpinBox()
+        self.rn_bodyrate_lookahead_ms.setRange(0.0, 500.0)
+        self.rn_bodyrate_lookahead_ms.setDecimals(1)
+        self.rn_bodyrate_lookahead_ms.setSingleStep(5.0)
+        self.rn_bodyrate_lookahead_ms.setValue(50.0)
+        self.rn_bodyrate_lookahead_ms.setToolTip(
+            "CTBR 体角速度取自 MPC horizon 中 t=该值(ms) 处（按 dt_mpc 插值），与 dt_mpc 解耦。\n"
+            "默认 50ms = 原行为(xs[1])；调小可减小前瞻相位（轨迹提前/终点超调）；0=当前步。\n"
+            "MPC 本身(dt_mpc/horizon)不变。点击「update_controller_params」在线生效。"
+        )
+        rn_common_grid.addWidget(self.rn_bodyrate_lookahead_ms, 1, 3)
+
         rn_mpc_vbox.addLayout(rn_common_grid)
 
         # ── Acados 求解器选项（仅 acados_full_state）──────────────────────────
@@ -3178,6 +3475,39 @@ class UamSuiteGUI(QMainWindow):
         )
         self.rn_l1_force_label.setStyleSheet("color: gray; font-size: 11px;")
         rn_l1_vbox.addWidget(self.rn_l1_force_label)
+
+        # 真值阻力前馈补偿（对照实验，与 L1 互斥）
+        rn_dragff_row = QHBoxLayout()
+        self.rn_drag_ff_enabled = QCheckBox("Compensate with TRUE drag (feedforward, no L1)")
+        self.rn_drag_ff_enabled.setToolTip(
+            "不开 L1，直接用解析重建的 Gazebo 转子阻力真值 -F_drag/m 作为补偿加速度，\n"
+            "注入与 L1 相同的 CTBR 通道。用于检验“扰动估计完全准确时”的补偿上限效果。\n"
+            "与 L1 互斥：勾选后启动/在线更新时会自动关闭 L1。"
+        )
+        rn_dragff_row.addWidget(self.rn_drag_ff_enabled)
+        self.rn_drag_ff_svc_on_btn = QPushButton("rosservice: /set_drag_ff_enabled ON")
+        self.rn_drag_ff_svc_on_btn.setToolTip("节点运行中立即开启真值阻力前馈（SetBool data=true）。")
+        self.rn_drag_ff_svc_on_btn.clicked.connect(lambda: self._call_set_drag_ff_enabled_service(True))
+        self.rn_drag_ff_svc_on_btn.setEnabled(False)
+        rn_dragff_row.addWidget(self.rn_drag_ff_svc_on_btn)
+        self.rn_drag_ff_svc_off_btn = QPushButton("OFF")
+        self.rn_drag_ff_svc_off_btn.setToolTip("节点运行中立即关闭真值阻力前馈（SetBool data=false）。")
+        self.rn_drag_ff_svc_off_btn.clicked.connect(lambda: self._call_set_drag_ff_enabled_service(False))
+        self.rn_drag_ff_svc_off_btn.setEnabled(False)
+        rn_dragff_row.addWidget(self.rn_drag_ff_svc_off_btn)
+        rn_l1_vbox.addLayout(rn_dragff_row)
+
+        # L1 与真值前馈互斥：勾选其一时取消另一个
+        def _l1_excl(checked):
+            if checked and self.rn_drag_ff_enabled.isChecked():
+                self.rn_drag_ff_enabled.setChecked(False)
+
+        def _dragff_excl(checked):
+            if checked and self.rn_l1_enabled.isChecked():
+                self.rn_l1_enabled.setChecked(False)
+
+        self.rn_l1_enabled.toggled.connect(_l1_excl)
+        self.rn_drag_ff_enabled.toggled.connect(_dragff_excl)
 
         rn_l1_grid = QGridLayout()
         rn_l1_grid.setColumnStretch(1, 1)
@@ -3547,6 +3877,7 @@ class UamSuiteGUI(QMainWindow):
         self.fig_3d_track, self.cv_3d_track = embed_fig("Base 3D", (10, 8))
         self.fig_traj_dash, self.cv_traj_dash = embed_fig("Tracking / MPC", (12, 11))
         self.fig_cost_analysis, self.cv_cost_analysis = embed_fig("Cost analysis", (12, 10))
+        self.fig_l1_dist, self.cv_l1_dist = embed_fig("L1 / Disturbance", (12, 10))
         # Backward-compatible aliases for existing planning preview rendering.
         self.fig_combined, self.cv_combined = self.fig_states, self.cv_states
 
@@ -3768,6 +4099,10 @@ class UamSuiteGUI(QMainWindow):
         if pos_r is not None:
             suf += " (meas solid / ref dashed)"
         self.fig_states.suptitle(suf, fontsize=11, y=0.995)
+        try:
+            self.fig_states.tight_layout(rect=(0, 0, 1, 0.96))
+        except Exception:
+            pass
 
         # ── Controls tab (s500) ─────────────────────────────────────────────
         self.fig_control.clear()
@@ -3835,64 +4170,68 @@ class UamSuiteGUI(QMainWindow):
         self.fig_traj_dash.suptitle(
             f"{title_prefix} — tracking errors & kinematics (see Controls tab for u)",
             fontsize=11,
-            y=0.98,
+            y=0.99,
         )
-        ad = [self.fig_traj_dash.add_subplot(4, 2, i + 1) for i in range(8)]
-        ad[0].plot(pos[:, 0], pos[:, 1], "b-", lw=1.2, label="meas")
-        if pos_r is not None:
-            ad[0].plot(pos_r[:, 0], pos_r[:, 1], color="tab:orange", ls="--", lw=1.1, alpha=0.9, label="ref")
-        ad[0].set_title("XY path", fontsize=_mpl_pt(9))
-        ad[0].set_xlabel("x [m]")
-        ad[0].set_ylabel("y [m]")
-        _xy_stack = [np.column_stack((pos[:, 0], pos[:, 1]))]
-        if pos_r is not None:
-            _xy_stack.append(np.column_stack((pos_r[:, 0], pos_r[:, 1])))
-        _set_2d_path_equal_meters(ad[0], *_xy_stack)
-        if pos_r is not None:
-            ad[0].legend(loc="best", fontsize=_mpl_pt(7))
-        ad[1].plot(pos[:, 0], pos[:, 2], "b-", lw=1.2, label="meas")
-        if pos_r is not None:
-            ad[1].plot(pos_r[:, 0], pos_r[:, 2], color="tab:orange", ls="--", lw=1.1, alpha=0.9, label="ref")
-        ad[1].set_title("XZ path", fontsize=_mpl_pt(9))
-        ad[1].set_xlabel("x [m]")
-        ad[1].set_ylabel("z [m]")
-        _xz_stack = [np.column_stack((pos[:, 0], pos[:, 2]))]
-        if pos_r is not None:
-            _xz_stack.append(np.column_stack((pos_r[:, 0], pos_r[:, 2])))
-        _set_2d_path_equal_meters(ad[1], *_xz_stack)
-        if pos_r is not None:
-            ad[1].legend(loc="best", fontsize=_mpl_pt(7))
+        gsd = self.fig_traj_dash.add_gridspec(4, 2, hspace=0.55, wspace=0.30)
+        ad = [self.fig_traj_dash.add_subplot(gsd[i, j]) for i in range(4) for j in range(2)]
 
+        def _wrap_deg(d):
+            return (np.asarray(d, dtype=float) + 180.0) % 360.0 - 180.0
+
+        # ── 行1：位置 / 速度 跟踪误差 ──────────────────────────────────
         if pos_r is not None:
             e_p = pos - pos_r
             for j, c in enumerate("rgb"):
-                ad[2].plot(t, e_p[:, j], color=c, lw=1.0, label=f"e_{'xyz'[j]}")
-            ad[2].plot(t, np.linalg.norm(e_p, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_p\|$")
-            ad[2].axhline(0.0, color="gray", ls=":", lw=0.7)
-            ad[2].set_title("Base position tracking error", fontsize=_mpl_pt(9))
+                ad[0].plot(t, e_p[:, j], color=c, lw=1.0, label=f"e_{'xyz'[j]}")
+            ad[0].plot(t, np.linalg.norm(e_p, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_p\|$")
+            ad[0].axhline(0.0, color="gray", ls=":", lw=0.7)
+            ad[0].legend(loc="best", fontsize=6, ncol=2)
         else:
-            ad[2].text(0.5, 0.5, "No reference — position error N/A", ha="center", va="center", transform=ad[2].transAxes)
-            ad[2].set_title("Base position tracking error", fontsize=_mpl_pt(9))
-        ad[2].set_xlabel("t [s]")
-        ad[2].set_ylabel("m")
-        if pos_r is not None:
-            ad[2].legend(loc="best", fontsize=6, ncol=2)
-        ad[2].grid(True, alpha=0.3)
+            ad[0].text(0.5, 0.5, "No reference — position error N/A", ha="center", va="center", transform=ad[0].transAxes)
+        ad[0].set_title("Base position tracking error", fontsize=_mpl_pt(9))
+        ad[0].set_xlabel("t [s]")
+        ad[0].set_ylabel("m")
+        ad[0].grid(True, alpha=0.3)
 
         if vel_r is not None:
             e_v = vel - vel_r
             for j, c in enumerate("rgb"):
-                ad[3].plot(t, e_v[:, j], color=c, lw=1.0, label=f"e_v{'xyz'[j]}")
-            ad[3].plot(t, np.linalg.norm(e_v, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_v\|$")
-            ad[3].axhline(0.0, color="gray", ls=":", lw=0.7)
-            ad[3].set_title("Base velocity tracking error", fontsize=_mpl_pt(9))
+                ad[1].plot(t, e_v[:, j], color=c, lw=1.0, label=f"e_v{'xyz'[j]}")
+            ad[1].plot(t, np.linalg.norm(e_v, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_v\|$")
+            ad[1].axhline(0.0, color="gray", ls=":", lw=0.7)
+            ad[1].legend(loc="best", fontsize=6, ncol=2)
         else:
-            ad[3].text(0.5, 0.5, "No reference — velocity error N/A", ha="center", va="center", transform=ad[3].transAxes)
-            ad[3].set_title("Base velocity tracking error", fontsize=_mpl_pt(9))
+            ad[1].text(0.5, 0.5, "No reference — velocity error N/A", ha="center", va="center", transform=ad[1].transAxes)
+        ad[1].set_title("Base velocity tracking error", fontsize=_mpl_pt(9))
+        ad[1].set_xlabel("t [s]")
+        ad[1].set_ylabel("m/s")
+        ad[1].grid(True, alpha=0.3)
+
+        # ── 行2：姿态 / 角速度 跟踪误差 ────────────────────────────────
+        if eul_r is not None:
+            e_att = _wrap_deg(eul - eul_r)
+            for j, (c, nm) in enumerate(zip("rgb", ("roll", "pitch", "yaw"))):
+                ad[2].plot(t, e_att[:, j], color=c, lw=1.0, label=f"e_{nm}")
+            ad[2].axhline(0.0, color="gray", ls=":", lw=0.7)
+            ad[2].legend(loc="best", fontsize=6, ncol=3)
+        else:
+            ad[2].text(0.5, 0.5, "No reference — attitude error N/A", ha="center", va="center", transform=ad[2].transAxes)
+        ad[2].set_title("Base attitude tracking error (Euler ZYX)", fontsize=_mpl_pt(9))
+        ad[2].set_xlabel("t [s]")
+        ad[2].set_ylabel("deg")
+        ad[2].grid(True, alpha=0.3)
+
+        if omg_deg_r is not None:
+            e_w = omg_deg - omg_deg_r
+            for j, c in enumerate("rgb"):
+                ad[3].plot(t, e_w[:, j], color=c, lw=1.0, label=f"e_ω{'xyz'[j]}")
+            ad[3].axhline(0.0, color="gray", ls=":", lw=0.7)
+            ad[3].legend(loc="best", fontsize=6, ncol=3)
+        else:
+            ad[3].text(0.5, 0.5, "No reference — angular-rate error N/A", ha="center", va="center", transform=ad[3].transAxes)
+        ad[3].set_title("Base angular velocity tracking error", fontsize=_mpl_pt(9))
         ad[3].set_xlabel("t [s]")
-        ad[3].set_ylabel("m/s")
-        if vel_r is not None:
-            ad[3].legend(loc="best", fontsize=6, ncol=2)
+        ad[3].set_ylabel("deg/s")
         ad[3].grid(True, alpha=0.3)
 
         speed = np.linalg.norm(vel, axis=1)
@@ -3967,6 +4306,12 @@ class UamSuiteGUI(QMainWindow):
             ad[7].set_ylabel("m/s⁴")
             ad[7].legend(loc="best", fontsize=_mpl_pt(7))
             ad[7].grid(True, alpha=0.3)
+
+        # 解决子图相互覆盖：tight_layout 预留 suptitle 空间。
+        try:
+            self.fig_traj_dash.tight_layout(rect=(0, 0, 1, 0.96))
+        except Exception:
+            pass
 
     def _render_planning_reference_full_state(self) -> None:
         """Render the full-state planning *reference* using the same dashboard framework as EE tracking GUI."""
@@ -4615,6 +4960,40 @@ class UamSuiteGUI(QMainWindow):
     def _is_s500_mode(self) -> bool:
         return hasattr(self, "task_robot_combo") and self.task_robot_combo.currentText() == "s500"
 
+    def _current_robot_context(self) -> dict:
+        """Single source of truth for the active robot in Sim Tracking / Regulation.
+
+        Any simulation path should read robot name / urdf / dims from here so that
+        s500 (no arm) and s500_uam (with arm) are dispatched consistently.
+        """
+        is_s500 = self._is_s500_mode()
+        name = "s500" if is_s500 else "s500_uam"
+        urdf = self._selected_robot_urdf_path()
+        try:
+            rm, _ = self._robot_model_and_ee()
+            nq, nv = int(rm.nq), int(rm.nv)
+        except Exception:
+            nq, nv = (7, 6) if is_s500 else (9, 8)
+        n_arm = max(0, nq - 7)
+        return {
+            "name": name,
+            "urdf_path": urdf,
+            "is_s500": is_s500,
+            "nq": nq,
+            "nv": nv,
+            "nu": 4 + n_arm,
+            "n_arm": n_arm,
+            "nx": nq + nv,
+        }
+
+    def _robot_hover_nominal_state(self) -> np.ndarray:
+        """Robot-aware hover nominal state (z=1 m, level attitude, zeros elsewhere)."""
+        ctx = self._current_robot_context()
+        x = np.zeros(int(ctx["nx"]), dtype=float)
+        x[2] = 1.0  # z = 1 m
+        x[6] = 1.0  # qw = 1 (q = [x,y,z, qx,qy,qz,qw, ...])
+        return x
+
     def _s500_plot_sanitize_res(self, res: dict) -> dict:
         """For s500 plotting, hide EE-specific channels while keeping base/state channels."""
         out = dict(res)
@@ -4810,6 +5189,11 @@ class UamSuiteGUI(QMainWindow):
         self._apply_robot_mode_ui_labels(robot_mode)
         self._on_task_traj_changed()
         self._sync_gazebo_launch_with_task()
+        if hasattr(self, "track_mode_combo"):
+            self._update_track_mode_enabled()
+        if hasattr(self, "reg_mode_combo"):
+            self._update_reg_mode_enabled()
+        self._refresh_track_drone_panel()
 
     def _apply_robot_mode_ui_labels(self, robot_mode: str) -> None:
         # s500 has no arm EE-tracking semantics in UI wording.
@@ -5297,6 +5681,7 @@ class UamSuiteGUI(QMainWindow):
             (self.fig_3d_track, self.cv_3d_track),
             (self.fig_traj_dash, self.cv_traj_dash),
             (self.fig_cost_analysis, self.cv_cost_analysis),
+            (getattr(self, "fig_l1_dist", None), getattr(self, "cv_l1_dist", None)),
         ):
             if fig is not None:
                 fig.clear()
@@ -5489,6 +5874,41 @@ class UamSuiteGUI(QMainWindow):
         self.log(f"[planning] Generated trajectory saved: {out}")
         return out
 
+    def _refresh_track_drone_panel(self) -> None:
+        """Update the Drone/limits sub-tab: show current robot and hide arm-only limits for s500."""
+        if not hasattr(self, "track_robot_label"):
+            return
+        robot = (
+            self.task_robot_combo.currentText()
+            if hasattr(self, "task_robot_combo")
+            else "s500_uam"
+        )
+        self.track_robot_label.setText(robot)
+        is_uam = not self._is_s500_mode()
+        for w in (
+            getattr(self, "_track_j_angle_label", None),
+            getattr(self, "track_j_angle_max", None),
+            getattr(self, "_track_j_vel_label", None),
+            getattr(self, "track_j_vel_max", None),
+        ):
+            if w is not None:
+                w.setVisible(is_uam)
+
+    def _update_reg_mode_enabled(self) -> None:
+        """s500 has no arm: EE-pose regulation is UAM-only; force full-state regulation."""
+        if not hasattr(self, "reg_mode_combo"):
+            return
+        is_s500 = self._is_s500_mode()
+        try:
+            it_ee = self.reg_mode_combo.model().item(1)
+            if it_ee is not None:
+                it_ee.setEnabled(not is_s500)
+        except Exception:
+            pass
+        if is_s500 and int(self.reg_mode_combo.currentIndex()) == 1:
+            self.reg_mode_combo.setCurrentIndex(0)
+        self._on_reg_mode_changed()
+
     def _on_reg_mode_changed(self):
         mode = int(self.reg_mode_combo.currentIndex()) if hasattr(self, "reg_mode_combo") else 0
         full = mode == 0
@@ -5528,7 +5948,8 @@ class UamSuiteGUI(QMainWindow):
         idx = int(self.track_mode_combo.currentIndex())
         if not hasattr(self, "track_algo_group"):
             return
-        visible_widgets = {self.dt_mpc}
+        # geometric (idx==4) 不跑 MPC，故不显示 dt_mpc；参考加速度后端用 control_dt 微分。
+        visible_widgets = set() if idx == 4 else {self.dt_mpc}
         if idx in (0, 1):
             visible_widgets.update(
                 {
@@ -5559,6 +5980,16 @@ class UamSuiteGUI(QMainWindow):
                         self.control_mode_track,
                     }
                 )
+        elif idx == 4:
+            visible_widgets.update(
+                {
+                    self.geo_kp_pos,
+                    self.geo_kd_vel,
+                    self.geo_kR,
+                    self.geo_kOmega,
+                    self.geo_max_tilt,
+                }
+            )
         elif idx == 2:
             visible_widgets.update(
                 {
@@ -5585,9 +6016,18 @@ class UamSuiteGUI(QMainWindow):
                     self.w_state_track,
                     self.croc_ee_w_terminal,
                     self.mpc_max_iter,
-                    self.croc_ee_use_thrust_constraints,
                 }
             )
+        # geometric 只支持 CTBR：禁用 direct 项并强制 CTBR。
+        if hasattr(self, "scheme_combo"):
+            try:
+                _direct_it = self.scheme_combo.model().item(0)
+                if _direct_it is not None:
+                    _direct_it.setEnabled(idx != 4)
+            except Exception:
+                pass
+            if idx == 4 and self.scheme_combo.currentIndex() != 1:
+                self.scheme_combo.setCurrentIndex(1)
         self._relayout_algo_grid(visible_widgets)
         if idx == 0:
             self.track_algo_group.setTitle(
@@ -5596,6 +6036,10 @@ class UamSuiteGUI(QMainWindow):
         elif idx == 1:
             self.track_algo_group.setTitle(
                 "Algorithm parameters (Acados full-state tracking; shared cost weights with Croc)"
+            )
+        elif idx == 4:
+            self.track_algo_group.setTitle(
+                "Geometric controller parameters (SE3 几何，机体 s500，仅 CTBR)"
             )
         elif idx == 2:
             self.track_algo_group.setTitle(
@@ -5606,6 +6050,683 @@ class UamSuiteGUI(QMainWindow):
                 "Algorithm parameters (Crocoddyl EE pose tracking)"
             )
         self._refresh_sim_plant_controls_state()
+
+    def _current_track_scheme(self) -> str:
+        """当前控制方案：'ctbr' 或 'direct'（geometric 恒为 ctbr）。"""
+        if int(self.track_mode_combo.currentIndex()) == 4:
+            return "ctbr"
+        if hasattr(self, "scheme_combo") and self.scheme_combo.currentIndex() == 1:
+            return "ctbr"
+        return "direct"
+
+    def _on_track_scheme_changed(self):
+        """方案切换：CTBR ↔ direct。CTBR 时勾选并展开 CTBR 参数组。"""
+        scheme = self._current_track_scheme()
+        if hasattr(self, "sim_ctbr_group"):
+            blocked = self.sim_ctbr_group.blockSignals(True)
+            self.sim_ctbr_group.setChecked(scheme == "ctbr")
+            self.sim_ctbr_group.blockSignals(blocked)
+        # 同步快捷页（若存在）。
+        if hasattr(self, "sim_quick_scheme"):
+            qi = 1 if scheme == "ctbr" else 0
+            if self.sim_quick_scheme.currentIndex() != qi:
+                blk = self.sim_quick_scheme.blockSignals(True)
+                self.sim_quick_scheme.setCurrentIndex(qi)
+                self.sim_quick_scheme.blockSignals(blk)
+        self._refresh_sim_plant_controls_state()
+
+    def _build_l1_disturbance_subtab(self) -> None:
+        """构建 Sim Tracking 的 "Disturbance" 与 "L1" 两个设置子标签。
+
+        Disturbance 页含 5 类可分时段开启的 plant 扰动（仅影响仿真，不改 MPC 名义模型）：
+        外界定常力/力矩、外界变化力、总推力估计偏差、桨叶气动阻力、状态估计误差；
+        L1 页为 L1 自适应估计与补偿（ros_tracking 的 scripts/l1_adaptive.py）。
+        仅 Acados full-state + direct 控制模式生效。
+        """
+
+        def _ds(lo, hi, val, dec=3, step=None, tip=None):
+            sb = QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setDecimals(dec)
+            if step is not None:
+                sb.setSingleStep(step)
+            sb.setValue(val)
+            if tip:
+                sb.setToolTip(tip)
+            return sb
+
+        def _win(grid, row):
+            """在 grid 的 row 行放置 t_start / t_end 两个时间窗 spinbox，返回 (t0, t1)。"""
+            t0 = _ds(0.0, 600.0, 0.0, 2, 0.1, "扰动开启时间 [s]")
+            t1 = _ds(0.0, 600.0, 0.0, 2, 0.1, "扰动结束时间 [s]（0 表示持续到结束）")
+            grid.addWidget(QLabel("t_start [s]"), row, 0)
+            grid.addWidget(t0, row, 1)
+            grid.addWidget(QLabel("t_end [s] (0=∞)"), row, 2)
+            grid.addWidget(t1, row, 3)
+            return t0, t1
+
+        page = QWidget()
+        page_v = QVBoxLayout(page)
+        page_v.setContentsMargins(6, 6, 6, 6)
+
+        intro = QLabel(
+            "Plant 扰动仅注入闭环仿真（Acados full-state, direct 控制），MPC 名义模型不变；"
+            "可用 \"L1\" 页的自适应在线估计并补偿。每组用标题复选框开启。\n"
+            "坐标系约定（世界系 = 惯性系，Z 轴向上，重力沿 -Z）：\n"
+            "  • 定常力/力矩、变化外力、阻力、推力偏置等效力 → 均在世界系定义 [N / N·m]；\n"
+            "  • 注入 plant 时力矩按 M_body=Rᵀ·M_world 转换（Pinocchio 机体系广义力）；\n"
+            "  • L1 仅估计平动集总扰动 → 世界系 m·σ̂ [N]；不估计力矩（力矩行无估计曲线）。"
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: palette(mid); font-size: 11px;")
+        page_v.addWidget(intro)
+
+        # ── 1) 外界定常扰动 ─────────────────────────────────────────────
+        self.dist_const_group = QGroupBox("外界定常扰动 (力/力矩均=世界系 N / N·m)")
+        self.dist_const_group.setCheckable(True)
+        self.dist_const_group.setChecked(False)
+        g1 = QGridLayout(self.dist_const_group)
+        self.dist_const_t0, self.dist_const_t1 = _win(g1, 0)
+        self.dist_const_fx = _ds(-50.0, 50.0, 0.0, 3, 0.1)
+        self.dist_const_fy = _ds(-50.0, 50.0, 0.0, 3, 0.1)
+        self.dist_const_fz = _ds(-50.0, 50.0, 0.0, 3, 0.1)
+        g1.addWidget(QLabel("Fx"), 1, 0); g1.addWidget(self.dist_const_fx, 1, 1)
+        g1.addWidget(QLabel("Fy"), 1, 2); g1.addWidget(self.dist_const_fy, 1, 3)
+        g1.addWidget(QLabel("Fz"), 2, 0); g1.addWidget(self.dist_const_fz, 2, 1)
+        self.dist_const_mx = _ds(-10.0, 10.0, 0.0, 3, 0.01, "Mx 世界系 [N·m]")
+        self.dist_const_my = _ds(-10.0, 10.0, 0.0, 3, 0.01, "My 世界系 [N·m]")
+        self.dist_const_mz = _ds(-10.0, 10.0, 0.0, 3, 0.01, "Mz 世界系 [N·m]")
+        g1.addWidget(QLabel("Mx"), 3, 0); g1.addWidget(self.dist_const_mx, 3, 1)
+        g1.addWidget(QLabel("My"), 3, 2); g1.addWidget(self.dist_const_my, 3, 3)
+        g1.addWidget(QLabel("Mz"), 4, 0); g1.addWidget(self.dist_const_mz, 4, 1)
+        page_v.addWidget(self.dist_const_group)
+
+        # ── 2) 外界变化扰动（世界系力正弦）────────────────────────────────
+        self.dist_var_group = QGroupBox("外界变化扰动 (世界系力, 逐轴正弦 A·sin(2πft+φ))")
+        self.dist_var_group.setCheckable(True)
+        self.dist_var_group.setChecked(False)
+        g2 = QGridLayout(self.dist_var_group)
+        self.dist_var_t0, self.dist_var_t1 = _win(g2, 0)
+        self.dist_var_amp_x = _ds(-50.0, 50.0, 0.0, 3, 0.1, "X 轴幅值 [N]")
+        self.dist_var_amp_y = _ds(-50.0, 50.0, 0.0, 3, 0.1, "Y 轴幅值 [N]")
+        self.dist_var_amp_z = _ds(-50.0, 50.0, 0.0, 3, 0.1, "Z 轴幅值 [N]")
+        g2.addWidget(QLabel("Amp X"), 1, 0); g2.addWidget(self.dist_var_amp_x, 1, 1)
+        g2.addWidget(QLabel("Amp Y"), 1, 2); g2.addWidget(self.dist_var_amp_y, 1, 3)
+        g2.addWidget(QLabel("Amp Z"), 2, 0); g2.addWidget(self.dist_var_amp_z, 2, 1)
+        self.dist_var_freq = _ds(0.0, 20.0, 0.5, 3, 0.1, "频率 [Hz]")
+        self.dist_var_phase = _ds(-360.0, 360.0, 0.0, 1, 5.0, "相位 [deg]")
+        g2.addWidget(QLabel("freq [Hz]"), 2, 2); g2.addWidget(self.dist_var_freq, 2, 3)
+        g2.addWidget(QLabel("phase [deg]"), 3, 0); g2.addWidget(self.dist_var_phase, 3, 1)
+        page_v.addWidget(self.dist_var_group)
+
+        # ── 3) 总推力估计偏差 ───────────────────────────────────────────
+        self.dist_thrust_group = QGroupBox("总推力估计偏差 (T_real = scale·T_cmd + bias)")
+        self.dist_thrust_group.setCheckable(True)
+        self.dist_thrust_group.setChecked(False)
+        g3 = QGridLayout(self.dist_thrust_group)
+        self.dist_thrust_t0, self.dist_thrust_t1 = _win(g3, 0)
+        self.dist_thrust_scale = _ds(0.5, 1.5, 1.0, 3, 0.01,
+            "实际/指令 总推力比例（1.0=无偏差）")
+        self.dist_thrust_bias = _ds(-10.0, 10.0, 0.0, 3, 0.1,
+            "总推力常值偏置 [N]（均分到各转子）")
+        g3.addWidget(QLabel("scale"), 1, 0); g3.addWidget(self.dist_thrust_scale, 1, 1)
+        g3.addWidget(QLabel("bias [N]"), 1, 2); g3.addWidget(self.dist_thrust_bias, 1, 3)
+        _thint = QLabel(
+            "控制器按名义推力系数估计总推力 T_cmd=Σuᵢ；真实平台因标定误差产生 "
+            "T_real=scale·T_cmd+bias。准确的总推力即 T_real，二者之差等效为沿机体 z 的"
+            "比力扰动，L1 会并入集总扰动 σ̂ 估计并补偿。"
+        )
+        _thint.setWordWrap(True)
+        _thint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        g3.addWidget(_thint, 2, 0, 1, 4)
+        page_v.addWidget(self.dist_thrust_group)
+
+        # ── 4) 桨叶空气阻力（Gazebo 风格）────────────────────────────────
+        self.dist_drag_group = QGroupBox("桨叶空气阻力 (Gazebo: -Cd·√(nT/kf)·V⊥)")
+        self.dist_drag_group.setCheckable(True)
+        self.dist_drag_group.setChecked(False)
+        g4 = QGridLayout(self.dist_drag_group)
+        self.dist_drag_t0, self.dist_drag_t1 = _win(g4, 0)
+        self.dist_drag_cd = _ds(0.0, 1.0, 1.0e-4, 6, 1e-4, "转子阻力系数 Cd (Gazebo rotorS 量级 ~1e-4)")
+        self.dist_drag_kf = _ds(1e-8, 1e-3, 8.54858e-06, 8, 1e-6, "电机推力常数 kf")
+        g4.addWidget(QLabel("Cd"), 1, 0); g4.addWidget(self.dist_drag_cd, 1, 1)
+        g4.addWidget(QLabel("kf"), 1, 2); g4.addWidget(self.dist_drag_kf, 1, 3)
+        self.dist_drag_wind_x = _ds(-30.0, 30.0, 0.0, 3, 0.1, "常值风 X [m/s]")
+        self.dist_drag_wind_y = _ds(-30.0, 30.0, 0.0, 3, 0.1, "常值风 Y [m/s]")
+        self.dist_drag_wind_z = _ds(-30.0, 30.0, 0.0, 3, 0.1, "常值风 Z [m/s]")
+        g4.addWidget(QLabel("wind X"), 2, 0); g4.addWidget(self.dist_drag_wind_x, 2, 1)
+        g4.addWidget(QLabel("wind Y"), 2, 2); g4.addWidget(self.dist_drag_wind_y, 2, 3)
+        g4.addWidget(QLabel("wind Z"), 3, 0); g4.addWidget(self.dist_drag_wind_z, 3, 1)
+        page_v.addWidget(self.dist_drag_group)
+
+        # ── 5) 状态估计误差（量测噪声）──────────────────────────────────
+        self.dist_est_group = QGroupBox("状态估计误差 (量测高斯噪声; 仅控制器可见)")
+        self.dist_est_group.setCheckable(True)
+        self.dist_est_group.setChecked(False)
+        g5 = QGridLayout(self.dist_est_group)
+        self.dist_est_t0, self.dist_est_t1 = _win(g5, 0)
+        self.dist_est_pos_std = _ds(0.0, 1.0, 0.0, 4, 0.005, "位置噪声 std [m]")
+        self.dist_est_att_std = _ds(0.0, 1.0, 0.0, 4, 0.005, "姿态噪声 std [rad]")
+        self.dist_est_vel_std = _ds(0.0, 5.0, 0.0, 4, 0.01, "线速度噪声 std [m/s]")
+        self.dist_est_omega_std = _ds(0.0, 5.0, 0.0, 4, 0.01, "角速度噪声 std [rad/s]")
+        g5.addWidget(QLabel("pos std"), 1, 0); g5.addWidget(self.dist_est_pos_std, 1, 1)
+        g5.addWidget(QLabel("att std"), 1, 2); g5.addWidget(self.dist_est_att_std, 1, 3)
+        g5.addWidget(QLabel("vel std"), 2, 0); g5.addWidget(self.dist_est_vel_std, 2, 1)
+        g5.addWidget(QLabel("ω std"), 2, 2); g5.addWidget(self.dist_est_omega_std, 2, 3)
+        page_v.addWidget(self.dist_est_group)
+        page_v.addStretch(1)
+
+        dist_scroll = QScrollArea()
+        dist_scroll.setWidgetResizable(True)
+        dist_scroll.setWidget(page)
+        self.track_settings_tabs.addTab(dist_scroll, "Disturbance")
+
+        # ── L1 自适应补偿（单独标签页）─────────────────────────────────
+        l1_page = QWidget()
+        l1_v = QVBoxLayout(l1_page)
+        l1_v.setContentsMargins(6, 6, 6, 6)
+        l1_intro = QLabel(
+            "L1 自适应：估计 \"Disturbance\" 页注入的世界系平动集总扰动 σ̂，"
+            "经 -σ̂ 低通生成补偿加速度并映射为四路推力增量注入仿真。\n"
+            "仅 Acados full-state + direct 控制模式生效；力矩通道不估计。"
+        )
+        l1_intro.setWordWrap(True)
+        l1_intro.setStyleSheet("color: palette(mid); font-size: 11px;")
+        l1_v.addWidget(l1_intro)
+
+        self.sim_l1_group = QGroupBox("扰动补偿 (L1 自适应 / 扰动真值 oracle)")
+        self.sim_l1_group.setCheckable(True)
+        self.sim_l1_group.setChecked(False)
+        gl = QGridLayout(self.sim_l1_group)
+        # 补偿来源：L1 在线估计 vs 直接用扰动真值（假设可精确测量，隔离评估补偿环节）。
+        self.sim_l1_comp_mode = QComboBox()
+        self.sim_l1_comp_mode.addItem("L1 自适应估计")
+        self.sim_l1_comp_mode.addItem("扰动真值 (oracle)")
+        self.sim_l1_comp_mode.setToolTip(
+            "L1 自适应：在线估计 σ̂ 再补偿（含估计误差/滞后）。\n"
+            "扰动真值 oracle：直接用注入扰动的真值作 σ̂（无估计误差/滞后），"
+            "只考验后续补偿环节（dFz/tilt、CTBR、电机）的好坏。"
+        )
+        self.sim_l1_as_gain = _ds(0.1, 100.0, 8.0, 3, 0.5, "预测器收敛速率 a_s")
+        self.sim_l1_wc_xy = _ds(0.0, 100.0, 6.0, 3, 0.5, "水平补偿 LPF 截止 [rad/s]")
+        self.sim_l1_wc_z = _ds(0.0, 100.0, 6.0, 3, 0.5, "竖直补偿 LPF 截止 [rad/s]")
+        self.sim_l1_tilt_gain = _ds(0.0, 50.0, 3.0, 3, 0.5, "横向补偿→体力矩增益")
+        gl.addWidget(QLabel("a_s"), 0, 0); gl.addWidget(self.sim_l1_as_gain, 0, 1)
+        gl.addWidget(QLabel("wc_xy"), 0, 2); gl.addWidget(self.sim_l1_wc_xy, 0, 3)
+        gl.addWidget(QLabel("wc_z"), 1, 0); gl.addWidget(self.sim_l1_wc_z, 1, 1)
+        gl.addWidget(QLabel("tilt_gain"), 1, 2); gl.addWidget(self.sim_l1_tilt_gain, 1, 3)
+        self.sim_l1_max_accel_xy = _ds(0.0, 50.0, 6.0, 3, 0.5, "补偿加速度上限 xy [m/s²]")
+        self.sim_l1_max_accel_z = _ds(0.0, 50.0, 6.0, 3, 0.5, "补偿加速度上限 z [m/s²]")
+        self.sim_l1_max_sigma = _ds(0.0, 100.0, 25.0, 3, 1.0, "扰动估计上限 [m/s²]")
+        gl.addWidget(QLabel("max_a_xy"), 2, 0); gl.addWidget(self.sim_l1_max_accel_xy, 2, 1)
+        gl.addWidget(QLabel("max_a_z"), 2, 2); gl.addWidget(self.sim_l1_max_accel_z, 2, 3)
+        gl.addWidget(QLabel("max_sigma"), 3, 0); gl.addWidget(self.sim_l1_max_sigma, 3, 1)
+        gl.addWidget(QLabel("补偿来源"), 3, 2); gl.addWidget(self.sim_l1_comp_mode, 3, 3)
+        _l1hint = QLabel(
+            "L1 估计世界系集总扰动 σ̂（含上述各扰动），按 -σ̂ 经低通生成补偿加速度，"
+            "映射为四路推力增量注入仿真。运行后右侧 \"L1 / Disturbance\" 页对比真值与估计。\n"
+            "「补偿来源=扰动真值 oracle」时：σ̂ 直接取注入扰动真值（绕过预测器/LPF，无估计"
+            "误差与滞后），其余补偿管线不变——用于把\"估计质量\"与\"补偿环节质量\"解耦评估。"
+        )
+        _l1hint.setWordWrap(True)
+        _l1hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        gl.addWidget(_l1hint, 4, 0, 1, 4)
+        l1_v.addWidget(self.sim_l1_group)
+
+        # ── 位置误差积分通道（独立小框，可勾选启用）─────────────────────
+        self.sim_l1_use_pos_fb = QGroupBox("位置误差积分通道")
+        self.sim_l1_use_pos_fb.setCheckable(True)
+        self.sim_l1_use_pos_fb.setChecked(False)
+        gpf = QGridLayout(self.sim_l1_use_pos_fb)
+        self.sim_l1_k_pos_i_xy = _ds(0.0, 10.0, 0.6, 3, 0.05, "水平位置误差积分增益")
+        self.sim_l1_k_pos_i_z = _ds(0.0, 10.0, 0.8, 3, 0.05, "竖直位置误差积分增益")
+        self.sim_l1_max_pos_integral = _ds(0.0, 10.0, 1.5, 3, 0.1, "积分 anti-windup 上限")
+        self.sim_l1_k_pos_p_xy = _ds(0.0, 20.0, 0.0, 3, 0.05, "水平位置误差比例增益（更快响应）")
+        self.sim_l1_k_pos_p_z = _ds(0.0, 20.0, 0.0, 3, 0.05, "竖直位置误差比例增益（更快响应）")
+        gpf.addWidget(QLabel("k_i_xy"), 0, 0); gpf.addWidget(self.sim_l1_k_pos_i_xy, 0, 1)
+        gpf.addWidget(QLabel("k_i_z"), 0, 2); gpf.addWidget(self.sim_l1_k_pos_i_z, 0, 3)
+        gpf.addWidget(QLabel("k_p_xy"), 1, 0); gpf.addWidget(self.sim_l1_k_pos_p_xy, 1, 1)
+        gpf.addWidget(QLabel("k_p_z"), 1, 2); gpf.addWidget(self.sim_l1_k_pos_p_z, 1, 3)
+        gpf.addWidget(QLabel("max∫"), 2, 0); gpf.addWidget(self.sim_l1_max_pos_integral, 2, 1)
+        _pfhint = QLabel(
+            "并联在 L1 补偿之上：对跟踪位置误差 e_p 做 PI 补偿（积分带 anti-windup），"
+            "消除 σ̂ 带宽/滞后残差导致的稳态/动态位置误差。a_ac += -k_p·e_p - k_i·∫e_p。"
+            "积分慢可加 k_p 提速（默认 0，过大易与 baseline/MPC 抢、引起振荡）。"
+        )
+        _pfhint.setWordWrap(True)
+        _pfhint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        gpf.addWidget(_pfhint, 3, 0, 1, 4)
+        l1_v.addWidget(self.sim_l1_use_pos_fb)
+        l1_v.addStretch(1)
+
+        l1_scroll = QScrollArea()
+        l1_scroll.setWidgetResizable(True)
+        l1_scroll.setWidget(l1_page)
+        self.track_settings_tabs.addTab(l1_scroll, "L1")
+
+        # ── CTBR 内环（单独标签页）─────────────────────────────────────
+        ctbr_page = QWidget()
+        ctbr_v = QVBoxLayout(ctbr_page)
+        ctbr_v.setContentsMargins(6, 6, 6, 6)
+        ctbr_intro = QLabel(
+            "CTBR 内环（仿 ROS tracking）：MPC 仍按 direct 求解，但只取其\"总推力\"与"
+            "horizon 中 lookahead 处的\"前瞻角速度\"作为设定点，自行用角速度 PID 生成体力矩，"
+            "经分配矩阵转回四路推力，并叠加电机一阶响应后施加到 plant。\n"
+            "勾选后替代 direct 直接施加；开 L1 时镜像 ROS：dFz→总推力，tilt→角速度设定点。"
+            "仅 Acados full-state + direct 模式生效。"
+        )
+        ctbr_intro.setWordWrap(True)
+        ctbr_intro.setStyleSheet("color: palette(mid); font-size: 11px;")
+        ctbr_v.addWidget(ctbr_intro)
+
+        self.sim_ctbr_group = QGroupBox("CTBR 内环：总推力 + 前瞻角速度 → 角速度 PID → 分配")
+        self.sim_ctbr_group.setCheckable(True)
+        self.sim_ctbr_group.setChecked(False)
+        cg = QGridLayout(self.sim_ctbr_group)
+        self.sim_ctbr_lookahead = _ds(0.0, 500.0, 50.0, 1, 5.0,
+                                      "前瞻时间 [ms]：从 MPC horizon 取该处角速度作设定点（默认≈dt_mpc）")
+        self.sim_ctbr_motor_tau = _ds(0.0, 1.0, 0.02, 4, 0.005,
+                                      "电机一阶响应时间常数 [s]（0=无滞后）")
+        cg.addWidget(QLabel("lookahead [ms]"), 0, 0); cg.addWidget(self.sim_ctbr_lookahead, 0, 1)
+        cg.addWidget(QLabel("motor_tau [s]"), 0, 2); cg.addWidget(self.sim_ctbr_motor_tau, 0, 3)
+        # roll/pitch PID
+        self.sim_ctbr_kp_rp = _ds(0.0, 200.0, 12.0, 3, 0.5, "roll/pitch 角速度比例增益（闭环带宽≈Kp [1/s]，已按 plant 控制有效性归一化）")
+        self.sim_ctbr_ki_rp = _ds(0.0, 200.0, 0.0, 3, 0.5, "roll/pitch 角速度积分增益")
+        self.sim_ctbr_kd_rp = _ds(0.0, 50.0, 0.0, 3, 0.1, "roll/pitch 角速度微分增益")
+        cg.addWidget(QLabel("kp_rp"), 1, 0); cg.addWidget(self.sim_ctbr_kp_rp, 1, 1)
+        cg.addWidget(QLabel("ki_rp"), 1, 2); cg.addWidget(self.sim_ctbr_ki_rp, 1, 3)
+        cg.addWidget(QLabel("kd_rp"), 2, 0); cg.addWidget(self.sim_ctbr_kd_rp, 2, 1)
+        # yaw PID
+        self.sim_ctbr_kp_yaw = _ds(0.0, 200.0, 8.0, 3, 0.5, "yaw 角速度比例增益（闭环带宽≈Kp [1/s]）")
+        self.sim_ctbr_ki_yaw = _ds(0.0, 200.0, 0.0, 3, 0.5, "yaw 角速度积分增益")
+        self.sim_ctbr_kd_yaw = _ds(0.0, 50.0, 0.0, 3, 0.1, "yaw 角速度微分增益")
+        cg.addWidget(QLabel("kp_yaw"), 2, 2); cg.addWidget(self.sim_ctbr_kp_yaw, 2, 3)
+        cg.addWidget(QLabel("ki_yaw"), 3, 0); cg.addWidget(self.sim_ctbr_ki_yaw, 3, 1)
+        cg.addWidget(QLabel("kd_yaw"), 3, 2); cg.addWidget(self.sim_ctbr_kd_yaw, 3, 3)
+        # 限幅
+        self.sim_ctbr_max_rate = _ds(0.0, 50.0, 8.0, 2, 0.5, "角速度设定点限幅 [rad/s]")
+        self.sim_ctbr_max_torque = _ds(0.0, 50.0, 0.0, 3, 0.1, "体力矩限幅 [N·m]（0=不限）")
+        self.sim_ctbr_int_limit = _ds(0.0, 50.0, 2.0, 3, 0.1, "积分 anti-windup 上限")
+        cg.addWidget(QLabel("max_rate"), 4, 0); cg.addWidget(self.sim_ctbr_max_rate, 4, 1)
+        cg.addWidget(QLabel("max_torque"), 4, 2); cg.addWidget(self.sim_ctbr_max_torque, 4, 3)
+        cg.addWidget(QLabel("max∫"), 5, 0); cg.addWidget(self.sim_ctbr_int_limit, 5, 1)
+        _ctbrhint = QLabel(
+            "ω̇_des = Kp·(ω_sp − ω) + Ki·∫ + Kd·dω/dt（roll/pitch 与 yaw 分组，Kp 单位≈1/s=闭环带宽）。"
+            "四路推力由 plant 真实控制有效性 ∂ω̇/∂T 求解分配（acados=对动力学有限差分，"
+            "croc=对作动模型有限差分），与 plant 完全一致后再经电机一阶 u̇=(u_cmd−u)/motor_tau。"
+            "默认纯 P（Ki=Kd=0），Kp=12 对应带宽≈12 rad/s（电机 20ms 下稳定）。"
+        )
+        _ctbrhint.setWordWrap(True)
+        _ctbrhint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        cg.addWidget(_ctbrhint, 6, 0, 1, 4)
+        self.sim_ctbr_step_btn = QPushButton("查看 Rate 阶跃响应")
+        self.sim_ctbr_step_btn.setToolTip(
+            "用当前角速度 PID/电机/控制率参数，仿真 roll/pitch/yaw 三轴角速度阶跃响应"
+        )
+        self.sim_ctbr_step_btn.clicked.connect(self._show_rate_step_response)
+        cg.addWidget(self.sim_ctbr_step_btn, 7, 0, 1, 2)
+        self.sim_motor_step_btn = QPushButton("查看电机阶跃响应")
+        self.sim_motor_step_btn.setToolTip(
+            "用当前电机时间常数 motor_tau，仿真单电机推力一阶阶跃响应"
+        )
+        self.sim_motor_step_btn.clicked.connect(self._show_motor_step_response)
+        cg.addWidget(self.sim_motor_step_btn, 7, 2, 1, 2)
+        ctbr_v.addWidget(self.sim_ctbr_group)
+        ctbr_v.addStretch(1)
+
+        ctbr_scroll = QScrollArea()
+        ctbr_scroll.setWidgetResizable(True)
+        ctbr_scroll.setWidget(ctbr_page)
+        self.track_settings_tabs.addTab(ctbr_scroll, "CTBR")
+
+    def _build_sim_quick_controls(self) -> None:
+        """在 Simulation 页顶部放置常用快捷开关，与详细控件双向同步。
+
+        包含：算法选择（镜像 track_mode_combo）、控制模式、L1 开关、以及五类扰动
+        的开/关复选框（与 L1/Disturbance 子标签内的 QGroupBox 状态联动）。
+        """
+        if not hasattr(self, "_sim_quick_holder"):
+            return
+        self._sync_guard = False
+
+        grp = QGroupBox("常用快捷开关 (与详细设置联动)")
+        gv = QGridLayout(grp)
+
+        # Baseline 选择（镜像 track_mode_combo，含可用性）。
+        self.sim_quick_mode = QComboBox()
+        for i in range(self.track_mode_combo.count()):
+            self.sim_quick_mode.addItem(self.track_mode_combo.itemText(i))
+        try:
+            _qv = self.sim_quick_mode.view()
+            for _ee_i in (2, 3):
+                _qv.setRowHidden(_ee_i, True)
+                _it = self.sim_quick_mode.model().item(_ee_i)
+                if _it is not None:
+                    _it.setEnabled(False)
+        except Exception:
+            pass
+        gv.addWidget(QLabel("Baseline controller"), 0, 0)
+        gv.addWidget(self.sim_quick_mode, 0, 1, 1, 3)
+
+        # 控制方案（镜像 scheme_combo：direct/CTBR）。
+        self.sim_quick_scheme = QComboBox()
+        for i in range(self.scheme_combo.count()):
+            self.sim_quick_scheme.addItem(self.scheme_combo.itemText(i))
+        gv.addWidget(QLabel("Control scheme"), 1, 0)
+        gv.addWidget(self.sim_quick_scheme, 1, 1, 1, 3)
+
+        # L1 + 扰动开关复选框。
+        self.sim_quick_l1 = QCheckBox("L1 自适应")
+        self.sim_quick_const = QCheckBox("定常力/力矩")
+        self.sim_quick_var = QCheckBox("变化扰动")
+        self.sim_quick_thrust = QCheckBox("推力估计偏差")
+        self.sim_quick_drag = QCheckBox("桨叶气动阻力")
+        self.sim_quick_est = QCheckBox("状态估计噪声")
+        gv.addWidget(self.sim_quick_l1, 2, 0)
+        gv.addWidget(self.sim_quick_const, 2, 1)
+        gv.addWidget(self.sim_quick_var, 2, 2)
+        gv.addWidget(self.sim_quick_thrust, 2, 3)
+        gv.addWidget(self.sim_quick_drag, 3, 0)
+        gv.addWidget(self.sim_quick_est, 3, 1)
+        # 补偿来源镜像（L1 自适应 / 扰动真值 oracle）。
+        self.sim_quick_l1_mode = QComboBox()
+        for _i in range(self.sim_l1_comp_mode.count()):
+            self.sim_quick_l1_mode.addItem(self.sim_l1_comp_mode.itemText(_i))
+        self.sim_quick_l1_mode.setToolTip(self.sim_l1_comp_mode.toolTip())
+        gv.addWidget(self.sim_quick_l1_mode, 3, 2, 1, 2)
+        _hint = QLabel("详细参数见 \"Disturbance\" / \"L1\" 子标签；这里只放最常调的开关。")
+        _hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        _hint.setWordWrap(True)
+        gv.addWidget(_hint, 4, 0, 1, 4)
+
+        self._sim_quick_holder.addWidget(grp)
+
+        # ── 双向同步 ────────────────────────────────────────────────────
+        self._link_quick_combo(self.sim_quick_mode, self.track_mode_combo)
+        self._link_quick_combo(self.sim_quick_scheme, self.scheme_combo)
+        self._link_quick_check(self.sim_quick_l1, self.sim_l1_group)
+        self._link_quick_combo(self.sim_quick_l1_mode, self.sim_l1_comp_mode)
+        self._link_quick_check(self.sim_quick_const, self.dist_const_group)
+        self._link_quick_check(self.sim_quick_var, self.dist_var_group)
+        self._link_quick_check(self.sim_quick_thrust, self.dist_thrust_group)
+        self._link_quick_check(self.sim_quick_drag, self.dist_drag_group)
+        self._link_quick_check(self.sim_quick_est, self.dist_est_group)
+        # 初始化为当前状态。
+        self.sim_quick_l1.setChecked(self.sim_l1_group.isChecked())
+        self.sim_quick_l1_mode.setCurrentIndex(self.sim_l1_comp_mode.currentIndex())
+        self.sim_quick_const.setChecked(self.dist_const_group.isChecked())
+        self.sim_quick_var.setChecked(self.dist_var_group.isChecked())
+        self.sim_quick_thrust.setChecked(self.dist_thrust_group.isChecked())
+        self.sim_quick_drag.setChecked(self.dist_drag_group.isChecked())
+        self.sim_quick_est.setChecked(self.dist_est_group.isChecked())
+        self._sync_sim_quick_mode_items()
+
+    def _link_quick_check(self, quick, group) -> None:
+        """复选框 quick 与 checkable QGroupBox group 双向同步（带递归保护）。"""
+
+        def on_quick(val):
+            if getattr(self, "_sync_guard", False):
+                return
+            self._sync_guard = True
+            try:
+                if group.isChecked() != bool(val):
+                    group.setChecked(bool(val))
+            finally:
+                self._sync_guard = False
+
+        def on_group(val):
+            if getattr(self, "_sync_guard", False):
+                return
+            self._sync_guard = True
+            try:
+                if quick.isChecked() != bool(val):
+                    quick.setChecked(bool(val))
+            finally:
+                self._sync_guard = False
+
+        quick.toggled.connect(on_quick)
+        group.toggled.connect(on_group)
+
+    def _link_quick_combo(self, quick, master) -> None:
+        """两个 combo 的当前项双向同步（带递归保护）。"""
+
+        def on_quick(idx):
+            if getattr(self, "_sync_guard", False):
+                return
+            self._sync_guard = True
+            try:
+                if 0 <= idx < master.count() and master.currentIndex() != idx:
+                    master.setCurrentIndex(idx)
+            finally:
+                self._sync_guard = False
+
+        def on_master(idx):
+            if getattr(self, "_sync_guard", False):
+                return
+            self._sync_guard = True
+            try:
+                if 0 <= idx < quick.count() and quick.currentIndex() != idx:
+                    quick.setCurrentIndex(idx)
+            finally:
+                self._sync_guard = False
+
+        quick.currentIndexChanged.connect(on_quick)
+        master.currentIndexChanged.connect(on_master)
+
+    def _sync_sim_quick_mode_items(self) -> None:
+        """把 track_mode_combo 的项可用性与当前项同步到快捷算法 combo。"""
+        if not hasattr(self, "sim_quick_mode"):
+            return
+        try:
+            src = self.track_mode_combo.model()
+            dst = self.sim_quick_mode.model()
+            for i in range(min(self.track_mode_combo.count(), self.sim_quick_mode.count())):
+                si, di = src.item(i), dst.item(i)
+                if si is not None and di is not None:
+                    di.setEnabled(si.isEnabled())
+            if self.sim_quick_mode.currentIndex() != self.track_mode_combo.currentIndex():
+                self._sync_guard = True
+                try:
+                    self.sim_quick_mode.setCurrentIndex(self.track_mode_combo.currentIndex())
+                finally:
+                    self._sync_guard = False
+        except Exception:
+            pass
+
+    def _collect_track_disturbance(self) -> dict:
+        """从 L1/Disturbance 子标签收集 plant 扰动配置（传给闭环仿真）。"""
+        if not hasattr(self, "dist_const_group"):
+            return {}
+        return {
+            "const_enable": bool(self.dist_const_group.isChecked()),
+            "const_t0": float(self.dist_const_t0.value()),
+            "const_t1": float(self.dist_const_t1.value()),
+            "const_fx": float(self.dist_const_fx.value()),
+            "const_fy": float(self.dist_const_fy.value()),
+            "const_fz": float(self.dist_const_fz.value()),
+            "const_mx": float(self.dist_const_mx.value()),
+            "const_my": float(self.dist_const_my.value()),
+            "const_mz": float(self.dist_const_mz.value()),
+            "var_enable": bool(self.dist_var_group.isChecked()),
+            "var_t0": float(self.dist_var_t0.value()),
+            "var_t1": float(self.dist_var_t1.value()),
+            "var_amp_x": float(self.dist_var_amp_x.value()),
+            "var_amp_y": float(self.dist_var_amp_y.value()),
+            "var_amp_z": float(self.dist_var_amp_z.value()),
+            "var_freq": float(self.dist_var_freq.value()),
+            "var_phase_deg": float(self.dist_var_phase.value()),
+            "thrust_enable": bool(self.dist_thrust_group.isChecked()),
+            "thrust_t0": float(self.dist_thrust_t0.value()),
+            "thrust_t1": float(self.dist_thrust_t1.value()),
+            "thrust_scale": float(self.dist_thrust_scale.value()),
+            "thrust_bias": float(self.dist_thrust_bias.value()),
+            "drag_enable": bool(self.dist_drag_group.isChecked()),
+            "drag_t0": float(self.dist_drag_t0.value()),
+            "drag_t1": float(self.dist_drag_t1.value()),
+            "drag_cd": float(self.dist_drag_cd.value()),
+            "drag_kf": float(self.dist_drag_kf.value()),
+            "drag_wind_x": float(self.dist_drag_wind_x.value()),
+            "drag_wind_y": float(self.dist_drag_wind_y.value()),
+            "drag_wind_z": float(self.dist_drag_wind_z.value()),
+            "est_enable": bool(self.dist_est_group.isChecked()),
+            "est_t0": float(self.dist_est_t0.value()),
+            "est_t1": float(self.dist_est_t1.value()),
+            "est_pos_std": float(self.dist_est_pos_std.value()),
+            "est_att_std": float(self.dist_est_att_std.value()),
+            "est_vel_std": float(self.dist_est_vel_std.value()),
+            "est_omega_std": float(self.dist_est_omega_std.value()),
+        }
+
+    def _collect_track_l1(self) -> dict:
+        """从 L1/Disturbance 子标签收集 L1 自适应配置（传给闭环仿真）。"""
+        if not hasattr(self, "sim_l1_group"):
+            return {"enabled": False}
+        return {
+            "enabled": bool(self.sim_l1_group.isChecked()),
+            "mode": ("oracle" if self.sim_l1_comp_mode.currentIndex() == 1 else "adaptive"),
+            "comp_mode_index": int(self.sim_l1_comp_mode.currentIndex()),
+            "as_gain": float(self.sim_l1_as_gain.value()),
+            "wc_xy": float(self.sim_l1_wc_xy.value()),
+            "wc_z": float(self.sim_l1_wc_z.value()),
+            "tilt_gain": float(self.sim_l1_tilt_gain.value()),
+            "max_accel_xy": float(self.sim_l1_max_accel_xy.value()),
+            "max_accel_z": float(self.sim_l1_max_accel_z.value()),
+            "max_sigma": float(self.sim_l1_max_sigma.value()),
+            "use_pos_feedback": bool(self.sim_l1_use_pos_fb.isChecked()),
+            "k_pos_i_xy": float(self.sim_l1_k_pos_i_xy.value()),
+            "k_pos_i_z": float(self.sim_l1_k_pos_i_z.value()),
+            "k_pos_p_xy": float(self.sim_l1_k_pos_p_xy.value()),
+            "k_pos_p_z": float(self.sim_l1_k_pos_p_z.value()),
+            "max_pos_integral_xy": float(self.sim_l1_max_pos_integral.value()),
+            "max_pos_integral_z": float(self.sim_l1_max_pos_integral.value()),
+        }
+
+    def _apply_track_disturbance(self, d: dict) -> None:
+        """从持久化字典恢复 L1/Disturbance 子标签的扰动控件。"""
+        if not hasattr(self, "dist_const_group") or not isinstance(d, dict):
+            return
+
+        def _sv(key, sb):
+            if key in d and d[key] is not None:
+                try:
+                    sb.setValue(float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+
+        self.dist_const_group.setChecked(bool(d.get("const_enable", False)))
+        for k, sb in (
+            ("const_t0", self.dist_const_t0), ("const_t1", self.dist_const_t1),
+            ("const_fx", self.dist_const_fx), ("const_fy", self.dist_const_fy),
+            ("const_fz", self.dist_const_fz), ("const_mx", self.dist_const_mx),
+            ("const_my", self.dist_const_my), ("const_mz", self.dist_const_mz),
+        ):
+            _sv(k, sb)
+        self.dist_var_group.setChecked(bool(d.get("var_enable", False)))
+        for k, sb in (
+            ("var_t0", self.dist_var_t0), ("var_t1", self.dist_var_t1),
+            ("var_amp_x", self.dist_var_amp_x), ("var_amp_y", self.dist_var_amp_y),
+            ("var_amp_z", self.dist_var_amp_z), ("var_freq", self.dist_var_freq),
+            ("var_phase_deg", self.dist_var_phase),
+        ):
+            _sv(k, sb)
+        self.dist_thrust_group.setChecked(bool(d.get("thrust_enable", False)))
+        for k, sb in (
+            ("thrust_t0", self.dist_thrust_t0), ("thrust_t1", self.dist_thrust_t1),
+            ("thrust_scale", self.dist_thrust_scale), ("thrust_bias", self.dist_thrust_bias),
+        ):
+            _sv(k, sb)
+        self.dist_drag_group.setChecked(bool(d.get("drag_enable", False)))
+        for k, sb in (
+            ("drag_t0", self.dist_drag_t0), ("drag_t1", self.dist_drag_t1),
+            ("drag_cd", self.dist_drag_cd), ("drag_kf", self.dist_drag_kf),
+            ("drag_wind_x", self.dist_drag_wind_x), ("drag_wind_y", self.dist_drag_wind_y),
+            ("drag_wind_z", self.dist_drag_wind_z),
+        ):
+            _sv(k, sb)
+        self.dist_est_group.setChecked(bool(d.get("est_enable", False)))
+        for k, sb in (
+            ("est_t0", self.dist_est_t0), ("est_t1", self.dist_est_t1),
+            ("est_pos_std", self.dist_est_pos_std), ("est_att_std", self.dist_est_att_std),
+            ("est_vel_std", self.dist_est_vel_std), ("est_omega_std", self.dist_est_omega_std),
+        ):
+            _sv(k, sb)
+
+    def _apply_track_l1(self, d: dict) -> None:
+        """从持久化字典恢复 L1/Disturbance 子标签的 L1 控件。"""
+        if not hasattr(self, "sim_l1_group") or not isinstance(d, dict):
+            return
+
+        def _sv(key, sb):
+            if key in d and d[key] is not None:
+                try:
+                    sb.setValue(float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+
+        self.sim_l1_group.setChecked(bool(d.get("enabled", False)))
+        if hasattr(self, "sim_l1_comp_mode"):
+            _ci = d.get("comp_mode_index")
+            if _ci is None:
+                _ci = 1 if str(d.get("mode", "adaptive")).lower() == "oracle" else 0
+            self.sim_l1_comp_mode.setCurrentIndex(int(_ci))
+        for k, sb in (
+            ("as_gain", self.sim_l1_as_gain), ("wc_xy", self.sim_l1_wc_xy),
+            ("wc_z", self.sim_l1_wc_z), ("tilt_gain", self.sim_l1_tilt_gain),
+            ("max_accel_xy", self.sim_l1_max_accel_xy),
+            ("max_accel_z", self.sim_l1_max_accel_z),
+            ("max_sigma", self.sim_l1_max_sigma),
+            ("k_pos_i_xy", self.sim_l1_k_pos_i_xy),
+            ("k_pos_i_z", self.sim_l1_k_pos_i_z),
+            ("k_pos_p_xy", self.sim_l1_k_pos_p_xy),
+            ("k_pos_p_z", self.sim_l1_k_pos_p_z),
+            ("max_pos_integral_xy", self.sim_l1_max_pos_integral),
+        ):
+            _sv(k, sb)
+        self.sim_l1_use_pos_fb.setChecked(bool(d.get("use_pos_feedback", False)))
+
+    def _collect_track_ctbr(self) -> dict:
+        """从 CTBR 子标签收集内环配置（传给闭环仿真）。"""
+        if not hasattr(self, "sim_ctbr_group"):
+            return {"enabled": False}
+        return {
+            "enabled": bool(self.sim_ctbr_group.isChecked()),
+            "lookahead_ms": float(self.sim_ctbr_lookahead.value()),
+            "motor_tau": float(self.sim_ctbr_motor_tau.value()),
+            "kp_rp": float(self.sim_ctbr_kp_rp.value()),
+            "ki_rp": float(self.sim_ctbr_ki_rp.value()),
+            "kd_rp": float(self.sim_ctbr_kd_rp.value()),
+            "kp_yaw": float(self.sim_ctbr_kp_yaw.value()),
+            "ki_yaw": float(self.sim_ctbr_ki_yaw.value()),
+            "kd_yaw": float(self.sim_ctbr_kd_yaw.value()),
+            "max_rate": float(self.sim_ctbr_max_rate.value()),
+            "max_torque": float(self.sim_ctbr_max_torque.value()),
+            "int_limit": float(self.sim_ctbr_int_limit.value()),
+        }
+
+    def _apply_track_ctbr(self, d: dict) -> None:
+        """从持久化字典恢复 CTBR 子标签控件。"""
+        if not hasattr(self, "sim_ctbr_group") or not isinstance(d, dict):
+            return
+
+        def _sv(key, sb):
+            if key in d and d[key] is not None:
+                try:
+                    sb.setValue(float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+
+        self.sim_ctbr_group.setChecked(bool(d.get("enabled", False)))
+        for k, sb in (
+            ("lookahead_ms", self.sim_ctbr_lookahead),
+            ("motor_tau", self.sim_ctbr_motor_tau),
+            ("kp_rp", self.sim_ctbr_kp_rp), ("ki_rp", self.sim_ctbr_ki_rp),
+            ("kd_rp", self.sim_ctbr_kd_rp), ("kp_yaw", self.sim_ctbr_kp_yaw),
+            ("ki_yaw", self.sim_ctbr_ki_yaw), ("kd_yaw", self.sim_ctbr_kd_yaw),
+            ("max_rate", self.sim_ctbr_max_rate),
+            ("max_torque", self.sim_ctbr_max_torque),
+            ("int_limit", self.sim_ctbr_int_limit),
+        ):
+            _sv(k, sb)
 
     def _refresh_sim_plant_controls_state(self) -> None:
         """Enable/disable plant-only simulator widgets (u lag, payload) by tracking mode."""
@@ -5760,6 +6881,12 @@ class UamSuiteGUI(QMainWindow):
             "plan_mode_index": int(self.plan_mode_combo.currentIndex()),
             "method_index": int(self.method_combo.currentIndex()),
             "track_mode_index": int(self.track_mode_combo.currentIndex()),
+            "track_scheme_index": int(self.scheme_combo.currentIndex()) if hasattr(self, "scheme_combo") else 1,
+            "geo_kp_pos": float(self.geo_kp_pos.value()) if hasattr(self, "geo_kp_pos") else 4.0,
+            "geo_kd_vel": float(self.geo_kd_vel.value()) if hasattr(self, "geo_kd_vel") else 2.5,
+            "geo_kR": float(self.geo_kR.value()) if hasattr(self, "geo_kR") else 4.0,
+            "geo_kOmega": float(self.geo_kOmega.value()) if hasattr(self, "geo_kOmega") else 0.35,
+            "geo_max_tilt": float(self.geo_max_tilt.value()) if hasattr(self, "geo_max_tilt") else 35.0,
             "track_mode_layout_version": 2,
             "reg_mode_index": int(self.reg_mode_combo.currentIndex()),
             "control_mode_track_index": int(self.control_mode_track.currentIndex()),
@@ -5769,6 +6896,8 @@ class UamSuiteGUI(QMainWindow):
             ],
             "ee_wp_rows": self._read_ee_rows(),
             "dt_plan": float(self.dt_plan.value()),
+            "plan_hover_pre": float(self.plan_hover_pre.value()),
+            "plan_hover_post": float(self.plan_hover_post.value()),
             "max_iter_plan": int(self.max_iter_plan.value()),
             "state_w": float(self.state_w.value()),
             "ctrl_w": float(self.ctrl_w.value()),
@@ -5871,11 +7000,18 @@ class UamSuiteGUI(QMainWindow):
             "w_joint_vel": float(self.w_joint_vel.value()),
             "w_u_thrust": float(self.w_u_thrust.value()),
             "w_u_joint_torque": float(self.w_u_joint_torque.value()),
+            "track_v_max": float(self.track_v_max.value()),
+            "track_omega_max": float(self.track_omega_max.value()),
+            "track_j_angle_max": float(self.track_j_angle_max.value()),
+            "track_j_vel_max": float(self.track_j_vel_max.value()),
             "croc_use_actuator_first_order": bool(self.croc_use_actuator_first_order.isChecked()),
             "croc_ee_use_thrust_constraints": bool(self.croc_ee_use_thrust_constraints.isChecked()),
             "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
             "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
             "sim_payload_mass": float(self.sim_payload_mass.value()),
+            "track_disturbance": self._collect_track_disturbance(),
+            "track_l1": self._collect_track_l1(),
+            "track_ctbr": self._collect_track_ctbr(),
             "plan_croc_use_actuator_first_order": bool(self.plan_croc_use_actuator_first_order.isChecked()),
             "plan_tau_motor": float(self.plan_tau_motor.value()),
             "plan_tau_joint": float(self.plan_tau_joint.value()),
@@ -5889,6 +7025,7 @@ class UamSuiteGUI(QMainWindow):
             "rn_dt_mpc": float(self.rn_dt_mpc.value()),
             "rn_horizon": int(self.rn_horizon.value()),
             "rn_mpc_max_iter": int(self.rn_mpc_max_iter.value()),
+            "rn_bodyrate_lookahead_ms": float(self.rn_bodyrate_lookahead_ms.value()),
             "rn_w_state_track": float(self.rn_w_state_track.value()),
             "rn_w_state_reg": float(self.rn_w_state_reg.value()),
             "rn_w_control": float(self.rn_w_control.value()),
@@ -5933,6 +7070,7 @@ class UamSuiteGUI(QMainWindow):
             "rn_l1_k_pos_i_xy": float(self.rn_l1_k_pos_i_xy.value()),
             "rn_l1_k_pos_i_z": float(self.rn_l1_k_pos_i_z.value()),
             "rn_l1_max_pos_integral": float(self.rn_l1_max_pos_integral.value()),
+            "rn_drag_ff_enabled": bool(self.rn_drag_ff_enabled.isChecked()),
             "gz_pkg": self.gz_pkg_combo.currentText().strip(),
             "gz_launch_file": self.gz_launch_combo.currentText().strip(),
             "gz_model": self.gz_model_combo.currentText().strip(),
@@ -5941,7 +7079,7 @@ class UamSuiteGUI(QMainWindow):
             "gz_model_index": int(self.gz_model_combo.currentIndex()),
             "gz_model_type_index": int(self.gz_model_type_combo.currentIndex()),
             "gz_world_index": int(self.gz_world_combo.currentIndex()),
-            "gz_launch_args": self.gz_args_edit.text().strip(),
+            "gz_enable_gui": bool(self.gz_enable_gui.isChecked()),
         }
 
     def _apply_params(self, p: dict) -> None:
@@ -5967,6 +7105,8 @@ class UamSuiteGUI(QMainWindow):
                 widget.setCurrentText(str(p[name]))
 
         _set_spin("dt_plan", self.dt_plan)
+        _set_spin("plan_hover_pre", self.plan_hover_pre)
+        _set_spin("plan_hover_post", self.plan_hover_post)
         _set_spin("max_iter_plan", self.max_iter_plan)
         _set_spin("state_w", self.state_w)
         _set_spin("ctrl_w", self.ctrl_w)
@@ -6027,6 +7167,12 @@ class UamSuiteGUI(QMainWindow):
         if hasattr(self, "sim_payload_enable"):
             self._on_sim_payload_enable_toggled(self.sim_payload_enable.isChecked())
             self._refresh_sim_payload_inertia_hint()
+        if isinstance(p.get("track_disturbance"), dict):
+            self._apply_track_disturbance(p["track_disturbance"])
+        if isinstance(p.get("track_l1"), dict):
+            self._apply_track_l1(p["track_l1"])
+        if isinstance(p.get("track_ctbr"), dict):
+            self._apply_track_ctbr(p["track_ctbr"])
         _set_spin("mpc_max_iter", self.mpc_max_iter)
         _set_spin("mpc_log_iv", self.mpc_log_iv)
         _set_spin("tau_thrust_track", self.tau_thrust_track)
@@ -6047,6 +7193,10 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("w_joint_vel", self.w_joint_vel)
         _set_spin("w_u_thrust", self.w_u_thrust)
         _set_spin("w_u_joint_torque", self.w_u_joint_torque)
+        _set_spin("track_v_max", self.track_v_max)
+        _set_spin("track_omega_max", self.track_omega_max)
+        _set_spin("track_j_angle_max", self.track_j_angle_max)
+        _set_spin("track_j_vel_max", self.track_j_vel_max)
         _set_spin("plan_tau_motor", self.plan_tau_motor)
         _set_spin("plan_tau_joint", self.plan_tau_joint)
         # Backward compatibility with earlier naming.
@@ -6066,6 +7216,7 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("rn_dt_mpc", self.rn_dt_mpc)
         _set_spin("rn_horizon", self.rn_horizon)
         _set_spin("rn_mpc_max_iter", self.rn_mpc_max_iter)
+        _set_spin("rn_bodyrate_lookahead_ms", self.rn_bodyrate_lookahead_ms)
         _set_spin("rn_w_state_track", self.rn_w_state_track)
         _set_spin("rn_w_state_reg", self.rn_w_state_reg)
         _set_spin("rn_w_control", self.rn_w_control)
@@ -6105,6 +7256,8 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("rn_l1_k_pos_i_xy", self.rn_l1_k_pos_i_xy)
         _set_spin("rn_l1_k_pos_i_z", self.rn_l1_k_pos_i_z)
         _set_spin("rn_l1_max_pos_integral", self.rn_l1_max_pos_integral)
+        if "rn_drag_ff_enabled" in p:
+            self.rn_drag_ff_enabled.setChecked(bool(p["rn_drag_ff_enabled"]))
         if isinstance(p.get("rn_mpc_weight_profiles"), dict) and hasattr(
             self, "_rn_mpc_weight_profiles"
         ):
@@ -6125,7 +7278,8 @@ class UamSuiteGUI(QMainWindow):
         _set_combo_text("gz_model", self.gz_model_combo)
         _set_combo_text("gz_model_type", self.gz_model_type_combo)
         _set_combo_text("gz_world", self.gz_world_combo)
-        _set_text("gz_launch_args", self.gz_args_edit)
+        if "gz_enable_gui" in p:
+            self.gz_enable_gui.setChecked(bool(p["gz_enable_gui"]))
 
         def _set_combo(name: str, widget):
             if name in p:
@@ -6153,6 +7307,14 @@ class UamSuiteGUI(QMainWindow):
                     idx = 3
             if 0 <= idx < self.track_mode_combo.count():
                 self.track_mode_combo.setCurrentIndex(idx)
+        if hasattr(self, "scheme_combo"):
+            _set_combo("track_scheme_index", self.scheme_combo)
+        if hasattr(self, "geo_kp_pos"):
+            _set_spin("geo_kp_pos", self.geo_kp_pos)
+            _set_spin("geo_kd_vel", self.geo_kd_vel)
+            _set_spin("geo_kR", self.geo_kR)
+            _set_spin("geo_kOmega", self.geo_kOmega)
+            _set_spin("geo_max_tilt", self.geo_max_tilt)
         _set_combo("reg_mode_index", self.reg_mode_combo)
         _set_combo("control_mode_track_index", self.control_mode_track)
         _set_combo("track_sim_control_stack_index", self.track_sim_control_stack)
@@ -6263,6 +7425,8 @@ class UamSuiteGUI(QMainWindow):
                 "wp_rows",
                 "ee_wp_rows",
                 "dt_plan",
+                "plan_hover_pre",
+                "plan_hover_post",
                 "max_iter_plan",
                 "state_w",
                 "ctrl_w",
@@ -6326,6 +7490,12 @@ class UamSuiteGUI(QMainWindow):
                 "version",
                 "track_mode_index",
                 "track_mode_layout_version",
+                "track_scheme_index",
+                "geo_kp_pos",
+                "geo_kd_vel",
+                "geo_kR",
+                "geo_kOmega",
+                "geo_max_tilt",
                 "reg_mode_index",
                 "control_mode_track_index",
                 "T_sim",
@@ -6364,11 +7534,17 @@ class UamSuiteGUI(QMainWindow):
                 "w_joint_vel",
                 "w_u_thrust",
                 "w_u_joint_torque",
+                "track_v_max",
+                "track_omega_max",
+                "track_j_angle_max",
+                "track_j_vel_max",
                 "croc_use_actuator_first_order",
                 "croc_ee_use_thrust_constraints",
                 "sim_payload_enable",
                 "sim_payload_t_grasp",
                 "sim_payload_mass",
+                "track_disturbance",
+                "track_l1",
                 "reg_full_x0",
                 "reg_full_xref",
                 "reg_ee_x0",
@@ -6382,6 +7558,7 @@ class UamSuiteGUI(QMainWindow):
                 "rn_dt_mpc",
                 "rn_horizon",
                 "rn_mpc_max_iter",
+                "rn_bodyrate_lookahead_ms",
                 "rn_w_state_track",
                 "rn_w_state_reg",
                 "rn_w_control",
@@ -6419,6 +7596,7 @@ class UamSuiteGUI(QMainWindow):
                 "rn_l1_k_pos_i_xy",
                 "rn_l1_k_pos_i_z",
                 "rn_l1_max_pos_integral",
+                "rn_drag_ff_enabled",
                 "gz_pkg",
                 "gz_launch_file",
                 "gz_model",
@@ -6427,7 +7605,7 @@ class UamSuiteGUI(QMainWindow):
                 "gz_model_index",
                 "gz_model_type_index",
                 "gz_world_index",
-                "gz_launch_args",
+                "gz_enable_gui",
             }
         return {"version"}
 
@@ -6866,6 +8044,157 @@ class UamSuiteGUI(QMainWindow):
             pass
         self._start_meshcat_playback(X, dt, traj_points=traj)
 
+    def _hover_control_for_state(self, x_state: np.ndarray, n_u: int) -> "np.ndarray | None":
+        """悬停配平控制：四旋翼等推力 m·g/4，机械臂关节用该位形的广义重力补偿力矩。
+
+        用于规划首/末追加的悬停段，使两段悬停的 u 都是物理静止配平（四 u 相等），
+        而非复制轨迹端点的机动控制。失败时返回 None（回退到端点复制）。
+        """
+        try:
+            import pinocchio as pin
+
+            rm, _ = self._robot_model_and_ee()
+            data = rm.createData()
+            mass = float(pin.computeTotalMass(rm))
+            q = np.asarray(x_state, dtype=float).flatten()[: rm.nq]
+            u = np.zeros(int(n_u), dtype=float)
+            n_rotors = 4
+            u[:n_rotors] = mass * 9.81 / n_rotors
+            n_arm = int(n_u) - n_rotors
+            if n_arm > 0:
+                g_gen = np.asarray(pin.computeGeneralizedGravity(rm, data, q), dtype=float)
+                if g_gen.size >= 6 + n_arm:
+                    u[n_rotors:n_rotors + n_arm] = g_gen[6:6 + n_arm]
+            return u
+        except Exception:
+            return None
+
+    def _apply_plan_hover_padding(self, pb: object) -> object:
+        """在规划轨迹首/末追加静止悬停段（Trajectory setting 的 Hover before/after）。
+
+        full-state：复制首/末整状态并将速度段清零（真正静止）；ee_snap：复制首/末
+        位置与 yaw，速度/加速度补零，并整体平移航点时间 t_wp。0 表示不追加。
+        """
+        if not isinstance(pb, dict):
+            return pb
+        pre = float(self.plan_hover_pre.value())
+        post = float(self.plan_hover_post.value())
+        if pre <= 0.0 and post <= 0.0:
+            return pb
+        kind = pb.get("kind")
+
+        def _n_steps(dt: float) -> tuple[int, int]:
+            return int(round(pre / dt)), int(round(post / dt))
+
+        if kind in ("full_croc", "full_acados"):
+            t = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+            x = np.asarray(pb.get("x_plan"), dtype=float)
+            if t.size < 2 or x.ndim != 2 or x.shape[0] != t.size:
+                return pb
+            dt = float(np.median(np.diff(t)))
+            if not np.isfinite(dt) or dt <= 0.0:
+                dt = float(self.dt_plan.value())
+            n_pre, n_post = _n_steps(dt)
+            if n_pre <= 0 and n_post <= 0:
+                return pb
+            try:
+                rm, _ = self._robot_model_and_ee()
+                nq, nv = int(rm.nq), int(rm.nv)
+            except Exception:
+                nq = nv = None
+            x_first = x[0:1].copy()
+            x_last = x[-1:].copy()
+            if nq is not None and nv is not None and x.shape[1] >= nq + nv:
+                x_first[0, nq:nq + nv] = 0.0  # 悬停：速度清零
+                x_last[0, nq:nq + nv] = 0.0
+            blocks = []
+            if n_pre > 0:
+                blocks.append(np.repeat(x_first, n_pre, axis=0))
+            blocks.append(x)
+            if n_post > 0:
+                blocks.append(np.repeat(x_last, n_post, axis=0))
+            x_new = np.vstack(blocks)
+            t_new = np.arange(x_new.shape[0], dtype=float) * dt
+            pb["t_plan"] = t_new
+            pb["x_plan"] = x_new
+            u = pb.get("u_plan")
+            if isinstance(u, np.ndarray) and u.ndim == 2 and u.shape[0] >= 1:
+                ncols = u.shape[1]
+                # 悬停段控制用静止配平（四 u 相等）；失败回退复制端点。
+                u_hover_pre = self._hover_control_for_state(x_first[0], ncols)
+                u_hover_post = self._hover_control_for_state(x_last[0], ncols)
+                row_pre = (u_hover_pre.reshape(1, -1) if u_hover_pre is not None
+                           else u[0:1])
+                row_post = (u_hover_post.reshape(1, -1) if u_hover_post is not None
+                            else u[-1:])
+                ub = []
+                if n_pre > 0:
+                    ub.append(np.repeat(row_pre, n_pre, axis=0))
+                ub.append(u)
+                if n_post > 0:
+                    ub.append(np.repeat(row_post, n_post, axis=0))
+                pb["u_plan"] = np.vstack(ub)
+            pb["hover_pre_s"] = n_pre * dt
+            pb["hover_post_s"] = n_post * dt
+            self.log(
+                f"[planning] 追加悬停段：前 {n_pre*dt:.2f}s / 后 {n_post*dt:.2f}s "
+                f"(dt={dt:.4f}s)。"
+            )
+        elif kind == "ee_snap":
+            t = np.asarray(pb.get("t_ref"), dtype=float).flatten()
+            if t.size < 2:
+                return pb
+            dt = float(np.median(np.diff(t)))
+            if not np.isfinite(dt) or dt <= 0.0:
+                dt = float(self.dt_plan.value())
+            n_pre, n_post = _n_steps(dt)
+            if n_pre <= 0 and n_post <= 0:
+                return pb
+
+            def _pad(arr, zero=False):
+                if arr is None:
+                    return None
+                a = np.asarray(arr, dtype=float)
+                if a.ndim == 1:
+                    f = np.zeros_like(a[0:1]) if zero else a[0:1]
+                    l = np.zeros_like(a[-1:]) if zero else a[-1:]
+                    parts = ([np.repeat(f, n_pre)] if n_pre > 0 else []) + [a] + \
+                            ([np.repeat(l, n_post)] if n_post > 0 else [])
+                    return np.concatenate(parts)
+                f = np.zeros_like(a[0:1]) if zero else a[0:1]
+                l = np.zeros_like(a[-1:]) if zero else a[-1:]
+                parts = ([np.repeat(f, n_pre, axis=0)] if n_pre > 0 else []) + [a] + \
+                        ([np.repeat(l, n_post, axis=0)] if n_post > 0 else [])
+                return np.vstack(parts)
+
+            p_ref = _pad(pb.get("p_ref"))
+            yaw_ref = _pad(pb.get("yaw_ref"))
+            t_new = np.arange(p_ref.shape[0], dtype=float) * dt
+            pb["t_ref"] = t_new
+            pb["p_ref"] = p_ref
+            pb["yaw_ref"] = yaw_ref
+            if pb.get("dp_ref") is not None:
+                pb["dp_ref"] = _pad(pb["dp_ref"], zero=True)
+            if pb.get("ddp_ref") is not None:
+                pb["ddp_ref"] = _pad(pb["ddp_ref"], zero=True)
+            if pb.get("dyaw_ref") is not None:
+                pb["dyaw_ref"] = _pad(pb["dyaw_ref"], zero=True)
+            if pb.get("t_wp") is not None:
+                pb["t_wp"] = np.asarray(pb["t_wp"], dtype=float).flatten() + n_pre * dt
+            u = pb.get("u_plan")
+            if isinstance(u, np.ndarray) and u.ndim == 2 and u.shape[0] >= 1:
+                ncols = u.shape[1]
+                pad_pre = np.zeros((n_pre, ncols), dtype=float)
+                pad_post = np.zeros((n_post, ncols), dtype=float)
+                pb["u_plan"] = np.vstack([pad_pre, u, pad_post])
+            pb["hover_pre_s"] = n_pre * dt
+            pb["hover_post_s"] = n_post * dt
+            self.log(
+                f"[planning] 追加悬停段：前 {n_pre*dt:.2f}s / 后 {n_post*dt:.2f}s "
+                f"(dt={dt:.4f}s)。"
+            )
+        return pb
+
     def _on_plan_finished(self, ok: bool, err: str, result_data: object):
         self.task_generate_btn.setEnabled(True)
         if not ok:
@@ -6916,6 +8245,9 @@ class UamSuiteGUI(QMainWindow):
             }
         else:
             self._plan_bundle = None
+
+        if self._plan_bundle is not None:
+            self._plan_bundle = self._apply_plan_hover_padding(self._plan_bundle)
 
         cache = None
         if result_data.get("method") == "crocoddyl" and result_data.get("planner"):
@@ -7136,6 +8468,7 @@ class UamSuiteGUI(QMainWindow):
             "waypoints": None,
             "t_wp": None,
         }
+        self._plan_bundle = self._apply_plan_hover_padding(self._plan_bundle)
         self._last_track_res = None
         self._redraw_combined_views(None)
         self._update_track_mode_enabled()
@@ -7178,6 +8511,7 @@ class UamSuiteGUI(QMainWindow):
             "waypoints": payload["waypoints_xyz_yaw"],
             "t_wp": payload["t_wp"],
         }
+        self._plan_bundle = self._apply_plan_hover_padding(self._plan_bundle)
         self._last_track_res = None
         self._redraw_combined_views(None)
         self._update_track_mode_enabled()
@@ -7206,6 +8540,9 @@ class UamSuiteGUI(QMainWindow):
             self._on_track_mode_changed()
             return
         full = self._plan_bundle["kind"] in ("full_croc", "full_acados")
+        is_s500 = self._is_s500_mode()
+        # s500 has no arm: EE-centric (2) and Croc EE pose (3) are UAM-only.
+        ee_ok = not is_s500
         try:
             it = self.track_mode_combo.model().item(0)
             if it is not None:
@@ -7213,14 +8550,25 @@ class UamSuiteGUI(QMainWindow):
             it_acados_full = self.track_mode_combo.model().item(1)
             if it_acados_full is not None:
                 it_acados_full.setEnabled(full and self._EE_MPC_OK)
+            it_ee_acados = self.track_mode_combo.model().item(2)
+            if it_ee_acados is not None:
+                it_ee_acados.setEnabled(ee_ok and self._EE_MPC_OK)
             it2 = self.track_mode_combo.model().item(3)
             if it2 is not None:
-                it2.setEnabled(self._CROC_EE_OK)
+                it2.setEnabled(ee_ok and self._CROC_EE_OK)
+            it_geo = self.track_mode_combo.model().item(4)
+            if it_geo is not None:
+                it_geo.setEnabled(full and self._EE_MPC_OK)
         except Exception:
             pass
-        if not full and self.track_mode_combo.currentIndex() in (0, 1):
-            self.track_mode_combo.setCurrentIndex(2)
+        cur = int(self.track_mode_combo.currentIndex())
+        if is_s500 and cur in (2, 3):
+            # Fall back to a full-state tracker for s500.
+            self.track_mode_combo.setCurrentIndex(0 if full else 1)
+        elif not full and cur in (0, 1, 4):
+            self.track_mode_combo.setCurrentIndex(2 if ee_ok else 0)
         self._on_track_mode_changed()
+        self._sync_sim_quick_mode_items()
 
     def _run_regulation(self):
         mode = int(self.reg_mode_combo.currentIndex())
@@ -7246,6 +8594,7 @@ class UamSuiteGUI(QMainWindow):
                 "t_plan": np.array([0.0, T_sim], dtype=float),
                 "x_plan": np.vstack([x_ref, x_ref]),
                 "x_nom": x_ref.copy(),
+                "urdf_path": self._selected_robot_urdf_path(),
                 "T_sim": T_sim,
                 "sim_dt": sim_dt,
                 "control_dt": self.control_dt.value(),
@@ -7544,6 +8893,7 @@ class UamSuiteGUI(QMainWindow):
         self.rn_dt_mpc.setEnabled(use_mpc_params)
         self.rn_horizon.setEnabled(use_mpc_params)
         self.rn_mpc_max_iter.setEnabled(use_mpc_params)
+        self.rn_bodyrate_lookahead_ms.setEnabled(use_mpc_params)
         # 切换模式后刷新依赖节点的服务按钮可用性（仅在节点运行时启用）
         if hasattr(self, "rn_start_svc_btn"):
             running = self._rn_process is not None and self._rn_process.poll() is None
@@ -7659,10 +9009,10 @@ class UamSuiteGUI(QMainWindow):
     def _start_ros_gazebo(self) -> None:
         pkg = self.gz_pkg_combo.currentText().strip() if hasattr(self, "gz_pkg_combo") else ""
         launch_file = self.gz_launch_combo.currentText().strip() if hasattr(self, "gz_launch_combo") else ""
-        args = self.gz_args_edit.text().strip() if hasattr(self, "gz_args_edit") else ""
         model = self.gz_model_combo.currentText().strip() if hasattr(self, "gz_model_combo") else ""
         model_type = self.gz_model_type_combo.currentText().strip() if hasattr(self, "gz_model_type_combo") else ""
         world = self.gz_world_combo.currentText().strip() if hasattr(self, "gz_world_combo") else ""
+        enable_gui = self.gz_enable_gui.isChecked() if hasattr(self, "gz_enable_gui") else True
         if not pkg or not launch_file:
             QMessageBox.warning(self, "Error", "Gazebo 启动参数不完整（package/launch file）。")
             return
@@ -7676,18 +9026,15 @@ class UamSuiteGUI(QMainWindow):
             cmd.append(f"model_type:={model_type}")
         if model:
             cmd.append(f"robot_model:={model}")
-        if args:
-            cmd.extend(args.split())
+        # gui:=false → 只跑物理引擎 gzserver，不开图形窗口（用 RViz 观察）
+        cmd.append(f"gui:={'true' if enable_gui else 'false'}")
+        if not enable_gui:
+            self.log("[Gazebo] GUI 窗口关闭 (gui:=false)，仅运行 gzserver；请用 RViz 观察。")
         sdf_path, sdf_note = _predict_gazebo_spawn_sdf_path(launch_file, model_type)
         if sdf_path:
             self.log(f"[Gazebo] Spawn SDF (expected): {sdf_path} ({sdf_note})")
         else:
             self.log(f"[Gazebo] SDF path: {sdf_note}")
-        if args and ("sdf:=" in args or "sdf_file:=" in args):
-            self.log(
-                "[Gazebo] Note: extra args may override the default SDF; "
-                "the path above matches the launch file defaults only."
-            )
         # 把本项目 models/ 目录加入 GAZEBO_MODEL_PATH，使 SDF 里的 model://s500_uam
         # 等 mesh 资源能被解析，不再依赖 eagle_mpc_debugger 的环境设置。
         gz_env = os.environ.copy()
@@ -7973,6 +9320,7 @@ class UamSuiteGUI(QMainWindow):
             f"_dt_mpc:={self.rn_dt_mpc.value()}",
             f"_horizon:={self.rn_horizon.value()}",
             f"_mpc_max_iter:={self.rn_mpc_max_iter.value()}",
+            f"_bodyrate_lookahead_ms:={self.rn_bodyrate_lookahead_ms.value()}",
             f"_w_state_track:={self.rn_w_state_track.value()}",
             f"_w_state_reg:={self.rn_w_state_reg.value()}",
             f"_w_control:={self.rn_w_control.value()}",
@@ -8014,6 +9362,7 @@ class UamSuiteGUI(QMainWindow):
             f"_l1_k_pos_i_xy:={self.rn_l1_k_pos_i_xy.value()}",
             f"_l1_k_pos_i_z:={self.rn_l1_k_pos_i_z.value()}",
             f"_l1_max_pos_integral:={self.rn_l1_max_pos_integral.value()}",
+            f"_drag_ff_enabled:={'true' if self.rn_drag_ff_enabled.isChecked() else 'false'}",
             "_viz_robot_markers:=false",
             "_viz_ee_axes:=false",
         ]
@@ -8331,6 +9680,9 @@ class UamSuiteGUI(QMainWindow):
                     f"L1 ON  |σ̂|={sig:.2f} m/s²  |a_ac|={ac:.2f} m/s²"
                 )
                 self.rn_l1_status_label.setStyleSheet("color: #2e7d32; font-size: 11px;")
+            elif ms.get("drag_ff_enabled"):
+                self.rn_l1_status_label.setText("TRUE-DRAG feedforward ON (L1 off)")
+                self.rn_l1_status_label.setStyleSheet("color: #6a1b9a; font-size: 11px;")
             else:
                 self.rn_l1_status_label.setText("L1 OFF")
                 self.rn_l1_status_label.setStyleSheet("color: gray; font-size: 11px;")
@@ -8346,6 +9698,17 @@ class UamSuiteGUI(QMainWindow):
                 )
                 self.rn_l1_force_label.setStyleSheet(
                     "color: #1565c0; font-size: 11px; font-weight: bold;"
+                )
+            elif ms_fresh and ms.get("drag_ff_enabled"):
+                fx = float(ms.get("drag_force_x", 0.0))
+                fy = float(ms.get("drag_force_y", 0.0))
+                fz = float(ms.get("drag_force_z", 0.0))
+                fn = float(np.linalg.norm([fx, fy, fz]))
+                self.rn_l1_force_label.setText(
+                    f"F_drag(true): Fx={fx:+.2f}  Fy={fy:+.2f}  Fz={fz:+.2f}  |F|={fn:.2f} N"
+                )
+                self.rn_l1_force_label.setStyleSheet(
+                    "color: #6a1b9a; font-size: 11px; font-weight: bold;"
                 )
             else:
                 self.rn_l1_force_label.setText("F_est: —")
@@ -8487,6 +9850,7 @@ class UamSuiteGUI(QMainWindow):
             "rn_start_svc_btn", "rn_stop_svc_btn", "rn_save_svc_btn",
             "rn_update_ctrl_btn", "rn_update_traj_btn",
             "rn_l1_svc_on_btn", "rn_l1_svc_off_btn",
+            "rn_drag_ff_svc_on_btn", "rn_drag_ff_svc_off_btn",
         ):
             btn = getattr(self, name, None)
             if btn is not None:
@@ -8636,6 +10000,203 @@ class UamSuiteGUI(QMainWindow):
         except Exception as e:
             self.log(f"[image] 无法显示 {png_path}: {e}")
 
+    def _show_rate_step_response(self):
+        """用当前 CTBR 角速度环参数仿真 roll/pitch/yaw 三轴角速度阶跃响应并弹窗显示。
+
+        简化每轴闭环模型（与后端 CTBR 一致的离散控制率 + 电机一阶滞后）：
+            每 control_dt：ω̇_des = Kp·e + Ki·∫e + Kd·ė（e=ω_sp−ω，∫ 带 anti-windup）
+            每 sim_dt：电机一阶 a_motor += (1−e^(−sim_dt/τ_m))·(ω̇_des − a_motor)；ω += sim_dt·a_motor
+        分配按 plant 控制有效性求解为理想（除电机滞后外 ω̇≈ω̇_des），故此处用归一化加速度模型即可。
+        """
+        try:
+            import numpy as np
+            from PyQt5.QtWidgets import QDialog, QVBoxLayout
+
+            sim_dt = max(float(self.sim_dt.value()), 1e-4)
+            control_dt = max(float(self.control_dt.value()), sim_dt)
+            motor_tau = float(self.sim_ctbr_motor_tau.value())
+            int_limit = float(self.sim_ctbr_int_limit.value())
+            max_rate = float(self.sim_ctbr_max_rate.value())
+            max_acc = float(self.sim_ctbr_max_torque.value())  # 新语义：角加速度限幅
+            gains = {
+                "roll": (float(self.sim_ctbr_kp_rp.value()),
+                         float(self.sim_ctbr_ki_rp.value()),
+                         float(self.sim_ctbr_kd_rp.value())),
+                "pitch": (float(self.sim_ctbr_kp_rp.value()),
+                          float(self.sim_ctbr_ki_rp.value()),
+                          float(self.sim_ctbr_kd_rp.value())),
+                "yaw": (float(self.sim_ctbr_kp_yaw.value()),
+                        float(self.sim_ctbr_ki_yaw.value()),
+                        float(self.sim_ctbr_kd_yaw.value())),
+            }
+            step = 1.0
+            if max_rate > 0.0:
+                step = min(step, max_rate)
+            T = 1.5
+            n = max(2, int(round(T / sim_dt)))
+            n_inner = max(1, int(round(control_dt / sim_dt)))
+            t = np.arange(n) * sim_dt
+            alpha_m = (1.0 - np.exp(-sim_dt / max(motor_tau, 1e-9))
+                       if motor_tau > 1e-9 else 1.0)
+
+            def _sim(kp, ki, kd):
+                omega = 0.0
+                integ = 0.0
+                prev_e = None
+                a_des = 0.0
+                a_motor = 0.0
+                out = np.zeros(n)
+                for k in range(n):
+                    if k % n_inner == 0:
+                        e = step - omega
+                        integ += control_dt * e
+                        if int_limit > 0.0:
+                            integ = float(np.clip(integ, -int_limit, int_limit))
+                        de = 0.0 if prev_e is None else (e - prev_e) / control_dt
+                        prev_e = e
+                        a_des = kp * e + ki * integ + kd * de
+                        if max_acc > 0.0:
+                            a_des = float(np.clip(a_des, -max_acc, max_acc))
+                    a_motor += alpha_m * (a_des - a_motor)
+                    omega += sim_dt * a_motor
+                    out[k] = omega
+                return out
+
+            def _metrics(y):
+                yf = step
+                # 上升时间 10%→90%
+                try:
+                    i10 = int(np.argmax(y >= 0.1 * yf))
+                    i90 = int(np.argmax(y >= 0.9 * yf))
+                    rise = (t[i90] - t[i10]) * 1e3 if i90 > i10 else float("nan")
+                except Exception:
+                    rise = float("nan")
+                over = (np.max(y) - yf) / yf * 100.0 if yf != 0 else 0.0
+                # 2% 调节时间
+                tol = 0.02 * abs(yf)
+                settle = float("nan")
+                for k in range(n - 1, -1, -1):
+                    if abs(y[k] - yf) > tol:
+                        settle = t[k + 1] * 1e3 if k + 1 < n else t[k] * 1e3
+                        break
+                return rise, over, settle
+
+            fig = Figure(figsize=(8.5, 4.6), tight_layout=True)
+            ax = fig.add_subplot(111)
+            colors = {"roll": "tab:blue", "pitch": "tab:green", "yaw": "tab:red"}
+            for name, (kp, ki, kd) in gains.items():
+                y = _sim(kp, ki, kd)
+                rise, over, settle = _metrics(y)
+                ax.plot(
+                    t, y, color=colors[name], lw=1.8,
+                    label=(f"{name} (Kp={kp:g},Ki={ki:g},Kd={kd:g}) | "
+                           f"tr={rise:.0f}ms, OS={over:.0f}%, ts={settle:.0f}ms"),
+                )
+            ax.axhline(step, color="gray", ls="--", lw=0.8)
+            ax.axhline(0.98 * step, color="gray", ls=":", lw=0.6)
+            ax.axhline(1.02 * step, color="gray", ls=":", lw=0.6)
+            ax.set_xlabel("t [s]")
+            ax.set_ylabel("body rate ω [rad/s]")
+            ax.set_title(
+                f"CTBR rate-loop step response (sp={step:g} rad/s, "
+                f"ctrl={1.0/control_dt:.0f}Hz, τ_motor={motor_tau*1e3:.0f}ms)"
+            )
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8, loc="lower right")
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Rate controller — 阶跃响应")
+            lay = QVBoxLayout(dlg)
+            cv = FigureCanvas(fig)
+            lay.addWidget(NavigationToolbar(cv, dlg))
+            lay.addWidget(cv)
+            dlg.resize(900, 560)
+            dlg.exec_()
+        except Exception as e:
+            import traceback
+            self.log(f"[rate-step] 失败: {e}\n{traceback.format_exc()}")
+
+    def _show_motor_step_response(self):
+        """用当前电机时间常数 motor_tau 仿真单电机推力一阶阶跃响应并弹窗显示。
+
+        模型与后端 CTBR 电机滞后一致（按 sim_dt 离散一阶）：
+            u += (1 − e^(−sim_dt/τ_m))·(u_cmd − u)
+        阶跃从悬停推力跳到 80% 满推力，标注 τ/上升时间/调节时间。
+        """
+        try:
+            import numpy as np
+            from PyQt5.QtWidgets import QDialog, QVBoxLayout
+
+            sim_dt = max(float(self.sim_dt.value()), 1e-4)
+            motor_tau = float(self.sim_ctbr_motor_tau.value())
+
+            # 阶跃幅度参考真实推力范围（悬停 → 80% 满推力）。
+            u_lo, u_hi = 0.0, 1.0
+            try:
+                from s500_uam_acados_state_tracking_mpc import load_s500_config
+                plat = load_s500_config()["platform"]
+                u_lo = float(plat.get("min_thrust", 0.0))
+                u_hi = 0.8 * float(plat["max_thrust"])
+            except Exception:
+                pass
+            T = max(0.3, 8.0 * max(motor_tau, sim_dt))
+            n = max(2, int(round(T / sim_dt)))
+            t = np.arange(n) * sim_dt
+            alpha_m = (1.0 - np.exp(-sim_dt / max(motor_tau, 1e-9))
+                       if motor_tau > 1e-9 else 1.0)
+
+            u = u_lo
+            y = np.zeros(n)
+            for k in range(n):
+                u += alpha_m * (u_hi - u)
+                y[k] = u
+            span = u_hi - u_lo
+
+            def _t_at(frac):
+                thr = u_lo + frac * span
+                idx = int(np.argmax(y >= thr))
+                return t[idx] if y[idx] >= thr else float("nan")
+
+            t10, t90 = _t_at(0.1), _t_at(0.9)
+            rise = (t90 - t10) * 1e3 if np.isfinite(t90) and np.isfinite(t10) else float("nan")
+            # 2% 调节时间
+            tol = 0.02 * abs(span)
+            settle = float("nan")
+            for k in range(n - 1, -1, -1):
+                if abs(y[k] - u_hi) > tol:
+                    settle = (t[k + 1] if k + 1 < n else t[k]) * 1e3
+                    break
+
+            fig = Figure(figsize=(8.0, 4.2), tight_layout=True)
+            ax = fig.add_subplot(111)
+            ax.plot(t, y, color="tab:blue", lw=1.8,
+                    label=f"motor (τ={motor_tau*1e3:.0f}ms) | tr={rise:.0f}ms, ts(2%)={settle:.0f}ms")
+            ax.axhline(u_hi, color="gray", ls="--", lw=0.8, label="cmd")
+            ax.axhline(u_lo + 0.98 * span, color="gray", ls=":", lw=0.6)
+            ax.axhline(u_lo + 0.632 * span, color="tab:red", ls=":", lw=0.8,
+                       label="63.2% (=τ)")
+            if motor_tau > 1e-9:
+                ax.axvline(motor_tau, color="tab:red", ls=":", lw=0.8)
+            ax.set_xlabel("t [s]")
+            ax.set_ylabel("rotor thrust [N]")
+            ax.set_title(
+                f"Motor first-order step response (τ={motor_tau*1e3:.0f}ms, sim_dt={sim_dt*1e3:.1f}ms)"
+            )
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8, loc="lower right")
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Motor — 阶跃响应")
+            lay = QVBoxLayout(dlg)
+            cv = FigureCanvas(fig)
+            lay.addWidget(NavigationToolbar(cv, dlg))
+            lay.addWidget(cv)
+            dlg.resize(860, 520)
+            dlg.exec_()
+        except Exception as e:
+            import traceback
+            self.log(f"[motor-step] 失败: {e}\n{traceback.format_exc()}")
+
     def _call_set_l1_enabled_service(self, enabled: bool):
         """调用 /set_l1_enabled (std_srvs/SetBool) 在线开关 L1 增广。"""
         import threading
@@ -8665,6 +10226,47 @@ class UamSuiteGUI(QMainWindow):
                         )
             except Exception as e:
                 msg = f"[/set_l1_enabled] ERROR: {e}"
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _call_set_drag_ff_enabled_service(self, enabled: bool):
+        """调用 /set_drag_ff_enabled (std_srvs/SetBool) 在线开关真值阻力前馈补偿。"""
+        import threading
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _run():
+            try:
+                import rospy
+                from std_srvs.srv import SetBool
+
+                if not self._ensure_ros_node():
+                    msg = "[/set_drag_ff_enabled] ERROR: ROS master 不可用"
+                else:
+                    rospy.wait_for_service("/set_drag_ff_enabled", timeout=5.0)
+                    resp = rospy.ServiceProxy("/set_drag_ff_enabled", SetBool)(bool(enabled))
+                    state = "ON" if enabled else "OFF"
+                    msg = (
+                        f"[/set_drag_ff_enabled {state}] "
+                        f"{'OK' if resp.success else 'FAIL'}: {resp.message}"
+                    )
+                    if resp.success:
+                        QMetaObject.invokeMethod(
+                            self.rn_drag_ff_enabled,
+                            "setChecked",
+                            Qt.QueuedConnection,
+                            Q_ARG(bool, bool(enabled)),
+                        )
+                        if enabled:
+                            # L1 与真值前馈互斥，前端同步取消 L1 勾选
+                            QMetaObject.invokeMethod(
+                                self.rn_l1_enabled,
+                                "setChecked",
+                                Qt.QueuedConnection,
+                                Q_ARG(bool, False),
+                            )
+            except Exception as e:
+                msg = f"[/set_drag_ff_enabled] ERROR: {e}"
             QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
 
         threading.Thread(target=_run, daemon=True).start()
@@ -8788,6 +10390,7 @@ class UamSuiteGUI(QMainWindow):
             "dt_mpc": float(self.rn_dt_mpc.value()),
             "horizon": int(self.rn_horizon.value()),
             "mpc_max_iter": int(self.rn_mpc_max_iter.value()),
+            "bodyrate_lookahead_ms": float(self.rn_bodyrate_lookahead_ms.value()),
             "w_state_track": float(self.rn_w_state_track.value()),
             "w_state_reg": float(self.rn_w_state_reg.value()),
             "w_control": float(self.rn_w_control.value()),
@@ -8829,6 +10432,7 @@ class UamSuiteGUI(QMainWindow):
             "l1_k_pos_i_xy": float(self.rn_l1_k_pos_i_xy.value()),
             "l1_k_pos_i_z": float(self.rn_l1_k_pos_i_z.value()),
             "l1_max_pos_integral": float(self.rn_l1_max_pos_integral.value()),
+            "drag_ff_enabled": bool(self.rn_drag_ff_enabled.isChecked()),
         }
 
     def _call_update_controller_params(self):
@@ -8979,6 +10583,9 @@ class UamSuiteGUI(QMainWindow):
         r_omg   = _arr("reference_angular_velocity")
         brate   = _arr("body_rate_commands")          # (N,3) CTBR body-rate cmd [rad/s]
         thr_cmd = _arr("thrust_command").flatten()    # (N,) normalized thrust cmd
+        l1_force   = _arr("l1_force_world")           # (N,3) L1 估计扰动力 [N]
+        l1_sigma   = _arr("l1_sigma_world")           # (N,3) L1 估计扰动加速度 [m/s²]
+        drag_force = _arr("aero_drag_force_world")    # (N,3) Gazebo 阻力真值 [N]
 
         N = len(t)
         if N < 2:
@@ -9149,6 +10756,19 @@ class UamSuiteGUI(QMainWindow):
         except Exception:
             self.log(f"[plot] CTBR/feedback figure failed:\n{_tb.format_exc()}")
 
+        # ── L1 扰动估计 vs Gazebo 气动阻力真值 ────────────────────────────────
+        try:
+            self._render_l1_disturbance_figure(
+                t=t,
+                force_truth=drag_force[:N] if drag_force.ndim == 2 and drag_force.shape[0] >= N else None,
+                force_est=l1_force[:N] if l1_force.ndim == 2 and l1_force.shape[0] >= N else None,
+                truth_label="Gazebo true drag",
+                est_label="L1 estimate m·σ̂",
+                title="L1 disturbance estimate vs Gazebo aerodynamic drag",
+            )
+        except Exception:
+            self.log(f"[plot] L1 disturbance figure failed:\n{_tb.format_exc()}")
+
         if self._is_s500_mode():
             self.log(
                 f"[plot] Rendered {N} steps (s500 base-only) | "
@@ -9291,6 +10911,108 @@ class UamSuiteGUI(QMainWindow):
             pass
         self.cv_control.draw()
 
+    def _render_l1_disturbance_figure(
+        self,
+        *,
+        t: np.ndarray,
+        force_truth: Optional[np.ndarray] = None,
+        force_est: Optional[np.ndarray] = None,
+        torque_truth: Optional[np.ndarray] = None,
+        torque_est: Optional[np.ndarray] = None,
+        comp_force: Optional[np.ndarray] = None,
+        truth_label: str = "truth",
+        est_label: str = "L1 estimate",
+        comp_label: str = "LPF compensation",
+        title: str = "L1 disturbance estimate vs truth",
+    ) -> None:
+        """扰动估计 vs 真值，4 行 3 列布局：
+
+          行1：力 Fx/Fy/Fz（世界系 N，估计 vs 真值）   行2：力估计误差 (est-truth)
+          行3：力矩 Mx/My/Mz（世界系 N·m，真值）       行4：力矩估计误差 (est-truth)
+
+        L1 平动通道仅估计世界系力；力矩无 L1 估计（est=0，误差行≈未补偿真值）。
+        """
+        fig = self.fig_l1_dist
+        fig.clear()
+        t = np.asarray(t, dtype=float).flatten()
+        N = t.size
+
+        def _arr(a):
+            if a is None:
+                return None
+            a = np.asarray(a, dtype=float)
+            return a if a.ndim == 2 and a.shape[1] >= 3 else None
+
+        ft, fe = _arr(force_truth), _arr(force_est)
+        mt, me = _arr(torque_truth), _arr(torque_est)
+        fc = _arr(comp_force)
+        present = [a for a in (ft, fe, mt, me, fc) if a is not None]
+        if N < 2 or not present:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "No disturbance / L1 data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=_mpl_pt(10))
+            ax.axis("off")
+            self.cv_l1_dist.draw()
+            return
+
+        n = min([a.shape[0] for a in present] + [N])
+        tt = t[:n]
+        axis_names = ["X", "Y", "Z"]
+
+        def _plot_block(row_base: int, truth, est, unit: str, kind: str, extra=None):
+            # row_base*3 : value row;  (row_base+1)*3 : error row
+            for j in range(3):
+                ax = fig.add_subplot(4, 3, row_base * 3 + j + 1)
+                # 估计放最底层、弱色细线（次要参考）；真值与补偿在上层、强色突出。
+                if est is not None:
+                    ax.plot(tt, est[:n, j], color="0.7", lw=1.0, alpha=0.7,
+                            zorder=1, label=est_label)
+                if truth is not None:
+                    ax.plot(tt, truth[:n, j], color="tab:blue", lw=1.8, ls="-",
+                            zorder=3, label=truth_label)
+                if extra is not None:
+                    ax.plot(tt, extra[:n, j], color="tab:orange", lw=1.6, ls="--",
+                            zorder=2, label=comp_label)
+                ax.set_title(f"{kind}{axis_names[j]} [{unit}]", fontsize=_mpl_pt(9))
+                if j == 0:
+                    ax.set_ylabel(f"{kind} [{unit}]")
+                ax.grid(True, alpha=0.3)
+                ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
+                if truth is not None or est is not None:
+                    ax.legend(loc="upper right", fontsize=_mpl_pt(7))
+            for j in range(3):
+                ax = fig.add_subplot(4, 3, (row_base + 1) * 3 + j + 1)
+                if truth is not None and est is not None:
+                    err = est[:n, j] - truth[:n, j]
+                    ax.plot(tt, err, color="tab:green", lw=1.2, label="error (est-truth)")
+                    i0 = max(0, int(0.66 * n))
+                    if n - i0 > 1:
+                        mae = float(np.mean(np.abs(err[i0:])))
+                        ax.text(0.02, 0.95, f"late |err|~{mae:.3g}",
+                                transform=ax.transAxes, fontsize=_mpl_pt(7),
+                                va="top", ha="left",
+                                bbox=dict(boxstyle="round", fc="white", alpha=0.7))
+                    ax.legend(loc="upper right", fontsize=_mpl_pt(7))
+                else:
+                    ax.text(0.5, 0.5, "no estimate", ha="center", va="center",
+                            transform=ax.transAxes, fontsize=_mpl_pt(8))
+                if j == 0:
+                    ax.set_ylabel(f"{kind} err [{unit}]")
+                ax.set_title(f"{kind}{axis_names[j]} error [{unit}]", fontsize=_mpl_pt(9))
+                ax.grid(True, alpha=0.3)
+                ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
+                ax.set_xlabel("t [s]")
+
+        _plot_block(0, ft, fe, "N, world", "F", extra=fc)
+        _plot_block(2, mt, me, "N·m, world", "M")
+
+        fig.suptitle(title, fontsize=_mpl_pt(11), y=0.998)
+        try:
+            fig.tight_layout(rect=(0, 0, 1, 0.98))
+        except Exception:
+            pass
+        self.cv_l1_dist.draw()
+
     def _run_track(self):
         if self._plan_bundle is None:
             return
@@ -9304,15 +11026,14 @@ class UamSuiteGUI(QMainWindow):
                     "Tracking along the full-state plan requires doing the \"Full state\" planning first.",
                 )
                 return
-            from s500_uam_crocoddyl_state_tracking_mpc import default_hover_nominal
-
             pb = self._plan_bundle
             x0 = np.asarray(pb["x_plan"][0], dtype=float).flatten()
             params = {
                 "x0": x0,
                 "t_plan": pb["t_plan"],
                 "x_plan": pb["x_plan"],
-                "x_nom": default_hover_nominal(),
+                "x_nom": self._robot_hover_nominal_state(),
+                "urdf_path": self._selected_robot_urdf_path(),
                 "T_sim": self.T_sim.value(),
                 "sim_dt": self.sim_dt.value(),
                 "control_dt": self.control_dt.value(),
@@ -9335,12 +11056,11 @@ class UamSuiteGUI(QMainWindow):
                 "tau_thrust": float(self.tau_thrust_track.value()),
                 "tau_theta": float(self.tau_theta_track.value()),
                 "sim_control_stack": (
-                    "px4_rate"
-                    if self.track_sim_control_stack.currentIndex() == 1
-                    else "direct"
+                    "ctbr" if self._current_track_scheme() == "ctbr" else "direct"
                 ),
                 "px4_rate_Kp": float(self.px4_rate_Kp_track.value()),
                 "px4_rate_Kd": float(self.px4_rate_Kd_track.value()),
+                "ctbr": self._collect_track_ctbr(),
                 "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
                 "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
                 "sim_payload_mass": float(self.sim_payload_mass.value()),
@@ -9353,17 +11073,28 @@ class UamSuiteGUI(QMainWindow):
             self._track_worker.start()
             return
 
-        if mode == 1:
+        if mode in (1, 4):
             if not self._EE_MPC_OK:
                 QMessageBox.warning(self, "Error", "Acados MPC is unavailable.")
                 return
+            if self._plan_bundle["kind"] not in ("full_croc", "full_acados"):
+                QMessageBox.warning(
+                    self,
+                    "Notice",
+                    "Tracking along the full-state plan requires doing the \"Full state\" planning first.",
+                )
+                return
+            is_geo = mode == 4
             pb = self._plan_bundle
             x0 = np.asarray(pb["x_plan"][0], dtype=float).flatten()
             cm = (
                 "direct"
-                if self.control_mode_track.currentIndex() == 0
+                if (is_geo or self.control_mode_track.currentIndex() == 0)
                 else "actuator_first_order"
             )
+            ctbr_cfg = dict(self._collect_track_ctbr())
+            # 以 Control scheme 选择器为准（geometric 恒为 CTBR）。
+            ctbr_cfg["enabled"] = bool(is_geo or self._current_track_scheme() == "ctbr")
             params = {
                 "x0": x0,
                 "t_plan": pb["t_plan"],
@@ -9376,6 +11107,7 @@ class UamSuiteGUI(QMainWindow):
                 "mpc_max_iter": self.mpc_max_iter.value(),
                 "mpc_log_interval": self.mpc_log_iv.value(),
                 "control_mode": cm,
+                "urdf_path": self._selected_robot_urdf_path(),
                 "w_state_track": self.w_state_track.value(),
                 "w_state_reg": self.w_state_reg.value(),
                 "w_control": self.w_control.value(),
@@ -9388,11 +11120,32 @@ class UamSuiteGUI(QMainWindow):
                 "w_joint_vel": self.w_joint_vel.value(),
                 "w_u_thrust": self.w_u_thrust.value(),
                 "w_u_joint_torque": self.w_u_joint_torque.value(),
+                "state_limits": {
+                    "v_max": float(self.track_v_max.value()),
+                    "omega_max": float(self.track_omega_max.value()),
+                    "j_angle_max": float(self.track_j_angle_max.value()),
+                    "j_vel_max": float(self.track_j_vel_max.value()),
+                },
+                "disturbance": self._collect_track_disturbance(),
+                "l1": self._collect_track_l1(),
+                "ctbr": ctbr_cfg,
+                "baseline": "geometric" if is_geo else "acados",
+                "geometric": {
+                    "kp_pos": float(self.geo_kp_pos.value()),
+                    "kd_vel": float(self.geo_kd_vel.value()),
+                    "kR": float(self.geo_kR.value()),
+                    "kOmega": float(self.geo_kOmega.value()),
+                    "max_tilt_deg": float(self.geo_max_tilt.value()),
+                },
             }
             self.run_track_btn.setEnabled(False)
-            self.log("Acados closed-loop tracking along the plan (shared Croc cost weights)…")
+            if is_geo:
+                self.log("Geometric controller closed-loop tracking (CTBR inner loop)…")
+            else:
+                self.log("Acados closed-loop tracking along the plan (shared Croc cost weights)…")
             self._track_worker = TrackAcadosAlongPlanWorker(params)
             self._track_worker.finished.connect(self._on_track_acados_full_finished)
+            self._track_worker.progress.connect(self._on_track_acados_progress)
             self._track_worker.start()
             return
 
@@ -9511,7 +11264,15 @@ class UamSuiteGUI(QMainWindow):
         self._track_worker.finished.connect(self._on_track_ee_finished)
         self._track_worker.start()
 
+    def _on_track_acados_progress(self, done: int, total: int, fps: float):
+        pct = (100.0 * done / total) if total > 0 else 0.0
+        sim_t = done * float(self.sim_dt.value())
+        self.run_track_btn.setText(
+            f"Tracking… {pct:4.0f}%  (t={sim_t:5.2f}s, {fps:6.0f} FPS)"
+        )
+
     def _on_track_acados_full_finished(self, ok: bool, err: str, payload: object):
+        self.run_track_btn.setText("Run closed-loop tracking")
         self.run_track_btn.setEnabled(True)
         if hasattr(self, "reg_run_btn"):
             self.reg_run_btn.setEnabled(True)
@@ -9522,12 +11283,240 @@ class UamSuiteGUI(QMainWindow):
         assert isinstance(payload, dict)
         res = payload["res"]
         cm = payload.get("control_mode", "direct")
-        self._render_tracking_figures(res, cm, payload.get("out"))
+        out = payload.get("out")
+        self._render_tracking_figures(res, cm, out)
+        self._render_track_control_decomp(out)
+        self._render_sim_l1_disturbance(out)
         self.log(
             f"Acados full-state tracking finished | EE error (final) {res['err'][-1]:.4f} m | "
             f"yaw err {res['err_yaw'][-1]:.4f} rad"
         )
         self.meshcat_track_btn.setEnabled(True)
+
+    def _render_sim_l1_disturbance(self, out: object) -> None:
+        """闭环仿真后：在 "L1 / Disturbance" 页对比注入扰动真值与 L1 估计。"""
+        if not isinstance(out, dict):
+            return
+        if not (out.get("disturbance_active") or out.get("l1_active")):
+            return
+        try:
+            t = np.asarray(out.get("time"), dtype=float).flatten()
+            n = max(0, t.size - 1)
+            tt = t[:n]
+
+            def _g(key):
+                a = out.get(key)
+                return np.asarray(a, dtype=float) if a is not None else None
+
+            l1f = _g("l1_force_world")
+            dgf = _g("dist_force_world")
+            mt = _g("dist_torque_world")
+            if mt is None:
+                mt = _g("dist_torque_body")
+            al1 = _g("l1_a_l1")
+            mass = float(out.get("nominal_mass", 1.0) or 1.0)
+            l1_on = bool(out.get("l1_active"))
+            # 力：估计（L1）vs 真值；未开 L1 时无估计。
+            force_est = l1f if l1_on else None
+            # 低通滤波后的补偿力（世界系）= m·a_l1（抵消扰动，≈ -扰动）；
+            # 取相反数后与真值扰动同向，便于直接对比补偿是否跟上扰动。
+            comp_force = (-mass * al1) if (l1_on and al1 is not None) else None
+            # 力矩：L1 平动通道不估计力矩 → 估计置 0，误差行显示未补偿真值。
+            torque_est = np.zeros_like(mt) if mt is not None else None
+            self._render_l1_disturbance_figure(
+                t=tt,
+                force_truth=dgf,
+                force_est=force_est,
+                torque_truth=mt,
+                torque_est=torque_est,
+                comp_force=comp_force,
+                truth_label="injected (truth)",
+                est_label="L1 estimate m·σ̂",
+                comp_label="LPF compensation -m·a_l1",
+                title="Sim: L1 (world force) vs injected disturbance (force & torque, world)",
+            )
+        except Exception as exc:  # pragma: no cover - 绘图失败不应中断流程
+            self.log(f"[L1/Disturbance] 渲染失败: {exc}")
+
+    def _render_track_control_decomp(self, out: object) -> bool:
+        """Control 图（闭环 sim track），4 行 × 2 列布局：
+
+        左列：电机力(行1) + 三轴体力矩 Mx/My/Mz(行2-4)；
+        右列：总推力 T(行1) + 三轴体角速度 p/q/r(行2-4)，按轴配对 Mx-p/My-q/Mz-r。
+
+        - 电机力：real(实线)/cmd(虚线)/ref(点线)。
+        - 体力矩 & 总推力：指令分解 u_b → u_b+u_ac → cmd(+u_p) 及 real(+ref)，
+          相邻线间隙即各通道(baseline/L1/位置)贡献。
+        - 体角速度：real 与 setpoint(CTBR 时)。
+        三路满足 clip(u_b+u_ac+u_p)+thrust_bias = u_real（direct 模式；CTBR 下
+        u_ac/u_p 记 0，u_b=ctbr 目标）。
+        """
+        import traceback as _tb
+        if not isinstance(out, dict):
+            return False
+        needed = ("u_baseline", "u_l1_delta", "u_pos_delta", "controls_real", "rotor_alloc")
+        if any(out.get(k) is None for k in needed):
+            return False
+        try:
+            u_b_all = np.asarray(out["u_baseline"], dtype=float)
+            u_ac_all = np.asarray(out["u_l1_delta"], dtype=float)
+            u_p_all = np.asarray(out["u_pos_delta"], dtype=float)
+            u_real_all = np.asarray(out["controls_real"], dtype=float)
+            A = np.asarray(out["rotor_alloc"], dtype=float)
+            n_rot = int(out.get("n_rotors", 4))
+            t_all = np.asarray(out.get("time"), dtype=float).flatten()
+            N = min(
+                u_b_all.shape[0], u_ac_all.shape[0], u_p_all.shape[0],
+                u_real_all.shape[0], max(0, t_all.size),
+            )
+            if N < 2 or A.shape != (4, 4):
+                return False
+            t = t_all[:N]
+            u_b = u_b_all[:N, :n_rot]
+            u_ac = u_ac_all[:N, :n_rot]
+            u_p = u_p_all[:N, :n_rot]
+            u_real = u_real_all[:N, :n_rot]
+            u_after_l1 = u_b + u_ac
+            u_cmd = u_after_l1 + u_p
+
+            # 体角速度真值（来自状态 x[nq+3:nq+6]）。
+            omega = None
+            states = out.get("states")
+            if states is not None:
+                states = np.asarray(states, dtype=float)
+                nq = int(out.get("nq", 7))
+                if states.ndim == 2 and states.shape[1] >= nq + 6:
+                    omega = states[:N, nq + 3 : nq + 6]
+
+            # CTBR 模式：角速度设定点（机体系，含 L1 tilt 增广）。
+            ctbr_on = bool(out.get("ctbr_active"))
+            rate_sp = None
+            if ctbr_on:
+                rsp = out.get("ctbr_rate_sp")
+                if rsp is not None:
+                    rsp = np.asarray(rsp, dtype=float)
+                    if rsp.ndim == 2 and rsp.shape[0] >= N and rsp.shape[1] >= 3:
+                        rate_sp = rsp[:N]
+
+            # 规划电机力（重采样到记录时间轴）作为 ref。
+            u_ref = None
+            pb = self._plan_bundle
+            try:
+                if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+                    up = np.asarray(pb.get("u_plan"), dtype=float)
+                    tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                    if up.ndim == 2 and up.shape[0] >= 1 and tp.size >= 2:
+                        tpc = tp[: up.shape[0]] - tp[0]
+                        nj = min(n_rot, up.shape[1])
+                        u_ref = np.column_stack(
+                            [np.interp(t, tpc, up[: tpc.size, j]) for j in range(nj)]
+                        )
+            except Exception:
+                u_ref = None
+
+            # 力旋量 [T, Mx, My, Mz] = A · [T1..T4]
+            W_b = (A @ u_b.T).T
+            W_ac = (A @ u_ac.T).T
+            W_p = (A @ u_p.T).T
+            W_real = (A @ u_real.T).T
+            W_after_l1 = W_b + W_ac
+            W_cmd = W_after_l1 + W_p
+
+            rotor_colors = ["tab:blue", "tab:orange", "tab:green", "tab:purple"]
+            # 指令分解三路 + real/ref 的统一配色（u_b / +u_ac / +u_p / real / ref）。
+            c_b, c_l1, c_cmd, c_real, c_ref = (
+                "tab:gray", "tab:blue", "tab:green", "tab:red", "k",
+            )
+            axis_names = ["x", "y", "z"]
+            rate_lbl = ["p", "q", "r"]
+
+            # 力旋量参考（规划）：W_ref = A·u_ref，供 T/Mx/My/Mz 各分量参考线。
+            W_ref = (A @ u_ref.T).T if u_ref is not None else None
+
+            def _plot_wrench_decomp(ax, idx, ref_series, unit):
+                """画某力旋量分量 idx∈{0:T,1:Mx,2:My,3:Mz} 的指令分解 + real(+ref)。
+
+                三路累加：u_b → u_b+u_ac → cmd(=+u_p)，相邻线间隙即各通道贡献。
+                """
+                ax.plot(t, W_b[:, idx], color=c_b, lw=0.9, alpha=0.75, label="u_b")
+                ax.plot(t, W_after_l1[:, idx], color=c_l1, lw=0.9, ls="--",
+                        alpha=0.85, label="u_b+u_ac")
+                ax.plot(t, W_cmd[:, idx], color=c_cmd, lw=1.3, label="cmd(+u_p)")
+                ax.plot(t, W_real[:, idx], color=c_real, lw=1.0, alpha=0.9, label="real")
+                if ref_series is not None:
+                    ax.plot(t, ref_series, color=c_ref, lw=0.8, ls=":",
+                            alpha=0.55, label="ref")
+                ax.set_ylabel(unit)
+                ax.grid(True, alpha=0.3)
+                ax.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+                ax.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=2)
+
+            fig = self.fig_control
+            fig.clear()
+            # 4 行 × 2 列：左列 = 电机力 + 三轴体力矩；右列 = 总推力 + 三轴角速度
+            # （按轴配对：Mx-p / My-q / Mz-r）。
+            gs = fig.add_gridspec(4, 2, hspace=0.62, wspace=0.24)
+
+            # ── 左上：4 个电机力合一（real/cmd/ref）────────────────────────
+            ax_rot = fig.add_subplot(gs[0, 0])
+            for j in range(min(4, n_rot)):
+                col = rotor_colors[j % len(rotor_colors)]
+                ax_rot.plot(t, u_real[:, j], color=col, lw=1.1, label=f"r{j + 1} real")
+                ax_rot.plot(t, u_cmd[:, j], color=col, lw=0.8, ls="--", alpha=0.6)
+                if u_ref is not None and j < u_ref.shape[1]:
+                    ax_rot.plot(t, u_ref[:, j], color=col, lw=0.7, ls=":", alpha=0.5)
+            ax_rot.set_title("Rotor forces [N] — real / cmd(--) / ref(:)",
+                             fontsize=_mpl_pt(9))
+            ax_rot.set_ylabel("N")
+            ax_rot.grid(True, alpha=0.3)
+            ax_rot.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=4)
+
+            # ── 右上：总推力 T（含 u_b/u_ac/u_p 分解 + real + ref）──────────
+            ax_T = fig.add_subplot(gs[0, 1])
+            ref_T = W_ref[:, 0] if W_ref is not None else None
+            _plot_wrench_decomp(ax_T, 0, ref_T, "N")
+            ax_T.set_title("Collective thrust T [N]", fontsize=_mpl_pt(9))
+
+            # ── 左列行2-4：三轴体力矩 Mx/My/Mz（含 u_b/u_ac/u_p 分解）──────
+            for i in range(3):
+                ax_M = fig.add_subplot(gs[i + 1, 0])
+                ref_i = W_ref[:, i + 1] if W_ref is not None else None
+                _plot_wrench_decomp(ax_M, i + 1, ref_i, "N·m")
+                ax_M.set_title(f"Body torque M{axis_names[i]} [N·m]", fontsize=_mpl_pt(9))
+                if i == 2:
+                    ax_M.set_xlabel("t [s]")
+
+            # ── 右列行2-4：三轴体角速度 p/q/r（real + setpoint）────────────
+            for i in range(3):
+                ax_w = fig.add_subplot(gs[i + 1, 1])
+                if omega is not None:
+                    ax_w.plot(t, omega[:, i], color=c_real, lw=1.2, label="real")
+                if rate_sp is not None:
+                    ax_w.plot(t, rate_sp[:, i], color=c_cmd, lw=1.0, ls="--",
+                              alpha=0.85, label="setpoint")
+                ax_w.set_title(f"Body rate {rate_lbl[i]} [rad/s]", fontsize=_mpl_pt(9))
+                ax_w.set_ylabel("rad/s")
+                ax_w.grid(True, alpha=0.3)
+                ax_w.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+                ax_w.legend(loc="upper right", fontsize=_mpl_pt(6))
+                if i == 2:
+                    ax_w.set_xlabel("t [s]")
+
+            _mode = "CTBR inner-loop" if ctbr_on else "direct"
+            fig.suptitle(
+                f"Control [{_mode}] — rotor forces & body torque (u_b,u_ac,u_p) "
+                f"| collective thrust & body rate",
+                fontsize=_mpl_pt(11), y=0.995,
+            )
+            try:
+                fig.tight_layout(rect=(0, 0, 1, 0.98))
+            except Exception:
+                pass
+            self.cv_control.draw()
+            return True
+        except Exception:
+            self.log(f"[plot] control decomposition figure failed:\n{_tb.format_exc()}")
+            return False
 
     def _on_track_croc_finished(self, ok: bool, err: str, payload: object):
         self.run_track_btn.setEnabled(True)

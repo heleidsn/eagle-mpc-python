@@ -23,6 +23,9 @@ from typing import Optional, Tuple
 import numpy as np
 
 try:
+    from acados_runtime import preload_acados_shared_libs
+
+    preload_acados_shared_libs()
     from acados_template import AcadosOcp, AcadosOcpSolver
 
     ACADOS_AVAILABLE = True
@@ -96,6 +99,10 @@ class AcadosFullStateRealtimeMPC:
         integrator_type: str = "ERK",
         hpipm_mode: str = "SPEED",
         qp_iter_max: int = 20,
+        qp_warm_start: int = 1,
+        sim_num_stages: int = 4,
+        sim_num_steps: int = 1,
+        as_rti_iter: int = 0,
     ):
         if not ACADOS_AVAILABLE:
             raise ImportError("acados_template not installed")
@@ -111,6 +118,11 @@ class AcadosFullStateRealtimeMPC:
         self.integrator_type = str(integrator_type).upper()  # "ERK" | "IRK"
         self.hpipm_mode = str(hpipm_mode).upper()             # "SPEED" | "BALANCE" | "ROBUST"
         self.qp_iter_max = int(qp_iter_max)
+        # 进一步的实时/精度调参
+        self.qp_warm_start = int(qp_warm_start)   # QP 热启动（1=用上一拍 QP 解，减少 qp_iter）
+        self.sim_num_stages = int(sim_num_stages) # 积分器级数（ERK: 4=RK4）
+        self.sim_num_steps = int(sim_num_steps)   # 每个 shooting 区间内积分子步数（>1 提升离散精度）
+        self.as_rti_iter = int(as_rti_iter)       # AS-RTI 迭代次数（0=普通 RTI）
 
         self.s500_config = load_s500_config()
         acados_model, pin_model, nq, nv, nu = self._build_robot_acados_model(urdf_path)
@@ -416,6 +428,10 @@ class AcadosFullStateRealtimeMPC:
                 ocp.solver_options.globalization = "MERIT_BACKTRACKING"
         if hasattr(ocp.solver_options, "qp_solver_iter_max"):
             ocp.solver_options.qp_solver_iter_max = int(self.qp_iter_max)
+        # QP 热启动：用上一拍 QP 解作为本拍 QP 初值，显著减少 HPIPM 迭代数。
+        # RTI 跨步 warm-start 配合 QP warm-start 是实时 NMPC 的常见组合。
+        if hasattr(ocp.solver_options, "qp_solver_warm_start"):
+            ocp.solver_options.qp_solver_warm_start = int(self.qp_warm_start)
         # HPIPM 模式：SPEED 最快；大初始误差不收敛时可调 BALANCE/ROBUST。
         if hasattr(ocp.solver_options, "hpipm_mode"):
             ocp.solver_options.hpipm_mode = self.hpipm_mode
@@ -425,6 +441,23 @@ class AcadosFullStateRealtimeMPC:
         # 部分凝聚的 horizon（对小 N 取较小值可减小 QP 规模、提速）。
         if hasattr(ocp.solver_options, "qp_solver_cond_N"):
             ocp.solver_options.qp_solver_cond_N = max(1, min(int(N), 5))
+        # 积分器精度：每个 shooting 区间内的级数/子步数。dt_mpc 较大（如 50ms）
+        # 且轨迹激烈时，单步 RK4 的离散误差会让 MPC 解“切角”、贴不住离线 plan；
+        # 把 num_steps 提到 2~4 可在 dt_mpc 不变的前提下改善离散精度（开销线性增加）。
+        if hasattr(ocp.solver_options, "sim_method_num_stages"):
+            ocp.solver_options.sim_method_num_stages = int(self.sim_num_stages)
+        if hasattr(ocp.solver_options, "sim_method_num_steps"):
+            ocp.solver_options.sim_method_num_steps = int(self.sim_num_steps)
+        # AS-RTI（advanced-step real-time iteration）：在保持实时的前提下，通过
+        # 额外的内层迭代提升 RTI 对激烈/非线性轨迹的收敛质量；0=普通单次 RTI。
+        if self.solver_mode == "rti" and int(self.as_rti_iter) > 0:
+            if hasattr(ocp.solver_options, "as_rti_iter"):
+                ocp.solver_options.as_rti_iter = int(self.as_rti_iter)
+            if hasattr(ocp.solver_options, "as_rti_level"):
+                # acados: LEVEL-A=0, B=1, C=2, LEVEL-D=3, STANDARD_RTI=4。
+                # LEVEL-D(3) 对全部 KKT 做 advanced-step 更新，质量最好（配合
+                # as_rti_iter>0 才有意义；4 等价普通 RTI）。
+                ocp.solver_options.as_rti_level = 3
 
         robot_tag = "uam" if na > 0 else "s500"
         code_export_dir = REPO_ROOT / "c_generated_code" / f"s500_{robot_tag}_full_state_rt_mpc"
