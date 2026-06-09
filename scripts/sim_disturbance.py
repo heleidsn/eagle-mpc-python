@@ -98,6 +98,10 @@ class DisturbanceParams:
     const_mx: float = 0.0
     const_my: float = 0.0
     const_mz: float = 0.0
+    # 定常力/力矩的定义坐标系：False=世界系（默认），True=机体系。
+    # 机体系沿 b3 的力天然 matched（纯推力可补）；世界系竖直力在机体倾斜时
+    # 会出现垂直 b3 的 unmatched 分量，只能靠倾转补偿——故此开关用于对照实验。
+    const_body_frame: bool = False
 
     # 2) 外界变化扰动（世界系力，逐轴正弦）
     var_enable: bool = False
@@ -187,8 +191,15 @@ def external_force_torque(
     b3 = R[:, 2]
 
     if _active(t, params.const_enable, params.const_t0, params.const_t1):
-        F_world += np.array([params.const_fx, params.const_fy, params.const_fz], dtype=float)
-        M_w = np.array([params.const_mx, params.const_my, params.const_mz], dtype=float)
+        F_const = np.array([params.const_fx, params.const_fy, params.const_fz], dtype=float)
+        M_const = np.array([params.const_mx, params.const_my, params.const_mz], dtype=float)
+        if params.const_body_frame:
+            # 机体系定义：随姿态旋转到世界系（力矩同理转世界系记录）。
+            F_world += R @ F_const
+            M_w = R @ M_const
+        else:
+            F_world += F_const
+            M_w = M_const
         M_world += M_w
         M_body += R.T @ M_w
 

@@ -717,7 +717,7 @@ def run_closed_loop_track_full_state_plan_acados(
 
         l1_keys = {
             "as_gain", "wc_xy", "wc_z", "tilt_gain", "max_accel_xy", "max_accel_z",
-            "max_sigma", "use_pos_feedback", "k_pos_i_xy", "k_pos_i_z",
+            "max_sigma", "frame", "use_pos_feedback", "k_pos_i_xy", "k_pos_i_z",
             "k_pos_p_xy", "k_pos_p_z", "max_pos_integral_xy", "max_pos_integral_z",
         }
         l1p = L1Params(enabled=True)
@@ -915,12 +915,13 @@ def run_closed_loop_track_full_state_plan_acados(
                         )
                     sigma_true = (F_ext_o + dT_o * b3) / max(nominal_mass, 1e-6)
                     a_ac = l1_aug.step_oracle(
-                        control_dt, sigma_true, pos_err_world=pos_err
+                        control_dt, sigma_true, pos_err_world=pos_err, R_bw=R_meas
                     )
                 else:
                     # 预测器输入用上一拍含 L1 竖直注入的实际加速度，使 σ̂ = 真实外部扰动。
                     a_ac = l1_aug.step(
-                        control_dt, v_world, l1_last_a_applied, pos_err_world=pos_err
+                        control_dt, v_world, l1_last_a_applied,
+                        pos_err_world=pos_err, R_bw=R_meas,
                     )
                 dFz = nominal_mass * float(np.dot(a_ac, b3))
                 a_nom = (T_cmd / max(nominal_mass, 1e-6)) * b3 - np.array([0.0, 0.0, GRAVITY])

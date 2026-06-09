@@ -3877,7 +3877,30 @@ class UamSuiteGUI(QMainWindow):
         self.fig_3d_track, self.cv_3d_track = embed_fig("Base 3D", (10, 8))
         self.fig_traj_dash, self.cv_traj_dash = embed_fig("Tracking / MPC", (12, 11))
         self.fig_cost_analysis, self.cv_cost_analysis = embed_fig("Cost analysis", (12, 10))
-        self.fig_l1_dist, self.cv_l1_dist = embed_fig("L1 / Disturbance", (12, 10))
+        # L1 / Disturbance 页带「坐标系」切换按钮（world↔body 显示），自定义容器。
+        _l1w = QWidget()
+        _l1l = QVBoxLayout(_l1w)
+        _l1btnrow = QHBoxLayout()
+        self.l1_dist_frame_btn = QPushButton("坐标系: 世界系 (world)")
+        self.l1_dist_frame_btn.setCheckable(True)
+        self.l1_dist_frame_btn.setToolTip(
+            "切换 L1/扰动曲线的显示坐标系（仅影响显示，不改估计/补偿）。\n"
+            "世界系：力/力矩按世界系分量显示。\n"
+            "机体系：按当前姿态旋转到机体系——机体 z 即 matched 推力轴，"
+            "便于看 matched(沿 b3) 与 unmatched(横向) 分量。"
+        )
+        self.l1_dist_frame_btn.toggled.connect(self._on_l1_dist_frame_toggled)
+        _l1btnrow.addWidget(self.l1_dist_frame_btn)
+        _l1btnrow.addStretch(1)
+        _l1l.addLayout(_l1btnrow)
+        self.fig_l1_dist = Figure(figsize=(12, 10))
+        self.cv_l1_dist = FigureCanvas(self.fig_l1_dist)
+        _l1tb = NavigationToolbar(self.cv_l1_dist, _l1w)
+        _l1l.addWidget(_l1tb)
+        _l1l.addWidget(self.cv_l1_dist)
+        right.addTab(_l1w, "L1 / Disturbance")
+        self._l1_dist_frame = "world"
+        self._l1_dist_cache = None
         # Backward-compatible aliases for existing planning preview rendering.
         self.fig_combined, self.cv_combined = self.fig_states, self.cv_states
 
@@ -6122,7 +6145,7 @@ class UamSuiteGUI(QMainWindow):
         page_v.addWidget(intro)
 
         # ── 1) 外界定常扰动 ─────────────────────────────────────────────
-        self.dist_const_group = QGroupBox("外界定常扰动 (力/力矩均=世界系 N / N·m)")
+        self.dist_const_group = QGroupBox("外界定常扰动 (力/力矩 N / N·m，坐标系可切换)")
         self.dist_const_group.setCheckable(True)
         self.dist_const_group.setChecked(False)
         g1 = QGridLayout(self.dist_const_group)
@@ -6139,6 +6162,16 @@ class UamSuiteGUI(QMainWindow):
         g1.addWidget(QLabel("Mx"), 3, 0); g1.addWidget(self.dist_const_mx, 3, 1)
         g1.addWidget(QLabel("My"), 3, 2); g1.addWidget(self.dist_const_my, 3, 3)
         g1.addWidget(QLabel("Mz"), 4, 0); g1.addWidget(self.dist_const_mz, 4, 1)
+        # 坐标系切换按钮：世界系 (默认) ↔ 机体系。
+        self.dist_const_frame_btn = QPushButton("坐标系: 世界系 (world)")
+        self.dist_const_frame_btn.setCheckable(True)
+        self.dist_const_frame_btn.setToolTip(
+            "切换定常力/力矩的定义坐标系。\n"
+            "世界系：Fz 恒为竖直向上/下；机体倾斜时含垂直 b3 的 unmatched 分量。\n"
+            "机体系：力随姿态旋转；沿机体 z 的力天然 matched，纯推力即可补偿。"
+        )
+        self.dist_const_frame_btn.toggled.connect(self._on_dist_const_frame_toggled)
+        g1.addWidget(self.dist_const_frame_btn, 4, 2, 1, 2)
         page_v.addWidget(self.dist_const_group)
 
         # ── 2) 外界变化扰动（世界系力正弦）────────────────────────────────
@@ -6262,15 +6295,27 @@ class UamSuiteGUI(QMainWindow):
         gl.addWidget(QLabel("max_a_z"), 2, 2); gl.addWidget(self.sim_l1_max_accel_z, 2, 3)
         gl.addWidget(QLabel("max_sigma"), 3, 0); gl.addWidget(self.sim_l1_max_sigma, 3, 1)
         gl.addWidget(QLabel("补偿来源"), 3, 2); gl.addWidget(self.sim_l1_comp_mode, 3, 3)
+        # 补偿 LPF 的 xy/z 通道坐标系：body（默认，wc_z 对齐机体 z=matched 推力轴）/ world。
+        self.sim_l1_frame = QComboBox()
+        self.sim_l1_frame.addItem("机体系 (body)")
+        self.sim_l1_frame.addItem("世界系 (world)")
+        self.sim_l1_frame.setCurrentIndex(0)
+        self.sim_l1_frame.setToolTip(
+            "L1 补偿低通的 wc_xy/wc_z 分通道所在坐标系。\n"
+            "机体系 body（默认）：wc_z 作用于机体 z（matched，纯推力可瞬时补），"
+            "wc_xy 作用于机体 xy（unmatched，需倾转）——与四旋翼欠驱动补偿能力对齐。\n"
+            "世界系 world：xy/z 按世界水平/竖直划分（旧行为）；倾飞时通道与 matched 不对齐。"
+        )
+        gl.addWidget(QLabel("估计坐标系"), 4, 0); gl.addWidget(self.sim_l1_frame, 4, 1)
         _l1hint = QLabel(
-            "L1 估计世界系集总扰动 σ̂（含上述各扰动），按 -σ̂ 经低通生成补偿加速度，"
+            "L1 估计集总扰动 σ̂（含上述各扰动），按 -σ̂ 经低通生成补偿加速度，"
             "映射为四路推力增量注入仿真。运行后右侧 \"L1 / Disturbance\" 页对比真值与估计。\n"
             "「补偿来源=扰动真值 oracle」时：σ̂ 直接取注入扰动真值（绕过预测器/LPF，无估计"
             "误差与滞后），其余补偿管线不变——用于把\"估计质量\"与\"补偿环节质量\"解耦评估。"
         )
         _l1hint.setWordWrap(True)
         _l1hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-        gl.addWidget(_l1hint, 4, 0, 1, 4)
+        gl.addWidget(_l1hint, 5, 0, 1, 4)
         l1_v.addWidget(self.sim_l1_group)
 
         # ── 位置误差积分通道（独立小框，可勾选启用）─────────────────────
@@ -6533,12 +6578,19 @@ class UamSuiteGUI(QMainWindow):
         except Exception:
             pass
 
+    def _on_dist_const_frame_toggled(self, checked: bool) -> None:
+        """切换定常扰动坐标系按钮文本（world ↔ body）。"""
+        self.dist_const_frame_btn.setText(
+            "坐标系: 机体系 (body)" if checked else "坐标系: 世界系 (world)"
+        )
+
     def _collect_track_disturbance(self) -> dict:
         """从 L1/Disturbance 子标签收集 plant 扰动配置（传给闭环仿真）。"""
         if not hasattr(self, "dist_const_group"):
             return {}
         return {
             "const_enable": bool(self.dist_const_group.isChecked()),
+            "const_body_frame": bool(self.dist_const_frame_btn.isChecked()),
             "const_t0": float(self.dist_const_t0.value()),
             "const_t1": float(self.dist_const_t1.value()),
             "const_fx": float(self.dist_const_fx.value()),
@@ -6585,6 +6637,8 @@ class UamSuiteGUI(QMainWindow):
             "enabled": bool(self.sim_l1_group.isChecked()),
             "mode": ("oracle" if self.sim_l1_comp_mode.currentIndex() == 1 else "adaptive"),
             "comp_mode_index": int(self.sim_l1_comp_mode.currentIndex()),
+            "frame": ("world" if self.sim_l1_frame.currentIndex() == 1 else "body"),
+            "frame_index": int(self.sim_l1_frame.currentIndex()),
             "as_gain": float(self.sim_l1_as_gain.value()),
             "wc_xy": float(self.sim_l1_wc_xy.value()),
             "wc_z": float(self.sim_l1_wc_z.value()),
@@ -6614,6 +6668,9 @@ class UamSuiteGUI(QMainWindow):
                     pass
 
         self.dist_const_group.setChecked(bool(d.get("const_enable", False)))
+        if hasattr(self, "dist_const_frame_btn"):
+            self.dist_const_frame_btn.setChecked(bool(d.get("const_body_frame", False)))
+            self._on_dist_const_frame_toggled(self.dist_const_frame_btn.isChecked())
         for k, sb in (
             ("const_t0", self.dist_const_t0), ("const_t1", self.dist_const_t1),
             ("const_fx", self.dist_const_fx), ("const_fy", self.dist_const_fy),
@@ -6669,6 +6726,11 @@ class UamSuiteGUI(QMainWindow):
             if _ci is None:
                 _ci = 1 if str(d.get("mode", "adaptive")).lower() == "oracle" else 0
             self.sim_l1_comp_mode.setCurrentIndex(int(_ci))
+        if hasattr(self, "sim_l1_frame"):
+            _fi = d.get("frame_index")
+            if _fi is None:
+                _fi = 1 if str(d.get("frame", "body")).lower() == "world" else 0
+            self.sim_l1_frame.setCurrentIndex(int(_fi))
         for k, sb in (
             ("as_gain", self.sim_l1_as_gain), ("wc_xy", self.sim_l1_wc_xy),
             ("wc_z", self.sim_l1_wc_z), ("tilt_gain", self.sim_l1_tilt_gain),
@@ -10911,6 +10973,44 @@ class UamSuiteGUI(QMainWindow):
             pass
         self.cv_control.draw()
 
+    def _on_l1_dist_frame_toggled(self, checked: bool) -> None:
+        """切换 L1/Disturbance 显示坐标系（world↔body），用缓存数据重绘。"""
+        self._l1_dist_frame = "body" if checked else "world"
+        self.l1_dist_frame_btn.setText(
+            "坐标系: 机体系 (body)" if checked else "坐标系: 世界系 (world)"
+        )
+        cache = getattr(self, "_l1_dist_cache", None)
+        if cache:
+            self._render_l1_disturbance_figure(**cache)
+
+    @staticmethod
+    def _world_to_body_series(arr: Optional[np.ndarray], quat: np.ndarray) -> Optional[np.ndarray]:
+        """把世界系时间序列 (N,3) 逐拍旋到机体系：v_body = R(q)ᵀ·v_world。
+
+        quat: (N,4) [qx,qy,qz,qw]（与 sim_disturbance._quat_to_R_np 同约定）。
+        """
+        if arr is None:
+            return None
+        a = np.asarray(arr, dtype=float)
+        if a.ndim != 2 or a.shape[1] < 3:
+            return arr
+        n = min(a.shape[0], quat.shape[0])
+        out = a.copy()
+        for k in range(n):
+            q = quat[k]
+            nn = float(np.linalg.norm(q))
+            if nn < 1e-12:
+                continue
+            x, y, z, w = q / nn
+            # R (world<-body)
+            R = np.array([
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ], dtype=float)
+            out[k, :3] = R.T @ a[k, :3]
+        return out
+
     def _render_l1_disturbance_figure(
         self,
         *,
@@ -10920,6 +11020,7 @@ class UamSuiteGUI(QMainWindow):
         torque_truth: Optional[np.ndarray] = None,
         torque_est: Optional[np.ndarray] = None,
         comp_force: Optional[np.ndarray] = None,
+        quat: Optional[np.ndarray] = None,
         truth_label: str = "truth",
         est_label: str = "L1 estimate",
         comp_label: str = "LPF compensation",
@@ -10927,11 +11028,33 @@ class UamSuiteGUI(QMainWindow):
     ) -> None:
         """扰动估计 vs 真值，4 行 3 列布局：
 
-          行1：力 Fx/Fy/Fz（世界系 N，估计 vs 真值）   行2：力估计误差 (est-truth)
-          行3：力矩 Mx/My/Mz（世界系 N·m，真值）       行4：力矩估计误差 (est-truth)
+          行1：力 Fx/Fy/Fz（估计 vs 真值）   行2：力估计误差 (est-truth)
+          行3：力矩 Mx/My/Mz（真值）         行4：力矩估计误差 (est-truth)
 
-        L1 平动通道仅估计世界系力；力矩无 L1 估计（est=0，误差行≈未补偿真值）。
+        L1 平动通道仅估计力；力矩无 L1 估计（est=0，误差行≈未补偿真值）。
+        显示坐标系由「坐标系」按钮切换：world（默认）或 body（需传 quat 逐拍旋转）。
         """
+        # 缓存原始（世界系）数据，供「坐标系」按钮切换时重绘。
+        self._l1_dist_cache = dict(
+            t=t, force_truth=force_truth, force_est=force_est,
+            torque_truth=torque_truth, torque_est=torque_est,
+            comp_force=comp_force, quat=quat, truth_label=truth_label,
+            est_label=est_label, comp_label=comp_label, title=title,
+        )
+        # 机体系显示：逐拍把各世界系序列旋到机体系。
+        use_body = (getattr(self, "_l1_dist_frame", "world") == "body") and (quat is not None)
+        if use_body:
+            q = np.asarray(quat, dtype=float)
+            if q.ndim == 2 and q.shape[1] >= 4:
+                force_truth = self._world_to_body_series(force_truth, q)
+                force_est = self._world_to_body_series(force_est, q)
+                torque_truth = self._world_to_body_series(torque_truth, q)
+                torque_est = self._world_to_body_series(torque_est, q)
+                comp_force = self._world_to_body_series(comp_force, q)
+            else:
+                use_body = False
+        frame_lbl = "body" if use_body else "world"
+
         fig = self.fig_l1_dist
         fig.clear()
         t = np.asarray(t, dtype=float).flatten()
@@ -11003,10 +11126,10 @@ class UamSuiteGUI(QMainWindow):
                 ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
                 ax.set_xlabel("t [s]")
 
-        _plot_block(0, ft, fe, "N, world", "F", extra=fc)
-        _plot_block(2, mt, me, "N·m, world", "M")
+        _plot_block(0, ft, fe, f"N, {frame_lbl}", "F", extra=fc)
+        _plot_block(2, mt, me, f"N·m, {frame_lbl}", "M")
 
-        fig.suptitle(title, fontsize=_mpl_pt(11), y=0.998)
+        fig.suptitle(f"{title}  [frame: {frame_lbl}]", fontsize=_mpl_pt(11), y=0.998)
         try:
             fig.tight_layout(rect=(0, 0, 1, 0.98))
         except Exception:
@@ -11323,6 +11446,9 @@ class UamSuiteGUI(QMainWindow):
             comp_force = (-mass * al1) if (l1_on and al1 is not None) else None
             # 力矩：L1 平动通道不估计力矩 → 估计置 0，误差行显示未补偿真值。
             torque_est = np.zeros_like(mt) if mt is not None else None
+            # 姿态四元数（逐拍）供「机体系」显示旋转用：states[:, 3:7] = [qx,qy,qz,qw]。
+            st = _g("states")
+            quat = st[:n, 3:7] if (st is not None and st.ndim == 2 and st.shape[1] >= 7) else None
             self._render_l1_disturbance_figure(
                 t=tt,
                 force_truth=dgf,
@@ -11330,6 +11456,7 @@ class UamSuiteGUI(QMainWindow):
                 torque_truth=mt,
                 torque_est=torque_est,
                 comp_force=comp_force,
+                quat=quat,
                 truth_label="injected (truth)",
                 est_label="L1 estimate m·σ̂",
                 comp_label="LPF compensation -m·a_l1",

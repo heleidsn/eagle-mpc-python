@@ -83,6 +83,12 @@ class L1Params:
     max_accel_z: float = 6.0
     # 扰动估计幅值上限（m/s^2），用于裁剪 σ̂，提升鲁棒性。
     max_sigma: float = 25.0
+    # 补偿低通滤波的 xy/z 通道所在坐标系：
+    #   "body"（默认）：wc_z 作用于机体 z（matched，纯推力可瞬时补）、wc_xy 作用于
+    #     机体 xy（unmatched，需倾转），与四旋翼欠驱动的补偿能力对齐；
+    #   "world"：xy/z 按世界系水平/竖直划分（旧行为）。
+    # 需调用方在 step() 传入机体→世界旋转矩阵 R_bw；未提供则回退世界系。
+    frame: str = "body"
 
     # ── 位置误差积分增广（消除 L1 扰动补偿残差导致的稳态位置误差）─────────
     # 纯速度预测器的 L1 只能让 plant≈名义；若 σ̂ 因带宽/滞后有残差，baseline
@@ -110,6 +116,7 @@ class L1Params:
         self.k_pos_p_z = float(max(0.0, self.k_pos_p_z))
         self.max_pos_integral_xy = float(max(0.0, self.max_pos_integral_xy))
         self.max_pos_integral_z = float(max(0.0, self.max_pos_integral_z))
+        self.frame = "body" if str(self.frame).strip().lower() == "body" else "world"
         return self
 
 
@@ -137,8 +144,10 @@ class L1AdaptiveAugmentation:
         self.v_hat: Optional[np.ndarray] = None
         self.sigma_hat = np.zeros(3, dtype=float)
         self.a_ac = np.zeros(3, dtype=float)
-        # L1 扰动补偿分量（不含位置反馈），用于诊断。
+        # L1 扰动补偿分量（不含位置反馈，世界系），用于诊断。
         self.a_l1 = np.zeros(3, dtype=float)
+        # body 系滤波时的 LPF 内部状态（机体系），输出再旋回世界系存入 a_l1。
+        self._a_l1_body = np.zeros(3, dtype=float)
         # 跟踪位置误差积分（世界系, m·s）与位置反馈补偿分量。
         self.pos_integral = np.zeros(3, dtype=float)
         self.a_pos = np.zeros(3, dtype=float)
@@ -168,6 +177,7 @@ class L1AdaptiveAugmentation:
         self.sigma_hat = np.zeros(3, dtype=float)
         self.a_ac = np.zeros(3, dtype=float)
         self.a_l1 = np.zeros(3, dtype=float)
+        self._a_l1_body = np.zeros(3, dtype=float)
         self.pos_integral = np.zeros(3, dtype=float)
         self.a_pos = np.zeros(3, dtype=float)
         if v_world is not None:
@@ -196,6 +206,7 @@ class L1AdaptiveAugmentation:
         v_world: np.ndarray,
         a_applied_world: np.ndarray,
         pos_err_world: Optional[np.ndarray] = None,
+        R_bw: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         推进一个控制周期，返回世界系补偿加速度 a_ac (3,)。
@@ -204,6 +215,8 @@ class L1AdaptiveAugmentation:
             pos_err_world : 跟踪位置误差 e_p = p - p_ref（世界系, 3,）。
                             提供且 use_pos_feedback=True 时，启用位置误差积分通道，
                             消除 L1 扰动补偿残差导致的稳态位置误差。
+            R_bw          : 机体→世界旋转矩阵 (3,3)。frame="body" 时把补偿 LPF 的
+                            xy/z 通道放到机体系；未提供则回退世界系滤波。
         """
         p = self.params
         v = np.asarray(v_world, dtype=float).reshape(3)
@@ -218,6 +231,7 @@ class L1AdaptiveAugmentation:
             self.sigma_hat = np.zeros(3, dtype=float)
             self.a_ac = np.zeros(3, dtype=float)
             self.a_l1 = np.zeros(3, dtype=float)
+            self._a_l1_body = np.zeros(3, dtype=float)
             self.a_pos = np.zeros(3, dtype=float)
             self.pos_integral = np.zeros(3, dtype=float)
             self._initialized = True
@@ -242,15 +256,41 @@ class L1AdaptiveAugmentation:
         self.v_hat = self.v_hat + dt * v_hat_dot
 
         # ── (4) 低通滤波得到 L1 扰动补偿（u_ac = C(s)·(-σ̂)） ──────────────
-        target = -self.sigma_hat
         alpha_xy = 1.0 - math.exp(-p.wc_xy * dt) if p.wc_xy > 0.0 else 0.0
         alpha_z = 1.0 - math.exp(-p.wc_z * dt) if p.wc_z > 0.0 else 0.0
-        self.a_l1[0] += alpha_xy * (target[0] - self.a_l1[0])
-        self.a_l1[1] += alpha_xy * (target[1] - self.a_l1[1])
-        self.a_l1[2] += alpha_z * (target[2] - self.a_l1[2])
+        self._lpf_compensation(-self.sigma_hat, alpha_xy, alpha_z, R_bw)
 
         # ── (5) 位置误差积分通道 + 合成总补偿（与 oracle 共用同一管线）──────
         return self._compose_a_ac(dt, pos_err_world)
+
+    # ──────────────────────────────────────────────────────────────────────
+    def _lpf_compensation(
+        self,
+        target_world: np.ndarray,
+        alpha_xy: float,
+        alpha_z: float,
+        R_bw: Optional[np.ndarray],
+    ) -> None:
+        """一阶低通生成 a_l1（世界系）。frame="body" 且给定 R_bw 时，在机体系做
+        xy/z 分通道滤波（wc_z 对齐机体 z=matched 推力轴），再旋回世界系。"""
+        target_world = np.asarray(target_world, dtype=float).reshape(3)
+        use_body = (self.params.frame == "body") and (R_bw is not None)
+        if use_body:
+            R = np.asarray(R_bw, dtype=float).reshape(3, 3)
+            target_b = R.T @ target_world
+            self._a_l1_body[0] += alpha_xy * (target_b[0] - self._a_l1_body[0])
+            self._a_l1_body[1] += alpha_xy * (target_b[1] - self._a_l1_body[1])
+            self._a_l1_body[2] += alpha_z * (target_b[2] - self._a_l1_body[2])
+            self.a_l1 = R @ self._a_l1_body
+        else:
+            self.a_l1[0] += alpha_xy * (target_world[0] - self.a_l1[0])
+            self.a_l1[1] += alpha_xy * (target_world[1] - self.a_l1[1])
+            self.a_l1[2] += alpha_z * (target_world[2] - self.a_l1[2])
+            # 同步机体状态，便于 world↔body 切换时无跳变。
+            if R_bw is not None:
+                self._a_l1_body = np.asarray(R_bw, dtype=float).reshape(3, 3).T @ self.a_l1
+            else:
+                self._a_l1_body = self.a_l1.copy()
 
     # ──────────────────────────────────────────────────────────────────────
     def step_oracle(
@@ -258,6 +298,7 @@ class L1AdaptiveAugmentation:
         dt: float,
         sigma_true_world: np.ndarray,
         pos_err_world: Optional[np.ndarray] = None,
+        R_bw: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Oracle 补偿：假设可**精确测量**扰动（绕过预测器与 LPF）。
 
@@ -275,8 +316,12 @@ class L1AdaptiveAugmentation:
         self.sigma_hat = sigma.copy()
         if p.max_sigma > 0.0:
             self.sigma_hat = np.clip(self.sigma_hat, -p.max_sigma, p.max_sigma)
-        # 完美测量：补偿直接等于 -σ̂，不经预测器/低通。
+        # 完美测量：补偿直接等于 -σ̂，不经预测器/低通（frame 无关，瞬时无滤波）。
         self.a_l1 = -self.sigma_hat.copy()
+        if R_bw is not None:
+            self._a_l1_body = np.asarray(R_bw, dtype=float).reshape(3, 3).T @ self.a_l1
+        else:
+            self._a_l1_body = self.a_l1.copy()
         self._initialized = True
         return self._compose_a_ac(dt, pos_err_world)
 
