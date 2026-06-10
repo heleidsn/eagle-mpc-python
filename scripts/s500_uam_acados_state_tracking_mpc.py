@@ -207,9 +207,19 @@ def _build_robot_acados_model(urdf_path: str):
     q = ca.SX.sym("q", nq)
     v = ca.SX.sym("v", nv)
     u = ca.SX.sym("u", nu)
+    # disturbance-aware MPC：世界系平动扰动力参数 p_dist(3,)（N）。增广动力学
+    #   v̇ = a_model + R^T·p_dist / —— 经 ABA 以机体系广义力注入平动通道，
+    # 使 MPC 在预测时已知扰动、规划最优倾角/推力（offset-free MPC）。
+    # 后嵌（bolt-on）模式下调用方令 p_dist=0，模型退化为名义动力学。
+    p_dist_w = ca.SX.sym("p_dist_w", 3)
 
     thrusts = u[:n_thrust]
     arm_tau = u[n_thrust:] if n_arm > 0 else None
+
+    quat = q[3:7]
+    v_lin = v[:3]
+    v_ang = v[3:6]
+    R = _quat_to_R(quat)
 
     Fz = thrusts[0] + thrusts[1] + thrusts[2] + thrusts[3]
     Mx = My = Mz = 0.0
@@ -220,15 +230,13 @@ def _build_robot_acados_model(urdf_path: str):
         Mx += -pos[1] * T
         My += pos[0] * T
         Mz += spin * cm_cf * T
-    tau_base = ca.vertcat(0, 0, Fz, Mx, My, Mz)
+    # 世界系扰动力转机体系并叠加到平动广义力（base 自由飞行关节的力部分为机体系）。
+    F_dist_b = ca.mtimes(R.T, p_dist_w)
+    tau_base = ca.vertcat(F_dist_b[0], F_dist_b[1], Fz + F_dist_b[2], Mx, My, Mz)
     tau = ca.vertcat(tau_base, arm_tau) if n_arm > 0 else tau_base
 
     a = cpin.aba(cmodel, cdata, q, v, tau)
 
-    quat = q[3:7]
-    v_lin = v[:3]
-    v_ang = v[3:6]
-    R = _quat_to_R(quat)
     pos_dot = ca.mtimes(R, v_lin)
     quat_dot = 0.5 * _quat_prod(quat, ca.vertcat(v_ang[0], v_ang[1], v_ang[2], 0))
     if n_arm > 0:
@@ -244,6 +252,7 @@ def _build_robot_acados_model(urdf_path: str):
     acados_model.x = x
     acados_model.u = u
     acados_model.xdot = ca.SX.sym("xdot", x.rows())
+    acados_model.p = p_dist_w
     acados_model.f_impl_expr = acados_model.xdot - x_dot
     acados_model.f_expl_expr = x_dot
     return acados_model, model, nq, nv, nu
@@ -328,6 +337,10 @@ def create_full_state_tracking_mpc_solver(
     ocp = AcadosOcp()
     ocp.model = acados_model
     nx = nq + nv + (6 if control_mode == "actuator_first_order" else 0)
+    # disturbance-aware MPC：direct 模型含 3 维世界系扰动力参数 p_dist_w，默认 0（名义）。
+    # 闭环每拍按 σ̂·m 下发到各 stage；后嵌模式保持 0。actuator_first_order 模型无参数。
+    if control_mode == "direct":
+        ocp.parameter_values = np.zeros(3)
 
     cost_y, cost_y_e = _build_cost_y_exprs(ocp.model.x, ocp.model.u, nq, n_arm)
     ocp.model.cost_y_expr = cost_y
@@ -527,17 +540,25 @@ def _geometric_baseline_command(
     kR: float,
     kOmega: float,
     max_tilt_deg: float,
+    a_ff_world: Optional[np.ndarray] = None,
 ) -> tuple:
     """SE3 几何控制律（移植 example/l1_geometric_tracking_sim.geometric_baseline）。
 
     返回 (thrust_N, body_rate_cmd)：总推力（N）与机体角速度设定点（rad/s）。
     与 ROS run_tracking_controller 的 geometric 一致：位置/速度 PD 得期望比力 a_des，
     构造期望姿态 R_des，姿态误差 e_R 经 kR/kOmega 得体角速度指令。
+
+    a_ff_world：L1 等扰动补偿的前馈加速度（世界系, m/s²），直接并入期望比力
+    a_des。这样补偿在**力/期望姿态层**生效——matched 抬推力、unmatched 让 R_des
+    主动倾转，控制器自己飞过去；避免在 baseline 算完后再往角速度上硬加 tilt 与
+    姿态环对抗（悬停下 oracle 也补不动横向扰动的根因）。
     """
     e3 = np.array([0.0, 0.0, 1.0], dtype=float)
     e_p = np.asarray(p, dtype=float) - np.asarray(p_ref, dtype=float)
     e_v = np.asarray(v_world, dtype=float) - np.asarray(v_ref, dtype=float)
     a_des = np.asarray(a_ref, dtype=float) - kp_pos * e_p - kd_vel * e_v + gravity * e3
+    if a_ff_world is not None:
+        a_des = a_des + np.asarray(a_ff_world, dtype=float).reshape(3)
 
     a_xy = float(np.linalg.norm(a_des[:2]))
     a_z = max(1e-3, float(a_des[2]))
@@ -639,7 +660,17 @@ def run_closed_loop_track_full_state_plan_acados(
             f"(urdf={urdf_path})"
         )
 
-    f_fun = _make_f_expl_fun(acados_model)
+    # 名义模型函数 f(x,u)：disturbance-aware 模型含自由参数 p_dist_w，这里代入 0 得到
+    # 名义动力学（rollout/初值猜测/CTBR 有限差分 B 都应基于无扰名义模型，扰动只通过
+    # solver 的 stage 参数进入预测）。无参数模型（actuator_first_order）直接构造。
+    _p_sym = getattr(acados_model, "p", None)
+    if _p_sym is not None and getattr(_p_sym, "shape", (0,))[0] > 0:
+        _f_expl_nom = ca.substitute(
+            acados_model.f_expl_expr, _p_sym, ca.DM.zeros(_p_sym.shape[0])
+        )
+        f_fun = ca.Function("f_nom", [acados_model.x, acados_model.u], [_f_expl_nom])
+    else:
+        f_fun = _make_f_expl_fun(acados_model)
     nx = n_robot + (6 if control_mode == "actuator_first_order" else 0)
 
     # ── Sim-only disturbances + L1 adaptive augmentation (direct control only) ──
@@ -658,6 +689,8 @@ def run_closed_loop_track_full_state_plan_acados(
     dist_params = DisturbanceParams.from_dict(disturbance)
     l1_cfg = dict(l1) if l1 else {}
     l1_on = bool(l1_cfg.get("enabled", False)) and control_mode == "direct"
+    # 位置误差反馈通道：独立于 L1 估计，可在不开 L1 时单独用跟踪误差产生补偿。
+    pos_fb_on = bool(l1_cfg.get("use_pos_feedback", False)) and control_mode == "direct"
     # 补偿来源：'adaptive'（L1 在线估计）或 'oracle'（用扰动真值，假设可精确测量），
     # 两者共用同一补偿管线（dFz/tilt、CTBR、位置通道），用于解耦评估补偿环节性能。
     comp_mode = str(l1_cfg.get("mode", "adaptive")).strip().lower()
@@ -701,6 +734,18 @@ def run_closed_loop_track_full_state_plan_acados(
         # 几何 baseline 没有直接四旋翼力指令，强制走 CTBR 内环。
         ctbr_on = True
 
+    # ── 补偿注入点：'bolt_on'（后嵌，默认：MPC 解完再叠 dFz/tilt）或
+    #    'in_model'（模型增广 disturbance-aware MPC：把 σ̂·m 作为世界系扰动力参数
+    #    喂进 acados 模型，MPC 预测时已知扰动、规划最优倾角/推力，不再事后叠加）。
+    # in_model 仅 acados baseline + direct 生效；geometric 无 MPC 模型故不适用。
+    inject_mode = str(l1_cfg.get("inject", "bolt_on")).strip().lower()
+    dist_aware_on = (
+        l1_on
+        and inject_mode == "in_model"
+        and not geometric_on
+        and control_mode == "direct"
+    )
+
     n_rotors = 4
     nominal_mass = float(pin.computeTotalMass(pin_model))
     cm_cf_alloc = float(load_s500_config()["platform"]["cm"] / load_s500_config()["platform"]["cf"])
@@ -711,16 +756,18 @@ def run_closed_loop_track_full_state_plan_acados(
     except np.linalg.LinAlgError:
         A_inv = np.linalg.pinv(A_alloc)
 
+    # L1 估计 或 位置误差反馈 任一开启即创建增广器（二者共用同一补偿管线/注入）。
     l1_aug = None
-    if l1_on:
+    if l1_on or pos_fb_on:
         from l1_adaptive import L1AdaptiveAugmentation, L1Params
 
         l1_keys = {
             "as_gain", "wc_xy", "wc_z", "tilt_gain", "max_accel_xy", "max_accel_z",
-            "max_sigma", "frame", "use_pos_feedback", "k_pos_i_xy", "k_pos_i_z",
+            "max_sigma", "frame", "method", "use_pos_feedback", "k_pos_i_xy", "k_pos_i_z",
             "k_pos_p_xy", "k_pos_p_z", "max_pos_integral_xy", "max_pos_integral_z",
         }
-        l1p = L1Params(enabled=True)
+        # enabled=L1 估计开关；位置反馈由 use_pos_feedback 单独控制，L1 关也能产生补偿。
+        l1p = L1Params(enabled=bool(l1_on))
         for k in l1_keys:
             if k in l1_cfg and l1_cfg[k] is not None:
                 setattr(l1p, k, l1_cfg[k])
@@ -757,12 +804,16 @@ def run_closed_loop_track_full_state_plan_acados(
     x_log = np.zeros((n_steps + 1, nx), dtype=float)
     u_log = np.zeros((n_steps, nu), dtype=float)
     dist_force_log = np.zeros((n_steps, 3), dtype=float)
+    # 同一拍同时记录机体系版本（= R(q_k)ᵀ·世界系），绘图按钮切换显示而非事后旋转。
+    dist_force_body_log = np.zeros((n_steps, 3), dtype=float)
     dist_torque_body_log = np.zeros((n_steps, 3), dtype=float)
     dist_torque_world_log = np.zeros((n_steps, 3), dtype=float)
     l1_force_log = np.zeros((n_steps, 3), dtype=float)
+    l1_force_body_log = np.zeros((n_steps, 3), dtype=float)
     l1_sigma_log = np.zeros((n_steps, 3), dtype=float)
     l1_aac_log = np.zeros((n_steps, 3), dtype=float)
     l1_al1_log = np.zeros((n_steps, 3), dtype=float)
+    l1_al1_body_log = np.zeros((n_steps, 3), dtype=float)
     # 控制分解日志：u_b(MPC baseline) / u_ac(L1 纯补偿) / u_p(位置通道)，
     # 三者满足 clip(u_b + u_ac + u_p) + thrust_bias = u_real(=u_log)。
     u_baseline_log = np.zeros((n_steps, nu), dtype=float)
@@ -800,6 +851,9 @@ def run_closed_loop_track_full_state_plan_acados(
     # L1 预测器输入：上一拍"名义施加"比力加速度（世界系），必须含 L1 竖直注入，
     # 否则补偿推力会被误并入 σ̂，导致稳态估计仅为真值一半（见 _l1_predictor_accel）。
     l1_last_a_applied = np.zeros(3, dtype=float)
+    # disturbance-aware MPC：下发给 acados 模型参数的世界系扰动力（N）= m·σ̂，
+    # 用上一控制拍 L1/oracle 的 σ̂ 估计（单拍滞后，扰动慢变可忽略）。
+    sigma_for_mpc = np.zeros(3, dtype=float)
 
     for k in range(n_steps):
         t_k = k * sim_dt
@@ -842,11 +896,20 @@ def run_closed_loop_track_full_state_plan_acados(
                 p_now = np.asarray(x_meas[0:3], dtype=float)
                 v_world_now = R_meas_g @ np.asarray(x_meas[nq : nq + 3], dtype=float)
                 omega_now = np.asarray(x_meas[nq + 3 : nq + 6], dtype=float)
+                # L1 补偿走力层：把上一拍补偿加速度 a_ac（世界系，LPF 平滑，单拍滞后
+                # 可忽略）前馈进 a_des，让 geometric 自己构造倾转姿态并飞过去；
+                # 不再在 ctbr 块对 geometric 事后叠 tilt（见下方 geometric_on 门控）。
+                a_ff_geo = (
+                    np.asarray(l1_aug.a_ac, dtype=float).reshape(3)
+                    if l1_aug is not None
+                    else None
+                )
                 T_geo, omega_geo = _geometric_baseline_command(
                     p_now, v_world_now, R_meas_g, omega_now,
                     p_ref, v_ref, a_ref, yaw_ref, nominal_mass, GRAVITY,
                     kp_pos=geo_kp_pos, kd_vel=geo_kd_vel, kR=geo_kR,
                     kOmega=geo_kOmega, max_tilt_deg=geo_max_tilt,
+                    a_ff_world=a_ff_geo,
                 )
                 u_apply = u_hover.copy()
                 T_baseline = float(T_geo)
@@ -870,6 +933,12 @@ def run_closed_loop_track_full_state_plan_acados(
                     solver.cost_set(i, "yref", yref, api="new")
                 xrN = interp_full_state_piecewise(t_k + N * dt_mpc, t_plan, x_plan, pin_model)
                 solver.cost_set(N, "yref", _state_to_yref_e(xrN, nq, n_arm), api="new")
+
+                # disturbance-aware MPC：把上一拍估计的世界系扰动力（常值保持）下发到
+                # horizon 全程参数 p_dist_w；后嵌模式保持 0（名义模型）。
+                p_dist_stage = sigma_for_mpc if dist_aware_on else np.zeros(3, dtype=float)
+                for i in range(N + 1):
+                    solver.set(i, "p", p_dist_stage)
 
                 t0 = time.perf_counter()
                 status = int(solver.solve())
@@ -923,51 +992,71 @@ def run_closed_loop_track_full_state_plan_acados(
                         control_dt, v_world, l1_last_a_applied,
                         pos_err_world=pos_err, R_bw=R_meas,
                     )
-                dFz = nominal_mass * float(np.dot(a_ac, b3))
-                a_nom = (T_cmd / max(nominal_mass, 1e-6)) * b3 - np.array([0.0, 0.0, GRAVITY])
-                f_des = a_nom + a_ac + np.array([0.0, 0.0, GRAVITY])
-                nfd = float(np.linalg.norm(f_des))
-                M_body = np.zeros(3)
-                if nfd > 1e-6 and l1_aug.params.tilt_gain > 0.0:
-                    b3_des = f_des / nfd
-                    e_tilt = np.cross(b3, b3_des)
-                    M_body = R_meas.T @ (float(l1_aug.params.tilt_gain) * e_tilt)
-                dthr = A_inv @ np.array([dFz, M_body[0], M_body[1], 0.0])
-                l1_thrust_delta = np.zeros(nu, dtype=float)
-                l1_thrust_delta[:n_rotors] = dthr
+                if geometric_on or dist_aware_on:
+                    # 补偿已在 baseline 力层注入，不做 direct 的事后 dFz/tilt 映射：
+                    #  • geometric：a_ac 前馈进 a_des（T_geo/omega_geo 已含倾转/抬推力）；
+                    #  • dist_aware：σ̂·m 作为模型参数喂进 MPC，u_apply 已是预测最优解。
+                    # 二者预测器输入都用名义比力 =(T_baseline/m)·b3 - g（不加 dFz，否则
+                    # 推力重复计入；横向补偿效果已体现在测量姿态 b3 中）。
+                    l1_thrust_delta = np.zeros(nu, dtype=float)
+                    l1_thrust_delta_l1 = np.zeros(nu, dtype=float)
+                    l1_thrust_delta_pos = np.zeros(nu, dtype=float)
+                    l1_last_a_applied = (
+                        (T_cmd / max(nominal_mass, 1e-6)) * b3
+                        - np.array([0.0, 0.0, GRAVITY])
+                    )
+                else:
+                    dFz = nominal_mass * float(np.dot(a_ac, b3))
+                    a_nom = (T_cmd / max(nominal_mass, 1e-6)) * b3 - np.array([0.0, 0.0, GRAVITY])
+                    f_des = a_nom + a_ac + np.array([0.0, 0.0, GRAVITY])
+                    nfd = float(np.linalg.norm(f_des))
+                    M_body = np.zeros(3)
+                    if nfd > 1e-6 and l1_aug.params.tilt_gain > 0.0:
+                        b3_des = f_des / nfd
+                        e_tilt = np.cross(b3, b3_des)
+                        M_body = R_meas.T @ (float(l1_aug.params.tilt_gain) * e_tilt)
+                    dthr = A_inv @ np.array([dFz, M_body[0], M_body[1], 0.0])
+                    l1_thrust_delta = np.zeros(nu, dtype=float)
+                    l1_thrust_delta[:n_rotors] = dthr
 
-                # ── 推力增量分解：L1 纯补偿(a_l1) 与 位置通道(a_pos) ──────────
-                # 竖直分量按比力投影线性可分；倾转力矩用 a_l1-only 的期望比力方向
-                # 计算 M_l1，剩余 M_pos = M_body - M_l1，保证两路之和恒等于总增量。
-                a_l1_w = np.asarray(l1_aug.a_l1, dtype=float)
-                a_pos_w = np.asarray(l1_aug.a_pos, dtype=float)
-                dFz_l1 = nominal_mass * float(np.dot(a_l1_w, b3))
-                dFz_pos = nominal_mass * float(np.dot(a_pos_w, b3))
-                M_l1 = np.zeros(3)
-                if nfd > 1e-6 and l1_aug.params.tilt_gain > 0.0:
-                    f_des_l1 = a_nom + a_l1_w + np.array([0.0, 0.0, GRAVITY])
-                    nfd_l1 = float(np.linalg.norm(f_des_l1))
-                    if nfd_l1 > 1e-6:
-                        b3_des_l1 = f_des_l1 / nfd_l1
-                        M_l1 = R_meas.T @ (
-                            float(l1_aug.params.tilt_gain) * np.cross(b3, b3_des_l1)
-                        )
-                M_pos = M_body - M_l1
-                l1_thrust_delta_l1 = np.zeros(nu, dtype=float)
-                l1_thrust_delta_pos = np.zeros(nu, dtype=float)
-                l1_thrust_delta_l1[:n_rotors] = A_inv @ np.array(
-                    [dFz_l1, M_l1[0], M_l1[1], 0.0]
-                )
-                l1_thrust_delta_pos[:n_rotors] = A_inv @ np.array(
-                    [dFz_pos, M_pos[0], M_pos[1], 0.0]
-                )
-                # 为下一拍更新预测器输入：实际总推力 = baseline + L1 竖直注入 dFz。
-                # 水平补偿靠倾转实现，其效果已体现在测量姿态 b3 中，故不再显式 +a_ac。
-                T_actual = T_cmd + dFz
-                l1_last_a_applied = (
-                    (T_actual / max(nominal_mass, 1e-6)) * b3
-                    - np.array([0.0, 0.0, GRAVITY])
-                )
+                    # ── 推力增量分解：L1 纯补偿(a_l1) 与 位置通道(a_pos) ──────────
+                    # 竖直分量按比力投影线性可分；倾转力矩用 a_l1-only 的期望比力方向
+                    # 计算 M_l1，剩余 M_pos = M_body - M_l1，保证两路之和恒等于总增量。
+                    a_l1_w = np.asarray(l1_aug.a_l1, dtype=float)
+                    a_pos_w = np.asarray(l1_aug.a_pos, dtype=float)
+                    dFz_l1 = nominal_mass * float(np.dot(a_l1_w, b3))
+                    dFz_pos = nominal_mass * float(np.dot(a_pos_w, b3))
+                    M_l1 = np.zeros(3)
+                    if nfd > 1e-6 and l1_aug.params.tilt_gain > 0.0:
+                        f_des_l1 = a_nom + a_l1_w + np.array([0.0, 0.0, GRAVITY])
+                        nfd_l1 = float(np.linalg.norm(f_des_l1))
+                        if nfd_l1 > 1e-6:
+                            b3_des_l1 = f_des_l1 / nfd_l1
+                            M_l1 = R_meas.T @ (
+                                float(l1_aug.params.tilt_gain) * np.cross(b3, b3_des_l1)
+                            )
+                    M_pos = M_body - M_l1
+                    l1_thrust_delta_l1 = np.zeros(nu, dtype=float)
+                    l1_thrust_delta_pos = np.zeros(nu, dtype=float)
+                    l1_thrust_delta_l1[:n_rotors] = A_inv @ np.array(
+                        [dFz_l1, M_l1[0], M_l1[1], 0.0]
+                    )
+                    l1_thrust_delta_pos[:n_rotors] = A_inv @ np.array(
+                        [dFz_pos, M_pos[0], M_pos[1], 0.0]
+                    )
+                    # 为下一拍更新预测器输入：实际总推力 = baseline + L1 竖直注入 dFz。
+                    # 水平补偿靠倾转实现，其效果已体现在测量姿态 b3 中，故不再显式 +a_ac。
+                    T_actual = T_cmd + dFz
+                    l1_last_a_applied = (
+                        (T_actual / max(nominal_mass, 1e-6)) * b3
+                        - np.array([0.0, 0.0, GRAVITY])
+                    )
+
+                # disturbance-aware MPC：用本拍 σ̂（adaptive 估计 / oracle 真值，均存于
+                # l1_aug.sigma_hat）换算世界系扰动力 m·σ̂，供下一拍下发给 MPC 模型参数。
+                sigma_for_mpc = nominal_mass * np.asarray(
+                    l1_aug.sigma_hat, dtype=float
+                ).reshape(3)
 
             # ── CTBR 内环：总推力 + 前瞻角速度设定点 → 角速度 PID → 分配 ──────
             if ctbr_on:
@@ -987,7 +1076,11 @@ def run_closed_loop_track_full_state_plan_acados(
                 # dFz→总推力，tilt→角速度设定点。a_ac≈0 时必须跳过——旧实现用
                 # b3_des=(a_ac+g)/|a_ac+g|，在 a_ac=0 时退化为世界竖直 [0,0,1]，
                 # 会持续把机体往“水平”拉，与 MPC 轨迹倾角对抗（无扰动也 ~4cm）。
-                if l1_aug is not None:
+                # geometric 路跳过：补偿已在 a_des 力层前馈进 T_geo/omega_geo，再叠 tilt
+                # 会与几何姿态环对抗（悬停 oracle 横向补不动的根因）。
+                # dist_aware 路跳过：补偿已作为模型参数喂进 MPC，u_apply/horizon 已含倾转，
+                # 再叠 tilt 会与 MPC 预测姿态对抗。仅 acados 后嵌 CTBR 走这里。
+                if l1_aug is not None and not geometric_on and not dist_aware_on:
                     a_ac = np.asarray(l1_aug.a_ac, dtype=float).reshape(3)
                     if np.any(np.abs(a_ac) > 1e-9):
                         T_cmd_c += nominal_mass * float(np.dot(a_ac, b3_c))
@@ -1103,6 +1196,7 @@ def run_closed_loop_track_full_state_plan_acados(
                     T_base = float(np.sum(u_apply[:n_rotors]))
                     dT_base = (dist_params.thrust_scale - 1.0) * T_base + dist_params.thrust_bias
                 dist_force_log[k] = F_ext + dT_base * b3_now
+                dist_force_body_log[k] = R_now.T @ dist_force_log[k]
                 dist_torque_body_log[k] = M_body_ext
                 dist_torque_world_log[k] = M_world_ext
 
@@ -1111,6 +1205,10 @@ def run_closed_loop_track_full_state_plan_acados(
                 l1_sigma_log[k] = l1_aug.sigma_hat
                 l1_aac_log[k] = l1_aug.a_ac
                 l1_al1_log[k] = l1_aug.a_l1
+                # 机体系版本：用本拍真实姿态把世界系估计/补偿旋到机体系一并记录。
+                R_b = _quat_to_R_np(x[3:7])
+                l1_force_body_log[k] = R_b.T @ l1_force_log[k]
+                l1_al1_body_log[k] = R_b.T @ l1_al1_log[k]
 
             x = plant.step(x, u_real)
             t_log[k + 1] = (k + 1) * sim_dt
@@ -1142,16 +1240,20 @@ def run_closed_loop_track_full_state_plan_acados(
         "state_limits": limits,
         "disturbance_active": bool(dist_on),
         "l1_active": bool(l1_on),
+        "pos_fb_active": bool(pos_fb_on),
         "comp_mode": ("oracle" if oracle_on else "adaptive"),
         "oracle_active": bool(oracle_on),
         "nominal_mass": nominal_mass,
         "dist_force_world": dist_force_log,
+        "dist_force_body": dist_force_body_log,
         "dist_torque_body": dist_torque_body_log,
         "dist_torque_world": dist_torque_world_log,
         "l1_force_world": l1_force_log,
+        "l1_force_body": l1_force_body_log,
         "l1_sigma": l1_sigma_log,
         "l1_a_ac": l1_aac_log,
         "l1_a_l1": l1_al1_log,
+        "l1_a_l1_body": l1_al1_body_log,
         "controls_real": u_log,
         "u_baseline": u_baseline_log,
         "u_l1_delta": u_l1_delta_log,
@@ -1164,6 +1266,8 @@ def run_closed_loop_track_full_state_plan_acados(
         "ctbr_rate_sp": ctbr_rate_sp_log,
         "baseline": baseline_kind,
         "geometric_active": bool(geometric_on),
+        "inject_mode": ("in_model" if dist_aware_on else "bolt_on"),
+        "dist_aware_active": bool(dist_aware_on),
     }
 
 

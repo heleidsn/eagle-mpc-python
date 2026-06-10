@@ -90,6 +90,16 @@ class L1Params:
     # 需调用方在 step() 传入机体→世界旋转矩阵 R_bw；未提供则回退世界系。
     frame: str = "body"
 
+    # 补偿方式（如何把扰动估计 σ̂ 映射成补偿）：
+    #   "baseline"（默认，本仓库原行为）：补偿 **全部** σ̂——matched（机体 z/推力轴）
+    #       经 dFz 直接补，unmatched（机体 xy）经 tilt_gain 主动倾转去补。对四旋翼
+    #       欠驱动而言，unmatched 力只能靠倾转产生，会与 baseline 期望姿态对抗。
+    #   "l1quad"（L1Quad 论文做法）：σ̂ 仍按 3 维估计（预测器/绘图不变），但补偿
+    #       **只取 matched 分量**（沿机体 z 的推力轴），unmatched（机体 xy）只估计、
+    #       不主动补偿，交由 baseline 控制器（geometric/MPC）的状态反馈处理。
+    #       => l1quad 下补偿 a_l1 恒沿 b3，tilt 自然≈0；对 geometric 与 MPC 通用。
+    method: str = "baseline"
+
     # ── 位置误差积分增广（消除 L1 扰动补偿残差导致的稳态位置误差）─────────
     # 纯速度预测器的 L1 只能让 plant≈名义；若 σ̂ 因带宽/滞后有残差，baseline
     # 仍会留下稳态位置误差 e_p≈d_res/kp。这里并联一个对跟踪位置误差的积分
@@ -117,6 +127,9 @@ class L1Params:
         self.max_pos_integral_xy = float(max(0.0, self.max_pos_integral_xy))
         self.max_pos_integral_z = float(max(0.0, self.max_pos_integral_z))
         self.frame = "body" if str(self.frame).strip().lower() == "body" else "world"
+        self.method = (
+            "l1quad" if str(self.method).strip().lower() == "l1quad" else "baseline"
+        )
         return self
 
 
@@ -222,8 +235,16 @@ class L1AdaptiveAugmentation:
         v = np.asarray(v_world, dtype=float).reshape(3)
         a_applied = np.asarray(a_applied_world, dtype=float).reshape(3)
 
-        if not p.enabled or dt <= 0.0:
+        if dt <= 0.0:
             return self.a_ac.copy()
+
+        # L1 估计关闭、仅位置误差反馈通道（独立控制器）：跳过预测器/自适应/LPF，
+        # σ̂ 与 a_l1 置零，只由 _compose_a_ac 用位置误差产生补偿 a_pos。
+        if not p.enabled:
+            self.sigma_hat = np.zeros(3, dtype=float)
+            self.a_l1 = np.zeros(3, dtype=float)
+            self._a_l1_body = np.zeros(3, dtype=float)
+            return self._compose_a_ac(dt, pos_err_world)
 
         # 首拍（或重置后）：用当前测量 seed 预测器，本拍不产生补偿。
         if not self._initialized or self.v_hat is None:
@@ -272,20 +293,33 @@ class L1AdaptiveAugmentation:
         R_bw: Optional[np.ndarray],
     ) -> None:
         """一阶低通生成 a_l1（世界系）。frame="body" 且给定 R_bw 时，在机体系做
-        xy/z 分通道滤波（wc_z 对齐机体 z=matched 推力轴），再旋回世界系。"""
+        xy/z 分通道滤波（wc_z 对齐机体 z=matched 推力轴），再旋回世界系。
+
+        method="l1quad" 时强制机体系分解，并把输出补偿 a_l1 中的机体 xy（unmatched）
+        分量置零——只保留机体 z（matched/推力轴）补偿；内部 _a_l1_body 仍保留三轴
+        滤波状态，便于 world↔body / baseline↔l1quad 切换无跳变。"""
         target_world = np.asarray(target_world, dtype=float).reshape(3)
-        use_body = (self.params.frame == "body") and (R_bw is not None)
+        is_l1quad = self.params.method == "l1quad"
+        use_body = ((self.params.frame == "body") or is_l1quad) and (R_bw is not None)
         if use_body:
             R = np.asarray(R_bw, dtype=float).reshape(3, 3)
             target_b = R.T @ target_world
             self._a_l1_body[0] += alpha_xy * (target_b[0] - self._a_l1_body[0])
             self._a_l1_body[1] += alpha_xy * (target_b[1] - self._a_l1_body[1])
             self._a_l1_body[2] += alpha_z * (target_b[2] - self._a_l1_body[2])
-            self.a_l1 = R @ self._a_l1_body
+            if is_l1quad:
+                # 只补 matched（机体 z=推力轴）；unmatched（机体 xy）不主动补偿。
+                self.a_l1 = R @ np.array([0.0, 0.0, self._a_l1_body[2]])
+            else:
+                self.a_l1 = R @ self._a_l1_body
         else:
             self.a_l1[0] += alpha_xy * (target_world[0] - self.a_l1[0])
             self.a_l1[1] += alpha_xy * (target_world[1] - self.a_l1[1])
             self.a_l1[2] += alpha_z * (target_world[2] - self.a_l1[2])
+            if is_l1quad:
+                # 无 R_bw 退化：以世界 z 近似 matched 推力轴，去掉世界 xy 补偿。
+                self.a_l1[0] = 0.0
+                self.a_l1[1] = 0.0
             # 同步机体状态，便于 world↔body 切换时无跳变。
             if R_bw is not None:
                 self._a_l1_body = np.asarray(R_bw, dtype=float).reshape(3, 3).T @ self.a_l1
@@ -318,7 +352,17 @@ class L1AdaptiveAugmentation:
             self.sigma_hat = np.clip(self.sigma_hat, -p.max_sigma, p.max_sigma)
         # 完美测量：补偿直接等于 -σ̂，不经预测器/低通（frame 无关，瞬时无滤波）。
         self.a_l1 = -self.sigma_hat.copy()
-        if R_bw is not None:
+        if p.method == "l1quad":
+            # L1Quad：oracle 也只补 matched（沿 b3 的推力轴）分量，unmatched 不补。
+            if R_bw is not None:
+                R = np.asarray(R_bw, dtype=float).reshape(3, 3)
+                self._a_l1_body = R.T @ self.a_l1
+                self.a_l1 = R @ np.array([0.0, 0.0, self._a_l1_body[2]])
+            else:
+                self.a_l1[0] = 0.0
+                self.a_l1[1] = 0.0
+                self._a_l1_body = self.a_l1.copy()
+        elif R_bw is not None:
             self._a_l1_body = np.asarray(R_bw, dtype=float).reshape(3, 3).T @ self.a_l1
         else:
             self._a_l1_body = self.a_l1.copy()

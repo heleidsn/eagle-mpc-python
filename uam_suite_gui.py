@@ -401,9 +401,9 @@ def _detect_plot_font_scale(app) -> float:
         dpr = float(screen.devicePixelRatio())
         phys_w = screen.geometry().width() * dpr
         if phys_w >= 3200:
-            return 1.5
+            return 1.6
         if phys_w >= 2560:
-            return 1.35
+            return 1.4
     except Exception:
         pass
     return 1.0
@@ -1142,6 +1142,163 @@ class TrackAcadosAlongPlanWorker(QThread):
             self.finished.emit(True, "", {"out": out, "res": res, "control_mode": p.get("control_mode", "direct")})
         except Exception:
             self.finished.emit(False, traceback.format_exc(), None)
+
+
+def _geo_pos_error_metrics(out: dict, alpha: float = 1.0) -> tuple:
+    """从闭环结果 out 计算 base 位置跟踪误差（世界系）。
+
+    返回 (mean_err, max_err, J)，J = mean + alpha*max。x_plan/states 的位置段都在
+    世界系（q[:3]），无需旋转。不可用时返回 (inf, inf, inf)。
+    """
+    try:
+        t = np.asarray(out.get("time"), dtype=float).flatten()
+        states = np.asarray(out.get("states"), dtype=float)
+        t_plan = np.asarray(out.get("t_plan"), dtype=float).flatten()
+        x_plan = np.asarray(out.get("x_plan"), dtype=float)
+        if t.size < 2 or states.ndim != 2 or x_plan.ndim != 2:
+            return (float("inf"),) * 3
+        n = min(t.size, states.shape[0])
+        t = t[:n]
+        pos = states[:n, 0:3]
+        ref = np.column_stack([
+            np.interp(t, t_plan, x_plan[:, c]) for c in range(3)
+        ])
+        err = np.linalg.norm(pos - ref, axis=1)
+        if not np.all(np.isfinite(err)):
+            return (float("inf"),) * 3
+        mean_e = float(np.mean(err))
+        max_e = float(np.max(err))
+        return (mean_e, max_e, mean_e + float(alpha) * max_e)
+    except Exception:
+        return (float("inf"),) * 3
+
+
+class GeometricAutoTuneWorker(QThread):
+    """针对当前轨迹自动调 geometric 控制器增益（kp_pos/kd_vel/kR/kOmega）。
+
+    模式搜索（坐标下降 + 步长收缩）：每次评估跑一次 headless 闭环仿真，
+    目标 J = mean_pos_err + alpha*max_pos_err。调参时强制关闭扰动与 L1，
+    只评估控制器本身。可中途 stop。
+    """
+
+    # eval_idx, budget, cur_J, best_J, mean_e, max_e, best_gains(dict)
+    progress = pyqtSignal(int, int, float, float, float, float, object)
+    finished = pyqtSignal(bool, str, object)
+
+    GAIN_KEYS = ("kp_pos", "kd_vel", "kR", "kOmega")
+    LOWER = np.array([0.5, 0.3, 1.0, 0.0], dtype=float)
+    UPPER = np.array([30.0, 30.0, 30.0, 5.0], dtype=float)
+    STEP_MIN = np.array([0.2, 0.2, 0.3, 0.02], dtype=float)
+
+    def __init__(self, params: dict):
+        super().__init__()
+        self.params = params
+        self._stop = False
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    def run(self):
+        try:
+            from s500_uam_acados_state_tracking_mpc import (
+                run_closed_loop_track_full_state_plan_acados,
+            )
+
+            p = self.params
+            alpha = float(p.get("alpha", 1.0))
+            budget = int(p.get("budget", 40))
+            max_tilt = float(p.get("max_tilt_deg", 30.0))
+            g0 = np.array(
+                [float(p["init"][k]) for k in self.GAIN_KEYS], dtype=float
+            )
+            g0 = np.clip(g0, self.LOWER, self.UPPER)
+
+            eval_count = {"n": 0}
+
+            def _evaluate(g: np.ndarray) -> tuple:
+                geo = {
+                    "kp_pos": float(g[0]),
+                    "kd_vel": float(g[1]),
+                    "kR": float(g[2]),
+                    "kOmega": float(g[3]),
+                    "max_tilt_deg": max_tilt,
+                }
+                ctbr_cfg = dict(p.get("ctbr") or {})
+                ctbr_cfg["enabled"] = True  # geometric 恒走 CTBR
+                try:
+                    out = run_closed_loop_track_full_state_plan_acados(
+                        p["x0"], p["t_plan"], p["x_plan"], p["T_sim"],
+                        p["sim_dt"], p["control_dt"], p["dt_mpc"], p["N"],
+                        mpc_max_iter=p.get("mpc_max_iter", 40),
+                        mpc_log_interval=0,
+                        control_mode="direct",
+                        urdf_path=p.get("urdf_path"),
+                        state_limits=p.get("state_limits"),
+                        disturbance=None,   # 调参时关闭扰动
+                        l1=None,            # 调参时关闭 L1
+                        ctbr=ctbr_cfg,
+                        baseline="geometric",
+                        geometric=geo,
+                    )
+                except Exception:
+                    return (float("inf"), float("inf"), float("inf"))
+                return _geo_pos_error_metrics(out, alpha)
+
+            # 初始点。
+            best_g = g0.copy()
+            best_mean, best_max, best_J = _evaluate(best_g)
+            eval_count["n"] += 1
+            self.progress.emit(
+                eval_count["n"], budget, best_J, best_J, best_mean, best_max,
+                dict(zip(self.GAIN_KEYS, best_g.tolist())),
+            )
+            if self._stop:
+                self._emit_done(best_g, best_J)
+                return
+
+            step = np.maximum(0.25 * np.abs(best_g), self.STEP_MIN * 2.0)
+            while eval_count["n"] < budget and np.any(step > self.STEP_MIN):
+                improved = False
+                for d in range(4):
+                    if eval_count["n"] >= budget or self._stop:
+                        break
+                    for sgn in (1.0, -1.0):
+                        cand = best_g.copy()
+                        cand[d] = float(np.clip(
+                            cand[d] + sgn * step[d], self.LOWER[d], self.UPPER[d]
+                        ))
+                        if abs(cand[d] - best_g[d]) < 1e-12:
+                            continue
+                        mean_e, max_e, J = _evaluate(cand)
+                        eval_count["n"] += 1
+                        cur_gains = dict(zip(self.GAIN_KEYS, cand.tolist()))
+                        if J < best_J - 1e-9:
+                            best_J, best_mean, best_max = J, mean_e, max_e
+                            best_g = cand
+                            improved = True
+                        self.progress.emit(
+                            eval_count["n"], budget, J, best_J,
+                            best_mean, best_max,
+                            dict(zip(self.GAIN_KEYS, best_g.tolist())),
+                        )
+                        if J < best_J + 1e-12 and improved:
+                            break  # 接受该维首个改进，转下一维
+                        if eval_count["n"] >= budget or self._stop:
+                            break
+                    if self._stop:
+                        break
+                if self._stop:
+                    break
+                if not improved:
+                    step = step * 0.5
+            self._emit_done(best_g, best_J)
+        except Exception:
+            self.finished.emit(False, traceback.format_exc(), None)
+
+    def _emit_done(self, best_g: np.ndarray, best_J: float) -> None:
+        best = dict(zip(self.GAIN_KEYS, best_g.tolist()))
+        best["J"] = float(best_J)
+        self.finished.emit(True, "", best)
 
 
 class TrackEeAcadosWorker(QThread):
@@ -1958,6 +2115,20 @@ class UamSuiteGUI(QMainWindow):
             for c, val in enumerate(row):
                 self.ee_wp_table.setItem(r, c, QTableWidgetItem(f"{val:g}"))
         g_ee.addWidget(self.ee_wp_table)
+        # 增删 waypoint 行（minimum snap：N 个点 → N-1 段；至少 2 个点）。
+        self.ee_wp_btn_row_widget = QWidget()
+        ee_wp_btn_row = QHBoxLayout(self.ee_wp_btn_row_widget)
+        ee_wp_btn_row.setContentsMargins(0, 0, 0, 0)
+        self.ee_add_wp_btn = QPushButton("Add row")
+        self.ee_add_wp_btn.setToolTip("在末尾增加一个 waypoint（默认时间在最后一点基础上 +2s）。")
+        self.ee_add_wp_btn.clicked.connect(self._add_ee_wp_row)
+        self.ee_del_wp_btn = QPushButton("Delete last row")
+        self.ee_del_wp_btn.setToolTip("删除最后一个 waypoint（最少保留 2 个点）。")
+        self.ee_del_wp_btn.clicked.connect(self._del_ee_wp_row)
+        ee_wp_btn_row.addWidget(self.ee_add_wp_btn)
+        ee_wp_btn_row.addWidget(self.ee_del_wp_btn)
+        ee_wp_btn_row.addStretch(1)
+        g_ee.addWidget(self.ee_wp_btn_row_widget)
         self.ee_eight_group = QGroupBox("Figure-eight parameters")
         ee8 = QGridLayout()
         self.ee_eight_cx = QDoubleSpinBox()
@@ -2769,6 +2940,28 @@ class UamSuiteGUI(QMainWindow):
         self.track_algo_group = QGroupBox("Cost-function parameters")
         algo_wrap = QVBoxLayout()
         algo_wrap.addLayout(self._algo_grid)
+        # Geometric 自动调参（仅 idx==4 显示）：针对当前轨迹搜索 kp_pos/kd_vel/kR/kOmega。
+        self.geo_autotune_btn = QPushButton("Auto tune (当前轨迹)")
+        self.geo_autotune_btn.setToolTip(
+            "针对当前规划轨迹自动搜索 geometric 增益（kp_pos/kd_vel/kR/kOmega），"
+            "目标 = 平均位置误差 + 最大位置误差。调参时关闭扰动与 L1。"
+        )
+        self.geo_autotune_btn.clicked.connect(self._on_geo_autotune_clicked)
+        self.geo_autotune_budget = QSpinBox()
+        self.geo_autotune_budget.setRange(8, 200)
+        self.geo_autotune_budget.setValue(40)
+        self.geo_autotune_budget.setToolTip("最大评估次数（每次=跑一遍闭环仿真）")
+        self.geo_autotune_status = QLabel("")
+        self.geo_autotune_status.setWordWrap(True)
+        self.geo_autotune_row = QWidget()
+        _at_h = QHBoxLayout(self.geo_autotune_row)
+        _at_h.setContentsMargins(0, 0, 0, 0)
+        _at_h.addWidget(self.geo_autotune_btn)
+        _at_h.addWidget(QLabel("budget"))
+        _at_h.addWidget(self.geo_autotune_budget)
+        _at_h.addWidget(self.geo_autotune_status, 1)
+        self.geo_autotune_row.setVisible(False)
+        algo_wrap.addWidget(self.geo_autotune_row)
         self.track_algo_group.setLayout(algo_wrap)
         algo_v.addWidget(self.track_algo_group)
         algo_v.addStretch(1)
@@ -3972,7 +4165,7 @@ class UamSuiteGUI(QMainWindow):
             ha="center",
             va="center",
             transform=ax.transAxes,
-            fontsize=11,
+            fontsize=_mpl_pt(14),
         )
         ax.axis("off")
 
@@ -4016,10 +4209,26 @@ class UamSuiteGUI(QMainWindow):
         vel = X[:, 9:12] if X.shape[1] >= 12 else np.zeros((len(t), 3), dtype=float)
         omg = X[:, 12:15] if X.shape[1] >= 15 else np.zeros((len(t), 3), dtype=float)
         omg_deg = np.degrees(omg)
+        # acc/jerk/snap 在世界系下算：v_world = R·v_body。直接对机体系速度做高阶微分会把
+        # ω×v（姿态/角速度抖动 × 速度幅值）混进去，几何控制器 ringing + 大速度时被强烈放大。
+        quat_meas = X[:, 3:7] if X.shape[1] >= 7 else None
+        vel_world = (
+            self._body_to_world_series(vel, quat_meas) if quat_meas is not None else vel
+        )
+        # 高阶导平滑窗口：盖住 control_dt(ZOH) 级毛刺、保留真实低频 ringing。
+        # 窗口 ≈ 4·control_dt，并夹在 [0.02s, 0.12s]；点数按当前采样步长换算。
+        try:
+            _ctrl_dt = float(self.control_dt.value())
+        except Exception:
+            _ctrl_dt = 0.01
+        _dt_grid = float(np.median(np.diff(t))) if len(t) >= 2 else _ctrl_dt
+        _win_s = min(0.12, max(0.02, 4.0 * _ctrl_dt))
+        smooth_win = int(max(3, round(_win_s / max(_dt_grid, 1e-9))))
         if len(t) >= 2:
-            acc = np.gradient(vel, t, axis=0)
-            jerk = np.gradient(acc, t, axis=0)
-            snap = np.gradient(jerk, t, axis=0)
+            vel_world_s = self._movavg(vel_world, smooth_win)
+            acc = self._movavg(np.gradient(vel_world_s, t, axis=0), smooth_win)
+            jerk = self._movavg(np.gradient(acc, t, axis=0), smooth_win)
+            snap = self._movavg(np.gradient(jerk, t, axis=0), smooth_win)
             omg_rad = np.asarray(omg, dtype=float)
             alpha_rad = np.gradient(omg_rad, t, axis=0)
         else:
@@ -4037,10 +4246,15 @@ class UamSuiteGUI(QMainWindow):
             vel_r = Xr_on_t[:, 9:12] if Xr_on_t.shape[1] >= 12 else np.zeros((len(t), 3), dtype=float)
             omg_r = Xr_on_t[:, 12:15] if Xr_on_t.shape[1] >= 15 else np.zeros((len(t), 3), dtype=float)
             omg_deg_r = np.degrees(omg_r)
+            quat_r = Xr_on_t[:, 3:7] if Xr_on_t.shape[1] >= 7 else None
+            vel_r_world = (
+                self._body_to_world_series(vel_r, quat_r) if quat_r is not None else vel_r
+            )
             if len(t) >= 2:
-                acc_r = np.gradient(vel_r, t, axis=0)
-                jerk_r = np.gradient(acc_r, t, axis=0)
-                snap_r = np.gradient(jerk_r, t, axis=0)
+                vel_r_world_s = self._movavg(vel_r_world, smooth_win)
+                acc_r = self._movavg(np.gradient(vel_r_world_s, t, axis=0), smooth_win)
+                jerk_r = self._movavg(np.gradient(acc_r, t, axis=0), smooth_win)
+                snap_r = self._movavg(np.gradient(jerk_r, t, axis=0), smooth_win)
                 alpha_deg_r = np.degrees(np.gradient(np.asarray(omg_r, dtype=float), t, axis=0))
             else:
                 acc_r = np.zeros_like(vel_r)
@@ -4055,10 +4269,10 @@ class UamSuiteGUI(QMainWindow):
             ("Base orientation (Euler ZYX)", "deg"),
             ("Base linear velocity", "m/s"),
             ("Base angular velocity", "deg/s"),
-            ("Base linear acceleration (d v/dt)", "m/s²"),
+            ("Base linear acceleration (world)", "m/s²"),
             ("Base angular acceleration (d ω/dt)", "deg/s²"),
-            ("Base linear jerk (d a/dt)", "m/s³"),
-            ("Base linear snap (d j/dt)", "m/s⁴"),
+            ("Base linear jerk (world, LP-smoothed)", "m/s³"),
+            ("Base linear snap (world, LP-smoothed)", "m/s⁴"),
         )
         series_meas = (
             (pos, ("x", "y", "z")),
@@ -4112,16 +4326,16 @@ class UamSuiteGUI(QMainWindow):
                                 alpha=0.88,
                                 label=f"{names_rf[j]} ref",
                             )
-            ax.set_title(ttl, fontsize=_mpl_pt(9))
+            ax.set_title(ttl, fontsize=_mpl_pt(12))
             ax.set_ylabel(yl)
             ax.set_xlabel("t [s]")
             ax.grid(True, alpha=0.3)
-            ax.legend(loc="upper right", fontsize=5, framealpha=0.9, ncol=3)
+            ax.legend(loc="upper right", fontsize=_mpl_pt(10), framealpha=0.9, ncol=3)
 
         suf = f"{title_prefix} — base state (pos…snap)"
         if pos_r is not None:
             suf += " (meas solid / ref dashed)"
-        self.fig_states.suptitle(suf, fontsize=11, y=0.995)
+        self.fig_states.suptitle(suf, fontsize=_mpl_pt(14), y=0.995)
         try:
             self.fig_states.tight_layout(rect=(0, 0, 1, 0.96))
         except Exception:
@@ -4151,7 +4365,7 @@ class UamSuiteGUI(QMainWindow):
                                 alpha=0.88,
                                 label=f"u{j+1} ref",
                             )
-                ax_u.legend(loc="upper right", fontsize=_mpl_pt(7), framealpha=0.9, ncol=2)
+                ax_u.legend(loc="upper right", fontsize=_mpl_pt(10), framealpha=0.9, ncol=2)
             else:
                 ax_u.text(0.5, 0.5, "No u_plan", ha="center", va="center", transform=ax_u.transAxes)
         else:
@@ -4161,11 +4375,11 @@ class UamSuiteGUI(QMainWindow):
             ctl_suf = "Control inputs (meas vs ref)"
         elif pos_r is not None:
             ctl_suf = "Control inputs (meas)"
-        ax_u.set_title(ctl_suf, fontsize=_mpl_pt(10))
+        ax_u.set_title(ctl_suf, fontsize=_mpl_pt(12))
         ax_u.set_ylabel("u")
         ax_u.set_xlabel("t [s]")
         ax_u.grid(True, alpha=0.3)
-        self.fig_control.suptitle(f"{title_prefix} — s500 actuation", fontsize=11, y=0.98)
+        self.fig_control.suptitle(f"{title_prefix} — s500 actuation", fontsize=_mpl_pt(14), y=0.98)
 
         self.fig_3d_track.clear()
         ax3 = self.fig_3d_track.add_subplot(111, projection="3d")
@@ -4185,14 +4399,14 @@ class UamSuiteGUI(QMainWindow):
         ax3.set_xlabel("X [m]")
         ax3.set_ylabel("Y [m]")
         ax3.set_zlabel("Z [m]")
-        ax3.set_title(f"{title_prefix} (base_link only, equal XYZ scale)", fontsize=_mpl_pt(10))
-        ax3.legend(loc="upper left", fontsize=_mpl_pt(7), framealpha=0.9)
+        ax3.set_title(f"{title_prefix} (base_link only, equal XYZ scale)", fontsize=_mpl_pt(12))
+        ax3.legend(loc="upper left", fontsize=_mpl_pt(10), framealpha=0.9)
         _set_mplot3d_equal_xyz(ax3, pos, pos_r)
 
         self.fig_traj_dash.clear()
         self.fig_traj_dash.suptitle(
             f"{title_prefix} — tracking errors & kinematics (see Controls tab for u)",
-            fontsize=11,
+            fontsize=_mpl_pt(14),
             y=0.99,
         )
         gsd = self.fig_traj_dash.add_gridspec(4, 2, hspace=0.55, wspace=0.30)
@@ -4208,10 +4422,10 @@ class UamSuiteGUI(QMainWindow):
                 ad[0].plot(t, e_p[:, j], color=c, lw=1.0, label=f"e_{'xyz'[j]}")
             ad[0].plot(t, np.linalg.norm(e_p, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_p\|$")
             ad[0].axhline(0.0, color="gray", ls=":", lw=0.7)
-            ad[0].legend(loc="best", fontsize=6, ncol=2)
+            ad[0].legend(loc="best", fontsize=_mpl_pt(10), ncol=2)
         else:
             ad[0].text(0.5, 0.5, "No reference — position error N/A", ha="center", va="center", transform=ad[0].transAxes)
-        ad[0].set_title("Base position tracking error", fontsize=_mpl_pt(9))
+        ad[0].set_title("Base position tracking error", fontsize=_mpl_pt(12))
         ad[0].set_xlabel("t [s]")
         ad[0].set_ylabel("m")
         ad[0].grid(True, alpha=0.3)
@@ -4222,10 +4436,10 @@ class UamSuiteGUI(QMainWindow):
                 ad[1].plot(t, e_v[:, j], color=c, lw=1.0, label=f"e_v{'xyz'[j]}")
             ad[1].plot(t, np.linalg.norm(e_v, axis=1), "k--", lw=0.95, alpha=0.65, label=r"$\|e_v\|$")
             ad[1].axhline(0.0, color="gray", ls=":", lw=0.7)
-            ad[1].legend(loc="best", fontsize=6, ncol=2)
+            ad[1].legend(loc="best", fontsize=_mpl_pt(10), ncol=2)
         else:
             ad[1].text(0.5, 0.5, "No reference — velocity error N/A", ha="center", va="center", transform=ad[1].transAxes)
-        ad[1].set_title("Base velocity tracking error", fontsize=_mpl_pt(9))
+        ad[1].set_title("Base velocity tracking error", fontsize=_mpl_pt(12))
         ad[1].set_xlabel("t [s]")
         ad[1].set_ylabel("m/s")
         ad[1].grid(True, alpha=0.3)
@@ -4236,10 +4450,10 @@ class UamSuiteGUI(QMainWindow):
             for j, (c, nm) in enumerate(zip("rgb", ("roll", "pitch", "yaw"))):
                 ad[2].plot(t, e_att[:, j], color=c, lw=1.0, label=f"e_{nm}")
             ad[2].axhline(0.0, color="gray", ls=":", lw=0.7)
-            ad[2].legend(loc="best", fontsize=6, ncol=3)
+            ad[2].legend(loc="best", fontsize=_mpl_pt(10), ncol=3)
         else:
             ad[2].text(0.5, 0.5, "No reference — attitude error N/A", ha="center", va="center", transform=ad[2].transAxes)
-        ad[2].set_title("Base attitude tracking error (Euler ZYX)", fontsize=_mpl_pt(9))
+        ad[2].set_title("Base attitude tracking error (Euler ZYX)", fontsize=_mpl_pt(12))
         ad[2].set_xlabel("t [s]")
         ad[2].set_ylabel("deg")
         ad[2].grid(True, alpha=0.3)
@@ -4249,10 +4463,10 @@ class UamSuiteGUI(QMainWindow):
             for j, c in enumerate("rgb"):
                 ad[3].plot(t, e_w[:, j], color=c, lw=1.0, label=f"e_ω{'xyz'[j]}")
             ad[3].axhline(0.0, color="gray", ls=":", lw=0.7)
-            ad[3].legend(loc="best", fontsize=6, ncol=3)
+            ad[3].legend(loc="best", fontsize=_mpl_pt(10), ncol=3)
         else:
             ad[3].text(0.5, 0.5, "No reference — angular-rate error N/A", ha="center", va="center", transform=ad[3].transAxes)
-        ad[3].set_title("Base angular velocity tracking error", fontsize=_mpl_pt(9))
+        ad[3].set_title("Base angular velocity tracking error", fontsize=_mpl_pt(12))
         ad[3].set_xlabel("t [s]")
         ad[3].set_ylabel("deg/s")
         ad[3].grid(True, alpha=0.3)
@@ -4261,31 +4475,31 @@ class UamSuiteGUI(QMainWindow):
         ad[4].plot(t, speed, "k-", lw=1.2, label="meas")
         if vel_r is not None:
             ad[4].plot(t, np.linalg.norm(vel_r, axis=1), color="tab:orange", ls="--", lw=1.05, alpha=0.9, label="ref")
-        ad[4].set_title("Speed norm", fontsize=_mpl_pt(9))
+        ad[4].set_title("Speed norm", fontsize=_mpl_pt(12))
         ad[4].set_xlabel("t [s]")
         ad[4].set_ylabel("m/s")
         if vel_r is not None:
-            ad[4].legend(loc="best", fontsize=_mpl_pt(7))
+            ad[4].legend(loc="best", fontsize=_mpl_pt(10))
         ad[4].grid(True, alpha=0.3)
         acc_norm = np.linalg.norm(acc, axis=1)
         jerk_norm = np.linalg.norm(jerk, axis=1)
         ad[5].plot(t, acc_norm, "m-", lw=1.2, label="meas")
         if acc_r is not None:
             ad[5].plot(t, np.linalg.norm(acc_r, axis=1), color="tab:orange", ls="--", lw=1.05, alpha=0.9, label="ref")
-        ad[5].set_title("Acceleration norm", fontsize=_mpl_pt(9))
+        ad[5].set_title("Acceleration norm", fontsize=_mpl_pt(12))
         ad[5].set_xlabel("t [s]")
         ad[5].set_ylabel("m/s²")
         if acc_r is not None:
-            ad[5].legend(loc="best", fontsize=_mpl_pt(7))
+            ad[5].legend(loc="best", fontsize=_mpl_pt(10))
         ad[5].grid(True, alpha=0.3)
         ad[6].plot(t, jerk_norm, "c-", lw=1.2, label="meas")
         if jerk_r is not None:
             ad[6].plot(t, np.linalg.norm(jerk_r, axis=1), color="tab:orange", ls="--", lw=1.05, alpha=0.9, label="ref")
-        ad[6].set_title("Jerk norm", fontsize=_mpl_pt(9))
+        ad[6].set_title("Jerk norm", fontsize=_mpl_pt(12))
         ad[6].set_xlabel("t [s]")
         ad[6].set_ylabel("m/s³")
         if jerk_r is not None:
-            ad[6].legend(loc="best", fontsize=_mpl_pt(7))
+            ad[6].legend(loc="best", fontsize=_mpl_pt(10))
         ad[6].grid(True, alpha=0.3)
 
         ms = mpc_solve if isinstance(mpc_solve, dict) else {}
@@ -4316,7 +4530,7 @@ class UamSuiteGUI(QMainWindow):
                 ax_t.step(t_u_mpc, nit, where="post", color="C2", lw=0.85, label="nlp_iter")
                 ax_t.set_ylabel("SQP iterations", color="C2")
                 ax_t.tick_params(axis="y", labelcolor="C2")
-            ax_m.set_title("MPC solve (wall time + iterations)", fontsize=_mpl_pt(9))
+            ax_m.set_title("MPC solve (wall time + iterations)", fontsize=_mpl_pt(12))
             ax_m.set_xlabel("t [s]")
             ax_m.grid(True, alpha=0.3)
         else:
@@ -4324,10 +4538,10 @@ class UamSuiteGUI(QMainWindow):
             ad[7].plot(t, snap_norm, color="tab:purple", lw=1.05, label=r"$\|$snap$\|$ meas")
             if snap_r is not None:
                 ad[7].plot(t, np.linalg.norm(snap_r, axis=1), "k--", lw=0.95, alpha=0.85, label=r"$\|$snap$\|$ ref")
-            ad[7].set_title("Linear snap norm (no MPC log)", fontsize=_mpl_pt(9))
+            ad[7].set_title("Linear snap norm (no MPC log)", fontsize=_mpl_pt(12))
             ad[7].set_xlabel("t [s]")
             ad[7].set_ylabel("m/s⁴")
-            ad[7].legend(loc="best", fontsize=_mpl_pt(7))
+            ad[7].legend(loc="best", fontsize=_mpl_pt(10))
             ad[7].grid(True, alpha=0.3)
 
         # 解决子图相互覆盖：tight_layout 预留 suptitle 空间。
@@ -4630,7 +4844,7 @@ class UamSuiteGUI(QMainWindow):
                 ha="center",
                 va="center",
                 transform=ax.transAxes,
-                fontsize=_mpl_pt(12),
+                fontsize=_mpl_pt(14),
             )
             ax.axis("off")
             return
@@ -4698,9 +4912,9 @@ class UamSuiteGUI(QMainWindow):
                 u_real = Ur
 
         def _style_leg(ax):
-            ax.legend(loc="upper right", fontsize=6, framealpha=0.88, ncol=2)
+            ax.legend(loc="upper right", fontsize=_mpl_pt(10), framealpha=0.88, ncol=2)
             ax.grid(True, alpha=0.3)
-            ax.tick_params(axis="both", labelsize=_mpl_pt(8))
+            ax.tick_params(axis="both", labelsize=_mpl_pt(10))
 
         # 0: base position
         ax = axes[0]
@@ -4714,7 +4928,7 @@ class UamSuiteGUI(QMainWindow):
             ax.plot(t_m, base_m[:, 2], "b-", lw=1.1, label="real z")
         ax.set_xlabel("t [s]", **tinfo)
         ax.set_ylabel("m", **tinfo)
-        ax.set_title("Base position", fontsize=_mpl_pt(9))
+        ax.set_title("Base position", fontsize=_mpl_pt(12))
         _style_leg(ax)
 
         # 1: base euler
@@ -4731,7 +4945,7 @@ class UamSuiteGUI(QMainWindow):
             ax.plot(t_m, em[:, 2], "b-", lw=1.1, label="real yaw")
         ax.set_xlabel("t [s]", **tinfo)
         ax.set_ylabel("deg", **tinfo)
-        ax.set_title("Base orientation (Euler ZYX)", fontsize=_mpl_pt(9))
+        ax.set_title("Base orientation (Euler ZYX)", fontsize=_mpl_pt(12))
         _style_leg(ax)
 
         # 2: EE position (or base linear velocity in s500 mode)
@@ -4756,7 +4970,7 @@ class UamSuiteGUI(QMainWindow):
                 ax.plot(t_m, ee_m[:, 2], "b-", lw=1.1, label="real z")
         ax.set_xlabel("t [s]", **tinfo)
         ax.set_ylabel("m/s" if s500_mode else "m", **tinfo)
-        ax.set_title("Base linear velocity" if s500_mode else "EE position (FK ref / meas. real)", fontsize=_mpl_pt(9))
+        ax.set_title("Base linear velocity" if s500_mode else "EE position (FK ref / meas. real)", fontsize=_mpl_pt(12))
         _style_leg(ax)
 
         # 3: arm joints (or control inputs in s500 mode)
@@ -4793,7 +5007,7 @@ class UamSuiteGUI(QMainWindow):
                 ax.plot(t_m, np.degrees(X_m[:, 8]), "g-", lw=1.1, label="real j2")
         ax.set_xlabel("t [s]", **tinfo)
         ax.set_ylabel("u" if s500_mode else "deg", **tinfo)
-        ax.set_title("Control inputs" if s500_mode else "Arm joints", fontsize=_mpl_pt(9))
+        ax.set_title("Control inputs" if s500_mode else "Arm joints", fontsize=_mpl_pt(12))
         _style_leg(ax)
 
         # 3D
@@ -4850,8 +5064,8 @@ class UamSuiteGUI(QMainWindow):
         ax3d.set_xlabel("X [m]", **tinfo)
         ax3d.set_ylabel("Y [m]", **tinfo)
         ax3d.set_zlabel("Z [m]", **tinfo)
-        ax3d.set_title("3D: ref (dashed) · real (solid)", fontsize=_mpl_pt(10))
-        ax3d.legend(loc="upper left", fontsize=6, framealpha=0.9)
+        ax3d.set_title("3D: ref (dashed) · real (solid)", fontsize=_mpl_pt(12))
+        ax3d.legend(loc="upper left", fontsize=_mpl_pt(10), framealpha=0.9)
         try:
             pts = []
             for arr in (base_ref, ee_ref, base_m, ee_m):
@@ -4870,10 +5084,10 @@ class UamSuiteGUI(QMainWindow):
             pass
 
         for ax in axes:
-            ax.tick_params(axis="both", labelsize=_mpl_pt(8))
-        ax3d.tick_params(axis="both", labelsize=_mpl_pt(8))
+            ax.tick_params(axis="both", labelsize=_mpl_pt(10))
+        ax3d.tick_params(axis="both", labelsize=_mpl_pt(10))
         subt = "(only ref)" if not has_real else "(ref + real)"
-        fig.suptitle(f"Plan ref (dashed) · closed-loop real (solid) {subt}", fontsize=_mpl_pt(12), y=0.98)
+        fig.suptitle(f"Plan ref (dashed) · closed-loop real (solid) {subt}", fontsize=_mpl_pt(14), y=0.98)
 
     def _make_plan_panel_scroll(self, stack: QStackedWidget) -> QScrollArea:
         scroll = QScrollArea()
@@ -5511,6 +5725,8 @@ class UamSuiteGUI(QMainWindow):
     def _on_ee_plan_type_changed(self):
         idx = int(self.ee_plan_type_combo.currentIndex())
         self.ee_wp_table.setVisible(idx == 0)
+        if hasattr(self, "ee_wp_btn_row_widget"):
+            self.ee_wp_btn_row_widget.setVisible(idx == 0)
         self.ee_eight_group.setVisible(idx == 1)
         self.ee_sun_group.setVisible(idx == 2)
         self.ee_circle_group.setVisible(idx == 3)
@@ -6013,6 +6229,8 @@ class UamSuiteGUI(QMainWindow):
                     self.geo_max_tilt,
                 }
             )
+        if hasattr(self, "geo_autotune_row"):
+            self.geo_autotune_row.setVisible(idx == 4)
         elif idx == 2:
             visible_widgets.update(
                 {
@@ -6260,82 +6478,118 @@ class UamSuiteGUI(QMainWindow):
         l1_v.setContentsMargins(6, 6, 6, 6)
         l1_intro = QLabel(
             "L1 自适应：估计 \"Disturbance\" 页注入的世界系平动集总扰动 σ̂，"
-            "经 -σ̂ 低通生成补偿加速度并映射为四路推力增量注入仿真。\n"
-            "仅 Acados full-state + direct 控制模式生效；力矩通道不估计。"
+            "经 -σ̂ 低通生成补偿加速度并映射注入仿真。\n"
+            "Acados(direct/CTBR) 与 geometric 均生效；geometric 把补偿前馈进期望比力 "
+            "a_des（力/姿态层），不再事后叠 tilt 与姿态环对抗。力矩通道暂不估计。"
         )
         l1_intro.setWordWrap(True)
         l1_intro.setStyleSheet("color: palette(mid); font-size: 11px;")
         l1_v.addWidget(l1_intro)
 
-        self.sim_l1_group = QGroupBox("扰动补偿 (L1 自适应 / 扰动真值 oracle)")
+        self.sim_l1_group = QGroupBox("扰动估计 + 扰动补偿")
         self.sim_l1_group.setCheckable(True)
         self.sim_l1_group.setChecked(False)
-        gl = QGridLayout(self.sim_l1_group)
-        # 补偿来源：L1 在线估计 vs 直接用扰动真值（假设可精确测量，隔离评估补偿环节）。
+        _l1_outer = QVBoxLayout(self.sim_l1_group)
+
+        # ── 扰动估计（estimation）：σ̂ 从哪来 ──────────────────────────────
+        _est_box = QGroupBox("扰动估计 (estimation)")
+        egl = QGridLayout(_est_box)
+        # 估计来源：L1 在线估计 vs 直接用扰动真值（绕过估计器，隔离评估补偿环节）。
         self.sim_l1_comp_mode = QComboBox()
         self.sim_l1_comp_mode.addItem("L1 自适应估计")
         self.sim_l1_comp_mode.addItem("扰动真值 (oracle)")
         self.sim_l1_comp_mode.setToolTip(
+            "扰动估计来源：\n"
             "L1 自适应：在线估计 σ̂ 再补偿（含估计误差/滞后）。\n"
-            "扰动真值 oracle：直接用注入扰动的真值作 σ̂（无估计误差/滞后），"
-            "只考验后续补偿环节（dFz/tilt、CTBR、电机）的好坏。"
+            "扰动真值 oracle：直接用注入扰动的真值作 σ̂（无估计误差/滞后，绕过预测器/LPF），"
+            "只考验后续补偿环节的好坏。"
         )
-        self.sim_l1_as_gain = _ds(0.1, 100.0, 8.0, 3, 0.5, "预测器收敛速率 a_s")
-        self.sim_l1_wc_xy = _ds(0.0, 100.0, 6.0, 3, 0.5, "水平补偿 LPF 截止 [rad/s]")
-        self.sim_l1_wc_z = _ds(0.0, 100.0, 6.0, 3, 0.5, "竖直补偿 LPF 截止 [rad/s]")
-        self.sim_l1_tilt_gain = _ds(0.0, 50.0, 3.0, 3, 0.5, "横向补偿→体力矩增益")
-        gl.addWidget(QLabel("a_s"), 0, 0); gl.addWidget(self.sim_l1_as_gain, 0, 1)
-        gl.addWidget(QLabel("wc_xy"), 0, 2); gl.addWidget(self.sim_l1_wc_xy, 0, 3)
-        gl.addWidget(QLabel("wc_z"), 1, 0); gl.addWidget(self.sim_l1_wc_z, 1, 1)
-        gl.addWidget(QLabel("tilt_gain"), 1, 2); gl.addWidget(self.sim_l1_tilt_gain, 1, 3)
-        self.sim_l1_max_accel_xy = _ds(0.0, 50.0, 6.0, 3, 0.5, "补偿加速度上限 xy [m/s²]")
-        self.sim_l1_max_accel_z = _ds(0.0, 50.0, 6.0, 3, 0.5, "补偿加速度上限 z [m/s²]")
+        self.sim_l1_as_gain = _ds(0.1, 100.0, 8.0, 3, 0.5, "预测器收敛速率 a_s（仅 L1 估计）")
+        self.sim_l1_wc_xy = _ds(0.0, 100.0, 6.0, 3, 0.5, "水平补偿 LPF 截止 [rad/s]（仅 L1 估计）")
+        self.sim_l1_wc_z = _ds(0.0, 100.0, 6.0, 3, 0.5, "竖直补偿 LPF 截止 [rad/s]（仅 L1 估计）")
         self.sim_l1_max_sigma = _ds(0.0, 100.0, 25.0, 3, 1.0, "扰动估计上限 [m/s²]")
-        gl.addWidget(QLabel("max_a_xy"), 2, 0); gl.addWidget(self.sim_l1_max_accel_xy, 2, 1)
-        gl.addWidget(QLabel("max_a_z"), 2, 2); gl.addWidget(self.sim_l1_max_accel_z, 2, 3)
-        gl.addWidget(QLabel("max_sigma"), 3, 0); gl.addWidget(self.sim_l1_max_sigma, 3, 1)
-        gl.addWidget(QLabel("补偿来源"), 3, 2); gl.addWidget(self.sim_l1_comp_mode, 3, 3)
-        # 补偿 LPF 的 xy/z 通道坐标系：body（默认，wc_z 对齐机体 z=matched 推力轴）/ world。
+        # 估计 LPF 的 xy/z 通道坐标系：body（默认，wc_z 对齐机体 z=matched 推力轴）/ world。
         self.sim_l1_frame = QComboBox()
         self.sim_l1_frame.addItem("机体系 (body)")
         self.sim_l1_frame.addItem("世界系 (world)")
         self.sim_l1_frame.setCurrentIndex(0)
         self.sim_l1_frame.setToolTip(
-            "L1 补偿低通的 wc_xy/wc_z 分通道所在坐标系。\n"
-            "机体系 body（默认）：wc_z 作用于机体 z（matched，纯推力可瞬时补），"
-            "wc_xy 作用于机体 xy（unmatched，需倾转）——与四旋翼欠驱动补偿能力对齐。\n"
-            "世界系 world：xy/z 按世界水平/竖直划分（旧行为）；倾飞时通道与 matched 不对齐。"
+            "L1 估计低通的 wc_xy/wc_z 分通道所在坐标系。\n"
+            "机体系 body（默认）：wc_z 作用于机体 z（matched），wc_xy 作用于机体 xy（unmatched）。\n"
+            "世界系 world：xy/z 按世界水平/竖直划分（旧行为）。"
         )
-        gl.addWidget(QLabel("估计坐标系"), 4, 0); gl.addWidget(self.sim_l1_frame, 4, 1)
+        egl.addWidget(QLabel("估计来源"), 0, 0); egl.addWidget(self.sim_l1_comp_mode, 0, 1, 1, 3)
+        egl.addWidget(QLabel("a_s"), 1, 0); egl.addWidget(self.sim_l1_as_gain, 1, 1)
+        egl.addWidget(QLabel("max_sigma"), 1, 2); egl.addWidget(self.sim_l1_max_sigma, 1, 3)
+        egl.addWidget(QLabel("wc_xy"), 2, 0); egl.addWidget(self.sim_l1_wc_xy, 2, 1)
+        egl.addWidget(QLabel("wc_z"), 2, 2); egl.addWidget(self.sim_l1_wc_z, 2, 3)
+        egl.addWidget(QLabel("估计坐标系"), 3, 0); egl.addWidget(self.sim_l1_frame, 3, 1, 1, 3)
+        _l1_outer.addWidget(_est_box)
+
+        # ── 扰动补偿（compensation）：σ̂ 怎么用 ───────────────────────────
+        _comp_box = QGroupBox("扰动补偿 (compensation)")
+        cgl = QGridLayout(_comp_box)
+        # 补偿方式（合并原"补偿方式"+"注入点"为单一策略选择）：
+        #  0 全部补偿 = baseline + bolt_on（matched 抬推力 + unmatched 倾转）
+        #  1 仅 matched = l1quad + bolt_on（只补推力轴，unmatched 交 baseline 反馈）
+        #  2 模型增广 = baseline + in_model（disturbance-aware MPC，仅 acados）
+        self.sim_l1_comp_strategy = QComboBox()
+        self.sim_l1_comp_strategy.addItem("全部补偿 (matched+unmatched/倾转)")
+        self.sim_l1_comp_strategy.addItem("仅补偿 matched (推力轴)")
+        self.sim_l1_comp_strategy.addItem("模型增广 (disturbance-aware MPC，仅 MPC)")
+        self.sim_l1_comp_strategy.setCurrentIndex(0)
+        self.sim_l1_comp_strategy.setToolTip(
+            "扰动补偿方式（σ̂ 如何注入控制器）：\n"
+            "全部补偿（默认）：matched（机体 z 推力轴）经 dFz 直补，unmatched（机体 xy）经 "
+            "tilt_gain 主动倾转去补；geometric 走力层前馈 a_des、acados 走后嵌 dFz/tilt。\n"
+            "仅补偿 matched（L1Quad 论文做法）：只补 matched 推力轴，unmatched 只估计不主动补，"
+            "交由 baseline 控制器状态反馈处理（tilt≈0）。\n"
+            "模型增广（disturbance-aware MPC，仅 acados）：把 σ̂·m 作为世界系扰动力参数喂进 MPC "
+            "模型，horizon 全程已知扰动、规划最优倾角/推力（offset-free），收敛快且满足约束；"
+            "需重新生成 acados 代码，可与原 MPC 对比求解时间。geometric 不支持（恒力层前馈）。"
+        )
+        self.sim_l1_tilt_gain = _ds(0.0, 50.0, 3.0, 3, 0.5, "横向补偿→体力矩增益（仅 acados 后嵌全部补偿）")
+        self.sim_l1_max_accel_xy = _ds(0.0, 50.0, 6.0, 3, 0.5, "补偿加速度上限 xy [m/s²]")
+        self.sim_l1_max_accel_z = _ds(0.0, 50.0, 6.0, 3, 0.5, "补偿加速度上限 z [m/s²]")
+        cgl.addWidget(QLabel("补偿方式"), 0, 0); cgl.addWidget(self.sim_l1_comp_strategy, 0, 1, 1, 3)
+        cgl.addWidget(QLabel("tilt_gain"), 1, 0); cgl.addWidget(self.sim_l1_tilt_gain, 1, 1)
+        cgl.addWidget(QLabel("max_a_xy"), 2, 0); cgl.addWidget(self.sim_l1_max_accel_xy, 2, 1)
+        cgl.addWidget(QLabel("max_a_z"), 2, 2); cgl.addWidget(self.sim_l1_max_accel_z, 2, 3)
+        _l1_outer.addWidget(_comp_box)
+
         _l1hint = QLabel(
-            "L1 估计集总扰动 σ̂（含上述各扰动），按 -σ̂ 经低通生成补偿加速度，"
-            "映射为四路推力增量注入仿真。运行后右侧 \"L1 / Disturbance\" 页对比真值与估计。\n"
-            "「补偿来源=扰动真值 oracle」时：σ̂ 直接取注入扰动真值（绕过预测器/LPF，无估计"
-            "误差与滞后），其余补偿管线不变——用于把\"估计质量\"与\"补偿环节质量\"解耦评估。"
+            "扰动估计得到 σ̂（含 Disturbance 页注入的各扰动），按上面的补偿方式注入仿真。"
+            "运行后右侧 \"L1 / Disturbance\" 页对比真值与估计。\n"
+            "下面的\"位置误差反馈控制器\"是独立通道：不开扰动补偿也能单独用跟踪误差产生补偿。"
         )
         _l1hint.setWordWrap(True)
         _l1hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-        gl.addWidget(_l1hint, 5, 0, 1, 4)
+        _l1_outer.addWidget(_l1hint)
         l1_v.addWidget(self.sim_l1_group)
 
-        # ── 位置误差积分通道（独立小框，可勾选启用）─────────────────────
-        self.sim_l1_use_pos_fb = QGroupBox("位置误差积分通道")
+        # ── 位置误差反馈控制器（独立于 L1，可单独勾选启用）─────────────────
+        self.sim_l1_use_pos_fb = QGroupBox("位置误差反馈控制器 (PI，独立，不依赖 L1)")
         self.sim_l1_use_pos_fb.setCheckable(True)
         self.sim_l1_use_pos_fb.setChecked(False)
         gpf = QGridLayout(self.sim_l1_use_pos_fb)
-        self.sim_l1_k_pos_i_xy = _ds(0.0, 10.0, 0.6, 3, 0.05, "水平位置误差积分增益")
-        self.sim_l1_k_pos_i_z = _ds(0.0, 10.0, 0.8, 3, 0.05, "竖直位置误差积分增益")
-        self.sim_l1_max_pos_integral = _ds(0.0, 10.0, 1.5, 3, 0.1, "积分 anti-windup 上限")
-        self.sim_l1_k_pos_p_xy = _ds(0.0, 20.0, 0.0, 3, 0.05, "水平位置误差比例增益（更快响应）")
-        self.sim_l1_k_pos_p_z = _ds(0.0, 20.0, 0.0, 3, 0.05, "竖直位置误差比例增益（更快响应）")
+        self.sim_l1_k_pos_i_xy = _ds(0.0, 100.0, 0.6, 3, 0.05, "水平位置误差积分增益")
+        self.sim_l1_k_pos_i_z = _ds(0.0, 100.0, 0.8, 3, 0.05, "竖直位置误差积分增益")
+        self.sim_l1_k_pos_p_xy = _ds(0.0, 100.0, 0.0, 3, 0.05, "水平位置误差比例增益（更快响应）")
+        self.sim_l1_k_pos_p_z = _ds(0.0, 100.0, 0.0, 3, 0.05, "竖直位置误差比例增益（更快响应）")
+        self.sim_l1_max_pos_integral_xy = _ds(0.0, 50.0, 1.5, 3, 0.1, "水平积分 anti-windup 上限 [m·s]")
+        self.sim_l1_max_pos_integral_z = _ds(0.0, 50.0, 1.5, 3, 0.1, "竖直积分 anti-windup 上限 [m·s]")
         gpf.addWidget(QLabel("k_i_xy"), 0, 0); gpf.addWidget(self.sim_l1_k_pos_i_xy, 0, 1)
         gpf.addWidget(QLabel("k_i_z"), 0, 2); gpf.addWidget(self.sim_l1_k_pos_i_z, 0, 3)
         gpf.addWidget(QLabel("k_p_xy"), 1, 0); gpf.addWidget(self.sim_l1_k_pos_p_xy, 1, 1)
         gpf.addWidget(QLabel("k_p_z"), 1, 2); gpf.addWidget(self.sim_l1_k_pos_p_z, 1, 3)
-        gpf.addWidget(QLabel("max∫"), 2, 0); gpf.addWidget(self.sim_l1_max_pos_integral, 2, 1)
+        gpf.addWidget(QLabel("max∫_xy"), 2, 0); gpf.addWidget(self.sim_l1_max_pos_integral_xy, 2, 1)
+        gpf.addWidget(QLabel("max∫_z"), 2, 2); gpf.addWidget(self.sim_l1_max_pos_integral_z, 2, 3)
         _pfhint = QLabel(
-            "并联在 L1 补偿之上：对跟踪位置误差 e_p 做 PI 补偿（积分带 anti-windup），"
-            "消除 σ̂ 带宽/滞后残差导致的稳态/动态位置误差。a_ac += -k_p·e_p - k_i·∫e_p。"
+            "独立 PI 位置反馈：对跟踪位置误差 e_p=p-p_ref（世界系）做补偿 "
+            "a_pos = -k_p·e_p - k_i·∫e_p（积分带 anti-windup，xy/z 上限可分设）。\n"
+            "补偿量 a_pos 与 L1 的 a_l1 合成 a_ac=a_l1+a_pos，按同一方式注入控制器："
+            "竖直分量改总推力、横向分量靠倾转（geometric→a_des / acados direct→dFz+tilt / "
+            "CTBR→总推力+角速度设定点）。不开 L1 时 a_l1=0，仅由本通道用误差产生补偿。\n"
             "积分慢可加 k_p 提速（默认 0，过大易与 baseline/MPC 抢、引起振荡）。"
         )
         _pfhint.setWordWrap(True)
@@ -6460,8 +6714,14 @@ class UamSuiteGUI(QMainWindow):
         gv.addWidget(QLabel("Control scheme"), 1, 0)
         gv.addWidget(self.sim_quick_scheme, 1, 1, 1, 3)
 
-        # L1 + 扰动开关复选框。
-        self.sim_quick_l1 = QCheckBox("L1 自适应")
+        # 扰动补偿总开关（启用后由"补偿来源"下拉选 L1 估计 / 扰动真值 oracle）+ 扰动开关。
+        self.sim_quick_l1 = QCheckBox("扰动补偿")
+        self.sim_quick_l1.setToolTip(
+            "扰动补偿总开关（= \"L1\" 子标签的扰动补偿组）。启用后由右侧\"补偿来源\"下拉选择：\n"
+            "  • L1 自适应估计：在线估计 σ̂ 再补偿；\n"
+            "  • 扰动真值 oracle：直接用注入扰动真值补偿（绕过 L1 估计器，无估计误差/滞后）。\n"
+            "即不使用 L1 也能开真值补偿；MPC 默认按后嵌(bolt-on)注入（注入点见 L1 子标签）。"
+        )
         self.sim_quick_const = QCheckBox("定常力/力矩")
         self.sim_quick_var = QCheckBox("变化扰动")
         self.sim_quick_thrust = QCheckBox("推力估计偏差")
@@ -6639,6 +6899,11 @@ class UamSuiteGUI(QMainWindow):
             "comp_mode_index": int(self.sim_l1_comp_mode.currentIndex()),
             "frame": ("world" if self.sim_l1_frame.currentIndex() == 1 else "body"),
             "frame_index": int(self.sim_l1_frame.currentIndex()),
+            # 补偿策略 → method+inject：0=全部(baseline,bolt_on) 1=仅matched(l1quad,bolt_on)
+            # 2=模型增广(baseline,in_model)。
+            "method": ("l1quad" if self.sim_l1_comp_strategy.currentIndex() == 1 else "baseline"),
+            "inject": ("in_model" if self.sim_l1_comp_strategy.currentIndex() == 2 else "bolt_on"),
+            "comp_strategy_index": int(self.sim_l1_comp_strategy.currentIndex()),
             "as_gain": float(self.sim_l1_as_gain.value()),
             "wc_xy": float(self.sim_l1_wc_xy.value()),
             "wc_z": float(self.sim_l1_wc_z.value()),
@@ -6651,8 +6916,8 @@ class UamSuiteGUI(QMainWindow):
             "k_pos_i_z": float(self.sim_l1_k_pos_i_z.value()),
             "k_pos_p_xy": float(self.sim_l1_k_pos_p_xy.value()),
             "k_pos_p_z": float(self.sim_l1_k_pos_p_z.value()),
-            "max_pos_integral_xy": float(self.sim_l1_max_pos_integral.value()),
-            "max_pos_integral_z": float(self.sim_l1_max_pos_integral.value()),
+            "max_pos_integral_xy": float(self.sim_l1_max_pos_integral_xy.value()),
+            "max_pos_integral_z": float(self.sim_l1_max_pos_integral_z.value()),
         }
 
     def _apply_track_disturbance(self, d: dict) -> None:
@@ -6731,6 +6996,17 @@ class UamSuiteGUI(QMainWindow):
             if _fi is None:
                 _fi = 1 if str(d.get("frame", "body")).lower() == "world" else 0
             self.sim_l1_frame.setCurrentIndex(int(_fi))
+        if hasattr(self, "sim_l1_comp_strategy"):
+            _si = d.get("comp_strategy_index")
+            if _si is None:
+                # 向后兼容旧持久化（分开的 method/inject）。
+                if str(d.get("inject", "bolt_on")).lower() == "in_model":
+                    _si = 2
+                elif str(d.get("method", "baseline")).lower() == "l1quad":
+                    _si = 1
+                else:
+                    _si = 0
+            self.sim_l1_comp_strategy.setCurrentIndex(int(_si))
         for k, sb in (
             ("as_gain", self.sim_l1_as_gain), ("wc_xy", self.sim_l1_wc_xy),
             ("wc_z", self.sim_l1_wc_z), ("tilt_gain", self.sim_l1_tilt_gain),
@@ -6741,7 +7017,8 @@ class UamSuiteGUI(QMainWindow):
             ("k_pos_i_z", self.sim_l1_k_pos_i_z),
             ("k_pos_p_xy", self.sim_l1_k_pos_p_xy),
             ("k_pos_p_z", self.sim_l1_k_pos_p_z),
-            ("max_pos_integral_xy", self.sim_l1_max_pos_integral),
+            ("max_pos_integral_xy", self.sim_l1_max_pos_integral_xy),
+            ("max_pos_integral_z", self.sim_l1_max_pos_integral_z),
         ):
             _sv(k, sb)
         self.sim_l1_use_pos_fb.setChecked(bool(d.get("use_pos_feedback", False)))
@@ -7855,6 +8132,30 @@ class UamSuiteGUI(QMainWindow):
         if self.wp_table.rowCount() > 2:
             self.wp_table.removeRow(self.wp_table.rowCount() - 1)
 
+    def _add_ee_wp_row(self):
+        """minimum snap：末尾增加一个 waypoint。x/y/z/yaw 复制上一行，t 默认 +2s。"""
+        r = self.ee_wp_table.rowCount()
+        self.ee_wp_table.insertRow(r)
+        prev = [0.0, 0.0, 0.0, 0.0, 0.0]
+        if r > 0:
+            for c in range(5):
+                it = self.ee_wp_table.item(r - 1, c)
+                if it is not None:
+                    try:
+                        prev[c] = float(it.text())
+                    except (TypeError, ValueError):
+                        pass
+        prev[4] = prev[4] + 2.0  # 时间默认在上一点基础上 +2s（保证递增）
+        for c, val in enumerate(prev):
+            self.ee_wp_table.setItem(r, c, QTableWidgetItem(f"{val:g}"))
+
+    def _del_ee_wp_row(self):
+        """删除最后一个 waypoint（最少保留 2 个点 = 1 段）。"""
+        if self.ee_wp_table.rowCount() > 2:
+            self.ee_wp_table.removeRow(self.ee_wp_table.rowCount() - 1)
+        else:
+            self.log("[minimum snap] 至少需要 2 个 waypoint（1 段），不能再删。")
+
     def _mixed_rows_to_waypoints7(self, sorted_rows: list[list]) -> list[list[float]]:
         """Acados multi-waypoint: 7 floats [x,y,z, j1°, j2°, yaw°, t] (consistent with wp_to_state)."""
         out: list[list[float]] = []
@@ -8596,11 +8897,38 @@ class UamSuiteGUI(QMainWindow):
             )
         self.log("EE reference generated. We recommend Acados EE-centric tracking.")
 
+    def _maybe_upgrade_ee_snap_for_s500(self) -> None:
+        """s500 无 EE：ee_snap 规划（minimum snap / figure-8 / circle …）本质是 base-link
+        位置+yaw 轨迹。用四旋翼微分平坦由 (ddp, yaw) 补全姿态/角速度，就地升级为
+        full-state（kind→full_acados），使其可被 Crocoddyl/Acados/Geometric 跟踪。
+        """
+        pb = self._plan_bundle
+        if not isinstance(pb, dict):
+            return
+        if pb.get("kind") != "ee_snap" or not self._is_s500_mode():
+            return
+        try:
+            fb = self._full_state_ros_plan_from_ee_snap(pb)
+        except Exception as e:
+            self.log(f"[tracking] s500 base-link 轨迹 → full-state 升级失败: {e!r}")
+            return
+        for k in ("hover_pre_s", "hover_post_s"):
+            if k in pb:
+                fb[k] = pb[k]
+        fb["upgraded_from"] = pb.get("ee_track_kind", "ee_snap")
+        self._plan_bundle = fb
+        self.log(
+            f"[tracking] s500：base-link 轨迹（{fb['upgraded_from']}）已用微分平坦升级为 "
+            "full-state，可用 Crocoddyl / Acados / Geometric 跟踪。"
+        )
+
     def _update_track_mode_enabled(self):
         """Crocoddyl tracking along the trajectory is selectable only when full-state planning is available."""
         if self._plan_bundle is None:
             self._on_track_mode_changed()
             return
+        # s500 下把 base-link ee_snap 轨迹升级为 full-state，让三种 baseline 可用。
+        self._maybe_upgrade_ee_snap_for_s500()
         full = self._plan_bundle["kind"] in ("full_croc", "full_acados")
         is_s500 = self._is_s500_mode()
         # s500 has no arm: EE-centric (2) and Croc EE pose (3) are UAM-only.
@@ -10164,7 +10492,7 @@ class UamSuiteGUI(QMainWindow):
                 f"ctrl={1.0/control_dt:.0f}Hz, τ_motor={motor_tau*1e3:.0f}ms)"
             )
             ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=8, loc="lower right")
+            ax.legend(fontsize=_mpl_pt(10), loc="lower right")
 
             dlg = QDialog(self)
             dlg.setWindowTitle("Rate controller — 阶跃响应")
@@ -10245,7 +10573,7 @@ class UamSuiteGUI(QMainWindow):
                 f"Motor first-order step response (τ={motor_tau*1e3:.0f}ms, sim_dt={sim_dt*1e3:.1f}ms)"
             )
             ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=8, loc="lower right")
+            ax.legend(fontsize=_mpl_pt(10), loc="lower right")
 
             dlg = QDialog(self)
             dlg.setWindowTitle("Motor — 阶跃响应")
@@ -10906,20 +11234,20 @@ class UamSuiteGUI(QMainWindow):
                     ax.plot(t, u_plan_interp[:, j], color=colors[j], lw=1.0,
                             ls="--", alpha=0.7,
                             label=f"plan rotor {j+1}" if j == 0 else None)
-        ax.set_title("Rotor forces — MPC (solid) vs plan (dashed)", fontsize=_mpl_pt(9))
+        ax.set_title("Rotor forces — MPC (solid) vs plan (dashed)", fontsize=_mpl_pt(12))
         ax.set_ylabel("force [N]")
         ax.grid(True, alpha=0.3)
-        ax.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=2)
+        ax.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=2)
 
         # ── 面板 2：CTBR 推力指令 ────────────────────────────────────────────
         ax = axes[1]
         if thr_cmd is not None and np.asarray(thr_cmd).size >= 2:
             tc = np.asarray(thr_cmd, dtype=float).flatten()
             ax.plot(t[: tc.size], tc[: t.size], color="k", lw=1.1, label="CTBR thrust cmd")
-        ax.set_title("CTBR normalized thrust command (→ PX4)", fontsize=_mpl_pt(9))
+        ax.set_title("CTBR normalized thrust command (→ PX4)", fontsize=_mpl_pt(12))
         ax.set_ylabel("thrust [0..1]")
         ax.grid(True, alpha=0.3)
-        ax.legend(loc="upper right", fontsize=_mpl_pt(6))
+        ax.legend(loc="upper right", fontsize=_mpl_pt(10))
 
         # ── 面板 3-5：三轴角速度（指令 vs 反馈 vs 参考）─────────────────────
         labels = ["roll rate p", "pitch rate q", "yaw rate r"]
@@ -10937,10 +11265,10 @@ class UamSuiteGUI(QMainWindow):
                 rw = np.asarray(r_omg, dtype=float)
                 ax.plot(t[: rw.shape[0]], rw[: t.size, k], color="tab:green", lw=1.0,
                         ls="--", alpha=0.8, label="reference")
-            ax.set_title(f"Angular velocity — {labels[k]} [rad/s]", fontsize=_mpl_pt(9))
+            ax.set_title(f"Angular velocity — {labels[k]} [rad/s]", fontsize=_mpl_pt(12))
             ax.set_ylabel("[rad/s]")
             ax.grid(True, alpha=0.3)
-            ax.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=3)
+            ax.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=3)
 
         # ── 面板 6：角速度跟踪误差（CTBR 指令 - 反馈），直观体现 PX4 延迟 ──────
         ax = axes[5]
@@ -10957,16 +11285,16 @@ class UamSuiteGUI(QMainWindow):
                 ax.plot(t[:n], br[:n, k] - ow[:n, k], color=err_colors[k], lw=1.0,
                         label=f"{err_labels[k]} err")
             ax.axhline(0.0, color="gray", lw=0.6, alpha=0.6)
-        ax.set_title("Body-rate tracking error (CTBR cmd − feedback)", fontsize=_mpl_pt(9))
+        ax.set_title("Body-rate tracking error (CTBR cmd − feedback)", fontsize=_mpl_pt(12))
         ax.set_ylabel("[rad/s]")
         ax.grid(True, alpha=0.3)
-        ax.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=3)
+        ax.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=3)
 
         for ax in (axes[4], axes[5]):
             ax.set_xlabel("t [s]")
 
         fig.suptitle("Control — rotor forces, CTBR commands & body-rate feedback",
-                     fontsize=_mpl_pt(11), y=0.995)
+                     fontsize=_mpl_pt(14), y=0.995)
         try:
             fig.tight_layout(rect=(0, 0, 1, 0.98))
         except Exception:
@@ -11011,6 +11339,54 @@ class UamSuiteGUI(QMainWindow):
             out[k, :3] = R.T @ a[k, :3]
         return out
 
+    @staticmethod
+    def _body_to_world_series(arr: Optional[np.ndarray], quat: np.ndarray) -> Optional[np.ndarray]:
+        """把机体系时间序列 (N,3) 逐拍旋到世界系：v_world = R(q)·v_body。
+
+        quat: (N,4) [qx,qy,qz,qw]（与 _world_to_body_series 同约定）。
+        """
+        if arr is None:
+            return None
+        a = np.asarray(arr, dtype=float)
+        if a.ndim != 2 or a.shape[1] < 3:
+            return arr
+        n = min(a.shape[0], quat.shape[0])
+        out = a.copy()
+        for k in range(n):
+            q = quat[k]
+            nn = float(np.linalg.norm(q))
+            if nn < 1e-12:
+                continue
+            x, y, z, w = q / nn
+            R = np.array([
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ], dtype=float)
+            out[k, :3] = R @ a[k, :3]
+        return out
+
+    @staticmethod
+    def _movavg(arr: np.ndarray, win: int) -> np.ndarray:
+        """零相位移动平均（reflect 边界）。win<3 或样本不足时原样返回。"""
+        a = np.asarray(arr, dtype=float)
+        if win is None or win < 3 or a.shape[0] < 3:
+            return a
+        if win % 2 == 0:
+            win += 1
+        if a.shape[0] < win:
+            win = a.shape[0] if a.shape[0] % 2 == 1 else a.shape[0] - 1
+            if win < 3:
+                return a
+        half = win // 2
+        kernel = np.ones(win, dtype=float) / float(win)
+        A = a if a.ndim == 2 else a[:, None]
+        out = np.empty_like(A)
+        for c in range(A.shape[1]):
+            padded = np.pad(A[:, c], half, mode="reflect")
+            out[:, c] = np.convolve(padded, kernel, mode="valid")
+        return out if a.ndim == 2 else out[:, 0]
+
     def _render_l1_disturbance_figure(
         self,
         *,
@@ -11020,6 +11396,11 @@ class UamSuiteGUI(QMainWindow):
         torque_truth: Optional[np.ndarray] = None,
         torque_est: Optional[np.ndarray] = None,
         comp_force: Optional[np.ndarray] = None,
+        force_truth_body: Optional[np.ndarray] = None,
+        force_est_body: Optional[np.ndarray] = None,
+        torque_truth_body: Optional[np.ndarray] = None,
+        torque_est_body: Optional[np.ndarray] = None,
+        comp_force_body: Optional[np.ndarray] = None,
         quat: Optional[np.ndarray] = None,
         truth_label: str = "truth",
         est_label: str = "L1 estimate",
@@ -11034,25 +11415,38 @@ class UamSuiteGUI(QMainWindow):
         L1 平动通道仅估计力；力矩无 L1 估计（est=0，误差行≈未补偿真值）。
         显示坐标系由「坐标系」按钮切换：world（默认）或 body（需传 quat 逐拍旋转）。
         """
-        # 缓存原始（世界系）数据，供「坐标系」按钮切换时重绘。
+        # 缓存原始（世界系 + 机体系两套）数据，供「坐标系」按钮切换时重绘。
         self._l1_dist_cache = dict(
             t=t, force_truth=force_truth, force_est=force_est,
             torque_truth=torque_truth, torque_est=torque_est,
-            comp_force=comp_force, quat=quat, truth_label=truth_label,
+            comp_force=comp_force,
+            force_truth_body=force_truth_body, force_est_body=force_est_body,
+            torque_truth_body=torque_truth_body, torque_est_body=torque_est_body,
+            comp_force_body=comp_force_body,
+            quat=quat, truth_label=truth_label,
             est_label=est_label, comp_label=comp_label, title=title,
         )
-        # 机体系显示：逐拍把各世界系序列旋到机体系。
-        use_body = (getattr(self, "_l1_dist_frame", "world") == "body") and (quat is not None)
-        if use_body:
-            q = np.asarray(quat, dtype=float)
-            if q.ndim == 2 and q.shape[1] >= 4:
-                force_truth = self._world_to_body_series(force_truth, q)
-                force_est = self._world_to_body_series(force_est, q)
-                torque_truth = self._world_to_body_series(torque_truth, q)
-                torque_est = self._world_to_body_series(torque_est, q)
-                comp_force = self._world_to_body_series(comp_force, q)
-            else:
-                use_body = False
+        # 机体系显示：优先用仿真同拍记录的 *_body 序列（无需事后旋转）；
+        # 若调用方未提供 body 序列（如 ROS/Gazebo 路径），回退到用 quat 逐拍旋转。
+        want_body = getattr(self, "_l1_dist_frame", "world") == "body"
+        use_body = False
+        if want_body:
+            if force_truth_body is not None or torque_truth_body is not None:
+                force_truth = force_truth_body
+                force_est = force_est_body
+                torque_truth = torque_truth_body
+                torque_est = torque_est_body
+                comp_force = comp_force_body
+                use_body = True
+            elif quat is not None:
+                q = np.asarray(quat, dtype=float)
+                if q.ndim == 2 and q.shape[1] >= 4:
+                    force_truth = self._world_to_body_series(force_truth, q)
+                    force_est = self._world_to_body_series(force_est, q)
+                    torque_truth = self._world_to_body_series(torque_truth, q)
+                    torque_est = self._world_to_body_series(torque_est, q)
+                    comp_force = self._world_to_body_series(comp_force, q)
+                    use_body = True
         frame_lbl = "body" if use_body else "world"
 
         fig = self.fig_l1_dist
@@ -11073,7 +11467,7 @@ class UamSuiteGUI(QMainWindow):
         if N < 2 or not present:
             ax = fig.add_subplot(111)
             ax.text(0.5, 0.5, "No disturbance / L1 data", ha="center", va="center",
-                    transform=ax.transAxes, fontsize=_mpl_pt(10))
+                    transform=ax.transAxes, fontsize=_mpl_pt(12))
             ax.axis("off")
             self.cv_l1_dist.draw()
             return
@@ -11096,13 +11490,13 @@ class UamSuiteGUI(QMainWindow):
                 if extra is not None:
                     ax.plot(tt, extra[:n, j], color="tab:orange", lw=1.6, ls="--",
                             zorder=2, label=comp_label)
-                ax.set_title(f"{kind}{axis_names[j]} [{unit}]", fontsize=_mpl_pt(9))
+                ax.set_title(f"{kind}{axis_names[j]} [{unit}]", fontsize=_mpl_pt(12))
                 if j == 0:
                     ax.set_ylabel(f"{kind} [{unit}]")
                 ax.grid(True, alpha=0.3)
                 ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
                 if truth is not None or est is not None:
-                    ax.legend(loc="upper right", fontsize=_mpl_pt(7))
+                    ax.legend(loc="upper right", fontsize=_mpl_pt(10))
             for j in range(3):
                 ax = fig.add_subplot(4, 3, (row_base + 1) * 3 + j + 1)
                 if truth is not None and est is not None:
@@ -11112,16 +11506,16 @@ class UamSuiteGUI(QMainWindow):
                     if n - i0 > 1:
                         mae = float(np.mean(np.abs(err[i0:])))
                         ax.text(0.02, 0.95, f"late |err|~{mae:.3g}",
-                                transform=ax.transAxes, fontsize=_mpl_pt(7),
+                                transform=ax.transAxes, fontsize=_mpl_pt(10),
                                 va="top", ha="left",
                                 bbox=dict(boxstyle="round", fc="white", alpha=0.7))
-                    ax.legend(loc="upper right", fontsize=_mpl_pt(7))
+                    ax.legend(loc="upper right", fontsize=_mpl_pt(10))
                 else:
                     ax.text(0.5, 0.5, "no estimate", ha="center", va="center",
-                            transform=ax.transAxes, fontsize=_mpl_pt(8))
+                            transform=ax.transAxes, fontsize=_mpl_pt(10))
                 if j == 0:
                     ax.set_ylabel(f"{kind} err [{unit}]")
-                ax.set_title(f"{kind}{axis_names[j]} error [{unit}]", fontsize=_mpl_pt(9))
+                ax.set_title(f"{kind}{axis_names[j]} error [{unit}]", fontsize=_mpl_pt(12))
                 ax.grid(True, alpha=0.3)
                 ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
                 ax.set_xlabel("t [s]")
@@ -11129,17 +11523,120 @@ class UamSuiteGUI(QMainWindow):
         _plot_block(0, ft, fe, f"N, {frame_lbl}", "F", extra=fc)
         _plot_block(2, mt, me, f"N·m, {frame_lbl}", "M")
 
-        fig.suptitle(f"{title}  [frame: {frame_lbl}]", fontsize=_mpl_pt(11), y=0.998)
+        fig.suptitle(f"{title}  [frame: {frame_lbl}]", fontsize=_mpl_pt(14), y=0.995)
         try:
-            fig.tight_layout(rect=(0, 0, 1, 0.98))
+            # 收紧子图间距（默认 pad 偏大，12 个子图之间空白过多）。
+            fig.tight_layout(rect=(0, 0, 1, 0.97), pad=0.4, h_pad=0.5, w_pad=0.4)
+            fig.subplots_adjust(hspace=0.32, wspace=0.22)
         except Exception:
             pass
         self.cv_l1_dist.draw()
+
+    def _on_geo_autotune_clicked(self):
+        """启动/停止 geometric 自动调参。"""
+        # 运行中再次点击 = 请求停止。
+        w = getattr(self, "_geo_autotune_worker", None)
+        if w is not None and w.isRunning():
+            w.request_stop()
+            self.geo_autotune_btn.setText("Stopping…")
+            self.geo_autotune_btn.setEnabled(False)
+            return
+        if self._plan_bundle is None:
+            QMessageBox.warning(self, "Notice", "请先规划一条轨迹。")
+            return
+        if not self._EE_MPC_OK:
+            QMessageBox.warning(self, "Error", "Acados 不可用，无法运行 geometric 仿真。")
+            return
+        self._maybe_upgrade_ee_snap_for_s500()
+        if self._plan_bundle.get("kind") not in ("full_croc", "full_acados"):
+            QMessageBox.warning(
+                self, "Notice",
+                "Geometric 自动调参需要 full-state 轨迹（先做 \"Full state\" 规划）。",
+            )
+            return
+        pb = self._plan_bundle
+        x0 = np.asarray(pb["x_plan"][0], dtype=float).flatten()
+        ctbr_cfg = dict(self._collect_track_ctbr())
+        ctbr_cfg["enabled"] = True
+        params = {
+            "x0": x0,
+            "t_plan": pb["t_plan"],
+            "x_plan": pb["x_plan"],
+            "T_sim": self.T_sim.value(),
+            "sim_dt": self.sim_dt.value(),
+            "control_dt": self.control_dt.value(),
+            "dt_mpc": self.dt_mpc.value(),
+            "N": self.N_mpc.value(),
+            "mpc_max_iter": self.mpc_max_iter.value(),
+            "urdf_path": self._selected_robot_urdf_path(),
+            "state_limits": {
+                "v_max": float(self.track_v_max.value()),
+                "omega_max": float(self.track_omega_max.value()),
+                "j_angle_max": float(self.track_j_angle_max.value()),
+                "j_vel_max": float(self.track_j_vel_max.value()),
+            },
+            "ctbr": ctbr_cfg,
+            "max_tilt_deg": float(self.geo_max_tilt.value()),
+            "alpha": 1.0,
+            "budget": int(self.geo_autotune_budget.value()),
+            "init": {
+                "kp_pos": float(self.geo_kp_pos.value()),
+                "kd_vel": float(self.geo_kd_vel.value()),
+                "kR": float(self.geo_kR.value()),
+                "kOmega": float(self.geo_kOmega.value()),
+            },
+        }
+        self._geo_autotune_worker = GeometricAutoTuneWorker(params)
+        self._geo_autotune_worker.progress.connect(self._on_geo_autotune_progress)
+        self._geo_autotune_worker.finished.connect(self._on_geo_autotune_finished)
+        self.geo_autotune_btn.setText("Stop")
+        self.geo_autotune_status.setText("启动中…（调参时关闭扰动/L1）")
+        self.run_track_btn.setEnabled(False)
+        self.log("[geo auto-tune] 开始针对当前轨迹自动调参（pattern search，关闭扰动/L1）。")
+        self._geo_autotune_worker.start()
+
+    def _on_geo_autotune_progress(
+        self, idx: int, budget: int, cur_J: float, best_J: float,
+        mean_e: float, max_e: float, best_gains: object,
+    ) -> None:
+        g = best_gains if isinstance(best_gains, dict) else {}
+        self.geo_autotune_status.setText(
+            f"#{idx}/{budget}  当前J={cur_J:.4g}  最佳J={best_J:.4g}  "
+            f"(mean={mean_e*1000:.1f}mm, max={max_e*1000:.1f}mm)  "
+            f"kp={g.get('kp_pos', 0):.2f} kd={g.get('kd_vel', 0):.2f} "
+            f"kR={g.get('kR', 0):.2f} kΩ={g.get('kOmega', 0):.3f}"
+        )
+
+    def _on_geo_autotune_finished(self, ok: bool, err: str, best: object) -> None:
+        self.geo_autotune_btn.setText("Auto tune (当前轨迹)")
+        self.geo_autotune_btn.setEnabled(True)
+        self.run_track_btn.setEnabled(True)
+        if not ok or not isinstance(best, dict):
+            self.geo_autotune_status.setText("失败")
+            self.log(f"[geo auto-tune] 失败:\n{err}")
+            return
+        # 写回最佳增益。
+        self.geo_kp_pos.setValue(float(best.get("kp_pos", self.geo_kp_pos.value())))
+        self.geo_kd_vel.setValue(float(best.get("kd_vel", self.geo_kd_vel.value())))
+        self.geo_kR.setValue(float(best.get("kR", self.geo_kR.value())))
+        self.geo_kOmega.setValue(float(best.get("kOmega", self.geo_kOmega.value())))
+        self.geo_autotune_status.setText(
+            f"完成 ✓ 最佳J={best.get('J', float('nan')):.4g}  "
+            f"kp={best.get('kp_pos', 0):.2f} kd={best.get('kd_vel', 0):.2f} "
+            f"kR={best.get('kR', 0):.2f} kΩ={best.get('kOmega', 0):.3f}（已写回）"
+        )
+        self.log(
+            f"[geo auto-tune] 完成：J={best.get('J', float('nan')):.4g}, "
+            f"kp_pos={best.get('kp_pos', 0):.3f}, kd_vel={best.get('kd_vel', 0):.3f}, "
+            f"kR={best.get('kR', 0):.3f}, kOmega={best.get('kOmega', 0):.3f}（已写回界面）"
+        )
 
     def _run_track(self):
         if self._plan_bundle is None:
             return
         self._manual_ref_overlay = None
+        # s500：确保 base-link ee_snap 已升级为 full-state（幂等；已升级则跳过）。
+        self._maybe_upgrade_ee_snap_for_s500()
         mode = self.track_mode_combo.currentIndex()
         if mode == 0:
             if self._plan_bundle["kind"] not in ("full_croc", "full_acados"):
@@ -11431,24 +11928,29 @@ class UamSuiteGUI(QMainWindow):
                 a = out.get(key)
                 return np.asarray(a, dtype=float) if a is not None else None
 
+            mass = float(out.get("nominal_mass", 1.0) or 1.0)
+            l1_on = bool(out.get("l1_active"))
+
+            # 世界系一套（默认显示）。
             l1f = _g("l1_force_world")
             dgf = _g("dist_force_world")
             mt = _g("dist_torque_world")
-            if mt is None:
-                mt = _g("dist_torque_body")
             al1 = _g("l1_a_l1")
-            mass = float(out.get("nominal_mass", 1.0) or 1.0)
-            l1_on = bool(out.get("l1_active"))
+            # 机体系一套（仿真时同拍按真实姿态记录，绘图按钮切换用，不再事后旋转）。
+            l1f_b = _g("l1_force_body")
+            dgf_b = _g("dist_force_body")
+            mt_b = _g("dist_torque_body")
+            al1_b = _g("l1_a_l1_body")
+
             # 力：估计（L1）vs 真值；未开 L1 时无估计。
             force_est = l1f if l1_on else None
-            # 低通滤波后的补偿力（世界系）= m·a_l1（抵消扰动，≈ -扰动）；
-            # 取相反数后与真值扰动同向，便于直接对比补偿是否跟上扰动。
+            force_est_b = l1f_b if l1_on else None
+            # 低通滤波后的补偿力 = m·a_l1（≈ -扰动）；取相反数与真值同向便于对比。
             comp_force = (-mass * al1) if (l1_on and al1 is not None) else None
+            comp_force_b = (-mass * al1_b) if (l1_on and al1_b is not None) else None
             # 力矩：L1 平动通道不估计力矩 → 估计置 0，误差行显示未补偿真值。
             torque_est = np.zeros_like(mt) if mt is not None else None
-            # 姿态四元数（逐拍）供「机体系」显示旋转用：states[:, 3:7] = [qx,qy,qz,qw]。
-            st = _g("states")
-            quat = st[:n, 3:7] if (st is not None and st.ndim == 2 and st.shape[1] >= 7) else None
+            torque_est_b = np.zeros_like(mt_b) if mt_b is not None else None
             self._render_l1_disturbance_figure(
                 t=tt,
                 force_truth=dgf,
@@ -11456,11 +11958,15 @@ class UamSuiteGUI(QMainWindow):
                 torque_truth=mt,
                 torque_est=torque_est,
                 comp_force=comp_force,
-                quat=quat,
+                force_truth_body=dgf_b,
+                force_est_body=force_est_b,
+                torque_truth_body=mt_b,
+                torque_est_body=torque_est_b,
+                comp_force_body=comp_force_b,
                 truth_label="injected (truth)",
                 est_label="L1 estimate m·σ̂",
                 comp_label="LPF compensation -m·a_l1",
-                title="Sim: L1 (world force) vs injected disturbance (force & torque, world)",
+                title="Sim: L1 vs injected disturbance (force & torque)",
             )
         except Exception as exc:  # pragma: no cover - 绘图失败不应中断流程
             self.log(f"[L1/Disturbance] 渲染失败: {exc}")
@@ -11576,7 +12082,7 @@ class UamSuiteGUI(QMainWindow):
                 ax.set_ylabel(unit)
                 ax.grid(True, alpha=0.3)
                 ax.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
-                ax.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=2)
+                ax.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=2)
 
             fig = self.fig_control
             fig.clear()
@@ -11593,23 +12099,23 @@ class UamSuiteGUI(QMainWindow):
                 if u_ref is not None and j < u_ref.shape[1]:
                     ax_rot.plot(t, u_ref[:, j], color=col, lw=0.7, ls=":", alpha=0.5)
             ax_rot.set_title("Rotor forces [N] — real / cmd(--) / ref(:)",
-                             fontsize=_mpl_pt(9))
+                             fontsize=_mpl_pt(12))
             ax_rot.set_ylabel("N")
             ax_rot.grid(True, alpha=0.3)
-            ax_rot.legend(loc="upper right", fontsize=_mpl_pt(6), ncol=4)
+            ax_rot.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=4)
 
             # ── 右上：总推力 T（含 u_b/u_ac/u_p 分解 + real + ref）──────────
             ax_T = fig.add_subplot(gs[0, 1])
             ref_T = W_ref[:, 0] if W_ref is not None else None
             _plot_wrench_decomp(ax_T, 0, ref_T, "N")
-            ax_T.set_title("Collective thrust T [N]", fontsize=_mpl_pt(9))
+            ax_T.set_title("Collective thrust T [N]", fontsize=_mpl_pt(12))
 
             # ── 左列行2-4：三轴体力矩 Mx/My/Mz（含 u_b/u_ac/u_p 分解）──────
             for i in range(3):
                 ax_M = fig.add_subplot(gs[i + 1, 0])
                 ref_i = W_ref[:, i + 1] if W_ref is not None else None
                 _plot_wrench_decomp(ax_M, i + 1, ref_i, "N·m")
-                ax_M.set_title(f"Body torque M{axis_names[i]} [N·m]", fontsize=_mpl_pt(9))
+                ax_M.set_title(f"Body torque M{axis_names[i]} [N·m]", fontsize=_mpl_pt(12))
                 if i == 2:
                     ax_M.set_xlabel("t [s]")
 
@@ -11621,11 +12127,11 @@ class UamSuiteGUI(QMainWindow):
                 if rate_sp is not None:
                     ax_w.plot(t, rate_sp[:, i], color=c_cmd, lw=1.0, ls="--",
                               alpha=0.85, label="setpoint")
-                ax_w.set_title(f"Body rate {rate_lbl[i]} [rad/s]", fontsize=_mpl_pt(9))
+                ax_w.set_title(f"Body rate {rate_lbl[i]} [rad/s]", fontsize=_mpl_pt(12))
                 ax_w.set_ylabel("rad/s")
                 ax_w.grid(True, alpha=0.3)
                 ax_w.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
-                ax_w.legend(loc="upper right", fontsize=_mpl_pt(6))
+                ax_w.legend(loc="upper right", fontsize=_mpl_pt(10))
                 if i == 2:
                     ax_w.set_xlabel("t [s]")
 
@@ -11633,7 +12139,7 @@ class UamSuiteGUI(QMainWindow):
             fig.suptitle(
                 f"Control [{_mode}] — rotor forces & body torque (u_b,u_ac,u_p) "
                 f"| collective thrust & body rate",
-                fontsize=_mpl_pt(11), y=0.995,
+                fontsize=_mpl_pt(14), y=0.995,
             )
             try:
                 fig.tight_layout(rect=(0, 0, 1, 0.98))
@@ -11912,7 +12418,7 @@ class UamSuiteGUI(QMainWindow):
             ax = axes[idx]
             idx += 1
             ax.plot(t, total, "k-", lw=1.3)
-            ax.set_title("total", fontsize=_mpl_pt(10))
+            ax.set_title("total", fontsize=_mpl_pt(12))
             ax.set_xlabel("t [s]")
             ax.set_ylabel("cost")
             ax.grid(True, alpha=0.3)
@@ -11923,14 +12429,14 @@ class UamSuiteGUI(QMainWindow):
             ax.plot(t, v, lw=1.0, color="tab:orange")
             w = float(weights.get(key, float("nan"))) if isinstance(weights, dict) else float("nan")
             if np.isfinite(w):
-                ax.set_title(f"{key} (w={w:g})", fontsize=_mpl_pt(10))
+                ax.set_title(f"{key} (w={w:g})", fontsize=_mpl_pt(12))
             else:
-                ax.set_title(str(key), fontsize=_mpl_pt(10))
+                ax.set_title(str(key), fontsize=_mpl_pt(12))
             ax.set_xlabel("t [s]")
             ax.set_ylabel("cost")
             ax.grid(True, alpha=0.3)
 
-        fig.suptitle("MPC cost analysis (total + weighted term costs)", fontsize=_mpl_pt(12), y=0.99)
+        fig.suptitle("MPC cost analysis (total + weighted term costs)", fontsize=_mpl_pt(14), y=0.99)
         fig.tight_layout(rect=[0, 0, 1, 0.97])
         self.cv_cost_analysis.draw()
 
@@ -11963,14 +12469,17 @@ def _apply_display_scaling(app) -> float:
     try:
         import matplotlib
 
+        # 统一字号层级（与各绘图里 _mpl_pt() 显式设置保持一致）：
+        # 图标题 14 / 子图标题 12 / 正文·坐标轴标签 11 / 图例·刻度 10。
         matplotlib.rcParams.update(
             {
-                "font.size": 10.0 * plot_scale,
-                "axes.titlesize": 11.0 * plot_scale,
-                "axes.labelsize": 10.0 * plot_scale,
-                "xtick.labelsize": 9.5 * plot_scale,
-                "ytick.labelsize": 9.5 * plot_scale,
-                "legend.fontsize": 9.0 * plot_scale,
+                "font.size": 11.0 * plot_scale,
+                "figure.titlesize": 14.0 * plot_scale,
+                "axes.titlesize": 12.0 * plot_scale,
+                "axes.labelsize": 11.0 * plot_scale,
+                "xtick.labelsize": 10.0 * plot_scale,
+                "ytick.labelsize": 10.0 * plot_scale,
+                "legend.fontsize": 10.0 * plot_scale,
             }
         )
     except Exception:
