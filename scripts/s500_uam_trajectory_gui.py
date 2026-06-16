@@ -52,6 +52,7 @@ try:
     from s500_uam_acados_trajectory import (
         run_simple_trajectory,
         run_multiwaypoint_trajectory,
+        run_unified_multiwaypoint_trajectory,
         run_simple_trajectory_cascade,
         run_multiwaypoint_trajectory_cascade,
         plot_acados_into_figure,
@@ -62,6 +63,7 @@ try:
 except (ImportError, Exception):
     run_simple_trajectory = None
     run_multiwaypoint_trajectory = None
+    run_unified_multiwaypoint_trajectory = None
     run_simple_trajectory_cascade = None
     run_multiwaypoint_trajectory_cascade = None
     plot_acados_into_figure = None
@@ -325,6 +327,11 @@ class OptimizationWorker(QThread):
             "max_iter": self.params.get("max_iter", 200),
             "verbose_opt": False,
         }
+        mixed_rows = self.params.get("mixed_wp_rows") or []
+        has_ee_knot = any(
+            mixed_wp_row_kind(r[0]) in ("ee_pos", "ee_pose") for r in mixed_rows
+        )
+        use_unified = bool(self.params.get("use_unified_ocp", has_ee_knot))
         if self.method == "acados_cascade":
             if not ACADOS_AVAILABLE or not CASCADE_TRAJ_AVAILABLE or run_simple_trajectory_cascade is None:
                 self.finished.emit(
@@ -356,18 +363,24 @@ class OptimizationWorker(QThread):
             if not ACADOS_AVAILABLE or run_simple_trajectory is None:
                 self.finished.emit(False, "Acados not available. Install acados_template and build acados.", None)
                 return
-            if len(waypoints) == 2:
+            if use_unified and run_unified_multiwaypoint_trajectory is not None and len(waypoints) >= 2:
+                simX, simU, time_arr, _, timing = run_unified_multiwaypoint_trajectory(
+                    states, durations, dt=self.params["dt"], **kw
+                )
+                method_tag = "acados_unified"
+            elif len(waypoints) == 2:
                 simX, simU, time_arr, _, timing = run_simple_trajectory(
                     states[0], states[1],
                     duration=durations[0],
                     dt=self.params["dt"],
                     **kw,
                 )
+                method_tag = "acados"
             else:
                 simX, simU, time_arr, _, timing = run_multiwaypoint_trajectory(
                     states, durations, dt=self.params["dt"], **kw
                 )
-            method_tag = "acados"
+                method_tag = "acados"
             control_layout = "direct"
         if simX is None:
             self.finished.emit(False, "Acados optimization failed.", None)

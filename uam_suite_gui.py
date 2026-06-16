@@ -3,7 +3,7 @@
 S500 UAM integrated GUI: trajectory planning (full-state / EE-only) + closed-loop tracking (Crocoddyl along the plan / Acados EE-centric).
 
 右侧绘图标签页：States（位置、姿态、速度、角速度、线加/角加、jerk、snap）、Controls（s500 执行器）、
-Base 3D（等比例 XYZ）、Tracking / MPC（轨迹、位置/速度跟踪误差、运动学范数、MPC 或 snap）、Cost analysis。
+Trajectory 3D（等比例 XYZ）、Tracking / MPC（位置/速度跟踪误差、运动学范数、MPC 或 snap）、Cost analysis。
 UAM 模式下 Controls 页提示见 States 的 Acados 布局；EE 的 Tracking 页含速度误差等（见 s500_uam_ee_snap_tracking_mpc）。
 
 Usage:
@@ -1136,6 +1136,10 @@ class TrackAcadosAlongPlanWorker(QThread):
                 ctbr=p.get("ctbr"),
                 baseline=p.get("baseline", "acados"),
                 geometric=p.get("geometric"),
+                solver_type=p.get("acados_solver_type", "SQP_RTI"),
+                integrator=p.get("acados_integrator", "ERK"),
+                cost_analysis=p.get("acados_cost_analysis", False),
+                inertia_scaling=p.get("acados_inertia_scaling", False),
                 progress_cb=_progress,
             )
             res = acados_closed_loop_to_ee_tracking_res(out)
@@ -1459,6 +1463,7 @@ class TrackEeCrocWorker(QThread):
                     k: float(v)
                     for k, v in (out.get("mpc_cost_weights", {}) or {}).items()
                 },
+                "timing": dict(out.get("timing", {}) or {}),
             }
             self.finished.emit(True, "", {"out": out, "res": res})
         except Exception:
@@ -2626,6 +2631,42 @@ class UamSuiteGUI(QMainWindow):
         self.mpc_log_iv = QSpinBox()
         self.mpc_log_iv.setRange(0, 1000)
         self.mpc_log_iv.setValue(0)
+        # Acados 求解器类型：SQP（精确，多迭代）vs SQP_RTI（实时迭代，单次 QP，更快）。
+        self.acados_solver_type = QComboBox()
+        self.acados_solver_type.addItems(["SQP (精确)", "SQP_RTI (快)"])
+        self.acados_solver_type.setCurrentIndex(1)  # 默认 SQP_RTI（实时迭代，提速）
+        self.acados_solver_type.setToolTip(
+            "SQP：每步迭代到收敛，最精确但慢（mpc_solve 主要耗时来源）。\n"
+            "SQP_RTI：实时迭代，每步仅 1 个 QP，暖启动下跟踪通常足够好，可显著提速。"
+        )
+        # Acados 积分器：默认随控制模式（direct=IRK 隐式更稳，actuator=ERK）。
+        # 选 ERK 在非刚性动力学下更快。
+        self.acados_integrator = QComboBox()
+        self.acados_integrator.addItems(["默认", "ERK (快)", "IRK (稳)"])
+        self.acados_integrator.setCurrentIndex(1)  # 默认 ERK（显式，提速）
+        self.acados_integrator.setToolTip(
+            "预测模型积分器。默认：direct→IRK / actuator→ERK。\n"
+            "ERK 显式，更快；IRK 隐式，刚性更稳。提速可尝试 ERK。"
+        )
+        # 成本分项分析：每控制步遍历 horizon 拆解各代价项，开销不小（~14%）。
+        # 关闭则只记录总代价（成本曲线仍可看总量，分项为空），仿真更快。
+        self.acados_cost_analysis = QCheckBox("成本分项分析")
+        self.acados_cost_analysis.setChecked(False)  # 默认关闭（提速 ~14%）
+        self.acados_cost_analysis.setToolTip(
+            "勾选：记录各代价分项（位置/姿态/关节/输入…），供成本分析页绘图，但每步有额外开销。\n"
+            "取消：仅记录总代价，跳过分项拆解，仿真更快（约提速 14%）。"
+        )
+        # 惯量缩放：串联臂各关节等效惯量差数倍（s500_uam: M[j1]≈4·M[j2]），同权重会扭曲
+        # 优化优先级、恶化 QP 条件数。勾选则按质量矩阵对角元（动能度量）自动归一化各关节
+        # 的 w_joint / w_joint_vel（均值=1，master 量级不变；等惯量退化为原行为）。
+        self.acados_inertia_scaling = QCheckBox("惯量缩放（按 M 自动归一化关节权重）")
+        self.acados_inertia_scaling.setChecked(False)
+        self.acados_inertia_scaling.setToolTip(
+            "勾选：按质量矩阵对角元 M_ii（动能度量）自动缩放各臂关节的 w_joint/w_joint_vel，\n"
+            "惯量大的关节权重更高；归一化到均值=1，故 master w_joint 量级不变。\n"
+            "用于串联臂 M 数量级差异（j1/j2 不应同权重）；等惯量或纯四旋翼无影响。\n"
+            "权重运行时下发，切换不触发 acados 重新编译。"
+        )
         self.control_mode_track = QComboBox()
         self.control_mode_track.addItems(["direct (thrust + τ)", "actuator_first_order (ω, T, θ)"])
 
@@ -2913,6 +2954,10 @@ class UamSuiteGUI(QMainWindow):
             ("Croc EE terminal scale", self.croc_ee_w_terminal),
             ("mpc max_iter", self.mpc_max_iter),
             ("mpc log ivl", self.mpc_log_iv),
+            ("Acados 求解器", self.acados_solver_type),
+            ("Acados 积分器", self.acados_integrator),
+            ("成本分析", self.acados_cost_analysis),
+            ("惯量缩放", self.acados_inertia_scaling),
             ("Control mode", self.control_mode_track),
             ("Geo kp_pos", self.geo_kp_pos),
             ("Geo kd_vel", self.geo_kd_vel),
@@ -4067,7 +4112,7 @@ class UamSuiteGUI(QMainWindow):
         self.fig_control, self.cv_control = embed_fig("Control", (12, 11))
         # CTBR/feedback 与控制输入合并到同一个 "Control" 标签页（别名复用）。
         self.fig_ctbr, self.cv_ctbr = self.fig_control, self.cv_control
-        self.fig_3d_track, self.cv_3d_track = embed_fig("Base 3D", (10, 8))
+        self.fig_3d_track, self.cv_3d_track = embed_fig("Trajectory 3D", (10, 8))
         self.fig_traj_dash, self.cv_traj_dash = embed_fig("Tracking / MPC", (12, 11))
         self.fig_cost_analysis, self.cv_cost_analysis = embed_fig("Cost analysis", (12, 10))
         # L1 / Disturbance 页带「坐标系」切换按钮（world↔body 显示），自定义容器。
@@ -4161,7 +4206,7 @@ class UamSuiteGUI(QMainWindow):
         ax.text(
             0.5,
             0.5,
-            "UAM / Acados：执行器指令见「States」标签页中的 Acados 布局。",
+            "UAM / Acados: actuator commands shown in the Acados layout on the 'States' tab.",
             ha="center",
             va="center",
             transform=ax.transAxes,
@@ -5430,6 +5475,7 @@ class UamSuiteGUI(QMainWindow):
             self._update_track_mode_enabled()
         if hasattr(self, "reg_mode_combo"):
             self._update_reg_mode_enabled()
+        self._update_dist_uam_only_visibility()
         self._refresh_track_drone_panel()
 
     def _apply_robot_mode_ui_labels(self, robot_mode: str) -> None:
@@ -6216,6 +6262,10 @@ class UamSuiteGUI(QMainWindow):
                         self.N_mpc,
                         self.mpc_max_iter,
                         self.mpc_log_iv,
+                        self.acados_solver_type,
+                        self.acados_integrator,
+                        self.acados_cost_analysis,
+                        self.acados_inertia_scaling,
                         self.control_mode_track,
                     }
                 )
@@ -6356,7 +6406,8 @@ class UamSuiteGUI(QMainWindow):
             "坐标系约定（世界系 = 惯性系，Z 轴向上，重力沿 -Z）：\n"
             "  • 定常力/力矩、变化外力、阻力、推力偏置等效力 → 均在世界系定义 [N / N·m]；\n"
             "  • 注入 plant 时力矩按 M_body=Rᵀ·M_world 转换（Pinocchio 机体系广义力）；\n"
-            "  • L1 仅估计平动集总扰动 → 世界系 m·σ̂ [N]；不估计力矩（力矩行无估计曲线）。"
+            "  • L1 自适应：仅估计 base 平动集总扰动 → 世界系 m·σ̂ [N]；不估计力矩/关节力矩。\n"
+            "  • 动量观测器 (momentum)：另估计 base 力矩 + 臂关节扰动力矩 τ_j [N·m]（s500_uam）。"
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: palette(mid); font-size: 11px;")
@@ -6392,23 +6443,131 @@ class UamSuiteGUI(QMainWindow):
         g1.addWidget(self.dist_const_frame_btn, 4, 2, 1, 2)
         page_v.addWidget(self.dist_const_group)
 
-        # ── 2) 外界变化扰动（世界系力正弦）────────────────────────────────
-        self.dist_var_group = QGroupBox("外界变化扰动 (世界系力, 逐轴正弦 A·sin(2πft+φ))")
+        def _frame_btn(body_label="机体系 (body)", tip=None):
+            """坐标系切换按钮（默认世界系），toggled 时自动更新文本。"""
+            b = QPushButton("坐标系: 世界系 (world)")
+            b.setCheckable(True)
+            if tip:
+                b.setToolTip(tip)
+            b.toggled.connect(
+                lambda chk, btn=b, bl=body_label: btn.setText(
+                    f"坐标系: {bl}" if chk else "坐标系: 世界系 (world)"
+                )
+            )
+            return b
+
+        # ── 2) 外界变化扰动（base-link，力+力矩正弦，坐标系可切换）──────────
+        self.dist_var_group = QGroupBox("外界变化扰动 (base, 力/力矩逐轴正弦 A·sin(2πft+φ))")
         self.dist_var_group.setCheckable(True)
         self.dist_var_group.setChecked(False)
         g2 = QGridLayout(self.dist_var_group)
         self.dist_var_t0, self.dist_var_t1 = _win(g2, 0)
-        self.dist_var_amp_x = _ds(-50.0, 50.0, 0.0, 3, 0.1, "X 轴幅值 [N]")
-        self.dist_var_amp_y = _ds(-50.0, 50.0, 0.0, 3, 0.1, "Y 轴幅值 [N]")
-        self.dist_var_amp_z = _ds(-50.0, 50.0, 0.0, 3, 0.1, "Z 轴幅值 [N]")
-        g2.addWidget(QLabel("Amp X"), 1, 0); g2.addWidget(self.dist_var_amp_x, 1, 1)
-        g2.addWidget(QLabel("Amp Y"), 1, 2); g2.addWidget(self.dist_var_amp_y, 1, 3)
-        g2.addWidget(QLabel("Amp Z"), 2, 0); g2.addWidget(self.dist_var_amp_z, 2, 1)
+        self.dist_var_amp_x = _ds(-50.0, 50.0, 0.0, 3, 0.1, "X 轴力幅值 [N]")
+        self.dist_var_amp_y = _ds(-50.0, 50.0, 0.0, 3, 0.1, "Y 轴力幅值 [N]")
+        self.dist_var_amp_z = _ds(-50.0, 50.0, 0.0, 3, 0.1, "Z 轴力幅值 [N]")
+        g2.addWidget(QLabel("Amp Fx"), 1, 0); g2.addWidget(self.dist_var_amp_x, 1, 1)
+        g2.addWidget(QLabel("Amp Fy"), 1, 2); g2.addWidget(self.dist_var_amp_y, 1, 3)
+        g2.addWidget(QLabel("Amp Fz"), 2, 0); g2.addWidget(self.dist_var_amp_z, 2, 1)
+        self.dist_var_amp_mx = _ds(-10.0, 10.0, 0.0, 3, 0.01, "X 轴力矩幅值 [N·m]")
+        self.dist_var_amp_my = _ds(-10.0, 10.0, 0.0, 3, 0.01, "Y 轴力矩幅值 [N·m]")
+        self.dist_var_amp_mz = _ds(-10.0, 10.0, 0.0, 3, 0.01, "Z 轴力矩幅值 [N·m]")
+        g2.addWidget(QLabel("Amp Mx"), 3, 0); g2.addWidget(self.dist_var_amp_mx, 3, 1)
+        g2.addWidget(QLabel("Amp My"), 3, 2); g2.addWidget(self.dist_var_amp_my, 3, 3)
+        g2.addWidget(QLabel("Amp Mz"), 4, 0); g2.addWidget(self.dist_var_amp_mz, 4, 1)
         self.dist_var_freq = _ds(0.0, 20.0, 0.5, 3, 0.1, "频率 [Hz]")
         self.dist_var_phase = _ds(-360.0, 360.0, 0.0, 1, 5.0, "相位 [deg]")
         g2.addWidget(QLabel("freq [Hz]"), 2, 2); g2.addWidget(self.dist_var_freq, 2, 3)
-        g2.addWidget(QLabel("phase [deg]"), 3, 0); g2.addWidget(self.dist_var_phase, 3, 1)
+        g2.addWidget(QLabel("phase [deg]"), 5, 0); g2.addWidget(self.dist_var_phase, 5, 1)
+        self.dist_var_frame_btn = _frame_btn(
+            tip="变化力/力矩的定义坐标系（世界系/机体系），与定常扰动一致。"
+        )
+        g2.addWidget(self.dist_var_frame_btn, 5, 2, 1, 2)
         page_v.addWidget(self.dist_var_group)
+
+        # ── 2b) EE-link 定常扰动（仅 s500_uam，坐标系=EE系/世界系）────────────
+        self.dist_ee_const_group = QGroupBox("EE 定常扰动 (力/力矩 N / N·m，坐标系可切换；仅 s500_uam)")
+        self.dist_ee_const_group.setCheckable(True)
+        self.dist_ee_const_group.setChecked(False)
+        ge = QGridLayout(self.dist_ee_const_group)
+        self.dist_ee_const_t0, self.dist_ee_const_t1 = _win(ge, 0)
+        self.dist_ee_const_fx = _ds(-50.0, 50.0, 0.0, 3, 0.1, "EE Fx")
+        self.dist_ee_const_fy = _ds(-50.0, 50.0, 0.0, 3, 0.1, "EE Fy")
+        self.dist_ee_const_fz = _ds(-50.0, 50.0, 0.0, 3, 0.1, "EE Fz")
+        ge.addWidget(QLabel("Fx"), 1, 0); ge.addWidget(self.dist_ee_const_fx, 1, 1)
+        ge.addWidget(QLabel("Fy"), 1, 2); ge.addWidget(self.dist_ee_const_fy, 1, 3)
+        ge.addWidget(QLabel("Fz"), 2, 0); ge.addWidget(self.dist_ee_const_fz, 2, 1)
+        self.dist_ee_const_mx = _ds(-10.0, 10.0, 0.0, 3, 0.01, "EE Mx")
+        self.dist_ee_const_my = _ds(-10.0, 10.0, 0.0, 3, 0.01, "EE My")
+        self.dist_ee_const_mz = _ds(-10.0, 10.0, 0.0, 3, 0.01, "EE Mz")
+        ge.addWidget(QLabel("Mx"), 3, 0); ge.addWidget(self.dist_ee_const_mx, 3, 1)
+        ge.addWidget(QLabel("My"), 3, 2); ge.addWidget(self.dist_ee_const_my, 3, 3)
+        ge.addWidget(QLabel("Mz"), 4, 0); ge.addWidget(self.dist_ee_const_mz, 4, 1)
+        self.dist_ee_const_frame_btn = _frame_btn(
+            body_label="EE系 (ee)",
+            tip="EE 扰动定义坐标系：EE系（随末端姿态旋转）或世界系。经 J(q)ᵀ 折算到广义力。",
+        )
+        ge.addWidget(self.dist_ee_const_frame_btn, 4, 2, 1, 2)
+        page_v.addWidget(self.dist_ee_const_group)
+
+        # ── 2c) EE-link 变化扰动（仅 s500_uam）──────────────────────────────
+        self.dist_ee_var_group = QGroupBox("EE 变化扰动 (力/力矩逐轴正弦；仅 s500_uam)")
+        self.dist_ee_var_group.setCheckable(True)
+        self.dist_ee_var_group.setChecked(False)
+        gev = QGridLayout(self.dist_ee_var_group)
+        self.dist_ee_var_t0, self.dist_ee_var_t1 = _win(gev, 0)
+        self.dist_ee_var_amp_x = _ds(-50.0, 50.0, 0.0, 3, 0.1, "EE X 力幅值 [N]")
+        self.dist_ee_var_amp_y = _ds(-50.0, 50.0, 0.0, 3, 0.1, "EE Y 力幅值 [N]")
+        self.dist_ee_var_amp_z = _ds(-50.0, 50.0, 0.0, 3, 0.1, "EE Z 力幅值 [N]")
+        gev.addWidget(QLabel("Amp Fx"), 1, 0); gev.addWidget(self.dist_ee_var_amp_x, 1, 1)
+        gev.addWidget(QLabel("Amp Fy"), 1, 2); gev.addWidget(self.dist_ee_var_amp_y, 1, 3)
+        gev.addWidget(QLabel("Amp Fz"), 2, 0); gev.addWidget(self.dist_ee_var_amp_z, 2, 1)
+        self.dist_ee_var_amp_mx = _ds(-10.0, 10.0, 0.0, 3, 0.01, "EE X 力矩幅值 [N·m]")
+        self.dist_ee_var_amp_my = _ds(-10.0, 10.0, 0.0, 3, 0.01, "EE Y 力矩幅值 [N·m]")
+        self.dist_ee_var_amp_mz = _ds(-10.0, 10.0, 0.0, 3, 0.01, "EE Z 力矩幅值 [N·m]")
+        gev.addWidget(QLabel("Amp Mx"), 3, 0); gev.addWidget(self.dist_ee_var_amp_mx, 3, 1)
+        gev.addWidget(QLabel("Amp My"), 3, 2); gev.addWidget(self.dist_ee_var_amp_my, 3, 3)
+        gev.addWidget(QLabel("Amp Mz"), 4, 0); gev.addWidget(self.dist_ee_var_amp_mz, 4, 1)
+        self.dist_ee_var_freq = _ds(0.0, 20.0, 0.5, 3, 0.1, "频率 [Hz]")
+        self.dist_ee_var_phase = _ds(-360.0, 360.0, 0.0, 1, 5.0, "相位 [deg]")
+        gev.addWidget(QLabel("freq [Hz]"), 2, 2); gev.addWidget(self.dist_ee_var_freq, 2, 3)
+        gev.addWidget(QLabel("phase [deg]"), 5, 0); gev.addWidget(self.dist_ee_var_phase, 5, 1)
+        self.dist_ee_var_frame_btn = _frame_btn(
+            body_label="EE系 (ee)",
+            tip="EE 变化扰动定义坐标系：EE系或世界系。",
+        )
+        gev.addWidget(self.dist_ee_var_frame_btn, 5, 2, 1, 2)
+        page_v.addWidget(self.dist_ee_var_group)
+
+        # ── 2d) 模拟负载（刚性附着 EE 的物体；仅 s500_uam）──────────────────
+        self.dist_load_group = QGroupBox("模拟负载 (刚性抓取物体，默认 400g 可乐罐；仅 s500_uam)")
+        self.dist_load_group.setCheckable(True)
+        self.dist_load_group.setChecked(False)
+        gl = QGridLayout(self.dist_load_group)
+        self.dist_load_t0, self.dist_load_t1 = _win(gl, 0)
+        self.dist_load_t0.setToolTip("抓取时刻 [s]：之前 plant 用名义模型，之后切换为含负载惯量的增广模型")
+        self.dist_load_mass = _ds(0.0, 5.0, 0.4, 4, 0.05, "负载质量 [kg]（可乐罐≈0.4）")
+        gl.addWidget(QLabel("mass [kg]"), 1, 0); gl.addWidget(self.dist_load_mass, 1, 1)
+        self.dist_load_ixx = _ds(0.0, 1.0, 5.5e-4, 7, 1e-5, "Ixx [kg·m²]（横向）")
+        self.dist_load_iyy = _ds(0.0, 1.0, 5.5e-4, 7, 1e-5, "Iyy [kg·m²]（横向）")
+        self.dist_load_izz = _ds(0.0, 1.0, 2.18e-4, 7, 1e-5, "Izz [kg·m²]（轴向）")
+        gl.addWidget(QLabel("Ixx"), 1, 2); gl.addWidget(self.dist_load_ixx, 1, 3)
+        gl.addWidget(QLabel("Iyy"), 2, 0); gl.addWidget(self.dist_load_iyy, 2, 1)
+        gl.addWidget(QLabel("Izz"), 2, 2); gl.addWidget(self.dist_load_izz, 2, 3)
+        self.dist_load_com_x = _ds(-0.5, 0.5, 0.0, 4, 0.005, "质心相对 EE 系 X 偏置 [m]")
+        self.dist_load_com_y = _ds(-0.5, 0.5, 0.0, 4, 0.005, "质心相对 EE 系 Y 偏置 [m]")
+        self.dist_load_com_z = _ds(-0.5, 0.5, 0.0, 4, 0.005, "质心相对 EE 系 Z 偏置 [m]")
+        gl.addWidget(QLabel("com X"), 3, 0); gl.addWidget(self.dist_load_com_x, 3, 1)
+        gl.addWidget(QLabel("com Y"), 3, 2); gl.addWidget(self.dist_load_com_y, 3, 3)
+        gl.addWidget(QLabel("com Z"), 4, 0); gl.addWidget(self.dist_load_com_z, 4, 1)
+        _loadint = QLabel(
+            "负载刚性附着 EE：plant 用含负载惯量的增广 Pinocchio 模型积分（重力/科氏/惯性耦合"
+            "全精确），MPC 仍用名义模型 → 模型失配=真实扰动。配合“动量观测器”估计 base 6D "
+            "wrench 再做模型增广补偿。默认 400g 圆柱(r≈33mm,h≈115mm) 近似可乐罐。"
+        )
+        _loadint.setWordWrap(True)
+        _loadint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        gl.addWidget(_loadint, 5, 0, 1, 4)
+        page_v.addWidget(self.dist_load_group)
 
         # ── 3) 总推力估计偏差 ───────────────────────────────────────────
         self.dist_thrust_group = QGroupBox("总推力估计偏差 (T_real = scale·T_cmd + bias)")
@@ -6471,6 +6630,7 @@ class UamSuiteGUI(QMainWindow):
         dist_scroll.setWidgetResizable(True)
         dist_scroll.setWidget(page)
         self.track_settings_tabs.addTab(dist_scroll, "Disturbance")
+        self._update_dist_uam_only_visibility()
 
         # ── L1 自适应补偿（单独标签页）─────────────────────────────────
         l1_page = QWidget()
@@ -6496,13 +6656,14 @@ class UamSuiteGUI(QMainWindow):
         egl = QGridLayout(_est_box)
         # 估计来源：L1 在线估计 vs 直接用扰动真值（绕过估计器，隔离评估补偿环节）。
         self.sim_l1_comp_mode = QComboBox()
-        self.sim_l1_comp_mode.addItem("L1 自适应估计")
+        self.sim_l1_comp_mode.addItem("广义 L1 自适应估计")
         self.sim_l1_comp_mode.addItem("扰动真值 (oracle)")
         self.sim_l1_comp_mode.setToolTip(
-            "扰动估计来源：\n"
-            "L1 自适应：在线估计 σ̂ 再补偿（含估计误差/滞后）。\n"
-            "扰动真值 oracle：直接用注入扰动的真值作 σ̂（无估计误差/滞后，绕过预测器/LPF），"
-            "只考验后续补偿环节的好坏。"
+            "扰动估计来源（仅两种）：\n"
+            "广义 L1：在广义动量上一阶自适应，在线估计**完整**广义外力\n"
+            "  τ̂_ext=[base力(3), base力矩(3), 臂关节(n)]（增益用下方 obs k_F/k_M/k_arm）。\n"
+            "扰动真值 oracle：直接用注入扰动真值（无估计误差/滞后），用于上界对照/调试。\n"
+            "两者共用两条注入路径（见下方补偿方式）：bolt-on（u_b+u_ad）与 in-model（增广 MPC）。"
         )
         self.sim_l1_as_gain = _ds(0.1, 100.0, 8.0, 3, 0.5, "预测器收敛速率 a_s（仅 L1 估计）")
         self.sim_l1_wc_xy = _ds(0.0, 100.0, 6.0, 3, 0.5, "水平补偿 LPF 截止 [rad/s]（仅 L1 估计）")
@@ -6524,29 +6685,50 @@ class UamSuiteGUI(QMainWindow):
         egl.addWidget(QLabel("wc_xy"), 2, 0); egl.addWidget(self.sim_l1_wc_xy, 2, 1)
         egl.addWidget(QLabel("wc_z"), 2, 2); egl.addWidget(self.sim_l1_wc_z, 2, 3)
         egl.addWidget(QLabel("估计坐标系"), 3, 0); egl.addWidget(self.sim_l1_frame, 3, 1, 1, 3)
+        # 广义 L1 估计带宽（rad/s，各通道一阶低通）：越大收敛越快、越对噪声敏感。
+        self.sim_obs_k_force = _ds(0.0, 500.0, 20.0, 1, 1.0, "广义 L1 base 力 通道带宽 [rad/s]")
+        self.sim_obs_k_torque = _ds(0.0, 500.0, 20.0, 1, 1.0, "广义 L1 base 力矩 通道带宽 [rad/s]")
+        self.sim_obs_k_arm = _ds(0.0, 500.0, 20.0, 1, 1.0, "广义 L1 臂关节 通道带宽 [rad/s]")
+        # 抓取事件软重置时刻 [s]：到时用当前广义动量重 seed，只看抓取后新增外力（<0 关闭）。
+        self.sim_obs_grasp_t = _ds(-1.0, 600.0, -1.0, 2, 0.1, "抓取软重置时刻 [s]（<0 关闭）")
+        egl.addWidget(QLabel("obs k_F"), 4, 0); egl.addWidget(self.sim_obs_k_force, 4, 1)
+        egl.addWidget(QLabel("obs k_M"), 4, 2); egl.addWidget(self.sim_obs_k_torque, 4, 3)
+        egl.addWidget(QLabel("obs k_arm"), 5, 0); egl.addWidget(self.sim_obs_k_arm, 5, 1)
+        egl.addWidget(QLabel("抓取重置t"), 5, 2); egl.addWidget(self.sim_obs_grasp_t, 5, 3)
         _l1_outer.addWidget(_est_box)
 
-        # ── 扰动补偿（compensation）：σ̂ 怎么用 ───────────────────────────
-        _comp_box = QGroupBox("扰动补偿 (compensation)")
+        # ── 扰动补偿（compensation）：σ̂ 怎么用（可关闭=仅估计不补偿）──────────
+        self.sim_l1_comp_box = QGroupBox("扰动补偿 (compensation)（取消勾选 = 仅估计不补偿）")
+        self.sim_l1_comp_box.setCheckable(True)
+        self.sim_l1_comp_box.setChecked(True)
+        self.sim_l1_comp_box.setToolTip(
+            "与扰动估计解耦：\n"
+            "勾选：用 σ̂ 按下面的补偿方式注入控制器（正常补偿）。\n"
+            "取消勾选：估计器照常运行并在 \"L1/Disturbance\" 页记录 σ̂（真值/估计对照），"
+            "但不注入任何 σ̂ 补偿（不做 bolt-on dFz/tilt、不做模型增广）。\n"
+            "下方独立的\"位置误差反馈控制器\"不受此开关影响。"
+        )
+        _comp_box = self.sim_l1_comp_box
         cgl = QGridLayout(_comp_box)
-        # 补偿方式（合并原"补偿方式"+"注入点"为单一策略选择）：
-        #  0 全部补偿 = baseline + bolt_on（matched 抬推力 + unmatched 倾转）
-        #  1 仅 matched = l1quad + bolt_on（只补推力轴，unmatched 交 baseline 反馈）
-        #  2 模型增广 = baseline + in_model（disturbance-aware MPC，仅 acados）
+        # 补偿方式：按"补偿发生在 MPC 之前还是之后"组织（合并 method+inject+更新时机）：
+        #  0 MPC 之后·全部补偿 = baseline + bolt_on（matched 抬推力 + unmatched 倾转）
+        #  1 MPC 之后·仅 matched = l1quad + bolt_on（只补推力轴，unmatched 交 baseline）
+        #  2 MPC 之前·模型增广(估计后置) = in_model + update=post（默认，单拍滞后）
+        #  3 MPC 之前·模型增广(估计前置) = in_model + update=pre（本拍先估计再求解，消滞后）
         self.sim_l1_comp_strategy = QComboBox()
-        self.sim_l1_comp_strategy.addItem("全部补偿 (matched+unmatched/倾转)")
-        self.sim_l1_comp_strategy.addItem("仅补偿 matched (推力轴)")
-        self.sim_l1_comp_strategy.addItem("模型增广 (disturbance-aware MPC，仅 MPC)")
+        self.sim_l1_comp_strategy.addItem("bolt-on (u = u_b + u_ad)")
+        self.sim_l1_comp_strategy.addItem("in-model (增广 MPC)")
         self.sim_l1_comp_strategy.setCurrentIndex(0)
         self.sim_l1_comp_strategy.setToolTip(
-            "扰动补偿方式（σ̂ 如何注入控制器）：\n"
-            "全部补偿（默认）：matched（机体 z 推力轴）经 dFz 直补，unmatched（机体 xy）经 "
-            "tilt_gain 主动倾转去补；geometric 走力层前馈 a_des、acados 走后嵌 dFz/tilt。\n"
-            "仅补偿 matched（L1Quad 论文做法）：只补 matched 推力轴，unmatched 只估计不主动补，"
-            "交由 baseline 控制器状态反馈处理（tilt≈0）。\n"
-            "模型增广（disturbance-aware MPC，仅 acados）：把 σ̂·m 作为世界系扰动力参数喂进 MPC "
-            "模型，horizon 全程已知扰动、规划最优倾角/推力（offset-free），收敛快且满足约束；"
-            "需重新生成 acados 代码，可与原 MPC 对比求解时间。geometric 不支持（恒力层前馈）。"
+            "扰动补偿方式（仅两种），把估计/真值的广义外力 τ̂_ext 用于补偿：\n"
+            "【bolt-on】MPC 用名义模型照常求解 u_b，解完再叠加补偿 u_ad = -τ̂_ext：\n"
+            "  • 臂关节（全驱动）→ 直接补 -τ̂_arm；\n"
+            "  • base 竖直力/转动力矩 → 经推力分配（dFz + 推力差动）；\n"
+            "  • base 水平力（欠驱动）→ 倾转（tilt_gain），本质由 MPC/baseline 姿态环承担。\n"
+            "【in-model】把 τ̂_ext 作为扰动参数喂进增广 MPC 模型（base 6D 世界系 wrench → p[:6]，\n"
+            "  臂关节力矩 → p[6:]），horizon 全程已知扰动、规划最优倾角/推力/关节力矩\n"
+            "  （offset-free）。oracle 下逐 stage 喂未来真值可提前预倾。需重新生成 acados 代码。\n"
+            "  geometric baseline 不支持 in-model（恒为 bolt-on 力层前馈）。"
         )
         self.sim_l1_tilt_gain = _ds(0.0, 50.0, 3.0, 3, 0.5, "横向补偿→体力矩增益（仅 acados 后嵌全部补偿）")
         self.sim_l1_max_accel_xy = _ds(0.0, 50.0, 6.0, 3, 0.5, "补偿加速度上限 xy [m/s²]")
@@ -6844,10 +7026,23 @@ class UamSuiteGUI(QMainWindow):
             "坐标系: 机体系 (body)" if checked else "坐标系: 世界系 (world)"
         )
 
+    def _update_dist_uam_only_visibility(self) -> None:
+        """EE 力旋量与模拟负载仅 s500_uam 适用：s500 模式下隐藏对应分组。"""
+        if not hasattr(self, "dist_ee_const_group"):
+            return
+        show = not self._is_s500_mode()
+        for grp in (
+            self.dist_ee_const_group,
+            self.dist_ee_var_group,
+            self.dist_load_group,
+        ):
+            grp.setVisible(show)
+
     def _collect_track_disturbance(self) -> dict:
         """从 L1/Disturbance 子标签收集 plant 扰动配置（传给闭环仿真）。"""
         if not hasattr(self, "dist_const_group"):
             return {}
+        is_s500 = self._is_s500_mode()
         return {
             "const_enable": bool(self.dist_const_group.isChecked()),
             "const_body_frame": bool(self.dist_const_frame_btn.isChecked()),
@@ -6865,8 +7060,46 @@ class UamSuiteGUI(QMainWindow):
             "var_amp_x": float(self.dist_var_amp_x.value()),
             "var_amp_y": float(self.dist_var_amp_y.value()),
             "var_amp_z": float(self.dist_var_amp_z.value()),
+            "var_amp_mx": float(self.dist_var_amp_mx.value()),
+            "var_amp_my": float(self.dist_var_amp_my.value()),
+            "var_amp_mz": float(self.dist_var_amp_mz.value()),
             "var_freq": float(self.dist_var_freq.value()),
             "var_phase_deg": float(self.dist_var_phase.value()),
+            "var_body_frame": bool(self.dist_var_frame_btn.isChecked()),
+            # EE-link 力旋量扰动（仅 s500_uam 生效）。
+            "ee_const_enable": bool(self.dist_ee_const_group.isChecked()) and not is_s500,
+            "ee_const_t0": float(self.dist_ee_const_t0.value()),
+            "ee_const_t1": float(self.dist_ee_const_t1.value()),
+            "ee_const_fx": float(self.dist_ee_const_fx.value()),
+            "ee_const_fy": float(self.dist_ee_const_fy.value()),
+            "ee_const_fz": float(self.dist_ee_const_fz.value()),
+            "ee_const_mx": float(self.dist_ee_const_mx.value()),
+            "ee_const_my": float(self.dist_ee_const_my.value()),
+            "ee_const_mz": float(self.dist_ee_const_mz.value()),
+            "ee_const_body_frame": bool(self.dist_ee_const_frame_btn.isChecked()),
+            "ee_var_enable": bool(self.dist_ee_var_group.isChecked()) and not is_s500,
+            "ee_var_t0": float(self.dist_ee_var_t0.value()),
+            "ee_var_t1": float(self.dist_ee_var_t1.value()),
+            "ee_var_amp_x": float(self.dist_ee_var_amp_x.value()),
+            "ee_var_amp_y": float(self.dist_ee_var_amp_y.value()),
+            "ee_var_amp_z": float(self.dist_ee_var_amp_z.value()),
+            "ee_var_amp_mx": float(self.dist_ee_var_amp_mx.value()),
+            "ee_var_amp_my": float(self.dist_ee_var_amp_my.value()),
+            "ee_var_amp_mz": float(self.dist_ee_var_amp_mz.value()),
+            "ee_var_freq": float(self.dist_ee_var_freq.value()),
+            "ee_var_phase_deg": float(self.dist_ee_var_phase.value()),
+            "ee_var_body_frame": bool(self.dist_ee_var_frame_btn.isChecked()),
+            # 模拟负载（仅 s500_uam 生效）。
+            "load_enable": bool(self.dist_load_group.isChecked()) and not is_s500,
+            "load_t0": float(self.dist_load_t0.value()),
+            "load_t1": float(self.dist_load_t1.value()),
+            "load_mass": float(self.dist_load_mass.value()),
+            "load_ixx": float(self.dist_load_ixx.value()),
+            "load_iyy": float(self.dist_load_iyy.value()),
+            "load_izz": float(self.dist_load_izz.value()),
+            "load_com_x": float(self.dist_load_com_x.value()),
+            "load_com_y": float(self.dist_load_com_y.value()),
+            "load_com_z": float(self.dist_load_com_z.value()),
             "thrust_enable": bool(self.dist_thrust_group.isChecked()),
             "thrust_t0": float(self.dist_thrust_t0.value()),
             "thrust_t1": float(self.dist_thrust_t1.value()),
@@ -6895,14 +7128,24 @@ class UamSuiteGUI(QMainWindow):
             return {"enabled": False}
         return {
             "enabled": bool(self.sim_l1_group.isChecked()),
-            "mode": ("oracle" if self.sim_l1_comp_mode.currentIndex() == 1 else "adaptive"),
+            "mode": (
+                "oracle" if self.sim_l1_comp_mode.currentIndex() == 1
+                else "adaptive"
+            ),
             "comp_mode_index": int(self.sim_l1_comp_mode.currentIndex()),
+            # 广义 L1 各通道估计带宽与抓取软重置时刻。
+            "obs_k_force": float(self.sim_obs_k_force.value()),
+            "obs_k_torque": float(self.sim_obs_k_torque.value()),
+            "obs_k_arm": float(self.sim_obs_k_arm.value()),
+            "obs_grasp_reset_t": float(self.sim_obs_grasp_t.value()),
             "frame": ("world" if self.sim_l1_frame.currentIndex() == 1 else "body"),
             "frame_index": int(self.sim_l1_frame.currentIndex()),
-            # 补偿策略 → method+inject：0=全部(baseline,bolt_on) 1=仅matched(l1quad,bolt_on)
-            # 2=模型增广(baseline,in_model)。
-            "method": ("l1quad" if self.sim_l1_comp_strategy.currentIndex() == 1 else "baseline"),
-            "inject": ("in_model" if self.sim_l1_comp_strategy.currentIndex() == 2 else "bolt_on"),
+            # 补偿策略 → inject（两种）：0=bolt_on（u_b+u_ad）、1=in_model（增广 MPC）。
+            # in-model 默认用估计前置（消单拍滞后）；增广模型由 inject 自动开启。
+            "comp_enabled": bool(self.sim_l1_comp_box.isChecked()),
+            "method": "baseline",
+            "inject": ("in_model" if self.sim_l1_comp_strategy.currentIndex() == 1 else "bolt_on"),
+            "dist_aware_update": ("pre" if self.sim_l1_comp_strategy.currentIndex() == 1 else "post"),
             "comp_strategy_index": int(self.sim_l1_comp_strategy.currentIndex()),
             "as_gain": float(self.sim_l1_as_gain.value()),
             "wc_xy": float(self.sim_l1_wc_xy.value()),
@@ -6944,13 +7187,49 @@ class UamSuiteGUI(QMainWindow):
         ):
             _sv(k, sb)
         self.dist_var_group.setChecked(bool(d.get("var_enable", False)))
+        if hasattr(self, "dist_var_frame_btn"):
+            self.dist_var_frame_btn.setChecked(bool(d.get("var_body_frame", False)))
         for k, sb in (
             ("var_t0", self.dist_var_t0), ("var_t1", self.dist_var_t1),
             ("var_amp_x", self.dist_var_amp_x), ("var_amp_y", self.dist_var_amp_y),
-            ("var_amp_z", self.dist_var_amp_z), ("var_freq", self.dist_var_freq),
+            ("var_amp_z", self.dist_var_amp_z),
+            ("var_amp_mx", self.dist_var_amp_mx), ("var_amp_my", self.dist_var_amp_my),
+            ("var_amp_mz", self.dist_var_amp_mz), ("var_freq", self.dist_var_freq),
             ("var_phase_deg", self.dist_var_phase),
         ):
             _sv(k, sb)
+        # EE-link 力旋量扰动。
+        if hasattr(self, "dist_ee_const_group"):
+            self.dist_ee_const_group.setChecked(bool(d.get("ee_const_enable", False)))
+            self.dist_ee_const_frame_btn.setChecked(bool(d.get("ee_const_body_frame", False)))
+            for k, sb in (
+                ("ee_const_t0", self.dist_ee_const_t0), ("ee_const_t1", self.dist_ee_const_t1),
+                ("ee_const_fx", self.dist_ee_const_fx), ("ee_const_fy", self.dist_ee_const_fy),
+                ("ee_const_fz", self.dist_ee_const_fz), ("ee_const_mx", self.dist_ee_const_mx),
+                ("ee_const_my", self.dist_ee_const_my), ("ee_const_mz", self.dist_ee_const_mz),
+            ):
+                _sv(k, sb)
+            self.dist_ee_var_group.setChecked(bool(d.get("ee_var_enable", False)))
+            self.dist_ee_var_frame_btn.setChecked(bool(d.get("ee_var_body_frame", False)))
+            for k, sb in (
+                ("ee_var_t0", self.dist_ee_var_t0), ("ee_var_t1", self.dist_ee_var_t1),
+                ("ee_var_amp_x", self.dist_ee_var_amp_x), ("ee_var_amp_y", self.dist_ee_var_amp_y),
+                ("ee_var_amp_z", self.dist_ee_var_amp_z), ("ee_var_amp_mx", self.dist_ee_var_amp_mx),
+                ("ee_var_amp_my", self.dist_ee_var_amp_my), ("ee_var_amp_mz", self.dist_ee_var_amp_mz),
+                ("ee_var_freq", self.dist_ee_var_freq), ("ee_var_phase_deg", self.dist_ee_var_phase),
+            ):
+                _sv(k, sb)
+            # 模拟负载。
+            self.dist_load_group.setChecked(bool(d.get("load_enable", False)))
+            for k, sb in (
+                ("load_t0", self.dist_load_t0), ("load_t1", self.dist_load_t1),
+                ("load_mass", self.dist_load_mass), ("load_ixx", self.dist_load_ixx),
+                ("load_iyy", self.dist_load_iyy), ("load_izz", self.dist_load_izz),
+                ("load_com_x", self.dist_load_com_x), ("load_com_y", self.dist_load_com_y),
+                ("load_com_z", self.dist_load_com_z),
+            ):
+                _sv(k, sb)
+            self._update_dist_uam_only_visibility()
         self.dist_thrust_group.setChecked(bool(d.get("thrust_enable", False)))
         for k, sb in (
             ("thrust_t0", self.dist_thrust_t0), ("thrust_t1", self.dist_thrust_t1),
@@ -6989,8 +7268,21 @@ class UamSuiteGUI(QMainWindow):
         if hasattr(self, "sim_l1_comp_mode"):
             _ci = d.get("comp_mode_index")
             if _ci is None:
-                _ci = 1 if str(d.get("mode", "adaptive")).lower() == "oracle" else 0
-            self.sim_l1_comp_mode.setCurrentIndex(int(_ci))
+                _m = str(d.get("mode", "adaptive")).lower()
+                _ci = 1 if _m == "oracle" else 0
+            # 旧持久化 momentum(2) 已并入广义 L1 → 归一到 adaptive(0)。
+            _ci = int(_ci)
+            if _ci not in (0, 1):
+                _ci = 0
+            self.sim_l1_comp_mode.setCurrentIndex(_ci)
+        for _k, _sb in (
+            ("obs_k_force", getattr(self, "sim_obs_k_force", None)),
+            ("obs_k_torque", getattr(self, "sim_obs_k_torque", None)),
+            ("obs_k_arm", getattr(self, "sim_obs_k_arm", None)),
+            ("obs_grasp_reset_t", getattr(self, "sim_obs_grasp_t", None)),
+        ):
+            if _sb is not None:
+                _sv(_k, _sb)
         if hasattr(self, "sim_l1_frame"):
             _fi = d.get("frame_index")
             if _fi is None:
@@ -7000,13 +7292,13 @@ class UamSuiteGUI(QMainWindow):
             _si = d.get("comp_strategy_index")
             if _si is None:
                 # 向后兼容旧持久化（分开的 method/inject）。
-                if str(d.get("inject", "bolt_on")).lower() == "in_model":
-                    _si = 2
-                elif str(d.get("method", "baseline")).lower() == "l1quad":
-                    _si = 1
-                else:
-                    _si = 0
+                _si = 1 if str(d.get("inject", "bolt_on")).lower() == "in_model" else 0
+            else:
+                # 旧 4 选项（0,1=bolt_on；2,3=in_model）→ 新 2 选项（0=bolt_on,1=in_model）。
+                _si = 1 if int(_si) in (2, 3) else 0
             self.sim_l1_comp_strategy.setCurrentIndex(int(_si))
+        if hasattr(self, "sim_l1_comp_box"):
+            self.sim_l1_comp_box.setChecked(bool(d.get("comp_enabled", True)))
         for k, sb in (
             ("as_gain", self.sim_l1_as_gain), ("wc_xy", self.sim_l1_wc_xy),
             ("wc_z", self.sim_l1_wc_z), ("tilt_gain", self.sim_l1_tilt_gain),
@@ -7022,6 +7314,19 @@ class UamSuiteGUI(QMainWindow):
         ):
             _sv(k, sb)
         self.sim_l1_use_pos_fb.setChecked(bool(d.get("use_pos_feedback", False)))
+
+    def _acados_solver_type_value(self) -> str:
+        """求解器类型组合框 → "SQP" / "SQP_RTI"。"""
+        if not hasattr(self, "acados_solver_type"):
+            return "SQP"
+        return "SQP_RTI" if self.acados_solver_type.currentIndex() == 1 else "SQP"
+
+    def _acados_integrator_value(self):
+        """积分器组合框 → None(默认) / "ERK" / "IRK"。"""
+        if not hasattr(self, "acados_integrator"):
+            return None
+        idx = self.acados_integrator.currentIndex()
+        return {0: None, 1: "ERK", 2: "IRK"}.get(idx, None)
 
     def _collect_track_ctbr(self) -> dict:
         """从 CTBR 子标签收集内环配置（传给闭环仿真）。"""
@@ -7320,6 +7625,10 @@ class UamSuiteGUI(QMainWindow):
             "croc_ee_w_terminal": float(self.croc_ee_w_terminal.value()),
             "mpc_max_iter": int(self.mpc_max_iter.value()),
             "mpc_log_iv": int(self.mpc_log_iv.value()),
+            "acados_solver_type_index": int(self.acados_solver_type.currentIndex()),
+            "acados_integrator_index": int(self.acados_integrator.currentIndex()),
+            "acados_cost_analysis": bool(self.acados_cost_analysis.isChecked()),
+            "acados_inertia_scaling": bool(self.acados_inertia_scaling.isChecked()),
             "tau_thrust_track": float(self.tau_thrust_track.value()),
             "tau_theta_track": float(self.tau_theta_track.value()),
             "track_sim_control_stack_index": int(self.track_sim_control_stack.currentIndex()),
@@ -7655,6 +7964,10 @@ class UamSuiteGUI(QMainWindow):
             _set_spin("geo_kOmega", self.geo_kOmega)
             _set_spin("geo_max_tilt", self.geo_max_tilt)
         _set_combo("reg_mode_index", self.reg_mode_combo)
+        _set_combo("acados_solver_type_index", self.acados_solver_type)
+        _set_combo("acados_integrator_index", self.acados_integrator)
+        _set_check("acados_cost_analysis", self.acados_cost_analysis)
+        _set_check("acados_inertia_scaling", self.acados_inertia_scaling)
         _set_combo("control_mode_track_index", self.control_mode_track)
         _set_combo("track_sim_control_stack_index", self.track_sim_control_stack)
         _set_combo("gz_model_index", self.gz_model_combo)
@@ -8167,18 +8480,26 @@ class UamSuiteGUI(QMainWindow):
             rk_fn = mixed_wp_row_kind
         import pinocchio as pin
 
+        pin_planner = self.planner
+        if pin_planner is None:
+            try:
+                self._robot_model_and_ee()
+                pin_planner = self._lazy_pin_planner
+            except Exception:
+                pin_planner = None
+
         for row in sorted_rows:
             rk = rk_fn(row[0])
             x, y, z, a, b, c, t = (float(row[i]) for i in range(1, 8))
             if rk == "base":
                 out.append([x, y, z, a, b, c, t])
-            elif rk == "ee_pos" and self.planner is not None and self._make_uam_state is not None:
+            elif rk == "ee_pos" and pin_planner is not None and self._make_uam_state is not None:
                 st0 = self._make_uam_state(0.0, 0.0, 1.0, j1=a * d2r, j2=b * d2r, yaw=c * d2r)
-                st = self.planner.align_state_ee_to_world_point(
+                st = pin_planner.align_state_ee_to_world_point(
                     st0, np.array([x, y, z], dtype=float)
                 )
                 out.append([float(st[0]), float(st[1]), float(st[2]), a, b, c, t])
-            elif rk == "ee_pose" and self.planner is not None:
+            elif rk == "ee_pose" and pin_planner is not None:
                 st0 = np.zeros(17)
                 st0[2] = 1.0
                 rpy = np.array([a, b, c], dtype=float) * d2r
@@ -8278,6 +8599,12 @@ class UamSuiteGUI(QMainWindow):
             if self.planner is None:
                 QMessageBox.warning(self, "Error", "Crocoddyl planner is not initialized.")
                 return
+        rk_fn = self._mixed_wp_row_kind
+        if rk_fn is None:
+            from s500_uam_trajectory_gui import mixed_wp_row_kind as rk_fn
+        has_ee_knot = any(rk_fn(r[0]) in ("ee_pos", "ee_pose") for r in sorted_rows)
+        if has_ee_knot and method in ("acados", "acados_cascade") and self.planner is None:
+            self._init_croc_planner()
         worker_method = "crocoddyl" if method == "crocoddyl_actuator_ocp" else method
         use_actuator_first_order = bool(
             method == "crocoddyl_actuator_ocp"
@@ -8312,6 +8639,7 @@ class UamSuiteGUI(QMainWindow):
                 dtype=float,
             ),
             "use_actuator_first_order": use_actuator_first_order,
+            "use_unified_ocp": bool(has_ee_knot and method == "acados"),
         }
         self.task_generate_btn.setEnabled(False)
         self.log(f"Planning started: {method}, {len(sorted_rows)} waypoints")
@@ -11402,17 +11730,21 @@ class UamSuiteGUI(QMainWindow):
         torque_est_body: Optional[np.ndarray] = None,
         comp_force_body: Optional[np.ndarray] = None,
         quat: Optional[np.ndarray] = None,
+        joint_torque_truth: Optional[np.ndarray] = None,
+        joint_torque_est: Optional[np.ndarray] = None,
+        joint_names: Optional[list] = None,
         truth_label: str = "truth",
         est_label: str = "L1 estimate",
         comp_label: str = "LPF compensation",
         title: str = "L1 disturbance estimate vs truth",
     ) -> None:
-        """扰动估计 vs 真值，4 行 3 列布局：
+        """扰动估计 vs 真值，固定 3×3（9 图）布局：
 
-          行1：力 Fx/Fy/Fz（估计 vs 真值）   行2：力估计误差 (est-truth)
-          行3：力矩 Mx/My/Mz（真值）         行4：力矩估计误差 (est-truth)
+          行1：力 Fx / Fy / Fz（真值 vs 估计 + 补偿）
+          行2：力矩 Mx / My / Mz（真值 vs 估计）
+          行3：[臂关节力矩合并(所有关节一张)] [力误差合并(XYZ一张)] [力矩误差合并(XYZ一张)]
 
-        L1 平动通道仅估计力；力矩无 L1 估计（est=0，误差行≈未补偿真值）。
+        无臂(s500)时行3第一格为占位。L1 平动通道仅估计力；力矩/关节力矩由动量观测器估计。
         显示坐标系由「坐标系」按钮切换：world（默认）或 body（需传 quat 逐拍旋转）。
         """
         # 缓存原始（世界系 + 机体系两套）数据，供「坐标系」按钮切换时重绘。
@@ -11423,6 +11755,8 @@ class UamSuiteGUI(QMainWindow):
             force_truth_body=force_truth_body, force_est_body=force_est_body,
             torque_truth_body=torque_truth_body, torque_est_body=torque_est_body,
             comp_force_body=comp_force_body,
+            joint_torque_truth=joint_torque_truth, joint_torque_est=joint_torque_est,
+            joint_names=joint_names,
             quat=quat, truth_label=truth_label,
             est_label=est_label, comp_label=comp_label, title=title,
         )
@@ -11463,7 +11797,27 @@ class UamSuiteGUI(QMainWindow):
         ft, fe = _arr(force_truth), _arr(force_est)
         mt, me = _arr(torque_truth), _arr(torque_est)
         fc = _arr(comp_force)
-        present = [a for a in (ft, fe, mt, me, fc) if a is not None]
+
+        def _arr_joint(a):
+            if a is None:
+                return None
+            a = np.asarray(a, dtype=float)
+            return a if a.ndim == 2 and a.shape[1] >= 1 else None
+
+        jt, je = _arr_joint(joint_torque_truth), _arr_joint(joint_torque_est)
+        jlabels = list(joint_names or [])
+        if jt is not None and len(jlabels) < jt.shape[1]:
+            jlabels += [f"j{i+1}" for i in range(len(jlabels), jt.shape[1])]
+        if je is not None and len(jlabels) < je.shape[1]:
+            jlabels += [f"j{i+1}" for i in range(len(jlabels), je.shape[1])]
+        n_joint = 0
+        if jt is not None or je is not None:
+            n_joint = max(
+                jt.shape[1] if jt is not None else 0,
+                je.shape[1] if je is not None else 0,
+            )
+
+        present = [a for a in (ft, fe, mt, me, fc, jt, je) if a is not None]
         if N < 2 or not present:
             ax = fig.add_subplot(111)
             ax.text(0.5, 0.5, "No disturbance / L1 data", ha="center", va="center",
@@ -11475,11 +11829,14 @@ class UamSuiteGUI(QMainWindow):
         n = min([a.shape[0] for a in present] + [N])
         tt = t[:n]
         axis_names = ["X", "Y", "Z"]
+        axis_colors = ["tab:red", "tab:green", "tab:blue"]
+        # 固定 3×3 布局：行1 力 Fx/Fy/Fz、行2 力矩 Mx/My/Mz、行3 关节力矩合并 + 力误差合并 + 力矩误差合并。
+        n_plot_rows = 3
 
-        def _plot_block(row_base: int, truth, est, unit: str, kind: str, extra=None):
-            # row_base*3 : value row;  (row_base+1)*3 : error row
+        def _plot_value_row(row_base: int, truth, est, unit: str, kind: str, extra=None):
+            """一行三列：分量 X/Y/Z 的真值 vs 估计（+ 可选补偿）。"""
             for j in range(3):
-                ax = fig.add_subplot(4, 3, row_base * 3 + j + 1)
+                ax = fig.add_subplot(n_plot_rows, 3, row_base * 3 + j + 1)
                 # 估计放最底层、弱色细线（次要参考）；真值与补偿在上层、强色突出。
                 if est is not None:
                     ax.plot(tt, est[:n, j], color="0.7", lw=1.0, alpha=0.7,
@@ -11496,38 +11853,69 @@ class UamSuiteGUI(QMainWindow):
                 ax.grid(True, alpha=0.3)
                 ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
                 if truth is not None or est is not None:
-                    ax.legend(loc="upper right", fontsize=_mpl_pt(10))
-            for j in range(3):
-                ax = fig.add_subplot(4, 3, (row_base + 1) * 3 + j + 1)
-                if truth is not None and est is not None:
+                    ax.legend(loc="upper right", fontsize=_mpl_pt(9))
+
+        def _plot_err_combined(pos: int, truth, est, unit: str, kind: str):
+            """单图汇总 X/Y/Z 三分量的估计误差 (est-truth)。"""
+            ax = fig.add_subplot(n_plot_rows, 3, pos)
+            if truth is not None and est is not None:
+                i0 = max(0, int(0.66 * n))
+                for j in range(3):
                     err = est[:n, j] - truth[:n, j]
-                    ax.plot(tt, err, color="tab:green", lw=1.2, label="error (est-truth)")
-                    i0 = max(0, int(0.66 * n))
+                    lbl = f"{kind}{axis_names[j]}"
                     if n - i0 > 1:
-                        mae = float(np.mean(np.abs(err[i0:])))
-                        ax.text(0.02, 0.95, f"late |err|~{mae:.3g}",
-                                transform=ax.transAxes, fontsize=_mpl_pt(10),
-                                va="top", ha="left",
-                                bbox=dict(boxstyle="round", fc="white", alpha=0.7))
-                    ax.legend(loc="upper right", fontsize=_mpl_pt(10))
-                else:
-                    ax.text(0.5, 0.5, "no estimate", ha="center", va="center",
-                            transform=ax.transAxes, fontsize=_mpl_pt(10))
-                if j == 0:
-                    ax.set_ylabel(f"{kind} err [{unit}]")
-                ax.set_title(f"{kind}{axis_names[j]} error [{unit}]", fontsize=_mpl_pt(12))
-                ax.grid(True, alpha=0.3)
-                ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
-                ax.set_xlabel("t [s]")
+                        lbl += f" (|err|~{float(np.mean(np.abs(err[i0:]))):.3g})"
+                    ax.plot(tt, err, color=axis_colors[j], lw=1.2, label=lbl)
+                ax.legend(loc="upper right", fontsize=_mpl_pt(9))
+            else:
+                ax.text(0.5, 0.5, "no estimate", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=_mpl_pt(10))
+            ax.set_title(f"{kind} error (est-truth) [{unit}]", fontsize=_mpl_pt(12))
+            ax.set_ylabel(f"{kind} err [{unit}]")
+            ax.set_xlabel("t [s]")
+            ax.grid(True, alpha=0.3)
+            ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
 
-        _plot_block(0, ft, fe, f"N, {frame_lbl}", "F", extra=fc)
-        _plot_block(2, mt, me, f"N·m, {frame_lbl}", "M")
+        def _plot_joint_combined(pos: int, truth, est, unit: str = "N·m"):
+            """单图汇总所有臂关节的扰动力矩真值 vs 估计（关节空间）。"""
+            ax = fig.add_subplot(n_plot_rows, 3, pos)
+            j_colors = ["tab:blue", "tab:orange", "tab:purple", "tab:brown"]
+            for j in range(n_joint):
+                c = j_colors[j % len(j_colors)]
+                lbl = jlabels[j] if j < len(jlabels) else f"j{j+1}"
+                if truth is not None and j < truth.shape[1]:
+                    ax.plot(tt, truth[:n, j], color=c, lw=1.8, ls="-",
+                            zorder=3, label=f"τ_{lbl} truth")
+                if est is not None and j < est.shape[1]:
+                    ax.plot(tt, est[:n, j], color=c, lw=1.2, ls="--", alpha=0.85,
+                            zorder=2, label=f"τ_{lbl} est")
+            ax.set_title(f"arm joint τ [{unit}]", fontsize=_mpl_pt(12))
+            ax.set_ylabel(f"joint τ [{unit}]")
+            ax.set_xlabel("t [s]")
+            ax.grid(True, alpha=0.3)
+            ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
+            if n_joint > 0 and (truth is not None or est is not None):
+                ax.legend(loc="upper right", fontsize=_mpl_pt(9))
 
-        fig.suptitle(f"{title}  [frame: {frame_lbl}]", fontsize=_mpl_pt(14), y=0.995)
+        # 行1：力分量；行2：力矩分量。
+        _plot_value_row(0, ft, fe, f"N, {frame_lbl}", "F", extra=fc)
+        _plot_value_row(1, mt, me, f"N·m, {frame_lbl}", "M")
+        # 行3：[关节力矩合并] [力误差合并] [力矩误差合并]。无臂时第一格留作占位说明。
+        if n_joint > 0:
+            _plot_joint_combined(7, jt, je)
+        else:
+            ax = fig.add_subplot(n_plot_rows, 3, 7)
+            ax.text(0.5, 0.5, "no arm joints", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=_mpl_pt(10))
+            ax.axis("off")
+        _plot_err_combined(8, ft, fe, f"N, {frame_lbl}", "F")
+        _plot_err_combined(9, mt, me, f"N·m, {frame_lbl}", "M")
+
+        frame_note = frame_lbl if n_joint == 0 else f"{frame_lbl}; joint τ in joint space"
+        fig.suptitle(f"{title}  [frame: {frame_note}]", fontsize=_mpl_pt(14), y=0.995)
         try:
-            # 收紧子图间距（默认 pad 偏大，12 个子图之间空白过多）。
-            fig.tight_layout(rect=(0, 0, 1, 0.97), pad=0.4, h_pad=0.5, w_pad=0.4)
-            fig.subplots_adjust(hspace=0.32, wspace=0.22)
+            fig.tight_layout(rect=(0, 0, 1, 0.96), pad=0.6, h_pad=1.0, w_pad=0.6)
+            fig.subplots_adjust(hspace=0.40, wspace=0.24)
         except Exception:
             pass
         self.cv_l1_dist.draw()
@@ -11726,6 +12114,10 @@ class UamSuiteGUI(QMainWindow):
                 "N": self.N_mpc.value(),
                 "mpc_max_iter": self.mpc_max_iter.value(),
                 "mpc_log_interval": self.mpc_log_iv.value(),
+                "acados_solver_type": self._acados_solver_type_value(),
+                "acados_integrator": self._acados_integrator_value(),
+                "acados_cost_analysis": bool(self.acados_cost_analysis.isChecked()),
+                "acados_inertia_scaling": bool(self.acados_inertia_scaling.isChecked()),
                 "control_mode": cm,
                 "urdf_path": self._selected_robot_urdf_path(),
                 "w_state_track": self.w_state_track.value(),
@@ -11911,7 +12303,34 @@ class UamSuiteGUI(QMainWindow):
             f"Acados full-state tracking finished | EE error (final) {res['err'][-1]:.4f} m | "
             f"yaw err {res['err_yaw'][-1]:.4f} rad"
         )
+        self._log_timing_breakdown(res.get("timing") or (out or {}).get("timing"))
         self.meshcat_track_btn.setEnabled(True)
+
+    def _log_timing_breakdown(self, timing: object) -> None:
+        """把闭环仿真的运行时间分解写入日志面板，便于定位仿真瓶颈。"""
+        if not isinstance(timing, dict) or not timing.get("sections"):
+            return
+        try:
+            total = float(timing.get("loop_wall_s", 0.0))
+            rtf = float(timing.get("rtf", float("nan")))
+            ns = int(timing.get("n_steps", 0))
+            nc = int(timing.get("n_control_steps", 0))
+            self.log(
+                f"⏱ 仿真耗时 {total:.2f}s | RTF {rtf:.2f}x | "
+                f"sim {ns} 步×{float(timing.get('sim_dt',0))*1e3:.1f}ms | "
+                f"control {nc} 步×{float(timing.get('control_dt',0))*1e3:.1f}ms"
+            )
+            secs = sorted(
+                timing["sections"].items(), key=lambda kv: -kv[1].get("total_s", 0.0)
+            )
+            for name, s in secs:
+                self.log(
+                    f"    {name:18s} {s.get('total_s',0):6.2f}s "
+                    f"{s.get('pct',0):5.1f}%  avg {s.get('avg_ms',0):.3f}ms "
+                    f"× {s.get('calls',0)}"
+                )
+        except Exception:
+            pass
 
     def _render_sim_l1_disturbance(self, out: object) -> None:
         """闭环仿真后：在 "L1 / Disturbance" 页对比注入扰动真值与 L1 估计。"""
@@ -11930,27 +12349,40 @@ class UamSuiteGUI(QMainWindow):
 
             mass = float(out.get("nominal_mass", 1.0) or 1.0)
             l1_on = bool(out.get("l1_active"))
+            oracle_on = bool(out.get("oracle_active"))
 
             # 世界系一套（默认显示）。
             l1f = _g("l1_force_world")
+            l1t = _g("l1_torque_world")
             dgf = _g("dist_force_world")
             mt = _g("dist_torque_world")
             al1 = _g("l1_a_l1")
+            djt = _g("dist_joint_torque")
+            ljt = _g("l1_joint_torque")
+            n_arm = int(out.get("n_arm", 0) or 0)
             # 机体系一套（仿真时同拍按真实姿态记录，绘图按钮切换用，不再事后旋转）。
             l1f_b = _g("l1_force_body")
             dgf_b = _g("dist_force_body")
             mt_b = _g("dist_torque_body")
             al1_b = _g("l1_a_l1_body")
 
-            # 力：估计（L1）vs 真值；未开 L1 时无估计。
+            # 力：广义 L1 / oracle 估计 base 世界系力 vs 真值；未开 L1 时无估计。
             force_est = l1f if l1_on else None
             force_est_b = l1f_b if l1_on else None
-            # 低通滤波后的补偿力 = m·a_l1（≈ -扰动）；取相反数与真值同向便于对比。
+            # bolt-on 补偿力 = m·a_l1（≈ -扰动平动分量）；in-model 下 a_l1≈0（补偿在模型层）。
             comp_force = (-mass * al1) if (l1_on and al1 is not None) else None
             comp_force_b = (-mass * al1_b) if (l1_on and al1_b is not None) else None
-            # 力矩：L1 平动通道不估计力矩 → 估计置 0，误差行显示未补偿真值。
-            torque_est = np.zeros_like(mt) if mt is not None else None
-            torque_est_b = np.zeros_like(mt_b) if mt_b is not None else None
+            # base 力矩：广义 L1 / oracle 直接估计（世界系）。
+            if l1_on and l1t is not None:
+                torque_est = l1t
+                torque_est_b = None
+            else:
+                torque_est = np.zeros_like(mt) if mt is not None else None
+                torque_est_b = np.zeros_like(mt_b) if mt_b is not None else None
+            # 臂关节扰动力矩（关节空间）：真值 τ_ext[6:] vs 广义 L1 / oracle 估计。
+            joint_truth = djt if (n_arm > 0 and djt is not None) else None
+            joint_est = ljt if (l1_on and n_arm > 0 and ljt is not None) else None
+            est_lbl = "oracle (truth)" if oracle_on else "generalized L1 τ̂_ext"
             self._render_l1_disturbance_figure(
                 t=tt,
                 force_truth=dgf,
@@ -11963,26 +12395,28 @@ class UamSuiteGUI(QMainWindow):
                 torque_truth_body=mt_b,
                 torque_est_body=torque_est_b,
                 comp_force_body=comp_force_b,
+                joint_torque_truth=joint_truth,
+                joint_torque_est=joint_est,
+                joint_names=[f"j{i+1}" for i in range(n_arm)] if n_arm > 0 else None,
                 truth_label="injected (truth)",
-                est_label="L1 estimate m·σ̂",
+                est_label=est_lbl,
                 comp_label="LPF compensation -m·a_l1",
-                title="Sim: L1 vs injected disturbance (force & torque)",
+                title="Sim: disturbance estimate vs truth (base + arm joints)",
             )
         except Exception as exc:  # pragma: no cover - 绘图失败不应中断流程
             self.log(f"[L1/Disturbance] 渲染失败: {exc}")
 
     def _render_track_control_decomp(self, out: object) -> bool:
-        """Control 图（闭环 sim track），4 行 × 2 列布局：
+        """Control 图（闭环 sim track），按"控制层"分行的 3×2 布局（带臂）/2×2（无臂）：
 
-        左列：电机力(行1) + 三轴体力矩 Mx/My/Mz(行2-4)；
-        右列：总推力 T(行1) + 三轴体角速度 p/q/r(行2-4)，按轴配对 Mx-p/My-q/Mz-r。
+        行1：rotor forces | body torque(xyz)   —— direct 模式（规划旋翼力/力矩）tracking 效果
+        行2：collective thrust | body rate(pqr) —— CTBR 模式（总推力+角速度内环）效果
+        行3：joint torques | joint angles       —— direct 力矩 / joint position control 效果（仅带臂）
 
-        - 电机力：real(实线)/cmd(虚线)/ref(点线)。
-        - 体力矩 & 总推力：指令分解 u_b → u_b+u_ac → cmd(+u_p) 及 real(+ref)，
-          相邻线间隙即各通道(baseline/L1/位置)贡献。
-        - 体角速度：real 与 setpoint(CTBR 时)。
-        三路满足 clip(u_b+u_ac+u_p)+thrust_bias = u_real（direct 模式；CTBR 下
-        u_ac/u_p 记 0，u_b=ctbr 目标）。
+        - rotor forces：real(实线)/cmd(虚线)/ref(点线)。
+        - body torque / collective thrust：real 与规划 ref；总推力另含 u_b/u_ac/u_p 分解。
+        - body rate：real 与 setpoint(CTBR 时)。
+        - joint torques：real/cmd(--)/ref(:)；joint angles：real 与规划 ref(--)。
         """
         import traceback as _tb
         if not isinstance(out, dict):
@@ -12011,6 +12445,13 @@ class UamSuiteGUI(QMainWindow):
             u_real = u_real_all[:N, :n_rot]
             u_after_l1 = u_b + u_ac
             u_cmd = u_after_l1 + u_p
+
+            # 机械臂关节力矩（仅 S500_uam，n_arm>0）：u_real/u_baseline 的 n_rot: 列。
+            nq_full = int(out.get("nq", 7))
+            n_arm = max(0, nq_full - 7)
+            n_arm = min(n_arm, max(0, u_real_all.shape[1] - n_rot))
+            tau_arm_real = u_real_all[:N, n_rot : n_rot + n_arm] if n_arm > 0 else None
+            tau_arm_cmd = u_b_all[:N, n_rot : n_rot + n_arm] if n_arm > 0 else None
 
             # 体角速度真值（来自状态 x[nq+3:nq+6]）。
             omega = None
@@ -12046,6 +12487,43 @@ class UamSuiteGUI(QMainWindow):
                         )
             except Exception:
                 u_ref = None
+
+            # 机械臂关节力矩的规划参考（plan u 的 n_rot: 列，重采样到记录时间轴）。
+            tau_arm_ref = None
+            if n_arm > 0:
+                try:
+                    if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+                        up = np.asarray(pb.get("u_plan"), dtype=float)
+                        tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                        if up.ndim == 2 and up.shape[1] > n_rot and tp.size >= 2:
+                            tpc = tp[: up.shape[0]] - tp[0]
+                            na = min(n_arm, up.shape[1] - n_rot)
+                            tau_arm_ref = np.column_stack(
+                                [np.interp(t, tpc, up[: tpc.size, n_rot + j]) for j in range(na)]
+                            )
+                except Exception:
+                    tau_arm_ref = None
+
+            # 关节角度真值（状态 q 的 arm 段：pos3·quat4·arm）与规划参考。
+            q_arm_real = None
+            q_arm_ref = None
+            if n_arm > 0:
+                if (
+                    states is not None and getattr(states, "ndim", 0) == 2
+                    and states.shape[1] >= 7 + n_arm
+                ):
+                    q_arm_real = states[:N, 7 : 7 + n_arm]
+                try:
+                    if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+                        xp = np.asarray(pb.get("x_plan"), dtype=float)
+                        tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                        if xp.ndim == 2 and xp.shape[1] >= 7 + n_arm and tp.size >= 2:
+                            tpc = tp[: xp.shape[0]] - tp[0]
+                            q_arm_ref = np.column_stack(
+                                [np.interp(t, tpc, xp[: tpc.size, 7 + j]) for j in range(n_arm)]
+                            )
+                except Exception:
+                    q_arm_ref = None
 
             # 力旋量 [T, Mx, My, Mz] = A · [T1..T4]
             W_b = (A @ u_b.T).T
@@ -12086,11 +12564,33 @@ class UamSuiteGUI(QMainWindow):
 
             fig = self.fig_control
             fig.clear()
-            # 4 行 × 2 列：左列 = 电机力 + 三轴体力矩；右列 = 总推力 + 三轴角速度
-            # （按轴配对：Mx-p / My-q / Mz-r）。
-            gs = fig.add_gridspec(4, 2, hspace=0.62, wspace=0.24)
+            arm_colors = [
+                "tab:blue", "tab:orange", "tab:green", "tab:purple",
+                "tab:red", "tab:brown", "tab:pink",
+            ]
+            axis_cols = ["tab:red", "tab:green", "tab:blue"]  # x/y/z
+            # 按控制层分行：3×2（带臂）/2×2（无臂）。
+            #   行1 rotor force | body torque(xyz)  → direct（规划旋翼力/力矩）效果
+            #   行2 collective thrust | body rate   → CTBR（总推力+角速度内环）效果
+            #   行3 joint torque | joint angle      → direct / joint position control 效果
+            n_rows = 3 if n_arm > 0 else 2
+            gs = fig.add_gridspec(n_rows, 2, hspace=0.45, wspace=0.22)
+            bottom_row = n_rows - 1
 
-            # ── 左上：4 个电机力合一（real/cmd/ref）────────────────────────
+            def _plot_multi_real_ref(ax, real, ref, labels, colors, unit, ref_ls=":"):
+                """同图叠多轴 real(实线) 与规划 ref（同色，ref_ls 虚/点线）。"""
+                for j in range(real.shape[1]):
+                    col = colors[j % len(colors)]
+                    ax.plot(t, real[:, j], color=col, lw=1.2, label=labels[j])
+                    if ref is not None and j < ref.shape[1]:
+                        ax.plot(t, ref[:, j], color=col, lw=0.8, ls=ref_ls, alpha=0.6)
+                ax.set_ylabel(unit)
+                ax.grid(True, alpha=0.3)
+                ax.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+                ax.legend(loc="upper right", fontsize=_mpl_pt(10),
+                          ncol=min(real.shape[1], 3))
+
+            # ── 行1左：4 电机力合一（real/cmd/ref）——direct tracking 效果 ──
             ax_rot = fig.add_subplot(gs[0, 0])
             for j in range(min(4, n_rot)):
                 col = rotor_colors[j % len(rotor_colors)]
@@ -12098,47 +12598,85 @@ class UamSuiteGUI(QMainWindow):
                 ax_rot.plot(t, u_cmd[:, j], color=col, lw=0.8, ls="--", alpha=0.6)
                 if u_ref is not None and j < u_ref.shape[1]:
                     ax_rot.plot(t, u_ref[:, j], color=col, lw=0.7, ls=":", alpha=0.5)
-            ax_rot.set_title("Rotor forces [N] — real / cmd(--) / ref(:)",
-                             fontsize=_mpl_pt(12))
+            ax_rot.set_title("Rotor forces [N] — real / cmd(--) / ref(:)", fontsize=_mpl_pt(12))
             ax_rot.set_ylabel("N")
             ax_rot.grid(True, alpha=0.3)
             ax_rot.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=4)
+            if bottom_row == 0:
+                ax_rot.set_xlabel("t [s]")
 
-            # ── 右上：总推力 T（含 u_b/u_ac/u_p 分解 + real + ref）──────────
-            ax_T = fig.add_subplot(gs[0, 1])
+            # ── 行1右：三轴体力矩合一（real vs 规划 ref）——direct tracking 效果 ──
+            ax_M = fig.add_subplot(gs[0, 1])
+            M_ref = W_ref[:, 1:4] if W_ref is not None else None
+            _plot_multi_real_ref(ax_M, W_real[:, 1:4], M_ref,
+                                 ["Mx", "My", "Mz"], axis_cols, "N·m")
+            ax_M.set_title("Body torque [N·m] — real / ref(:)", fontsize=_mpl_pt(12))
+            if bottom_row == 0:
+                ax_M.set_xlabel("t [s]")
+
+            # ── 行2左：总推力 T（含 u_b/u_ac/u_p 分解 + real + ref）——CTBR 效果 ──
+            ax_T = fig.add_subplot(gs[1, 0])
             ref_T = W_ref[:, 0] if W_ref is not None else None
             _plot_wrench_decomp(ax_T, 0, ref_T, "N")
             ax_T.set_title("Collective thrust T [N]", fontsize=_mpl_pt(12))
+            if bottom_row == 1:
+                ax_T.set_xlabel("t [s]")
 
-            # ── 左列行2-4：三轴体力矩 Mx/My/Mz（含 u_b/u_ac/u_p 分解）──────
-            for i in range(3):
-                ax_M = fig.add_subplot(gs[i + 1, 0])
-                ref_i = W_ref[:, i + 1] if W_ref is not None else None
-                _plot_wrench_decomp(ax_M, i + 1, ref_i, "N·m")
-                ax_M.set_title(f"Body torque M{axis_names[i]} [N·m]", fontsize=_mpl_pt(12))
-                if i == 2:
-                    ax_M.set_xlabel("t [s]")
+            # ── 行2右：三轴体角速度合一（real vs setpoint）——CTBR 效果 ──
+            ax_w = fig.add_subplot(gs[1, 1])
+            if omega is not None:
+                for i in range(3):
+                    ax_w.plot(t, omega[:, i], color=axis_cols[i], lw=1.2,
+                              label=f"{rate_lbl[i]} real")
+            if rate_sp is not None:
+                for i in range(3):
+                    ax_w.plot(t, rate_sp[:, i], color=axis_cols[i], lw=0.8, ls="--",
+                              alpha=0.6)
+            ax_w.set_title("Body rate [rad/s] — real / setpoint(--)", fontsize=_mpl_pt(12))
+            ax_w.set_ylabel("rad/s")
+            ax_w.grid(True, alpha=0.3)
+            ax_w.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+            ax_w.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=3)
+            if bottom_row == 1:
+                ax_w.set_xlabel("t [s]")
 
-            # ── 右列行2-4：三轴体角速度 p/q/r（real + setpoint）────────────
-            for i in range(3):
-                ax_w = fig.add_subplot(gs[i + 1, 1])
-                if omega is not None:
-                    ax_w.plot(t, omega[:, i], color=c_real, lw=1.2, label="real")
-                if rate_sp is not None:
-                    ax_w.plot(t, rate_sp[:, i], color=c_cmd, lw=1.0, ls="--",
-                              alpha=0.85, label="setpoint")
-                ax_w.set_title(f"Body rate {rate_lbl[i]} [rad/s]", fontsize=_mpl_pt(12))
-                ax_w.set_ylabel("rad/s")
-                ax_w.grid(True, alpha=0.3)
-                ax_w.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
-                ax_w.legend(loc="upper right", fontsize=_mpl_pt(10))
-                if i == 2:
-                    ax_w.set_xlabel("t [s]")
+            # ── 行3（仅带臂）：关节力矩(direct) | 关节角度(direct / joint pos ctrl) ──
+            if n_arm > 0:
+                ax_jt = fig.add_subplot(gs[2, 0])
+                for j in range(n_arm):
+                    col = arm_colors[j % len(arm_colors)]
+                    if tau_arm_real is not None:
+                        ax_jt.plot(t, tau_arm_real[:, j], color=col, lw=1.1, label=f"j{j+1} real")
+                    if tau_arm_cmd is not None:
+                        ax_jt.plot(t, tau_arm_cmd[:, j], color=col, lw=0.8, ls="--", alpha=0.6)
+                    if tau_arm_ref is not None and j < tau_arm_ref.shape[1]:
+                        ax_jt.plot(t, tau_arm_ref[:, j], color=col, lw=0.7, ls=":", alpha=0.5)
+                ax_jt.set_title("Joint torques [N·m] — real / cmd(--) / ref(:)", fontsize=_mpl_pt(12))
+                ax_jt.set_ylabel("N·m")
+                ax_jt.set_xlabel("t [s]")
+                ax_jt.grid(True, alpha=0.3)
+                ax_jt.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+                ax_jt.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=min(n_arm, 4))
+
+                ax_jq = fig.add_subplot(gs[2, 1])
+                for j in range(n_arm):
+                    col = arm_colors[j % len(arm_colors)]
+                    if q_arm_real is not None and j < q_arm_real.shape[1]:
+                        ax_jq.plot(t, q_arm_real[:, j], color=col, lw=1.2, label=f"j{j+1} real")
+                    if q_arm_ref is not None and j < q_arm_ref.shape[1]:
+                        ax_jq.plot(t, q_arm_ref[:, j], color=col, lw=0.8, ls="--", alpha=0.6)
+                ax_jq.set_title("Joint angles [rad] — real / ref(--)", fontsize=_mpl_pt(12))
+                ax_jq.set_ylabel("rad")
+                ax_jq.set_xlabel("t [s]")
+                ax_jq.grid(True, alpha=0.3)
+                ax_jq.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+                ax_jq.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=min(n_arm, 4))
 
             _mode = "CTBR inner-loop" if ctbr_on else "direct"
+            _arm_suffix = " | joint torque & angle" if n_arm > 0 else ""
             fig.suptitle(
-                f"Control [{_mode}] — rotor forces & body torque (u_b,u_ac,u_p) "
-                f"| collective thrust & body rate",
+                f"Control [{_mode}] — rotor force & body torque | "
+                f"collective thrust & body rate{_arm_suffix}",
                 fontsize=_mpl_pt(14), y=0.995,
             )
             try:
@@ -12342,7 +12880,7 @@ class UamSuiteGUI(QMainWindow):
                 ax.text(
                     0.5,
                     0.5,
-                    "s500 绘图：t 与 x 行数不一致",
+                    "s500 plot: t and x have mismatched row counts",
                     ha="center",
                     va="center",
                     transform=ax.transAxes,
@@ -12469,6 +13007,23 @@ def _apply_display_scaling(app) -> float:
     try:
         import matplotlib
 
+        # 选一个系统里实际存在的中文字体放到 sans-serif 首位，避免图表里的中文/全角标点
+        # （冒号、「」、句号等）渲染为缺字形方块并刷一堆 "Glyph ... missing" 警告。
+        _cjk_pref = [
+            "Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC",
+            "Source Han Sans SC", "Source Han Sans CN",
+            "WenQuanYi Zen Hei", "WenQuanYi Micro Hei",
+            "Microsoft YaHei", "SimHei",
+            "Droid Sans Fallback", "AR PL UMing CN",
+        ]
+        try:
+            import matplotlib.font_manager as _fm
+            _avail = {f.name for f in _fm.fontManager.ttflist}
+        except Exception:
+            _avail = set()
+        _cjk_fonts = [c for c in _cjk_pref if c in _avail]
+        _sans = _cjk_fonts + ["DejaVu Sans", "sans-serif"]
+
         # 统一字号层级（与各绘图里 _mpl_pt() 显式设置保持一致）：
         # 图标题 14 / 子图标题 12 / 正文·坐标轴标签 11 / 图例·刻度 10。
         matplotlib.rcParams.update(
@@ -12480,6 +13035,10 @@ def _apply_display_scaling(app) -> float:
                 "xtick.labelsize": 10.0 * plot_scale,
                 "ytick.labelsize": 10.0 * plot_scale,
                 "legend.fontsize": 10.0 * plot_scale,
+                "font.family": "sans-serif",
+                "font.sans-serif": _sans,
+                # 中文字体的连字号会被当作减号缺字形，用 ASCII 减号避免负号告警。
+                "axes.unicode_minus": False,
             }
         )
     except Exception:

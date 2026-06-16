@@ -181,18 +181,41 @@ def ee_obs9_from_state17(pin_model, frame_id: int, x17: np.ndarray, q_ref_ee: np
     return np.concatenate([np.asarray(pose.translation).flatten(), r_so3, np.asarray(vel.linear).flatten()])
 
 
-def _codegen_flags(export_dir: Path, model_name: str) -> tuple[bool, bool]:
+def _codegen_flags(export_dir: Path, model_name: str, max_iter: int | None = None) -> tuple[bool, bool]:
+    """决定 (generate, build)。
+
+    注意：``nlp_solver_max_iter`` 是在代码生成时烘焙进 C 代码的；若仅复用已编译的 .so，
+    运行时无法提高迭代上限。因此这里把 max_iter 记进 marker 文件，一旦请求值与缓存
+    编译值不同就强制重新生成 + 重新编译，避免 grasp 这类需要更多 SQP 迭代的 OCP 被
+    旧的低 max_iter 卡在 MAXITER(status=2)。
+    """
     try:
         from acados_template.utils import get_shared_lib_ext, get_shared_lib_prefix
     except ImportError:
         return True, True
     lib = f"{get_shared_lib_prefix()}acados_ocp_solver_{model_name}{get_shared_lib_ext()}"
     d = Path(export_dir)
+    marker = d / ".compiled_max_iter"
+    if max_iter is not None and (d / lib).is_file():
+        cached = None
+        try:
+            cached = int(marker.read_text().strip())
+        except (OSError, ValueError):
+            cached = None
+        if cached != int(max_iter):
+            return True, True  # max_iter 变化 → 重新生成
     if (d / lib).is_file():
         return False, False
     if (d / "Makefile").is_file():
         return False, True
     return True, True
+
+
+def _write_compiled_max_iter(export_dir: Path, max_iter: int) -> None:
+    try:
+        (Path(export_dir) / ".compiled_max_iter").write_text(str(int(max_iter)))
+    except OSError:
+        pass
 
 
 # ========== OCP 构造：代价与约束分块写清 ==========
@@ -204,7 +227,7 @@ def build_ocp_with_ctrl_error(
     state_weight: float = 1.0,
     control_weight: float = 1,
     terminal_scale: float = 1.0,
-    max_iter: int = 10,
+    max_iter: int = 60,
     pos_err_gain: np.ndarray | list[float] | float = (0.08, 0.08, 0.08),
     enable_ctrl_error: bool = True,
 ):
@@ -359,10 +382,12 @@ def build_ocp_with_ctrl_error(
     ocp.code_gen_opts.code_export_directory = str(code_dir)
     ocp.code_gen_opts.json_file = str(json_path)
 
-    gen, bld = _codegen_flags(code_dir, acados_model.name)
+    gen, bld = _codegen_flags(code_dir, acados_model.name, max_iter=max_iter)
     solver = AcadosOcpSolver(
         ocp, json_file=str(json_path), generate=gen, build=bld, verbose=False, check_reuse_possible=True
     )
+    if gen or bld:
+        _write_compiled_max_iter(code_dir, max_iter)
     return solver, N, pin_model, k, enable_ctrl_error
 
 
@@ -518,7 +543,7 @@ def run_wp3_joint_opt(cfg: dict | None = None, *, show_plots: bool = True) -> di
         "state_weight": 1.0,
         "control_weight": 1.0,
         "terminal_scale": 1.0,
-        "max_iter": 10,
+        "max_iter": 60,  # grasp OCP 收敛约需 ~13 次 SQP；旧默认 10 会 MAXITER(status=2) 失败
         "wp0": np.array([-1.5, 0, 1.5, 0.0, 0.0, 0.0], dtype=float),  # x,y,z,j1_deg,j2_deg,yaw_deg
         "wp2": np.array([1.5, 0, 1.5, 0.0, 0.0, 0.0], dtype=float),
         **cfg,
@@ -585,7 +610,15 @@ def run_wp3_joint_opt(cfg: dict | None = None, *, show_plots: bool = True) -> di
     warm_start(solver, wps, durs, dt, pin_model)
 
     st = solver.solve()
-    print(f"solve status={st}  wall={time.perf_counter() - t0:.3f}s  cost={solver.get_cost():.6e}")
+    n_it = solver.get_stats("sqp_iter")
+    print(f"solve status={st}  iters={n_it}  wall={time.perf_counter() - t0:.3f}s  cost={solver.get_cost():.6e}")
+    if st == 2:
+        print(
+            f"  [警告] status=2 (MAXITER): 达到 max_iter={int(cfg['max_iter'])} 仍未收敛。"
+            f" grasp OCP 通常需 ~13 次 SQP；请调大 max_iter 或检查抓取约束是否可行。"
+        )
+    elif st not in (0, 2):
+        print(f"  [警告] 求解器返回 status={st}（非收敛）。检查约束可行性 / 初值 / 限位。")
 
     nu = 6
     simX, simU = extract_open_loop(solver, N, nu)

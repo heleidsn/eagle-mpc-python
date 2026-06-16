@@ -11,6 +11,19 @@ import numpy as np
 from matplotlib.lines import Line2D
 
 
+def _ft(pt: float) -> float:
+    """4K 屏绘图字号缩放：跟随 GUI 设的全局 matplotlib font.size（基准 11pt）。
+
+    与 s500 绘图 `_mpl_pt` 同源；未缩放（CLI）时返回原值。
+    """
+    try:
+        import matplotlib as _mpl
+
+        return float(pt) * (float(_mpl.rcParams.get("font.size", 11.0)) / 11.0)
+    except Exception:
+        return float(pt)
+
+
 def _quat_xyzw_batch_to_R(quat: np.ndarray) -> np.ndarray:
     """R_wb from body to world; quat (N,4) [qx,qy,qz,qw]. Same as s500_uam_trajectory_planner."""
     quat = np.asarray(quat, dtype=float)
@@ -327,7 +340,7 @@ def plot_acados_into_figure(
     positions = simX[:, :3]
     fig.clear()
     gs = fig.add_gridspec(6, 4, hspace=0.36, wspace=0.32, left=0.05, right=0.98, top=0.96, bottom=0.04)
-    tinfo = {'fontsize': 9, 'labelpad': 2}
+    tinfo = {'fontsize': _ft(9), 'labelpad': 2}
 
     # Row 0: Base
     ax00 = fig.add_subplot(gs[0, 0])
@@ -358,10 +371,10 @@ def plot_acados_into_figure(
     if waypoint_times is not None and np.asarray(waypoint_times).size > 0:
         h00.append(Line2D([0], [0], color="orange", linestyle="--", alpha=0.55, lw=1.0, label="WP time"))
         l00.append("WP time")
-    ax00.legend(h00, l00, loc='upper right', fontsize=7, framealpha=0.9)
+    ax00.legend(h00, l00, loc='upper right', fontsize=_ft(7), framealpha=0.9)
     ax00.set_xlabel('Time (s)', **tinfo)
     ax00.set_ylabel('Position (m)', **tinfo)
-    ax00.set_title('Base Position', fontsize=9)
+    ax00.set_title('Base Position', fontsize=_ft(9))
 
     ax01 = fig.add_subplot(gs[0, 1])
     ax01.plot(time_states, v_lin_w[:, 0], 'r-', label='vx')
@@ -374,8 +387,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax01)
     ax01.set_xlabel('Time (s)', **tinfo)
     ax01.set_ylabel('Velocity (m/s)', **tinfo)
-    ax01.set_title('Base linear vel. (world)', fontsize=9)
-    ax01.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax01.set_title('Base linear vel. (world)', fontsize=_ft(9))
+    ax01.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     ax02 = fig.add_subplot(gs[0, 2])
     ax02.plot(time_states, np.degrees(euler[:, 0]), 'r-', label='roll')
@@ -388,8 +401,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax02)
     ax02.set_xlabel('Time (s)', **tinfo)
     ax02.set_ylabel('Angle (°)', **tinfo)
-    ax02.set_title('Base Orientation (Euler)', fontsize=9)
-    ax02.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax02.set_title('Base Orientation (Euler)', fontsize=_ft(9))
+    ax02.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     ax03 = fig.add_subplot(gs[0, 3])
     ax03.plot(time_states, np.degrees(w_base_w[:, 0]), 'r-', label='ωx')
@@ -402,8 +415,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax03)
     ax03.set_xlabel('Time (s)', **tinfo)
     ax03.set_ylabel('Angular vel (deg/s)', **tinfo)
-    ax03.set_title('Base angular vel. (world)', fontsize=9)
-    ax03.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax03.set_title('Base angular vel. (world)', fontsize=_ft(9))
+    ax03.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     # Row 1: EE
     ax10 = fig.add_subplot(gs[1, 0])
@@ -434,10 +447,10 @@ def plot_acados_into_figure(
     if waypoint_times is not None and np.asarray(waypoint_times).size > 0:
         h10.append(Line2D([0], [0], color="orange", linestyle="--", alpha=0.55, lw=1.0, label="WP time"))
         l10.append("WP time")
-    ax10.legend(h10, l10, loc='upper right', fontsize=7, framealpha=0.9)
+    ax10.legend(h10, l10, loc='upper right', fontsize=_ft(7), framealpha=0.9)
     ax10.set_xlabel('Time (s)', **tinfo)
     ax10.set_ylabel('Position (m)', **tinfo)
-    ax10.set_title('EE Position', fontsize=9)
+    ax10.set_title('EE Position', fontsize=_ft(9))
 
     ax11 = fig.add_subplot(gs[1, 1])
     ax11.plot(time_states, ee_v[:, 0], 'r-', label='vx')
@@ -450,8 +463,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax11)
     ax11.set_xlabel('Time (s)', **tinfo)
     ax11.set_ylabel('Velocity (m/s)', **tinfo)
-    ax11.set_title('EE linear vel. (world)', fontsize=9)
-    ax11.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax11.set_title('EE linear vel. (world)', fontsize=_ft(9))
+    ax11.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     ax12 = fig.add_subplot(gs[1, 2])
     ax12.plot(time_states, np.degrees(ee_rpy[:, 0]), 'r-', label='roll')
@@ -464,8 +477,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax12)
     ax12.set_xlabel('Time (s)', **tinfo)
     ax12.set_ylabel('Angle (°)', **tinfo)
-    ax12.set_title('EE Orientation (RPY)', fontsize=9)
-    ax12.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax12.set_title('EE Orientation (RPY)', fontsize=_ft(9))
+    ax12.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     ax13 = fig.add_subplot(gs[1, 3])
     ax13.plot(time_states, np.degrees(ee_w[:, 0]), 'r-', label='ωx')
@@ -478,8 +491,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax13)
     ax13.set_xlabel('Time (s)', **tinfo)
     ax13.set_ylabel('Angular vel (deg/s)', **tinfo)
-    ax13.set_title('EE angular vel. (world)', fontsize=9)
-    ax13.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax13.set_title('EE angular vel. (world)', fontsize=_ft(9))
+    ax13.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     # Row 2: Base linear acc / jerk / angular acc; EE linear acc (world)
     ax_ba = fig.add_subplot(gs[2, 0])
@@ -493,8 +506,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax_ba)
     ax_ba.set_xlabel("Time (s)", **tinfo)
     ax_ba.set_ylabel("m/s²", **tinfo)
-    ax_ba.set_title("Base linear acc (world)", fontsize=9)
-    ax_ba.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_ba.set_title("Base linear acc (world)", fontsize=_ft(9))
+    ax_ba.legend(loc="upper right", fontsize=_ft(6), framealpha=0.9, ncol=2)
     ax_ba.grid(True, alpha=0.3)
 
     ax_bj = fig.add_subplot(gs[2, 1])
@@ -508,8 +521,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax_bj)
     ax_bj.set_xlabel("Time (s)", **tinfo)
     ax_bj.set_ylabel("m/s³", **tinfo)
-    ax_bj.set_title("Base linear jerk (world)", fontsize=9)
-    ax_bj.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_bj.set_title("Base linear jerk (world)", fontsize=_ft(9))
+    ax_bj.legend(loc="upper right", fontsize=_ft(6), framealpha=0.9, ncol=2)
     ax_bj.grid(True, alpha=0.3)
 
     ax_baa = fig.add_subplot(gs[2, 2])
@@ -523,8 +536,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax_baa)
     ax_baa.set_xlabel("Time (s)", **tinfo)
     ax_baa.set_ylabel("deg/s²", **tinfo)
-    ax_baa.set_title("Base angular acc (world)", fontsize=9)
-    ax_baa.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_baa.set_title("Base angular acc (world)", fontsize=_ft(9))
+    ax_baa.legend(loc="upper right", fontsize=_ft(6), framealpha=0.9, ncol=2)
     ax_baa.grid(True, alpha=0.3)
 
     ax_ea = fig.add_subplot(gs[2, 3])
@@ -538,8 +551,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax_ea)
     ax_ea.set_xlabel("Time (s)", **tinfo)
     ax_ea.set_ylabel("m/s²", **tinfo)
-    ax_ea.set_title("EE linear acc (world)", fontsize=9)
-    ax_ea.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_ea.set_title("EE linear acc (world)", fontsize=_ft(9))
+    ax_ea.legend(loc="upper right", fontsize=_ft(6), framealpha=0.9, ncol=2)
     ax_ea.grid(True, alpha=0.3)
 
     # Row 3: EE jerk / angular acc; joint angular acc; control rate norm
@@ -554,8 +567,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax_ej)
     ax_ej.set_xlabel("Time (s)", **tinfo)
     ax_ej.set_ylabel("m/s³", **tinfo)
-    ax_ej.set_title("EE linear jerk (world)", fontsize=9)
-    ax_ej.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_ej.set_title("EE linear jerk (world)", fontsize=_ft(9))
+    ax_ej.legend(loc="upper right", fontsize=_ft(6), framealpha=0.9, ncol=2)
     ax_ej.grid(True, alpha=0.3)
 
     ax_eaa = fig.add_subplot(gs[3, 1])
@@ -569,8 +582,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax_eaa)
     ax_eaa.set_xlabel("Time (s)", **tinfo)
     ax_eaa.set_ylabel("deg/s²", **tinfo)
-    ax_eaa.set_title("EE angular acc (world)", fontsize=9)
-    ax_eaa.legend(loc="upper right", fontsize=6, framealpha=0.9, ncol=2)
+    ax_eaa.set_title("EE angular acc (world)", fontsize=_ft(9))
+    ax_eaa.legend(loc="upper right", fontsize=_ft(6), framealpha=0.9, ncol=2)
     ax_eaa.grid(True, alpha=0.3)
 
     ax_ja = fig.add_subplot(gs[3, 2])
@@ -585,19 +598,19 @@ def plot_acados_into_figure(
     add_wp_lines(ax_ja)
     ax_ja.set_xlabel("Time (s)", **tinfo)
     ax_ja.set_ylabel("deg/s²", **tinfo)
-    ax_ja.set_title("Arm joint angular acc", fontsize=9)
-    ax_ja.legend(loc="upper right", fontsize=6, framealpha=0.9)
+    ax_ja.set_title("Arm joint angular acc", fontsize=_ft(9))
+    ax_ja.legend(loc="upper right", fontsize=_ft(6), framealpha=0.9)
     ax_ja.grid(True, alpha=0.3)
 
     ax_ud = fig.add_subplot(gs[3, 3])
     if u_rate_norm is not None:
         ax_ud.plot(time_controls, u_rate_norm, "k-", lw=1.1, label="‖du/dt‖")
-        ax_ud.legend(loc="upper right", fontsize=7)
+        ax_ud.legend(loc="upper right", fontsize=_ft(7))
     else:
         ax_ud.text(0.5, 0.5, "Control rate N/A", ha="center", va="center", transform=ax_ud.transAxes)
     ax_ud.set_xlabel("Time (s)", **tinfo)
     ax_ud.set_ylabel("‖du/dt‖", **tinfo)
-    ax_ud.set_title("Control effort rate", fontsize=9)
+    ax_ud.set_title("Control effort rate", fontsize=_ft(9))
     ax_ud.grid(True, alpha=0.3)
 
     # Row 4–5: Arm & controls, paths & solver (was rows 2–3)
@@ -610,8 +623,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax20)
     ax20.set_xlabel('Time (s)', **tinfo)
     ax20.set_ylabel('Angle (°)', **tinfo)
-    ax20.set_title('Arm Joint Angles', fontsize=9)
-    ax20.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax20.set_title('Arm Joint Angles', fontsize=_ft(9))
+    ax20.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     ax21 = fig.add_subplot(gs[4, 1])
     ax21.plot(time_states, np.degrees(simX[:, 15]), 'r-', label='j1_dot')
@@ -622,8 +635,8 @@ def plot_acados_into_figure(
     add_wp_lines(ax21)
     ax21.set_xlabel('Time (s)', **tinfo)
     ax21.set_ylabel('Joint rate (deg/s)', **tinfo)
-    ax21.set_title('Arm joint angular velocity', fontsize=9)
-    ax21.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax21.set_title('Arm joint angular velocity', fontsize=_ft(9))
+    ax21.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     ax22 = fig.add_subplot(gs[4, 2])
     ax23 = fig.add_subplot(gs[4, 3])
@@ -636,8 +649,8 @@ def plot_acados_into_figure(
             ax22.plot(time_controls, np.degrees(refU_interp[:, 1]), 'g--', alpha=0.9, lw=1.1, label='ref ωy')
             ax22.plot(time_controls, np.degrees(refU_interp[:, 2]), 'b--', alpha=0.9, lw=1.1, label='ref ωz')
         ax22.set_ylabel('Ang. rate cmd (deg/s)', **tinfo)
-        ax22.set_title('High-level ω cmd', fontsize=9)
-        ax22.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax22.set_title('High-level ω cmd', fontsize=_ft(9))
+        ax22.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
         ax22.set_xlabel('Time (s)', **tinfo)
         ax23.plot(time_controls, simU[:, 3], 'k-', label='T_tot')
         ax23.plot(time_controls, simU[:, 4], 'r--', label='θ1 cmd')
@@ -648,8 +661,8 @@ def plot_acados_into_figure(
             ax23.plot(time_controls, refU_interp[:, 5], 'g:', alpha=0.9, lw=1.1, label='ref θ2')
         ax23.set_xlabel('Time (s)', **tinfo)
         ax23.set_ylabel('T (N) / θ (rad)', **tinfo)
-        ax23.set_title('High-level T & θ cmd', fontsize=9)
-        ax23.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax23.set_title('High-level T & θ cmd', fontsize=_ft(9))
+        ax23.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
     else:
         colors = ['r', 'g', 'b', 'orange']
         for i in range(min(4, simU.shape[1])):
@@ -667,8 +680,8 @@ def plot_acados_into_figure(
                 )
         ax22.set_xlabel('Time (s)', **tinfo)
         ax22.set_ylabel('Thrust (N)', **tinfo)
-        ax22.set_title('Base Control (Thrusters)', fontsize=9)
-        ax22.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax22.set_title('Base Control (Thrusters)', fontsize=_ft(9))
+        ax22.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
         if simU.shape[1] >= 6:
             ax23.plot(time_controls, simU[:, 4], 'r-', label='τ1')
             ax23.plot(time_controls, simU[:, 5], 'g-', label='τ2')
@@ -677,8 +690,8 @@ def plot_acados_into_figure(
             ax23.plot(time_controls, refU_interp[:, 5], 'g--', alpha=0.9, lw=1.1, label='ref τ2')
         ax23.set_xlabel('Time (s)', **tinfo)
         ax23.set_ylabel('Torque (N·m)', **tinfo)
-        ax23.set_title('Arm Control (Joint Torques)', fontsize=9)
-        ax23.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax23.set_title('Arm Control (Joint Torques)', fontsize=_ft(9))
+        ax23.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     # Row 3
     ax30 = fig.add_subplot(gs[5, 0])
@@ -698,10 +711,10 @@ def plot_acados_into_figure(
         ax30.scatter(Ewp[:, 0], Ewp[:, 1], c="darkorange", s=65, marker="*", zorder=6, label="plan EE WP")
     ax30.set_xlabel('X (m)', **tinfo)
     ax30.set_ylabel('Y (m)', **tinfo)
-    ax30.set_title('Horizontal trajectory (XY)', fontsize=9)
+    ax30.set_title('Horizontal trajectory (XY)', fontsize=_ft(9))
     ax30.axis('equal')
     ax30.grid(True, alpha=0.3)
-    ax30.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax30.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     ax31 = fig.add_subplot(gs[5, 1])
     ax31.plot(positions[:, 0], positions[:, 2], 'b-', linewidth=1.5, label='Base')
@@ -718,9 +731,9 @@ def plot_acados_into_figure(
         ax31.scatter(Ewp[:, 0], Ewp[:, 2], c="darkorange", s=65, marker="*", zorder=6, label="plan EE WP")
     ax31.set_xlabel('X (m)', **tinfo)
     ax31.set_ylabel('Z (m)', **tinfo)
-    ax31.set_title('Vertical profile (XZ)', fontsize=9)
+    ax31.set_title('Vertical profile (XZ)', fontsize=_ft(9))
     ax31.grid(True, alpha=0.3)
-    ax31.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    ax31.legend(loc='upper right', fontsize=_ft(7), framealpha=0.9)
 
     ax32 = fig.add_subplot(gs[5, 2])
     ax33 = fig.add_subplot(gs[5, 3])
@@ -735,7 +748,7 @@ def plot_acados_into_figure(
             costs = meta.get("costs")
             if costs is not None and len(costs) > 0:
                 ax_cost.semilogy(np.asarray(costs, dtype=float), "b-", linewidth=2)
-                ax_cost.set_title("Crocoddyl: cost vs iter", fontsize=9)
+                ax_cost.set_title("Crocoddyl: cost vs iter", fontsize=_ft(9))
             else:
                 ax_cost.text(
                     0.5,
@@ -744,9 +757,9 @@ def plot_acados_into_figure(
                     ha="center",
                     va="center",
                     transform=ax_cost.transAxes,
-                    fontsize=9,
+                    fontsize=_ft(9),
                 )
-                ax_cost.set_title("Crocoddyl: cost", fontsize=9)
+                ax_cost.set_title("Crocoddyl: cost", fontsize=_ft(9))
             ax_cost.set_xlabel("Iteration", **tinfo)
             ax_cost.set_ylabel("Cost", **tinfo)
             ax_cost.grid(True, alpha=0.3)
@@ -758,15 +771,15 @@ def plot_acados_into_figure(
                 ha="center",
                 va="center",
                 transform=ax_cost.transAxes,
-                fontsize=9,
+                fontsize=_ft(9),
             )
-            ax_cost.set_title("Trajectory optimization", fontsize=9)
+            ax_cost.set_title("Trajectory optimization", fontsize=_ft(9))
             ax_cost.set_xlabel("—", **tinfo)
             ax_cost.set_ylabel("—", **tinfo)
             ax_cost.grid(True, alpha=0.3)
         else:
             ax_cost.text(0.5, 0.5, "Unknown solver meta", ha="center", va="center", transform=ax_cost.transAxes)
-            ax_cost.set_title("Solver", fontsize=9)
+            ax_cost.set_title("Solver", fontsize=_ft(9))
             ax_cost.grid(True, alpha=0.3)
 
         if n_it > 0 and avg_ms > 0:
@@ -776,15 +789,15 @@ def plot_acados_into_figure(
             ax_time.set_xlabel("Iteration", **tinfo)
             ax_time.set_ylabel("Time per iter (ms)", **tinfo)
             ttl = "Crocoddyl: time / iter" if backend == "crocoddyl" else "Acados traj.: time / iter"
-            ax_time.set_title(ttl, fontsize=9)
-            ax_time.legend(loc="upper right", fontsize=7)
+            ax_time.set_title(ttl, fontsize=_ft(9))
+            ax_time.legend(loc="upper right", fontsize=_ft(7))
             ax_time.grid(True, alpha=0.3)
         else:
             msg = f"Total {tot_s:.3f} s" if tot_s > 0 else "Timing N/A"
             if n_it > 0:
                 msg = f"{n_it} iter, {msg}"
-            ax_time.text(0.5, 0.5, msg, ha="center", va="center", transform=ax_time.transAxes, fontsize=9)
-            ax_time.set_title("Solver time", fontsize=9)
+            ax_time.text(0.5, 0.5, msg, ha="center", va="center", transform=ax_time.transAxes, fontsize=_ft(9))
+            ax_time.set_title("Solver time", fontsize=_ft(9))
             ax_time.grid(True, alpha=0.3)
 
     if traj_solver_meta is not None:
@@ -793,7 +806,7 @@ def plot_acados_into_figure(
         ax32.text(0.5, 0.5, 'Acados: cost in solver log', ha='center', va='center', transform=ax32.transAxes)
         ax32.set_xlabel('Iteration', **tinfo)
         ax32.set_ylabel('Cost', **tinfo)
-        ax32.set_title('Cost convergence', fontsize=9)
+        ax32.set_title('Cost convergence', fontsize=_ft(9))
         ax32.grid(True, alpha=0.3)
 
         ti = timing_info or {}
@@ -805,17 +818,17 @@ def plot_acados_into_figure(
             ax33.fill_between(iters, 0, np.full(n_it, avg_ms), alpha=0.15, color='g')
             ax33.set_xlabel('Iteration', **tinfo)
             ax33.set_ylabel('Time per iter (ms)', **tinfo)
-            ax33.set_title('Solver time / iteration', fontsize=9)
-            ax33.legend(loc='upper right', fontsize=7)
+            ax33.set_title('Solver time / iteration', fontsize=_ft(9))
+            ax33.legend(loc='upper right', fontsize=_ft(7))
             ax33.grid(True, alpha=0.3)
         else:
             ax33.text(0.5, 0.5, 'Timing N/A', ha='center', va='center', transform=ax33.transAxes)
-            ax33.set_title('Solver time / iteration', fontsize=9)
+            ax33.set_title('Solver time / iteration', fontsize=_ft(9))
 
-    fig.suptitle(title, fontsize=12, y=0.98)
+    fig.suptitle(title, fontsize=_ft(12), y=0.98)
     all_axes = fig.get_axes()
     for ax in all_axes:
-        ax.tick_params(axis='both', labelsize=8)
+        ax.tick_params(axis='both', labelsize=_ft(8))
     return fig
 
 
@@ -922,7 +935,7 @@ def plot_acados_3d_into_figure(
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
     ax.set_title('3D Trajectory (acados)')
-    ax.legend(loc='upper right', fontsize=8)
+    ax.legend(loc='upper right', fontsize=_ft(8))
     if waypoint_positions:
         wp_arr = np.asarray(waypoint_positions, dtype=float).reshape(-1, 3)
         wp_ok = np.isfinite(wp_arr).all(axis=1)
@@ -998,7 +1011,7 @@ def plot_results(
     ax.axhline(j_deg, color='gray', linestyle='--', alpha=0.7, label=f'±{j_deg:.0f}°')
     ax.axhline(-j_deg, color='gray', linestyle='--', alpha=0.7)
     ax.set_ylabel('Joint (°)')
-    ax.legend(loc='upper right', fontsize=8)
+    ax.legend(loc='upper right', fontsize=_ft(8))
     ax.grid(True, alpha=0.3)
 
     v_lin_w, w_base_w = base_lin_ang_world_from_robot_state(simX)
@@ -1049,7 +1062,7 @@ def plot_results(
         for i in range(min(4, simU.shape[1])):
             ax.plot(t_u, simU[:, i], label=f'T{i+1}')
         ax.set_ylabel('Thrust (N)')
-    ax.legend(loc='upper right', fontsize=8)
+    ax.legend(loc='upper right', fontsize=_ft(8))
     ax.grid(True, alpha=0.3)
 
     ax = axes[2, 1]
@@ -1066,7 +1079,7 @@ def plot_results(
             ax.plot(t_u, simU[:, 4], 'r-', label='τ1')
             ax.plot(t_u, simU[:, 5], 'g-', label='τ2')
         ax.set_ylabel('Torque (N·m)')
-    ax.legend(loc='upper right', fontsize=8)
+    ax.legend(loc='upper right', fontsize=_ft(8))
     ax.grid(True, alpha=0.3)
 
     ax = axes[2, 2]

@@ -103,15 +103,59 @@ class DisturbanceParams:
     # 会出现垂直 b3 的 unmatched 分量，只能靠倾转补偿——故此开关用于对照实验。
     const_body_frame: bool = False
 
-    # 2) 外界变化扰动（世界系力，逐轴正弦）
+    # 2) 外界变化扰动（逐轴正弦，力 + 力矩，坐标系可切换）
     var_enable: bool = False
     var_t0: float = 0.0
     var_t1: float = 0.0
     var_amp_x: float = 0.0
     var_amp_y: float = 0.0
     var_amp_z: float = 0.0
+    var_amp_mx: float = 0.0
+    var_amp_my: float = 0.0
+    var_amp_mz: float = 0.0
     var_freq: float = 0.5  # Hz
     var_phase_deg: float = 0.0
+    var_body_frame: bool = False
+
+    # 2b) EE-link 外界定常扰动（力/力矩，坐标系=EE系或世界系，仅 s500_uam）
+    ee_const_enable: bool = False
+    ee_const_t0: float = 0.0
+    ee_const_t1: float = 0.0
+    ee_const_fx: float = 0.0
+    ee_const_fy: float = 0.0
+    ee_const_fz: float = 0.0
+    ee_const_mx: float = 0.0
+    ee_const_my: float = 0.0
+    ee_const_mz: float = 0.0
+    ee_const_body_frame: bool = False  # True=EE 局部系（随 EE 旋转），False=世界系
+
+    # 2c) EE-link 外界变化扰动（逐轴正弦力/力矩）
+    ee_var_enable: bool = False
+    ee_var_t0: float = 0.0
+    ee_var_t1: float = 0.0
+    ee_var_amp_x: float = 0.0
+    ee_var_amp_y: float = 0.0
+    ee_var_amp_z: float = 0.0
+    ee_var_amp_mx: float = 0.0
+    ee_var_amp_my: float = 0.0
+    ee_var_amp_mz: float = 0.0
+    ee_var_freq: float = 0.5
+    ee_var_phase_deg: float = 0.0
+    ee_var_body_frame: bool = False
+
+    # 2d) 模拟负载（刚性附着 EE 的物体，默认 400g 可乐罐圆柱；仅 s500_uam）
+    #   plant 用"含负载惯量的增广 Pinocchio 模型"积分（重力/科氏/惯性耦合全精确），
+    #   MPC 仍用名义模型 → 模型失配=真实扰动，适合抓取后用动量观测器估计再补偿。
+    load_enable: bool = False
+    load_t0: float = 0.0       # 抓取时刻（之前 plant 用名义模型，之后用增广模型）
+    load_t1: float = 0.0       # <=0 持续到结束
+    load_mass: float = 0.4     # kg
+    load_ixx: float = 5.5e-4   # kg·m²（可乐罐横向，r≈33mm/h≈115mm）
+    load_iyy: float = 5.5e-4
+    load_izz: float = 2.18e-4  # 轴向
+    load_com_x: float = 0.0    # 负载质心相对 EE 系偏置 [m]
+    load_com_y: float = 0.0
+    load_com_z: float = 0.0
 
     # 3) 总推力估计偏差： T_real = scale·T_cmd + bias
     thrust_enable: bool = False
@@ -143,8 +187,14 @@ class DisturbanceParams:
     def any_plant_disturbance(self) -> bool:
         """是否存在改变 plant 真实动力学的扰动（不含状态估计误差）。"""
         return bool(
-            self.const_enable or self.var_enable or self.thrust_enable or self.drag_enable
+            self.const_enable or self.var_enable or self.thrust_enable
+            or self.drag_enable or self.ee_const_enable or self.ee_var_enable
+            or self.load_enable
         )
+
+    def any_ee_disturbance(self) -> bool:
+        """是否存在 EE-link 力旋量扰动（需 J^T 注入；不含负载增广模型）。"""
+        return bool(self.ee_const_enable or self.ee_var_enable)
 
     def any_enabled(self) -> bool:
         return bool(self.any_plant_disturbance() or self.est_enable)
@@ -206,9 +256,20 @@ def external_force_torque(
     if _active(t, params.var_enable, params.var_t0, params.var_t1):
         ph = math.radians(params.var_phase_deg)
         s = math.sin(2.0 * math.pi * params.var_freq * t + ph)
-        F_world += np.array(
+        F_var = np.array(
             [params.var_amp_x * s, params.var_amp_y * s, params.var_amp_z * s], dtype=float
         )
+        M_var = np.array(
+            [params.var_amp_mx * s, params.var_amp_my * s, params.var_amp_mz * s], dtype=float
+        )
+        if params.var_body_frame:
+            F_world += R @ F_var
+            M_w_var = R @ M_var
+        else:
+            F_world += F_var
+            M_w_var = M_var
+        M_world += M_w_var
+        M_body += R.T @ M_w_var
 
     if _active(t, params.drag_enable, params.drag_t0, params.drag_t1):
         wind = np.array(
@@ -222,6 +283,160 @@ def external_force_torque(
         F_world += -float(params.drag_cd) * sum_omega * v_perp
 
     return F_world, M_body, M_world
+
+
+def ee_wrench_world(
+    params: DisturbanceParams, t: float, R_ee: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """EE-link 外界扰动（定常 + 变化）合成的力旋量，返回世界系 (F_world, M_world)。
+
+    定义坐标系：body=EE 局部系（随 EE 姿态旋转，用 R_ee 转世界）；world=世界系直给。
+    施力点取 EE 帧原点（注入侧用 LOCAL_WORLD_ALIGNED 雅可比折算到广义力）。
+    """
+    F_w = np.zeros(3, dtype=float)
+    M_w = np.zeros(3, dtype=float)
+    R_ee = np.asarray(R_ee, dtype=float)
+
+    if _active(t, params.ee_const_enable, params.ee_const_t0, params.ee_const_t1):
+        F = np.array([params.ee_const_fx, params.ee_const_fy, params.ee_const_fz], dtype=float)
+        M = np.array([params.ee_const_mx, params.ee_const_my, params.ee_const_mz], dtype=float)
+        if params.ee_const_body_frame:
+            F_w += R_ee @ F
+            M_w += R_ee @ M
+        else:
+            F_w += F
+            M_w += M
+
+    if _active(t, params.ee_var_enable, params.ee_var_t0, params.ee_var_t1):
+        ph = math.radians(params.ee_var_phase_deg)
+        s = math.sin(2.0 * math.pi * params.ee_var_freq * t + ph)
+        F = np.array(
+            [params.ee_var_amp_x * s, params.ee_var_amp_y * s, params.ee_var_amp_z * s],
+            dtype=float,
+        )
+        M = np.array(
+            [params.ee_var_amp_mx * s, params.ee_var_amp_my * s, params.ee_var_amp_mz * s],
+            dtype=float,
+        )
+        if params.ee_var_body_frame:
+            F_w += R_ee @ F
+            M_w += R_ee @ M
+        else:
+            F_w += F
+            M_w += M
+
+    return F_w, M_w
+
+
+def disturbance_base_equiv_world(
+    params: DisturbanceParams,
+    t: float,
+    q: np.ndarray,
+    R: np.ndarray,
+    v_world: np.ndarray,
+    thrust_total: float,
+    n_rotors: int,
+    pin_model,
+    data,
+    ee_frame_id: int,
+    nv: int,
+    n_arm: int,
+    gravity: float = GRAVITY,
+    return_arm: bool = False,
+):
+    """base 等效世界系扰动 (F_world, M_world)：base wrench + EE(J^T 折算到 base) +
+    负载重力等效。**不含**推力估计偏差（调用方按需叠加 dT·b3）。
+
+    与动量观测器估计的 base 6D wrench 同口径，便于真值/估计对照与 oracle 补偿。
+    EE/负载需 n_arm>0；负载项为准静态重力等效（忽略运动惯性，plant 侧由增广模型精确）。
+
+    ``return_arm=True`` 时额外返回臂关节空间扰动力矩 ``tau_arm`` (n_arm,)：来自 EE 力旋量
+    与负载重力经 J^T 折算的关节分量（= 整段 J^T·w 的第 6: 维）。base 6D wrench 只表示
+    浮动基所受合力/合力矩，**无法**表达"力作用在 EE 上同时压弯机械臂关节"这一效应——
+    要在 whole-body 增广里补偿 EE 侧向力，必须把这一关节力矩也喂给 MPC（见调用方）。
+    """
+    q = np.asarray(q, dtype=float)[: pin_model.nq]
+    R = np.asarray(R, dtype=float)
+    F_ext, M_body_ext, _M_world_ext = external_force_torque(
+        params, t, R, v_world, thrust_total, n_rotors
+    )
+    tau = np.zeros(int(nv), dtype=float)
+    tau[:3] = R.T @ F_ext
+    tau[3:6] = M_body_ext
+    J = None
+    if n_arm > 0 and params.any_ee_disturbance():
+        pin.framesForwardKinematics(pin_model, data, q)
+        R_ee = np.asarray(data.oMf[int(ee_frame_id)].rotation, dtype=float)
+        F_ee_w, M_ee_w = ee_wrench_world(params, t, R_ee)
+        if np.any(np.abs(F_ee_w) > 1e-12) or np.any(np.abs(M_ee_w) > 1e-12):
+            J = pin.computeFrameJacobian(
+                pin_model, data, q, int(ee_frame_id), pin.LOCAL_WORLD_ALIGNED
+            )
+            tau += J.T @ np.concatenate([F_ee_w, M_ee_w])
+    F_w = R @ tau[:3]
+    M_w = R @ tau[3:6]
+    # 臂关节扰动力矩（关节空间）：EE 力旋量经 J^T 的第 6: 维；负载部分在下方累加。
+    tau_arm = (
+        np.asarray(tau[6 : 6 + int(n_arm)], dtype=float).copy()
+        if (return_arm and n_arm > 0)
+        else np.zeros(int(n_arm) if n_arm > 0 else 0, dtype=float)
+    )
+    if (
+        n_arm > 0 and params.load_enable
+        and _active(t, True, params.load_t0, params.load_t1)
+    ):
+        pin.framesForwardKinematics(pin_model, data, q)
+        oMf = data.oMf[int(ee_frame_id)]
+        com_off = np.array(
+            [params.load_com_x, params.load_com_y, params.load_com_z], dtype=float
+        )
+        com_off_w = np.asarray(oMf.rotation, dtype=float) @ com_off
+        p_com_w = np.asarray(oMf.translation, dtype=float) + com_off_w
+        F_load_w = float(params.load_mass) * np.array([0.0, 0.0, -gravity], dtype=float)
+        F_w = F_w + F_load_w
+        M_w = M_w + np.cross(p_com_w - q[:3], F_load_w)
+        if return_arm:
+            if J is None:
+                pin.framesForwardKinematics(pin_model, data, q)
+                J = pin.computeFrameJacobian(
+                    pin_model, data, q, int(ee_frame_id), pin.LOCAL_WORLD_ALIGNED
+                )
+            # 负载力作用在 COM：等价于 EE 帧原点处力 F + 力矩 (com_off×F)（LWA 力旋量）。
+            w_load_ee = np.concatenate([F_load_w, np.cross(com_off_w, F_load_w)])
+            tau_arm = tau_arm + (J.T @ w_load_ee)[6 : 6 + int(n_arm)]
+    if return_arm:
+        return F_w, M_w, tau_arm
+    return F_w, M_w
+
+
+def make_load_inertia(params: DisturbanceParams):
+    """构造负载的 Pinocchio 惯量（质量 + 质心偏置 + 对角主惯量，COM 系下）。"""
+    if pin is None:
+        raise ImportError("pinocchio is required for load model")
+    com = np.array([params.load_com_x, params.load_com_y, params.load_com_z], dtype=float)
+    I3 = np.diag([
+        max(float(params.load_ixx), 0.0),
+        max(float(params.load_iyy), 0.0),
+        max(float(params.load_izz), 0.0),
+    ]).astype(float)
+    return pin.Inertia(float(params.load_mass), com, I3)
+
+
+def augment_pin_model_with_load(
+    pin_model, ee_frame_id: int, params: DisturbanceParams
+):
+    """返回把负载惯量刚性附着到 EE 帧后的 Pinocchio 模型副本（plant 用）。
+
+    负载惯量加到 EE 帧所属关节上、放在 EE 帧位姿处 → 重力/科氏/惯性耦合在积分中全精确。
+    """
+    if pin is None:
+        raise ImportError("pinocchio is required for load model")
+    model = pin_model.copy()
+    frame = model.frames[int(ee_frame_id)]
+    jid = int(getattr(frame, "parentJoint", getattr(frame, "parent", 0)))
+    iMf = frame.placement  # EE 帧相对父关节的位姿
+    model.appendBodyToJoint(jid, make_load_inertia(params), iMf)
+    return model
 
 
 def apply_thrust_bias(
@@ -282,8 +497,12 @@ def corrupt_state_estimate(
 class DisturbedRK4Plant:
     """RK4 plant：在 MPC 的 CasADi 显式动力学上叠加广义外力 τ_ext（ZOH/步内常值）。
 
-    ẋ = f_model(x,u) + [0_{nq}; M(q)^{-1} τ_ext]，τ_ext=[w_body(6); 0(臂)]。
-    每个仿真步开始用 set_tau_ext_body() 设定本步外力（机体系 wrench）。
+    ẋ = f_model(x,u) + [0_{nq}; M(q)^{-1} τ_ext]，τ_ext 为完整 nv 维广义外力
+    （base 6 维 wrench + 经 J^T 折算的 EE 力旋量 + 臂关节外力）。
+
+    模拟负载：可设第二套动力学 f_load（含负载惯量的增广模型）与抓取时间窗
+    [load_t0, load_t1]；窗内用 f_load 积分（M^{-1} 也用增广模型），否则用名义 f。
+    每步由 on_pre_step(t,·) 缓存当前时刻以选择动力学。
     """
 
     def __init__(
@@ -294,6 +513,10 @@ class DisturbedRK4Plant:
         nq: int,
         nv: int,
         nu: int,
+        f_load: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
+        load_model=None,
+        load_t0: float = 0.0,
+        load_t1: float = 0.0,
     ):
         if pin is None:
             raise ImportError("pinocchio is required for DisturbedRK4Plant")
@@ -306,22 +529,49 @@ class DisturbedRK4Plant:
         self.nu = int(nu)
         self._tau_ext = np.zeros(self.nv, dtype=float)
         self._has_ext = False
+        # 负载增广动力学（可选）。
+        self._f_load = f_load
+        self._load_model = load_model
+        self._load_data = load_model.createData() if load_model is not None else None
+        self._load_t0 = float(load_t0)
+        self._load_t1 = float(load_t1)
+        self._t = 0.0
 
     def set_tau_ext_body(self, w_body6: np.ndarray) -> None:
-        """设定本步外力（机体系 6 维 wrench [F; M]，臂关节外力置 0）。"""
+        """设定本步 base 外力（机体系 6 维 wrench [F; M]，其余分量置 0）。"""
         tau = np.zeros(self.nv, dtype=float)
         tau[:6] = np.asarray(w_body6, dtype=float).reshape(6)
-        self._tau_ext = tau
-        self._has_ext = bool(np.any(np.abs(tau) > 1e-12))
+        self.set_tau_ext_full(tau)
+
+    def set_tau_ext_full(self, tau_nv: np.ndarray) -> None:
+        """设定本步完整广义外力 τ_ext（nv 维，含 base wrench + EE 折算 + 臂关节）。"""
+        tau = np.asarray(tau_nv, dtype=float).flatten()
+        out = np.zeros(self.nv, dtype=float)
+        out[: min(self.nv, tau.size)] = tau[: min(self.nv, tau.size)]
+        self._tau_ext = out
+        self._has_ext = bool(np.any(np.abs(out) > 1e-12))
+
+    def _load_active(self) -> bool:
+        if self._f_load is None:
+            return False
+        if self._t < self._load_t0 - 1e-12:
+            return False
+        if self._load_t1 > 0.0 and self._t > self._load_t1 + 1e-12:
+            return False
+        return True
 
     def on_pre_step(self, t: float, step_index: int) -> None:
-        return None
+        self._t = float(t)
 
     def _f_total(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
-        xdot = np.asarray(self._f(x, u), dtype=float).flatten()
+        use_load = self._load_active()
+        f = self._f_load if use_load else self._f
+        model = self._load_model if use_load else self._model
+        data = self._load_data if use_load else self._data
+        xdot = np.asarray(f(x, u), dtype=float).flatten()
         if self._has_ext:
             q = np.asarray(x, dtype=float).flatten()[: self.nq]
-            Minv = pin.computeMinverse(self._model, self._data, q)
+            Minv = pin.computeMinverse(model, data, q)
             xdot[self.nq : self.nq + self.nv] += Minv @ self._tau_ext
         return xdot
 

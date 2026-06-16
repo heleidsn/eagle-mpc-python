@@ -12,6 +12,7 @@ s500_uam_ee_snap_tracking_mpc (same as Acados EE tracking).
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from pathlib import Path
@@ -42,7 +43,10 @@ try:
     from pinocchio import casadi as cpin
 
     from s500_uam_acados_model import _quat_prod, _quat_to_R, load_s500_config
-    from s500_uam_acados_trajectory import STATE_LIMITS
+    from s500_uam_acados_trajectory import (
+        STATE_LIMITS,
+        _acados_ocp_generate_build_flags,
+    )
 
     DEPS_OK = True
 except ImportError as e:
@@ -74,6 +78,36 @@ class _AcadosTrackMpcShim:
         self._planner = type("_PlannerShim", (), {"ee_frame_id": int(ee_frame_id)})()
 
 
+def arm_joint_inertia_scales(
+    pin_model, n_arm: int, q_ref: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """各臂关节按质量矩阵对角元归一化的权重缩放系数（动能度量，均值=1）。
+
+    串联臂各关节的等效惯量可差数倍（s500_uam: M[j1]≈4·M[j2]），给 j1/j2 同一权重
+    会扭曲优化优先级、恶化 QP 条件数。这里用动能度量 W_i ∝ M_ii：惯量大的关节误差
+    权重更高（更"贵"）。归一化到均值=1 → master ``w_joint`` 量级不变，且等惯量时
+    退化为全 1（与原行为一致）。M 与构型弱相关，取中性构型评估即可。
+    """
+    na = int(n_arm)
+    if na <= 0:
+        return np.ones(0, dtype=float)
+    nq = int(pin_model.nq)
+    nv = int(pin_model.nv)
+    if q_ref is None:
+        q = pin.neutral(pin_model)
+    else:
+        q = np.asarray(q_ref, dtype=float).reshape(-1)[:nq].copy()
+    data = pin_model.createData()
+    M = pin.crba(pin_model, data, q)
+    M = np.triu(M) + np.triu(M, 1).T
+    diag = np.array([M[nv - na + i, nv - na + i] for i in range(na)], dtype=float)
+    diag = np.clip(diag, 1e-12, None)
+    mean = float(np.mean(diag))
+    if mean <= 0.0:
+        return np.ones(na, dtype=float)
+    return diag / mean
+
+
 def croc_tracking_weights_to_W_R(
     *,
     n_arm: int = 2,
@@ -88,19 +122,30 @@ def croc_tracking_weights_to_W_R(
     w_u_joint_torque: float = 1.0,
     w_state_track: float = 10.0,
     w_terminal_track: float = 100.0,
+    joint_weight_scales: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Map Crocoddyl full-state tracking GUI weights to Acados NONLINEAR_LS W / W_e / R.
 
     State cost layout (robot-aware, matches ``_state_to_y_np``):
     [pos(3), yaw, roll, pitch, j*(n_arm), v_lin(3), ω(3), j̇*(n_arm)].
+
+    ``joint_weight_scales``：长度 n_arm 的逐关节权重缩放（惯量缩放开启时由
+    ``arm_joint_inertia_scales`` 提供），None 则全 1（各关节同权重，原行为）。
+    位置与速度通道用同一缩放，保持度量一致。
     """
     na = int(n_arm)
+    if joint_weight_scales is None:
+        jsc = np.ones(na, dtype=float)
+    else:
+        jsc = np.asarray(joint_weight_scales, dtype=float).reshape(-1)
+        if jsc.size != na:
+            jsc = np.ones(na, dtype=float)
     s = float(w_state_track)
     diag = [float(w_pos) * s] * 3 + [float(w_att) * s] * 3
-    diag += [float(w_joint) * s] * na
+    diag += [float(w_joint) * s * float(jsc[i]) for i in range(na)]
     diag += [float(w_vel) * s] * 3 + [float(w_omega) * s] * 3
-    diag += [float(w_joint_vel) * s] * na
+    diag += [float(w_joint_vel) * s * float(jsc[i]) for i in range(na)]
     W_state = np.diag(diag)
     r_thrust = float(w_control) * float(w_u_thrust)
     r_torque = float(w_control) * float(w_u_joint_torque) * 10000.0
@@ -184,8 +229,14 @@ def _infer_urdf_path(x_plan: np.ndarray, urdf_path: Optional[str] = None) -> str
     return _default_urdf_path()
 
 
-def _build_robot_acados_model(urdf_path: str):
-    """Robot-aware AcadosModel: s500 (nq=7, nu=4) or s500_uam (nq=9, nu=6)."""
+def _build_robot_acados_model(urdf_path: str, wholebody: bool = False):
+    """Robot-aware AcadosModel: s500 (nq=7, nu=4) or s500_uam (nq=9, nu=6).
+
+    ``wholebody=True`` 时把扰动参数从 6 维（base 等效 wrench）扩成 ``6+n_arm`` 维
+    （whole-body）：前 6 维仍是世界系 base wrench（模型内旋回机体注入 floating
+    joint），后 ``n_arm`` 维是关节空间扰动力矩，直接叠加到对应臂关节广义力通道，
+    无坐标变换。用于动量观测器可直接给出整段 ``τ_ext`` (nv 维) 时不丢弃臂关节分量。
+    """
     from acados_template import AcadosModel
 
     model = pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer())
@@ -207,11 +258,14 @@ def _build_robot_acados_model(urdf_path: str):
     q = ca.SX.sym("q", nq)
     v = ca.SX.sym("v", nv)
     u = ca.SX.sym("u", nu)
-    # disturbance-aware MPC：世界系平动扰动力参数 p_dist(3,)（N）。增广动力学
-    #   v̇ = a_model + R^T·p_dist / —— 经 ABA 以机体系广义力注入平动通道，
-    # 使 MPC 在预测时已知扰动、规划最优倾角/推力（offset-free MPC）。
+    # disturbance-aware MPC：扰动参数 p_dist。默认 6 维 = 世界系 base wrench
+    #   [F_world(3), M_world(3)]（N, N·m），经 ABA 以机体系广义力注入 base floating
+    # joint 的力/力矩通道，使 MPC 在预测时已知扰动、规划最优倾角/推力/力矩（offset-free
+    # MPC）。抓取负载在 ee 处的等效效应（重力 + 杠杆臂力矩）即以此 base 等效 wrench 表示。
+    # wholebody=True 时再追加 n_arm 维关节空间扰动力矩 p_dist[6:]，直接叠加臂关节通道。
     # 后嵌（bolt-on）模式下调用方令 p_dist=0，模型退化为名义动力学。
-    p_dist_w = ca.SX.sym("p_dist_w", 3)
+    n_dist = 6 + (n_arm if (wholebody and n_arm > 0) else 0)
+    p_dist_w = ca.SX.sym("p_dist_w", n_dist)
 
     thrusts = u[:n_thrust]
     arm_tau = u[n_thrust:] if n_arm > 0 else None
@@ -230,10 +284,19 @@ def _build_robot_acados_model(urdf_path: str):
         Mx += -pos[1] * T
         My += pos[0] * T
         Mz += spin * cm_cf * T
-    # 世界系扰动力转机体系并叠加到平动广义力（base 自由飞行关节的力部分为机体系）。
-    F_dist_b = ca.mtimes(R.T, p_dist_w)
-    tau_base = ca.vertcat(F_dist_b[0], F_dist_b[1], Fz + F_dist_b[2], Mx, My, Mz)
-    tau = ca.vertcat(tau_base, arm_tau) if n_arm > 0 else tau_base
+    # 世界系扰动 wrench 转机体系并叠加到 base 广义力（floating joint 力/力矩均机体系）。
+    F_dist_b = ca.mtimes(R.T, p_dist_w[:3])
+    M_dist_b = ca.mtimes(R.T, p_dist_w[3:6])
+    tau_base = ca.vertcat(
+        F_dist_b[0], F_dist_b[1], Fz + F_dist_b[2],
+        Mx + M_dist_b[0], My + M_dist_b[1], Mz + M_dist_b[2],
+    )
+    if n_arm > 0:
+        # whole-body：关节空间扰动力矩直接叠加到臂关节广义力（无坐标变换）。
+        arm_total = arm_tau + p_dist_w[6 : 6 + n_arm] if n_dist > 6 else arm_tau
+        tau = ca.vertcat(tau_base, arm_total)
+    else:
+        tau = tau_base
 
     a = cpin.aba(cmodel, cdata, q, v, tau)
 
@@ -258,6 +321,66 @@ def _build_robot_acados_model(urdf_path: str):
     return acados_model, model, nq, nv, nu
 
 
+def build_plant_f_fun(urdf_path: str, load_params=None, ee_frame_id: Optional[int] = None):
+    """构造 plant 用的 CasADi 显式动力学 f(x,u)（numpy 可调用），无扰动参数。
+
+    与 MPC 名义模型同构（同一推力分配/ABA），但当 ``load_params`` 含启用的模拟负载时，
+    把负载惯量刚性附着到 EE 帧再建动力学 → plant 比 MPC 名义模型多出负载效应（模型失配
+    即真实扰动）。``ee_frame_id`` 缺省时按 EE_FRAME_NAME 解析。
+    """
+    model = pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer())
+    if load_params is not None and getattr(load_params, "load_enable", False):
+        from sim_disturbance import augment_pin_model_with_load
+
+        fid = ee_frame_id if ee_frame_id is not None else int(model.getFrameId(EE_FRAME_NAME))
+        model = augment_pin_model_with_load(model, fid, load_params)
+
+    cmodel = cpin.Model(model)
+    cdata = cmodel.createData()
+    cfg = load_s500_config()
+    platform = cfg["platform"]
+    cm_cf = platform["cm"] / platform["cf"]
+    rotors = platform["$rotors"]
+
+    nq, nv = model.nq, model.nv
+    n_arm = nq - 7
+    n_thrust = 4
+    nu = n_thrust + n_arm
+
+    q = ca.SX.sym("q", nq)
+    v = ca.SX.sym("v", nv)
+    u = ca.SX.sym("u", nu)
+    thrusts = u[:n_thrust]
+    arm_tau = u[n_thrust:] if n_arm > 0 else None
+
+    quat = q[3:7]
+    v_lin = v[:3]
+    v_ang = v[3:6]
+    R = _quat_to_R(quat)
+
+    Fz = thrusts[0] + thrusts[1] + thrusts[2] + thrusts[3]
+    Mx = My = Mz = 0.0
+    for i, r in enumerate(rotors):
+        pos = r["translation"]
+        spin = r["spin_direction"][0]
+        T = thrusts[i]
+        Mx += -pos[1] * T
+        My += pos[0] * T
+        Mz += spin * cm_cf * T
+    tau_base = ca.vertcat(0.0, 0.0, Fz, Mx, My, Mz)
+    tau = ca.vertcat(tau_base, arm_tau) if n_arm > 0 else tau_base
+
+    a = cpin.aba(cmodel, cdata, q, v, tau)
+    pos_dot = ca.mtimes(R, v_lin)
+    quat_dot = 0.5 * _quat_prod(quat, ca.vertcat(v_ang[0], v_ang[1], v_ang[2], 0))
+    if n_arm > 0:
+        q_dot = ca.vertcat(pos_dot, quat_dot, v[6 : 6 + n_arm])
+    else:
+        q_dot = ca.vertcat(pos_dot, quat_dot)
+    x_dot = ca.vertcat(q_dot, a)
+    return ca.Function("f_plant", [ca.vertcat(q, v), u], [x_dot])
+
+
 def _build_cost_y_exprs(x_sym, u_sym, nq: int, n_arm: int):
     quat = x_sym[3:7]
     roll, pitch, yaw = _quat_to_euler_zyx_ca(quat)
@@ -270,6 +393,61 @@ def _build_cost_y_exprs(x_sym, u_sym, nq: int, n_arm: int):
     cost_y_e = ca.vertcat(*pieces)
     cost_y = ca.vertcat(cost_y_e, u_sym)
     return cost_y, cost_y_e
+
+
+# codegen 时 NLP/QP 迭代上界（运行时可 options_set 下调，避免 max_iter 改动触发重编）。
+_ACADOS_CODEGEN_NLP_MAX_ITER = 80
+_ACADOS_CODEGEN_QP_ITER_MAX = 100
+
+
+def _align_ocp_with_cached_json(ocp: "AcadosOcp", json_path: Path) -> bool:
+    """把参与 OCP 哈希、但运行时可改的字段对齐到已缓存 ocp.json，避免无谓 codegen。
+
+    权重 W/W_e、状态/输入约束界、NLP/QP 迭代上限在加载后仍会用当前参数覆盖。
+    """
+    if not json_path.is_file():
+        return False
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    cost = data.get("cost") or {}
+    if cost.get("W"):
+        ocp.cost.W = np.array(cost["W"], dtype=float)
+    if cost.get("W_e"):
+        ocp.cost.W_e = np.array(cost["W_e"], dtype=float)
+
+    solver_opts = data.get("solver_options") or {}
+    for key in ("nlp_solver_max_iter", "qp_solver_iter_max"):
+        if key in solver_opts and hasattr(ocp.solver_options, key):
+            setattr(ocp.solver_options, key, solver_opts[key])
+
+    cst = data.get("constraints") or {}
+    for key in ("lbx", "ubx", "lbu", "ubu"):
+        vals = cst.get(key)
+        if vals is not None and len(vals) > 0 and hasattr(ocp.constraints, key):
+            setattr(ocp.constraints, key, np.array(vals, dtype=float))
+    return True
+
+
+def _apply_runtime_solver_options(
+    solver: "AcadosOcpSolver", max_iter: int, *, solver_type: str = "SQP"
+) -> None:
+    """在已编译上界内下调 NLP 迭代次数（SQP 专用；RTI 每步固定 1 次 QP）。"""
+    if str(solver_type or "SQP").upper() == "SQP_RTI":
+        return
+    want = int(max_iter)
+    try:
+        baked = int(solver.__solver_options.get("nlp_solver_max_iter", want))
+    except Exception:
+        baked = want
+    if want <= baked:
+        try:
+            solver.options_set("nlp_solver_max_iter", want)
+        except Exception:
+            pass
 
 
 def create_full_state_tracking_mpc_solver(
@@ -291,6 +469,10 @@ def create_full_state_tracking_mpc_solver(
     control_mode: str = "direct",
     urdf_path: Optional[str] = None,
     state_limits: Optional[Dict[str, float]] = None,
+    solver_type: str = "SQP",
+    integrator: Optional[str] = None,
+    obs_wholebody: bool = False,
+    inertia_scaling: bool = False,
 ) -> tuple:
     if not ACADOS_AVAILABLE:
         raise ImportError("acados_template not installed")
@@ -303,9 +485,22 @@ def create_full_state_tracking_mpc_solver(
     n_arm_probe = pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer()).nq - 7
 
     if control_mode == "direct":
-        acados_model, pin_model, nq, nv, nu = _build_robot_acados_model(urdf_path)
+        acados_model, pin_model, nq, nv, nu = _build_robot_acados_model(
+            urdf_path, wholebody=bool(obs_wholebody)
+        )
         robot_tag = "uam" if n_arm_probe > 0 else "s500"
-        code_subdir = f"s500_{robot_tag}_full_state_track_mpc"
+        wb_tag = "_wb" if (obs_wholebody and n_arm_probe > 0) else ""
+        _integ_tag = str(
+            integrator or ("ERK" if control_mode == "actuator_first_order" else "IRK")
+        ).strip().upper()
+        _stype_tag = str(solver_type or "SQP").strip().upper()
+        if _stype_tag not in ("SQP", "SQP_RTI"):
+            _stype_tag = "SQP"
+        # 求解器/积分器写入子目录名，避免 SQP+IRK 与 SQP_RTI+ERK 共用目录互相覆盖 .so。
+        code_subdir = (
+            f"s500_{robot_tag}_full_state_track_mpc{wb_tag}"
+            f"_{_stype_tag.lower()}_{_integ_tag.lower()}"
+        )
     elif control_mode == "actuator_first_order":
         if n_arm_probe <= 0:
             raise ValueError("actuator_first_order is only supported for s500_uam (with arm)")
@@ -319,6 +514,16 @@ def create_full_state_tracking_mpc_solver(
         raise ValueError("control_mode must be 'direct' or 'actuator_first_order'")
 
     n_arm = nq - 7
+    joint_weight_scales = (
+        arm_joint_inertia_scales(pin_model, n_arm)
+        if (inertia_scaling and n_arm > 0)
+        else None
+    )
+    if joint_weight_scales is not None:
+        print(
+            "[acados track] inertia scaling on: joint weight scales = "
+            + ", ".join(f"{v:.3f}" for v in joint_weight_scales)
+        )
     W_state, R, W_e = croc_tracking_weights_to_W_R(
         n_arm=n_arm,
         w_pos=w_pos,
@@ -332,15 +537,18 @@ def create_full_state_tracking_mpc_solver(
         w_u_joint_torque=w_u_joint_torque,
         w_state_track=w_state_track,
         w_terminal_track=w_terminal_track,
+        joint_weight_scales=joint_weight_scales,
     )
 
     ocp = AcadosOcp()
     ocp.model = acados_model
     nx = nq + nv + (6 if control_mode == "actuator_first_order" else 0)
-    # disturbance-aware MPC：direct 模型含 3 维世界系扰动力参数 p_dist_w，默认 0（名义）。
-    # 闭环每拍按 σ̂·m 下发到各 stage；后嵌模式保持 0。actuator_first_order 模型无参数。
+    # disturbance-aware MPC：direct 模型含扰动 wrench 参数 p_dist_w（默认 6 维世界系 base
+    # wrench；whole-body 时 6+n_arm 维，追加关节扰动力矩），默认 0（名义）。闭环每拍按估计
+    # wrench 下发到各 stage；后嵌模式保持 0。actuator_first_order 模型无参数。
     if control_mode == "direct":
-        ocp.parameter_values = np.zeros(3)
+        n_dist_param = 6 + (n_arm if (obs_wholebody and n_arm > 0) else 0)
+        ocp.parameter_values = np.zeros(n_dist_param)
 
     cost_y, cost_y_e = _build_cost_y_exprs(ocp.model.x, ocp.model.u, nq, n_arm)
     ocp.model.cost_y_expr = cost_y
@@ -355,7 +563,10 @@ def create_full_state_tracking_mpc_solver(
 
     ocp.dims.N = int(N)
     ocp.solver_options.tf = float(N) * float(dt)
-    ocp.solver_options.nlp_solver_max_iter = int(max_iter)
+    # 编译进 C 的迭代上界取固定较大值；实际 max_iter 在加载后 options_set 下调。
+    codegen_nlp_iter = max(_ACADOS_CODEGEN_NLP_MAX_ITER, int(max_iter))
+    codegen_qp_iter = max(_ACADOS_CODEGEN_QP_ITER_MAX, int(max_iter) * 2)
+    ocp.solver_options.nlp_solver_max_iter = codegen_nlp_iter
     if hasattr(ocp.solver_options, "N_horizon"):
         ocp.solver_options.N_horizon = int(N)
 
@@ -394,38 +605,55 @@ def create_full_state_tracking_mpc_solver(
     ocp.constraints.idxbu = np.arange(nu)
     ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
-    ocp.solver_options.integrator_type = (
-        "ERK" if control_mode == "actuator_first_order" else "IRK"
-    )
-    ocp.solver_options.nlp_solver_type = "SQP"
+    # 积分器：默认 actuator_first_order 用 ERK，direct 用 IRK（隐式，更稳但更慢）。
+    # 可经 integrator 覆盖为 "ERK" 提速（动力学非刚性时通常够用且快很多）。
+    _integ = (integrator or ("ERK" if control_mode == "actuator_first_order" else "IRK"))
+    ocp.solver_options.integrator_type = str(_integ).upper()
+    # 求解器类型：SQP（多迭代到收敛，精确）或 SQP_RTI（实时迭代，每步 1 个 QP，快很多，
+    # 暖启动下跟踪通常足够好）。RTI 下 nlp_solver_max_iter 无意义（固定单次）。
+    _stype = str(solver_type or "SQP").upper()
+    if _stype not in ("SQP", "SQP_RTI"):
+        _stype = "SQP"
+    ocp.solver_options.nlp_solver_type = _stype
     ocp.solver_options.print_level = 0
     if hasattr(ocp.solver_options, "qp_solver_iter_max"):
-        ocp.solver_options.qp_solver_iter_max = max(50, int(max_iter) * 2)
+        ocp.solver_options.qp_solver_iter_max = codegen_qp_iter
 
     code_export_dir = REPO_ROOT / "c_generated_code" / code_subdir
     code_export_dir.mkdir(parents=True, exist_ok=True)
+    json_path = code_export_dir / "ocp.json"
     ocp.code_gen_opts.code_export_directory = str(code_export_dir)
-    ocp.code_gen_opts.json_file = str(code_export_dir / "ocp.json")
+    ocp.code_gen_opts.json_file = str(json_path)
     ocp.constraints.x0 = np.zeros(nx)
 
-    # 非必要不重新生成代码：generate/build 置 False + check_reuse_possible，acados 用整个
-    # OCP 的哈希判断是否可复用已编译代码——权重/N/dt/模型/约束/求解器选项任一改变都会
-    # 触发重生成，否则跳过 codegen+build（仅加载已有 .so 并重建 solver，很快）。
+    # 权重/约束界/max_iter 会进入 OCP 哈希；对齐已缓存 json 后再比哈希，可避免每次仿真
+    # 因调权重或状态限位而触发 ~15s 的 codegen+build（结构未变时应 <0.1s 加载 .so）。
+    _align_ocp_with_cached_json(ocp, json_path)
+
+    gen, bld = _acados_ocp_generate_build_flags(code_export_dir, acados_model.name)
+    t_solver0 = time.perf_counter()
     solver = AcadosOcpSolver(
         ocp,
-        json_file=str(code_export_dir / "ocp.json"),
-        generate=False,
-        build=False,
+        json_file=str(json_path),
+        generate=gen,
+        build=bld,
         verbose=False,
         check_reuse_possible=True,
     )
-    # 复用已生成代码时，C 代码里 bake 的 W 是上次生成时的值；运行时按当前权重重新下发
-    # W / W_e，确保即便跳过 codegen，权重修改也立即生效（不依赖哈希是否覆盖 W）。
+    solver_setup_s = time.perf_counter() - t_solver0
+    if solver_setup_s > 1.0 or getattr(solver, "generated", False):
+        tag = "codegen+build" if getattr(solver, "generated", False) else "build"
+        print(
+            f"[acados track] OCP {tag} {solver_setup_s:.1f}s "
+            f"dir={code_subdir} (结构/哈希变化；同结构二次运行应 <1s)"
+        )
+    # 运行时覆盖：权重、状态界、NLP 迭代（不必重编）。
     W_full = np.diag(np.concatenate([np.diag(W_state), np.diag(R)]))
     for i in range(int(N)):
         solver.cost_set(i, "W", W_full)
     solver.cost_set(int(N), "W", W_e)
     _apply_solver_state_bounds(solver, int(N), robot_lbx, robot_ubx)
+    _apply_runtime_solver_options(solver, int(max_iter), solver_type=_stype)
     return solver, acados_model, pin_model, nq, nv, nu, limits
 
 
@@ -470,6 +698,81 @@ def _state_to_yref_e(x_ref: np.ndarray, nq: int, n_arm: int) -> np.ndarray:
     return _state_to_y_np(x_ref, nq, n_arm)
 
 
+def _cost_term_keys(n_arm: int) -> List[str]:
+    """Cost analysis 分项名（与 _build_cost_y_exprs / W 布局对应，含臂时多关节项）。"""
+    keys = ["pos", "att"]
+    if n_arm > 0:
+        keys.append("joint")
+    keys += ["vel", "omega"]
+    if n_arm > 0:
+        keys.append("joint_vel")
+    keys.append("u_thrust")
+    if n_arm > 0:
+        keys.append("u_torque")
+    keys.append("terminal")
+    return keys
+
+
+def _acados_cost_term_breakdown(
+    solver: "AcadosOcpSolver",
+    N: int,
+    nq: int,
+    n_arm: int,
+    W_state_diag: np.ndarray,
+    R_diag: np.ndarray,
+    w_terminal_track: float,
+    yref_running: List[np.ndarray],
+    yref_terminal: Optional[np.ndarray],
+) -> Dict[str, float]:
+    """按 NONLINEAR_LS 布局拆解本拍 MPC 的加权代价（0.5·rᵀWr，分项求和）。
+
+    running 段（stage 0..N-1）：y=[pos,att,joint?,vel,omega,joint_vel?,u_thrust,u_torque?]；
+    terminal 段（stage N）：仅状态项，权重 ×w_terminal_track，单列为 'terminal'。
+    各分项之和 ≈ solver.get_cost()，但 get_cost 作为 total 单独记录以保精确。
+    """
+    na = int(n_arm)
+    sy = 12 + 2 * na  # 状态 y 维度
+    W_run = np.concatenate([np.asarray(W_state_diag, float), np.asarray(R_diag, float)])
+    W_e_diag = np.asarray(W_state_diag, float) * float(w_terminal_track)
+    grp = {k: 0.0 for k in _cost_term_keys(na)}
+
+    for i in range(int(N)):
+        xi = np.asarray(solver.get(i, "x"), dtype=float).flatten()
+        ui = np.asarray(solver.get(i, "u"), dtype=float).flatten()
+        yi = np.concatenate([_state_to_y_np(xi, nq, na), ui])
+        ref = (
+            np.asarray(yref_running[i], dtype=float).flatten()
+            if i < len(yref_running)
+            else np.zeros_like(yi)
+        )
+        m = min(yi.size, ref.size, W_run.size)
+        wsq = W_run[:m] * (yi[:m] - ref[:m]) ** 2
+        grp["pos"] += 0.5 * float(np.sum(wsq[0:3]))
+        grp["att"] += 0.5 * float(np.sum(wsq[3:6]))
+        off = 6
+        if na > 0:
+            grp["joint"] += 0.5 * float(np.sum(wsq[off : off + na]))
+            off += na
+        grp["vel"] += 0.5 * float(np.sum(wsq[off : off + 3]))
+        grp["omega"] += 0.5 * float(np.sum(wsq[off + 3 : off + 6]))
+        wc = wsq[sy:]
+        grp["u_thrust"] += 0.5 * float(np.sum(wc[0:4]))
+        if na > 0:
+            grp["joint_vel"] += 0.5 * float(np.sum(wsq[off + 6 : off + 6 + na]))
+            grp["u_torque"] += 0.5 * float(np.sum(wc[4 : 4 + na]))
+
+    xN = np.asarray(solver.get(int(N), "x"), dtype=float).flatten()
+    yN = _state_to_y_np(xN, nq, na)
+    refN = (
+        np.asarray(yref_terminal, dtype=float).flatten()
+        if yref_terminal is not None
+        else np.zeros_like(yN)
+    )
+    me = min(yN.size, refN.size, W_e_diag.size)
+    grp["terminal"] = 0.5 * float(np.sum(W_e_diag[:me] * (yN[:me] - refN[:me]) ** 2))
+    return grp
+
+
 def _resolve_ee_frame_id(pin_model: "pin.Model") -> int:
     """Return a valid EE frame id. For s500 (no gripper) fall back to the base frame.
 
@@ -485,6 +788,45 @@ def _resolve_ee_frame_id(pin_model: "pin.Model") -> int:
         if 0 <= cand < nframes:
             return cand
     return max(0, nframes - 1)
+
+
+def _tau_applied_generalized(
+    u_apply: np.ndarray,
+    A_alloc: np.ndarray,
+    nv: int,
+    nu: int,
+    n_rotors: int,
+) -> np.ndarray:
+    """名义施加广义力（机体系 rotor wrench + 臂关节力矩），与 aba / 动量观测器输入一致。"""
+    w_rotor = A_alloc @ np.asarray(u_apply[:n_rotors], dtype=float)
+    tau_app = np.zeros(nv, dtype=float)
+    tau_app[2] = float(w_rotor[0])
+    tau_app[3:6] = np.asarray(w_rotor[1:4], dtype=float)
+    if nu > n_rotors and nv > 6:
+        n_extra = min(nu - n_rotors, nv - 6)
+        tau_app[6 : 6 + n_extra] = np.asarray(
+            u_apply[n_rotors : n_rotors + n_extra], dtype=float
+        )
+    return tau_app
+
+
+def _fill_sigma_mom_wb(
+    sigma_for_mpc: np.ndarray,
+    mom_obs,
+    R_bw: np.ndarray,
+    n_dist_param: int,
+    n_arm: int,
+    *,
+    arm_only: bool = False,
+) -> None:
+    """动量观测器 → MPC 扰动参数。arm_only=True 时只填 p[6:]（臂关节）。"""
+    if not arm_only:
+        w_w = mom_obs.base_wrench_world(R_bw)
+        sigma_for_mpc[:6] = np.asarray(w_w, dtype=float).reshape(6)
+    if n_dist_param > 6 and n_arm > 0:
+        arm_ext = np.asarray(mom_obs.arm_torque_ext(), dtype=float).reshape(-1)
+        n_take = min(n_dist_param - 6, int(n_arm), arm_ext.size)
+        sigma_for_mpc[6 : 6 + n_take] = arm_ext[:n_take]
 
 
 def _bodyrate_from_horizon_states(
@@ -620,6 +962,10 @@ def run_closed_loop_track_full_state_plan_acados(
     baseline: str = "acados",
     geometric: Optional[Dict[str, Any]] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    solver_type: str = "SQP",
+    integrator: Optional[str] = None,
+    cost_analysis: bool = True,
+    inertia_scaling: bool = False,
 ) -> Dict[str, Any]:
     """Receding-horizon Acados tracking of ``(t_plan, x_plan)`` with RK4 plant.
 
@@ -633,6 +979,13 @@ def run_closed_loop_track_full_state_plan_acados(
         raise ValueError("x_plan must be 2D with same length as t_plan")
 
     urdf_path = _infer_urdf_path(x_plan, urdf_path)
+    # 扰动增广开关：扩成 6+n_arm 维模型扰动参数（base 6D 世界系 wrench + 臂关节力矩），
+    # 供 in-model 注入喂入广义外力。in-model 注入**必须**增广（否则臂关节那块广义力无
+    # 通道传给 MPC）；bolt-on 不需要增广模型，u_ad 直接补。
+    _inject_early = str((l1 or {}).get("inject", "bolt_on")).strip().lower()
+    obs_wholebody = control_mode == "direct" and (
+        _inject_early == "in_model" or bool((l1 or {}).get("obs_wholebody", False))
+    )
     solver, acados_model, pin_model, nq, nv, nu, limits = create_full_state_tracking_mpc_solver(
         N,
         dt_mpc,
@@ -651,14 +1004,50 @@ def run_closed_loop_track_full_state_plan_acados(
         control_mode=control_mode,
         urdf_path=urdf_path,
         state_limits=state_limits,
+        solver_type=solver_type,
+        integrator=integrator,
+        obs_wholebody=obs_wholebody,
+        inertia_scaling=inertia_scaling,
     )
     n_arm = nq - 7
+    joint_weight_scales = (
+        arm_joint_inertia_scales(pin_model, n_arm)
+        if (inertia_scaling and n_arm > 0)
+        else None
+    )
+    # 扰动参数维度：whole-body 时 6+n_arm（base 6 维世界系 wrench + 臂关节力矩），否则 6。
+    n_dist_param = 6 + (n_arm if (obs_wholebody and n_arm > 0) else 0)
     n_robot = nq + nv
     if x_plan.shape[1] < n_robot:
         raise ValueError(
             f"x_plan has {x_plan.shape[1]} state columns but robot needs {n_robot} "
             f"(urdf={urdf_path})"
         )
+
+    # ── Cost analysis：重建权重对角，用于每拍 NONLINEAR_LS 代价分项拆解 ──
+    _Wst, _Rdiag, _ = croc_tracking_weights_to_W_R(
+        n_arm=n_arm, w_pos=w_pos, w_att=w_att, w_joint=w_joint, w_vel=w_vel,
+        w_omega=w_omega, w_joint_vel=w_joint_vel, w_control=w_control,
+        w_u_thrust=w_u_thrust, w_u_joint_torque=w_u_joint_torque,
+        w_state_track=w_state_track, w_terminal_track=w_terminal_track,
+        joint_weight_scales=joint_weight_scales,
+    )
+    W_state_diag = np.diag(_Wst).astype(float)
+    R_diag = np.diag(_Rdiag).astype(float)
+    cost_term_keys = _cost_term_keys(n_arm)
+    _s_track = float(w_state_track)
+    mpc_cost_weights: Dict[str, float] = {
+        "pos": w_pos * _s_track, "att": w_att * _s_track,
+        "vel": w_vel * _s_track, "omega": w_omega * _s_track,
+        "u_thrust": w_control * w_u_thrust, "terminal": float(w_terminal_track),
+    }
+    if n_arm > 0:
+        mpc_cost_weights["joint"] = w_joint * _s_track
+        mpc_cost_weights["joint_vel"] = w_joint_vel * _s_track
+        mpc_cost_weights["u_torque"] = w_control * w_u_joint_torque * 10000.0
+    mpc_costs: List[float] = []
+    mpc_solve_t: List[float] = []
+    mpc_cost_terms_hist: Dict[str, List[float]] = {k: [] for k in cost_term_keys}
 
     # 名义模型函数 f(x,u)：disturbance-aware 模型含自由参数 p_dist_w，这里代入 0 得到
     # 名义动力学（rollout/初值猜测/CTBR 有限差分 B 都应基于无扰名义模型，扰动只通过
@@ -682,6 +1071,8 @@ def run_closed_loop_track_full_state_plan_acados(
         build_rotor_allocation,
         corrupt_state_estimate,
         external_force_torque,
+        ee_wrench_world,
+        disturbance_base_equiv_world,
         _active as _dist_active,
         _quat_to_R_np,
     )
@@ -689,12 +1080,23 @@ def run_closed_loop_track_full_state_plan_acados(
     dist_params = DisturbanceParams.from_dict(disturbance)
     l1_cfg = dict(l1) if l1 else {}
     l1_on = bool(l1_cfg.get("enabled", False)) and control_mode == "direct"
+    # 扰动补偿开关：与扰动估计解耦。comp_on=False → 估计器照常运行并记录 σ̂（供
+    # 真值/估计对照绘图），但不把 σ̂ 注入控制器（不做 bolt-on dFz/tilt、不做模型增广），
+    # 即"只估计不补偿"。独立的位置误差反馈通道不受此开关影响。
+    comp_on = bool(l1_cfg.get("comp_enabled", True))
     # 位置误差反馈通道：独立于 L1 估计，可在不开 L1 时单独用跟踪误差产生补偿。
     pos_fb_on = bool(l1_cfg.get("use_pos_feedback", False)) and control_mode == "direct"
-    # 补偿来源：'adaptive'（L1 在线估计）或 'oracle'（用扰动真值，假设可精确测量），
-    # 两者共用同一补偿管线（dFz/tilt、CTBR、位置通道），用于解耦评估补偿环节性能。
+    # 补偿来源（仅两种）：
+    #   'adaptive' → 广义 L1：在广义动量上一阶自适应，在线估计**完整**广义外力
+    #                τ̂_ext = [base力(3), base力矩(3), 臂关节(n)]（GeneralizedL1Estimator）；
+    #   'oracle'   → 用扰动真值（假设可精确测量），同一注入管线，用于上界对照/调试。
+    # 两者共用两条注入路径：bolt-on（u_b+u_ad）与 in-model（增广 MPC）。
     comp_mode = str(l1_cfg.get("mode", "adaptive")).strip().lower()
+    if comp_mode not in ("adaptive", "oracle"):
+        comp_mode = "adaptive"   # 旧 'momentum' 等估计来源已统一并入广义 L1
     oracle_on = l1_on and comp_mode == "oracle"
+    # 广义 L1 估计开关（估计独立于补偿：comp_on=False 时仍估计并记录，仅不注入）。
+    gen_l1_on = l1_on and comp_mode == "adaptive" and control_mode == "direct"
     dist_on = dist_params.any_enabled() and control_mode == "direct"
 
     # ── CTBR 内环（总推力 + 前瞻角速度设定点 → 角速度 PID → 分配 → 电机一阶）──
@@ -741,9 +1143,24 @@ def run_closed_loop_track_full_state_plan_acados(
     inject_mode = str(l1_cfg.get("inject", "bolt_on")).strip().lower()
     dist_aware_on = (
         l1_on
+        and comp_on
         and inject_mode == "in_model"
         and not geometric_on
         and control_mode == "direct"
+    )
+    # per-stage 扰动前馈：oracle（扰动解析已知）时，给 horizon 每个 stage 喂它对应
+    # 预测时刻 t_k+i·dt_mpc 的真实世界系扰动力，而非全程常值。这样 MPC 能在扰动
+    # 真正作用前就"看见"后段 stage 的扰动并提前预倾（preview/anticipation），
+    # 显著削弱阶跃扰动瞬间的位置/姿态暂态。L1 估计模式无未来信息 → 仍常值保持。
+    dist_aware_perstage = dist_aware_on and oracle_on
+    # 模型增广的"估计更新时机"：
+    #   'post'（默认，原行为）：求解后才更新 σ̂，下一拍才喂进模型 → 单拍滞后；
+    #   'pre'：本拍先用当前量测做估计，立刻用于本拍 MPC 模型参数 → 消除单拍滞后。
+    # 仅对 L1 估计的模型增广有意义（oracle 走 per-stage、用当前/未来解析真值，无滞后）。
+    dist_aware_update = str(l1_cfg.get("dist_aware_update", "post")).strip().lower()
+    dist_aware_pre = (
+        dist_aware_on and (not dist_aware_perstage)
+        and dist_aware_update == "pre"
     )
 
     n_rotors = 4
@@ -773,8 +1190,45 @@ def run_closed_loop_track_full_state_plan_acados(
                 setattr(l1p, k, l1_cfg[k])
         l1_aug = L1AdaptiveAugmentation(l1p)
 
+    # ── 广义 L1 估计器：在广义动量上一阶自适应，估计完整广义外力 τ̂_ext (nv) ──
+    # 内核为广义动量观测器（即广义 L1 的实现），增益 K 即各通道低通带宽。base 平动力
+    # 的补偿映射（bolt-on 的 dFz/tilt + 位置积分）仍复用 l1_aug 的成熟管线。
+    gen_est = None
+    obs_grasp_reset_t = float(l1_cfg.get("obs_grasp_reset_t", -1.0))
+    if gen_l1_on:
+        from l1_adaptive import GeneralizedL1Estimator, GeneralizedL1Params
+
+        gen_est = GeneralizedL1Estimator(
+            pin_model, nq, nv,
+            GeneralizedL1Params(
+                enabled=True,
+                k_force=float(l1_cfg.get("obs_k_force", 20.0)),
+                k_torque=float(l1_cfg.get("obs_k_torque", 20.0)),
+                k_arm=float(l1_cfg.get("obs_k_arm", 20.0)),
+                max_force=float(l1_cfg.get("gen_max_force", 40.0)),
+                max_torque=float(l1_cfg.get("gen_max_torque", 10.0)),
+                max_arm=float(l1_cfg.get("gen_max_arm", 10.0)),
+            ),
+        )
+
+    # EE 力旋量注入 / 负载真值折算所需：EE 帧 id 与一份独立 pin data。
+    ee_id = _resolve_ee_frame_id(pin_model)
+    dist_data = pin_model.createData()
+    # 模拟负载仅 s500_uam(direct) 支持：plant 改用含负载惯量的增广模型积分。
+    load_on = bool(dist_params.load_enable) and n_arm > 0 and control_mode == "direct"
     if dist_params.any_plant_disturbance():
-        plant = DisturbedRK4Plant(f_fun, pin_model, sim_dt, nq, nv, nu)
+        f_load = None
+        load_model = None
+        if load_on:
+            from sim_disturbance import augment_pin_model_with_load
+
+            f_load = build_plant_f_fun(urdf_path, load_params=dist_params, ee_frame_id=ee_id)
+            load_model = augment_pin_model_with_load(pin_model, ee_id, dist_params)
+        plant = DisturbedRK4Plant(
+            f_fun, pin_model, sim_dt, nq, nv, nu,
+            f_load=f_load, load_model=load_model,
+            load_t0=float(dist_params.load_t0), load_t1=float(dist_params.load_t1),
+        )
     else:
         plant = CasadiRK4Plant(f_fun, sim_dt, nu)
     est_rng = np.random.default_rng(int(dist_params.est_seed))
@@ -809,6 +1263,15 @@ def run_closed_loop_track_full_state_plan_acados(
     dist_torque_body_log = np.zeros((n_steps, 3), dtype=float)
     dist_torque_world_log = np.zeros((n_steps, 3), dtype=float)
     l1_force_log = np.zeros((n_steps, 3), dtype=float)
+    # 动量观测器：base 估计力矩（世界系），与真实 dist_torque 对比。
+    l1_torque_log = np.zeros((n_steps, 3), dtype=float)
+    # s500_uam 臂关节扰动力矩真值/估计（关节空间 [N·m]，仅 n_arm>0 时有效）。
+    dist_joint_torque_log = (
+        np.zeros((n_steps, n_arm), dtype=float) if n_arm > 0 else None
+    )
+    l1_joint_torque_log = (
+        np.zeros((n_steps, n_arm), dtype=float) if n_arm > 0 else None
+    )
     l1_force_body_log = np.zeros((n_steps, 3), dtype=float)
     l1_sigma_log = np.zeros((n_steps, 3), dtype=float)
     l1_aac_log = np.zeros((n_steps, 3), dtype=float)
@@ -851,14 +1314,32 @@ def run_closed_loop_track_full_state_plan_acados(
     # L1 预测器输入：上一拍"名义施加"比力加速度（世界系），必须含 L1 竖直注入，
     # 否则补偿推力会被误并入 σ̂，导致稳态估计仅为真值一半（见 _l1_predictor_accel）。
     l1_last_a_applied = np.zeros(3, dtype=float)
-    # disturbance-aware MPC：下发给 acados 模型参数的世界系扰动力（N）= m·σ̂，
-    # 用上一控制拍 L1/oracle 的 σ̂ 估计（单拍滞后，扰动慢变可忽略）。
-    sigma_for_mpc = np.zeros(3, dtype=float)
+    # disturbance-aware MPC：下发给 acados 模型参数的扰动 wrench（n_dist_param 维）。前 6
+    #   维 = 世界系 [F_world(3), M_world(3)]：力 = m·σ̂（L1/oracle 估计），力矩仅 oracle/动量
+    # 观测器提供；whole-body 时第 6: 维 = 关节空间扰动力矩（仅动量观测器提供）。
+    sigma_for_mpc = np.zeros(n_dist_param, dtype=float)
+    mom_grasp_done = False  # 估计器抓取事件软重置是否已触发
+    # 广义外力估计供绘图（base 世界系力/力矩 + 臂关节力矩），每个 MPC 拍更新、跨 stride 保持。
+    est_base_F_w = np.zeros(3, dtype=float)
+    est_base_M_w = np.zeros(3, dtype=float)
+    est_arm_tau = np.zeros(n_arm, dtype=float) if n_arm > 0 else None
+
+    # ── 运行时间分解统计（找瓶颈用）：各段累计墙钟 [s] 与调用次数 ──────────
+    prof_t: Dict[str, float] = {}
+    prof_n: Dict[str, int] = {}
+
+    def _prof(name: str, dt: float) -> None:
+        prof_t[name] = prof_t.get(name, 0.0) + float(dt)
+        prof_n[name] = prof_n.get(name, 0) + 1
+
+    _loop_t0 = time.perf_counter()
 
     for k in range(n_steps):
         t_k = k * sim_dt
         plant.on_pre_step(t_k, k)
         do_mpc = k % mpc_stride == 0
+        # 模型增广 'pre' 模式：本拍是否已在 MPC 求解前做过 L1 估计（避免后置块重复 step）。
+        l1_pre_done = False
 
         # 控制器看到的状态估计（含量测噪声）。
         x_meas = (
@@ -867,6 +1348,7 @@ def run_closed_loop_track_full_state_plan_acados(
             else x
         )
 
+        _t_dompc = time.perf_counter()
         if do_mpc:
             if geometric_on:
                 # ── geometric baseline（SE3 几何，机体 s500，只走 CTBR）──────────
@@ -926,19 +1408,144 @@ def run_closed_loop_track_full_state_plan_acados(
                 solver.constraints_set(0, "ubx", x_meas, api="new")
 
                 xr_now = interp_full_state_piecewise(t_k, t_plan, x_plan, pin_model)
+                yref_running: List[np.ndarray] = []
                 for i in range(N):
                     ti = t_k + i * dt_mpc
                     xr = interp_full_state_piecewise(ti, t_plan, x_plan, pin_model)
                     yref = _state_to_yref(xr, u_hover, nq, n_arm)
                     solver.cost_set(i, "yref", yref, api="new")
+                    yref_running.append(yref)
                 xrN = interp_full_state_piecewise(t_k + N * dt_mpc, t_plan, x_plan, pin_model)
-                solver.cost_set(N, "yref", _state_to_yref_e(xrN, nq, n_arm), api="new")
+                yref_terminal = _state_to_yref_e(xrN, nq, n_arm)
+                solver.cost_set(N, "yref", yref_terminal, api="new")
 
-                # disturbance-aware MPC：把上一拍估计的世界系扰动力（常值保持）下发到
-                # horizon 全程参数 p_dist_w；后嵌模式保持 0（名义模型）。
-                p_dist_stage = sigma_for_mpc if dist_aware_on else np.zeros(3, dtype=float)
-                for i in range(N + 1):
-                    solver.set(i, "p", p_dist_stage)
+                # 模型增广 'pre'：本拍先用当前量测做广义 L1 估计，立即用于本拍模型参数
+                # （消除单拍滞后）。仅 adaptive(广义 L1) 的 in-model 走这里（oracle 走 per-stage）。
+                # 补偿全在模型层，事后推力增量恒 0；广义 L1 产出 base 6D wrench + 臂关节力矩。
+                if dist_aware_pre and gen_est is not None:
+                    R_meas_pre = _quat_to_R_np(x_meas[3:7])
+                    b3_pre = R_meas_pre[:, 2]
+                    v_world_pre = R_meas_pre @ x_meas[nq : nq + 3]
+                    pos_err_pre = x_meas[0:3] - np.asarray(xr_now[0:3], dtype=float)
+                    # 位置积分通道仍由 l1_aug 维护（其平动 σ̂ 不再用于喂模型）。
+                    if l1_aug is not None:
+                        l1_aug.step(
+                            control_dt, v_world_pre, l1_last_a_applied,
+                            pos_err_world=pos_err_pre, R_bw=R_meas_pre,
+                        )
+                    if obs_grasp_reset_t >= 0.0 and not mom_grasp_done and (
+                        t_k >= obs_grasp_reset_t
+                    ):
+                        gen_est.reset(
+                            np.asarray(x_meas[:nq], dtype=float),
+                            np.asarray(x_meas[nq : nq + nv], dtype=float),
+                        )
+                        mom_grasp_done = True
+                    tau_app_pre = _tau_applied_generalized(
+                        u_apply, A_alloc, nv, nu, n_rotors
+                    )
+                    gen_est.step(
+                        np.asarray(x_meas[:nq], dtype=float),
+                        np.asarray(x_meas[nq : nq + nv], dtype=float),
+                        tau_app_pre, control_dt,
+                    )
+                    # 求解前尚无本拍 T_baseline，用上一拍 MPC 指令 u_apply 的总推力。
+                    T_cmd_pre = float(np.sum(u_apply[:n_rotors]))
+                    l1_last_a_applied = (
+                        (T_cmd_pre / max(nominal_mass, 1e-6)) * b3_pre
+                        - np.array([0.0, 0.0, GRAVITY])
+                    )
+                    l1_thrust_delta = np.zeros(nu, dtype=float)
+                    l1_thrust_delta_l1 = np.zeros(nu, dtype=float)
+                    l1_thrust_delta_pos = np.zeros(nu, dtype=float)
+                    # 广义 L1：base 6D 世界系 wrench → p[:6]，臂关节力矩 → p[6:]。
+                    sigma_for_mpc = np.zeros(n_dist_param, dtype=float)
+                    _fill_sigma_mom_wb(
+                        sigma_for_mpc, gen_est, R_meas_pre,
+                        n_dist_param, n_arm, arm_only=False,
+                    )
+                    _bw_pre = gen_est.base_wrench_world(R_meas_pre)
+                    est_base_F_w = np.asarray(_bw_pre[:3], dtype=float)
+                    est_base_M_w = np.asarray(_bw_pre[3:6], dtype=float)
+                    if n_arm > 0:
+                        _ae = np.asarray(gen_est.arm_torque_ext(), dtype=float).reshape(-1)
+                        est_arm_tau = np.zeros(n_arm, dtype=float)
+                        est_arm_tau[: min(n_arm, _ae.size)] = _ae[:n_arm]
+                    l1_pre_done = True
+
+                # disturbance-aware MPC：下发世界系扰动力参数 p_dist_w 给 horizon。
+                #  • oracle（per-stage）：逐 stage 按预测时刻的解析真值下发 → 提前预倾；
+                #  • L1 估计：无未来信息，全程用上一拍 σ̂·m 常值保持；
+                #  • 后嵌/非增广：恒 0（名义模型）。
+                if dist_aware_perstage:
+                    # 位置误差积分反馈（in_model 专用）：前馈只把"已知扰动"喂进模型，MPC 是
+                    # 有限权重的比例式调节器，对常值扰动天然留有稳态偏差（提高 w_pos/w_att
+                    # 只能缩小不能归零）。把积分+比例位置反馈折算成"附加等效扰动力"叠加进
+                    # p[:3]，MPC 会多倾转一点去抵消它 → 真正的零稳态误差（offset-free）。
+                    # 注：l1_aug.a_pos 用上一拍值（step_oracle 在本块之后才更新），单拍滞后。
+                    pos_fb_force_w = np.zeros(3, dtype=float)
+                    if pos_fb_on and l1_aug is not None:
+                        pos_fb_force_w = -nominal_mass * np.asarray(
+                            l1_aug.a_pos, dtype=float
+                        ).reshape(3)
+                    for i in range(N + 1):
+                        ti = t_k + i * dt_mpc
+                        xi = (
+                            x_prev[i]
+                            if (x_prev is not None and i < len(x_prev))
+                            else x_meas
+                        )
+                        ui = (
+                            u_prev[i]
+                            if (u_prev is not None and i < len(u_prev))
+                            else u_hover
+                        )
+                        Ri = _quat_to_R_np(np.asarray(xi[3:7], dtype=float))
+                        vi_w = Ri @ np.asarray(xi[nq : nq + 3], dtype=float)
+                        Ti = float(np.sum(np.asarray(ui)[:n_rotors]))
+                        # base 等效世界系 6D wrench（base+EE+负载重力等效）；whole-body
+                        # 时再取 EE/负载经 J^T 折算的臂关节力矩，喂给 p[6:]（否则 EE 侧向力
+                        # 压弯机械臂的关节力矩没有任何通道补偿 → 稳态 EE 侧偏无法消除）。
+                        _want_arm = n_dist_param > 6 and n_arm > 0
+                        if _want_arm:
+                            F_w_i, M_w_i, tau_arm_i = disturbance_base_equiv_world(
+                                dist_params, ti, np.asarray(xi[:nq], dtype=float), Ri,
+                                vi_w, Ti, n_rotors, pin_model, dist_data, ee_id, nv,
+                                n_arm, return_arm=True,
+                            )
+                        else:
+                            F_w_i, M_w_i = disturbance_base_equiv_world(
+                                dist_params, ti, np.asarray(xi[:nq], dtype=float), Ri,
+                                vi_w, Ti, n_rotors, pin_model, dist_data, ee_id, nv,
+                                n_arm,
+                            )
+                            tau_arm_i = None
+                        dT_i = 0.0
+                        if dist_on and _dist_active(
+                            ti, dist_params.thrust_enable,
+                            dist_params.thrust_t0, dist_params.thrust_t1,
+                        ):
+                            dT_i = (
+                                (dist_params.thrust_scale - 1.0) * Ti
+                                + dist_params.thrust_bias
+                            )
+                        # 6D wrench：力 = 外力 + 推力偏差等效力；力矩 = 外力矩（世界系）。
+                        p_i = np.zeros(n_dist_param, dtype=float)
+                        p_i[:3] = F_w_i + dT_i * Ri[:, 2] + pos_fb_force_w
+                        p_i[3:6] = np.asarray(M_w_i, dtype=float).reshape(3)
+                        if tau_arm_i is not None:
+                            n_take = min(n_dist_param - 6, int(n_arm), tau_arm_i.size)
+                            p_i[6 : 6 + n_take] = np.asarray(
+                                tau_arm_i, dtype=float
+                            )[:n_take]
+                        solver.set(i, "p", p_i)
+                else:
+                    p_dist_stage = (
+                        sigma_for_mpc if dist_aware_on
+                        else np.zeros(n_dist_param, dtype=float)
+                    )
+                    for i in range(N + 1):
+                        solver.set(i, "p", p_dist_stage)
 
                 t0 = time.perf_counter()
                 status = int(solver.solve())
@@ -948,6 +1555,32 @@ def run_closed_loop_track_full_state_plan_acados(
                 mpc_solve_steps.append(k)
                 mpc_iters.append(n_iter)
                 mpc_wall_s.append(wall_s)
+                _prof("mpc_solve", wall_s)
+
+                # ── Cost analysis：总代价（get_cost）+ 分项拆解（与 Crocoddyl 对齐）──
+                _t_cost = time.perf_counter()
+                try:
+                    _total_cost = float(solver.get_cost())
+                except Exception:
+                    _total_cost = float("nan")
+                mpc_costs.append(_total_cost)
+                mpc_solve_t.append(float(t_k))
+                # 分项拆解开销不小（每控制步遍历 horizon 读 solver.get）。cost_analysis=False
+                # 时跳过，仅保留总代价（get_cost 很便宜），分项填 NaN 保持数组对齐。
+                if cost_analysis:
+                    try:
+                        _grp = _acados_cost_term_breakdown(
+                            solver, N, nq, n_arm, W_state_diag, R_diag,
+                            w_terminal_track, yref_running, yref_terminal,
+                        )
+                    except Exception:
+                        _grp = {}
+                    for _ck in cost_term_keys:
+                        mpc_cost_terms_hist[_ck].append(float(_grp.get(_ck, float("nan"))))
+                else:
+                    for _ck in cost_term_keys:
+                        mpc_cost_terms_hist[_ck].append(float("nan"))
+                _prof("cost_breakdown", time.perf_counter() - _t_cost)
 
                 if mpc_log_interval > 0 and len(mpc_solve_steps) % mpc_log_interval == 0:
                     print(
@@ -960,18 +1593,27 @@ def run_closed_loop_track_full_state_plan_acados(
                 T_baseline = float(np.sum(u_apply[:n_rotors]))
                 ctbr_omega_base = None
 
-            # ── L1 自适应：估计集总扰动并映射为四路推力增量（control rate） ──
-            if l1_aug is not None:
+            # ── 扰动估计 + 注入：估计完整广义外力 → bolt-on(u_ad) 或 in-model(模型增广) ──
+            # 'pre' 模式本拍已在求解前 step 过 → 跳过，避免估计器被二次步进。
+            _t_est = time.perf_counter()
+            if (gen_est is not None or oracle_on) and not l1_pre_done:
                 R_meas = _quat_to_R_np(x_meas[3:7])
                 b3 = R_meas[:, 2]
                 v_world = R_meas @ x_meas[nq : nq + 3]
                 T_cmd = float(T_baseline)
                 pos_err = (x_meas[0:3] - np.asarray(xr_now[0:3], dtype=float))
+
+                # ── 估计/真值：base 世界系 wrench [F_w(3), M_w(3)] + 臂关节力矩 τ_arm(n) ──
+                base_F_w = np.zeros(3, dtype=float)
+                base_M_w = np.zeros(3, dtype=float)
+                arm_tau = np.zeros(n_arm, dtype=float) if n_arm > 0 else None
                 if oracle_on:
-                    # Oracle：用扰动真值（世界系加速度）= F_dist_world / m，假设可精确测量。
-                    # 与 plant 侧 dist_force_log 一致：外力 + 推力估计偏差等效力。
-                    F_ext_o, _Mb_o, _Mw_o = external_force_torque(
-                        dist_params, t_k, R_meas, v_world, float(T_baseline), n_rotors
+                    # Oracle：用扰动真值（base 等效世界系 wrench + 臂关节力矩），与 plant
+                    # 侧 dist_force_log 同口径，外加推力估计偏差等效力（沿机体 z）。
+                    F_w_o, M_w_o, tau_arm_o = disturbance_base_equiv_world(
+                        dist_params, t_k, x_meas[:nq], R_meas, v_world,
+                        float(T_baseline), n_rotors, pin_model, dist_data, ee_id,
+                        nv, n_arm, return_arm=True,
                     )
                     dT_o = 0.0
                     if dist_on and _dist_active(
@@ -982,22 +1624,58 @@ def run_closed_loop_track_full_state_plan_acados(
                             (dist_params.thrust_scale - 1.0) * float(T_baseline)
                             + dist_params.thrust_bias
                         )
-                    sigma_true = (F_ext_o + dT_o * b3) / max(nominal_mass, 1e-6)
+                    base_F_w = np.asarray(F_w_o, dtype=float).reshape(3) + dT_o * b3
+                    base_M_w = np.asarray(M_w_o, dtype=float).reshape(3)
+                    if n_arm > 0 and tau_arm_o is not None:
+                        ta = np.asarray(tau_arm_o, dtype=float).reshape(-1)
+                        arm_tau = np.zeros(n_arm, dtype=float)
+                        arm_tau[: min(n_arm, ta.size)] = ta[:n_arm]
+                else:
+                    # adaptive：广义 L1 在广义动量上一阶自适应，估计完整广义外力 τ̂_ext。
+                    if obs_grasp_reset_t >= 0.0 and not mom_grasp_done and (
+                        t_k >= obs_grasp_reset_t
+                    ):
+                        gen_est.reset(
+                            np.asarray(x_meas[:nq], dtype=float),
+                            np.asarray(x_meas[nq : nq + nv], dtype=float),
+                        )
+                        mom_grasp_done = True
+                    tau_app = _tau_applied_generalized(u_apply, A_alloc, nv, nu, n_rotors)
+                    gen_est.step(
+                        np.asarray(x_meas[:nq], dtype=float),
+                        np.asarray(x_meas[nq : nq + nv], dtype=float),
+                        tau_app, control_dt,
+                    )
+                    bw = gen_est.base_wrench_world(R_meas)
+                    base_F_w = np.asarray(bw[:3], dtype=float)
+                    base_M_w = np.asarray(bw[3:6], dtype=float)
+                    if n_arm > 0:
+                        ae = np.asarray(gen_est.arm_torque_ext(), dtype=float).reshape(-1)
+                        arm_tau = np.zeros(n_arm, dtype=float)
+                        arm_tau[: min(n_arm, ae.size)] = ae[:n_arm]
+
+                # base 平动补偿加速度（世界系）σ=F_ext/m，补偿=-σ。复用 l1_aug 的 dFz/tilt
+                # + 位置积分管线（step_oracle = 给定 σ̂ 算补偿，不经预测器）。
+                sigma_world = base_F_w / max(nominal_mass, 1e-6)
+                if l1_aug is not None:
                     a_ac = l1_aug.step_oracle(
-                        control_dt, sigma_true, pos_err_world=pos_err, R_bw=R_meas
+                        control_dt, sigma_world, pos_err_world=pos_err, R_bw=R_meas
                     )
                 else:
-                    # 预测器输入用上一拍含 L1 竖直注入的实际加速度，使 σ̂ = 真实外部扰动。
-                    a_ac = l1_aug.step(
-                        control_dt, v_world, l1_last_a_applied,
-                        pos_err_world=pos_err, R_bw=R_meas,
-                    )
+                    a_ac = np.zeros(3, dtype=float)
+
+                if not comp_on:
+                    # 仅估计不补偿：丢弃 L1 补偿分量，仅保留位置误差反馈 a_pos。
+                    if l1_aug is not None:
+                        l1_aug.a_l1 = np.zeros(3, dtype=float)
+                        l1_aug._a_l1_body = np.zeros(3, dtype=float)
+                        l1_aug.a_ac = np.asarray(l1_aug.a_pos, dtype=float).copy()
+                        a_ac = l1_aug.a_ac.copy()
+                    else:
+                        a_ac = np.zeros(3, dtype=float)
+
                 if geometric_on or dist_aware_on:
-                    # 补偿已在 baseline 力层注入，不做 direct 的事后 dFz/tilt 映射：
-                    #  • geometric：a_ac 前馈进 a_des（T_geo/omega_geo 已含倾转/抬推力）；
-                    #  • dist_aware：σ̂·m 作为模型参数喂进 MPC，u_apply 已是预测最优解。
-                    # 二者预测器输入都用名义比力 =(T_baseline/m)·b3 - g（不加 dFz，否则
-                    # 推力重复计入；横向补偿效果已体现在测量姿态 b3 中）。
+                    # in-model / geometric：补偿走模型层 / baseline 力层，不做事后推力映射。
                     l1_thrust_delta = np.zeros(nu, dtype=float)
                     l1_thrust_delta_l1 = np.zeros(nu, dtype=float)
                     l1_thrust_delta_pos = np.zeros(nu, dtype=float)
@@ -1006,28 +1684,38 @@ def run_closed_loop_track_full_state_plan_acados(
                         - np.array([0.0, 0.0, GRAVITY])
                     )
                 else:
+                    # ── bolt-on：u = u_b + u_ad ─────────────────────────────────
+                    # base 竖直/水平力 → dFz + 倾转（复用 a_ac 管线）；base 转动力矩 →
+                    # 推力差动 -M_b；臂关节（全驱动）→ 直接补 -τ̂_arm。
                     dFz = nominal_mass * float(np.dot(a_ac, b3))
                     a_nom = (T_cmd / max(nominal_mass, 1e-6)) * b3 - np.array([0.0, 0.0, GRAVITY])
                     f_des = a_nom + a_ac + np.array([0.0, 0.0, GRAVITY])
                     nfd = float(np.linalg.norm(f_des))
                     M_body = np.zeros(3)
-                    if nfd > 1e-6 and l1_aug.params.tilt_gain > 0.0:
+                    if nfd > 1e-6 and l1_aug is not None and l1_aug.params.tilt_gain > 0.0:
                         b3_des = f_des / nfd
                         e_tilt = np.cross(b3, b3_des)
                         M_body = R_meas.T @ (float(l1_aug.params.tilt_gain) * e_tilt)
-                    dthr = A_inv @ np.array([dFz, M_body[0], M_body[1], 0.0])
+                    # base 转动力矩补偿（机体系）：抵消外部 base 力矩 → -M_b（仅 comp_on）。
+                    M_base_comp = R_meas.T @ (-base_M_w) if comp_on else np.zeros(3)
+                    dthr = A_inv @ np.array([
+                        dFz, M_body[0] + M_base_comp[0],
+                        M_body[1] + M_base_comp[1], M_base_comp[2],
+                    ])
                     l1_thrust_delta = np.zeros(nu, dtype=float)
                     l1_thrust_delta[:n_rotors] = dthr
+                    # 臂关节直接补偿（全驱动）：u_ad_arm = -τ̂_arm（仅 comp_on）。
+                    if comp_on and n_arm > 0 and nu > n_rotors and arm_tau is not None:
+                        n_take = min(nu - n_rotors, n_arm)
+                        l1_thrust_delta[n_rotors : n_rotors + n_take] = -arm_tau[:n_take]
 
-                    # ── 推力增量分解：L1 纯补偿(a_l1) 与 位置通道(a_pos) ──────────
-                    # 竖直分量按比力投影线性可分；倾转力矩用 a_l1-only 的期望比力方向
-                    # 计算 M_l1，剩余 M_pos = M_body - M_l1，保证两路之和恒等于总增量。
-                    a_l1_w = np.asarray(l1_aug.a_l1, dtype=float)
-                    a_pos_w = np.asarray(l1_aug.a_pos, dtype=float)
+                    # ── 推力增量分解：L1 纯补偿(a_l1+base力矩+臂) 与 位置通道(a_pos) ──
+                    a_l1_w = np.asarray(l1_aug.a_l1, dtype=float) if l1_aug is not None else np.zeros(3)
+                    a_pos_w = np.asarray(l1_aug.a_pos, dtype=float) if l1_aug is not None else np.zeros(3)
                     dFz_l1 = nominal_mass * float(np.dot(a_l1_w, b3))
                     dFz_pos = nominal_mass * float(np.dot(a_pos_w, b3))
                     M_l1 = np.zeros(3)
-                    if nfd > 1e-6 and l1_aug.params.tilt_gain > 0.0:
+                    if nfd > 1e-6 and l1_aug is not None and l1_aug.params.tilt_gain > 0.0:
                         f_des_l1 = a_nom + a_l1_w + np.array([0.0, 0.0, GRAVITY])
                         nfd_l1 = float(np.linalg.norm(f_des_l1))
                         if nfd_l1 > 1e-6:
@@ -1038,27 +1726,39 @@ def run_closed_loop_track_full_state_plan_acados(
                     M_pos = M_body - M_l1
                     l1_thrust_delta_l1 = np.zeros(nu, dtype=float)
                     l1_thrust_delta_pos = np.zeros(nu, dtype=float)
+                    # base 力矩补偿归入 L1 补偿路（M_base_comp、Mz）。
                     l1_thrust_delta_l1[:n_rotors] = A_inv @ np.array(
-                        [dFz_l1, M_l1[0], M_l1[1], 0.0]
+                        [dFz_l1, M_l1[0] + M_base_comp[0], M_l1[1] + M_base_comp[1], M_base_comp[2]]
                     )
                     l1_thrust_delta_pos[:n_rotors] = A_inv @ np.array(
                         [dFz_pos, M_pos[0], M_pos[1], 0.0]
                     )
-                    # 为下一拍更新预测器输入：实际总推力 = baseline + L1 竖直注入 dFz。
-                    # 水平补偿靠倾转实现，其效果已体现在测量姿态 b3 中，故不再显式 +a_ac。
+                    if comp_on and n_arm > 0 and nu > n_rotors and arm_tau is not None:
+                        n_take = min(nu - n_rotors, n_arm)
+                        l1_thrust_delta_l1[n_rotors : n_rotors + n_take] = -arm_tau[:n_take]
+                    # 下一拍预测器输入：实际总推力 = baseline + L1 竖直注入 dFz。
                     T_actual = T_cmd + dFz
                     l1_last_a_applied = (
                         (T_actual / max(nominal_mass, 1e-6)) * b3
                         - np.array([0.0, 0.0, GRAVITY])
                     )
 
-                # disturbance-aware MPC：用本拍 σ̂（adaptive 估计 / oracle 真值，均存于
-                # l1_aug.sigma_hat）换算世界系扰动力 m·σ̂，供下一拍下发给 MPC 模型参数。
-                sigma_for_mpc = nominal_mass * np.asarray(
-                    l1_aug.sigma_hat, dtype=float
-                ).reshape(3)
+                # ── in-model：填 sigma_for_mpc（base 世界系 wrench + 臂关节）下拍喂模型 ──
+                sigma_for_mpc = np.zeros(n_dist_param, dtype=float)
+                if dist_aware_on and comp_on:
+                    sigma_for_mpc[:3] = base_F_w
+                    sigma_for_mpc[3:6] = base_M_w
+                    if n_dist_param > 6 and n_arm > 0 and arm_tau is not None:
+                        n_take = min(n_dist_param - 6, n_arm)
+                        sigma_for_mpc[6 : 6 + n_take] = arm_tau[:n_take]
+                # 估计供绘图：本拍 base wrench / 臂关节力矩（与 l1_aug.sigma_hat 一致）。
+                est_base_F_w = base_F_w
+                est_base_M_w = base_M_w
+                est_arm_tau = arm_tau
+            _prof("estimation", time.perf_counter() - _t_est)
 
             # ── CTBR 内环：总推力 + 前瞻角速度设定点 → 角速度 PID → 分配 ──────
+            _t_ctbr = time.perf_counter()
             if ctbr_on:
                 R_c = _quat_to_R_np(x_meas[3:7])
                 b3_c = R_c[:, 2]
@@ -1129,14 +1829,26 @@ def run_closed_loop_track_full_state_plan_acados(
                     uu[_j] += 1.0
                     xdj = np.asarray(f_fun(x_eff, uu)).flatten()
                     B[:, _j] = (xdj[nq + 3 : nq + 6] - xdot0[nq + 3 : nq + 6])
+                # 角加速度对旋翼力为仿射：α(r)=α0+B·r，α0=ω̇(r=0)=xdot0−B·u_apply 为
+                # 零旋翼力时的开环角加速度，含重力力矩 **与机械臂反作用力矩**（aba 对广义力
+                # 线性，故 α0 精确、非线性化近似）。要让实际角加速度=w_cmd，须解 B·r=w_cmd−α0。
+                # 旧实现解 B·r=w_cmd 漏掉 α0：纯四旋翼水平悬停 α0≈0 看不出，但带臂/偏置负载
+                # 时 α0≠0，稳态(PID→0)旋翼不平衡 arm 反作用力矩 → base 姿态漂移 → 经耦合
+                # 引起 arm joint 静差。等价于以 MPC 旋翼力为前馈、PID 仅作修正。
+                alpha0 = (
+                    xdot0[nq + 3 : nq + 6]
+                    - B @ np.asarray(u_apply[:n_rotors], dtype=float)
+                )
                 A_mix = np.vstack([np.ones((1, n_rotors)), B])
-                b_mix = np.concatenate([[T_cmd_c], w_cmd])
+                b_mix = np.concatenate([[T_cmd_c], w_cmd - alpha0])
                 try:
                     rotors = np.linalg.solve(A_mix, b_mix)
                 except np.linalg.LinAlgError:
                     rotors = np.linalg.lstsq(A_mix, b_mix, rcond=None)[0]
                 ctbr_u_target = u_apply.copy()
                 ctbr_u_target[:n_rotors] = np.clip(rotors, min_thrust, max_thrust)
+            _prof("ctbr", time.perf_counter() - _t_ctbr)
+            _prof("control_total", time.perf_counter() - _t_dompc)
 
         if k < n_steps:
             if ctbr_on:
@@ -1160,6 +1872,9 @@ def run_closed_loop_track_full_state_plan_acados(
                 u_cmd[:n_rotors] = np.clip(
                     u_cmd[:n_rotors] + l1_thrust_delta[:n_rotors], min_thrust, max_thrust
                 )
+                # bolt-on 臂关节直接补偿：u_ad_arm 叠加到关节力矩通道（全驱动，无需分配）。
+                if nu > n_rotors:
+                    u_cmd[n_rotors:] = u_cmd[n_rotors:] + l1_thrust_delta[n_rotors:]
             if dist_on and dist_params.thrust_enable:
                 u_real, _dT = apply_thrust_bias(dist_params, t_k, u_cmd, n_rotors)
             else:
@@ -1176,48 +1891,135 @@ def run_closed_loop_track_full_state_plan_acados(
                 u_l1_delta_log[k] = l1_thrust_delta_l1
                 u_pos_delta_log[k] = l1_thrust_delta_pos
 
+            _t_inject = time.perf_counter()
             if isinstance(plant, DisturbedRK4Plant):
                 R_now = _quat_to_R_np(x[3:7])
                 b3_now = R_now[:, 2]
                 v_world_now = R_now @ x[nq : nq + 3]
                 T_real = float(np.sum(u_real[:n_rotors]))
+                q_now = np.asarray(x[:nq], dtype=float)
+                # base wrench（const+var+drag）→ 机体系广义力 [:6]。
                 F_ext, M_body_ext, M_world_ext = external_force_torque(
                     dist_params, t_k, R_now, v_world_now, T_real, n_rotors
                 )
-                w_body = np.zeros(6)
-                w_body[:3] = R_now.T @ F_ext
-                w_body[3:6] = M_body_ext
-                plant.set_tau_ext_body(w_body)
-                # 真值扰动力（世界系）：外力 + 推力估计偏差等效力（相对 MPC 基线 u_apply）。
+                tau_ext = np.zeros(nv, dtype=float)
+                tau_ext[:3] = R_now.T @ F_ext
+                tau_ext[3:6] = M_body_ext
+                # EE/负载都需 EE 帧位姿：合并一次 framesForwardKinematics（省一次 FK）。
+                _ee_on = dist_params.any_ee_disturbance() and n_arm > 0
+                _load_now = load_on and _dist_active(
+                    t_k, True, dist_params.load_t0, dist_params.load_t1
+                )
+                if _ee_on or _load_now:
+                    pin.framesForwardKinematics(pin_model, dist_data, q_now)
+                # EE-link 力旋量 → 经 LOCAL_WORLD_ALIGNED 雅可比折算到完整广义力。
+                if _ee_on:
+                    R_ee = np.asarray(dist_data.oMf[ee_id].rotation, dtype=float)
+                    F_ee_w, M_ee_w = ee_wrench_world(dist_params, t_k, R_ee)
+                    if np.any(np.abs(F_ee_w) > 1e-12) or np.any(np.abs(M_ee_w) > 1e-12):
+                        J_ee = pin.computeFrameJacobian(
+                            pin_model, dist_data, q_now, ee_id, pin.LOCAL_WORLD_ALIGNED
+                        )
+                        tau_ext += J_ee.T @ np.concatenate([F_ee_w, M_ee_w])
+                plant.set_tau_ext_full(tau_ext)
+                # 推力估计偏差等效力（沿机体 z，相对 MPC 基线 u_apply）。
                 dT_base = 0.0
                 if _dist_active(
                     t_k, dist_params.thrust_enable, dist_params.thrust_t0, dist_params.thrust_t1
                 ):
                     T_base = float(np.sum(u_apply[:n_rotors]))
                     dT_base = (dist_params.thrust_scale - 1.0) * T_base + dist_params.thrust_bias
-                dist_force_log[k] = F_ext + dT_base * b3_now
+                # 负载真值（准静态重力等效，仅用于日志/oracle；plant 已用增广模型精确积分）。
+                F_load_w = np.zeros(3, dtype=float)
+                M_load_w = np.zeros(3, dtype=float)
+                if _load_now:
+                    oMf = dist_data.oMf[ee_id]
+                    com_off = np.array(
+                        [dist_params.load_com_x, dist_params.load_com_y, dist_params.load_com_z],
+                        dtype=float,
+                    )
+                    p_com_w = np.asarray(oMf.translation, dtype=float) + (
+                        np.asarray(oMf.rotation, dtype=float) @ com_off
+                    )
+                    F_load_w = float(dist_params.load_mass) * np.array(
+                        [0.0, 0.0, -GRAVITY], dtype=float
+                    )
+                    M_load_w = np.cross(p_com_w - np.asarray(x[:3], dtype=float), F_load_w)
+                # 真值扰动（世界系，base 等效）：base+EE 经 [:6] 折算 + 推力偏差 + 负载重力等效。
+                dist_force_log[k] = (
+                    R_now @ tau_ext[:3] + dT_base * b3_now + F_load_w
+                )
                 dist_force_body_log[k] = R_now.T @ dist_force_log[k]
-                dist_torque_body_log[k] = M_body_ext
-                dist_torque_world_log[k] = M_world_ext
+                dist_torque_world_log[k] = R_now @ tau_ext[3:6] + M_load_w
+                dist_torque_body_log[k] = R_now.T @ dist_torque_world_log[k]
+                if dist_joint_torque_log is not None and n_arm > 0:
+                    dist_joint_torque_log[k, :] = tau_ext[6 : 6 + n_arm]
 
-            if l1_aug is not None:
-                l1_force_log[k] = l1_aug.disturbance_force_world(nominal_mass)
-                l1_sigma_log[k] = l1_aug.sigma_hat
-                l1_aac_log[k] = l1_aug.a_ac
-                l1_al1_log[k] = l1_aug.a_l1
-                # 机体系版本：用本拍真实姿态把世界系估计/补偿旋到机体系一并记录。
+            if l1_aug is not None or gen_est is not None:
                 R_b = _quat_to_R_np(x[3:7])
+                # 广义 L1 / oracle 估计：base 世界系力/力矩 + 臂关节力矩（与 plant 真值对比）。
+                l1_force_log[k] = est_base_F_w
+                l1_torque_log[k] = est_base_M_w
+                l1_sigma_log[k] = est_base_F_w / max(nominal_mass, 1e-6)
+                if l1_aug is not None:
+                    l1_aac_log[k] = l1_aug.a_ac
+                    l1_al1_log[k] = l1_aug.a_l1
+                else:
+                    l1_al1_log[k] = l1_sigma_log[k]
+                if l1_joint_torque_log is not None and n_arm > 0 and est_arm_tau is not None:
+                    _ae = np.asarray(est_arm_tau, dtype=float).reshape(-1)
+                    l1_joint_torque_log[k, : min(n_arm, _ae.size)] = _ae[:n_arm]
+                # 机体系版本：用本拍真实姿态把世界系估计/补偿旋到机体系一并记录。
                 l1_force_body_log[k] = R_b.T @ l1_force_log[k]
                 l1_al1_body_log[k] = R_b.T @ l1_al1_log[k]
+            _prof("dist_inject_log", time.perf_counter() - _t_inject)
 
+            _t_plant = time.perf_counter()
             x = plant.step(x, u_real)
+            _prof("plant_step", time.perf_counter() - _t_plant)
             t_log[k + 1] = (k + 1) * sim_dt
             x_log[k + 1] = x
 
         if progress_cb is not None:
             progress_cb(k + 1, n_steps)
 
-    ee_id = _resolve_ee_frame_id(pin_model)
+    # ── 运行时间分解汇总：按耗时排序打印，并随结果返回（GUI 可展示）──────────
+    loop_wall = time.perf_counter() - _loop_t0
+    n_ctrl = max(1, len(mpc_solve_steps))
+    timing_summary = {
+        "loop_wall_s": float(loop_wall),
+        "n_steps": int(n_steps),
+        "n_control_steps": int(n_ctrl),
+        "sim_dt": float(sim_dt),
+        "control_dt": float(control_dt),
+        "rtf": float((n_steps * sim_dt) / loop_wall) if loop_wall > 0 else float("nan"),
+        "sections": {
+            name: {
+                "total_s": float(prof_t[name]),
+                "calls": int(prof_n.get(name, 0)),
+                "avg_ms": float(prof_t[name] / max(1, prof_n.get(name, 1)) * 1e3),
+                "pct": float(100.0 * prof_t[name] / loop_wall) if loop_wall > 0 else 0.0,
+            }
+            for name in prof_t
+        },
+    }
+    try:
+        print(
+            f"[acados track] 仿真耗时分解  total={loop_wall:.2f}s  "
+            f"sim_steps={n_steps} (dt={sim_dt*1e3:.1f}ms)  "
+            f"control_steps={n_ctrl} (dt={control_dt*1e3:.1f}ms)  "
+            f"RTF={timing_summary['rtf']:.2f}x"
+        )
+        for name, s in sorted(
+            timing_summary["sections"].items(), key=lambda kv: -kv[1]["total_s"]
+        ):
+            print(
+                f"    {name:18s} {s['total_s']:7.3f}s  {s['pct']:5.1f}%  "
+                f"calls={s['calls']:6d}  avg={s['avg_ms']:.3f}ms"
+            )
+    except Exception:
+        pass
+
     shim = _AcadosTrackMpcShim(pin_model, ee_id)
 
     return {
@@ -1233,6 +2035,14 @@ def run_closed_loop_track_full_state_plan_acados(
         "mpc_solve_steps": mpc_solve_steps,
         "mpc_iters": mpc_iters,
         "mpc_wall_s": mpc_wall_s,
+        "mpc_costs": np.asarray(mpc_costs, dtype=float),
+        "mpc_solve_t": np.asarray(mpc_solve_t, dtype=float),
+        "mpc_cost_terms": {
+            k: np.asarray(v, dtype=float) for k, v in mpc_cost_terms_hist.items()
+        },
+        "mpc_cost_groups": {},
+        "mpc_cost_weights": {k: float(v) for k, v in mpc_cost_weights.items()},
+        "timing": timing_summary,
         "mpc": shim,
         "control_mode": control_mode,
         "dt_mpc": dt_mpc,
@@ -1243,12 +2053,17 @@ def run_closed_loop_track_full_state_plan_acados(
         "pos_fb_active": bool(pos_fb_on),
         "comp_mode": ("oracle" if oracle_on else "adaptive"),
         "oracle_active": bool(oracle_on),
+        "gen_l1_active": bool(gen_l1_on),
         "nominal_mass": nominal_mass,
         "dist_force_world": dist_force_log,
         "dist_force_body": dist_force_body_log,
         "dist_torque_body": dist_torque_body_log,
         "dist_torque_world": dist_torque_world_log,
         "l1_force_world": l1_force_log,
+        "l1_torque_world": l1_torque_log,
+        "dist_joint_torque": dist_joint_torque_log,
+        "l1_joint_torque": l1_joint_torque_log,
+        "n_arm": int(n_arm),
         "l1_force_body": l1_force_body_log,
         "l1_sigma": l1_sigma_log,
         "l1_a_ac": l1_aac_log,
@@ -1268,6 +2083,10 @@ def run_closed_loop_track_full_state_plan_acados(
         "geometric_active": bool(geometric_on),
         "inject_mode": ("in_model" if dist_aware_on else "bolt_on"),
         "dist_aware_active": bool(dist_aware_on),
+        "dist_aware_perstage": bool(dist_aware_perstage),
+        "dist_aware_update": ("pre" if dist_aware_pre else "post"),
+        "obs_wholebody": bool(obs_wholebody),
+        "n_dist_param": int(n_dist_param),
     }
 
 

@@ -434,3 +434,137 @@ class L1AdaptiveAugmentation:
         if GRAVITY <= 0.0:
             return 0.0
         return float(-mass * self.sigma_hat[2] / GRAVITY)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 广义 L1 自适应扰动估计器（aerial manipulator 专用，估计完整广义力）
+# ══════════════════════════════════════════════════════════════════════════
+@dataclass
+class GeneralizedL1Params:
+    """广义 L1 估计参数。增益 K 即各通道一阶低通带宽 (rad/s)，限幅提升鲁棒性。"""
+
+    enabled: bool = True
+    # 各通道自适应带宽（rad/s）：越大收敛越快、噪声敏感度越高。
+    k_force: float = 20.0    # base 平动力通道
+    k_torque: float = 20.0   # base 转动力矩通道
+    k_arm: float = 20.0      # 臂关节力矩通道
+    # 估计限幅（防发散）：base 力 (N)、base 力矩 (N·m)、臂关节力矩 (N·m)。
+    max_force: float = 40.0
+    max_torque: float = 10.0
+    max_arm: float = 10.0
+
+    def sanitize(self) -> "GeneralizedL1Params":
+        self.k_force = float(max(0.0, self.k_force))
+        self.k_torque = float(max(0.0, self.k_torque))
+        self.k_arm = float(max(0.0, self.k_arm))
+        self.max_force = float(max(0.0, self.max_force))
+        self.max_torque = float(max(0.0, self.max_torque))
+        self.max_arm = float(max(0.0, self.max_arm))
+        return self
+
+
+class GeneralizedL1Estimator:
+    """广义 L1 自适应扰动估计器。
+
+    在广义动量上做一阶自适应（De Luca 广义动量观测器，等价于广义速度通道上的
+    piecewise-constant L1），在线估计**完整**广义外部力：
+
+        τ̂_ext ∈ R^nv = [F_b(3, 机体系); M_b(3, 机体系); τ_arm(n)]
+
+    增益 K=[k_force, k_torque, k_arm] 即各通道 L1 低通带宽（rad/s）；常值外力下
+    无静差、收敛时间 ≈ 3/K。
+
+    与平动 L1（``L1AdaptiveAugmentation``，只估世界系平动加速度 σ̂(3)）相比，本
+    估计器额外估计 base 转动力矩与臂关节力矩，供两条注入路径共用：
+      • bolt-on：映射回 u_ad（臂关节直接补；base 竖直力/力矩经推力分配；base 水平
+        力欠驱动→倾转）；
+      • in-model：base 6D 世界系 wrench 喂 MPC 扰动参数 p[:6]，臂关节力矩喂 p[6:]。
+
+    内核复用经验证的 ``MomentumWrenchObserver``（广义动量律即广义 L1 的实现），
+    本类只追加 L1 风格的逐通道限幅与统一接口。依赖 pinocchio（经动量观测器构造），
+    仅在 aerial-manipulator 场景使用，故 import 延迟到构造时。
+    """
+
+    def __init__(self, pin_model, nq: int, nv: int,
+                 params: Optional[GeneralizedL1Params] = None) -> None:
+        from momentum_observer import MomentumWrenchObserver
+
+        self.params: GeneralizedL1Params = (params or GeneralizedL1Params()).sanitize()
+        self.nq = int(nq)
+        self.nv = int(nv)
+        self._obs = MomentumWrenchObserver(
+            pin_model, nq, nv,
+            k_force=self.params.k_force,
+            k_torque=self.params.k_torque,
+            k_arm=self.params.k_arm,
+        )
+        # 机体系广义外力估计（base 6 机体系 + 臂 n），已逐通道限幅。
+        self.tau_ext = np.zeros(self.nv, dtype=float)
+
+    # ──────────────────────────────────────────────────────────────────────
+    @property
+    def enabled(self) -> bool:
+        return bool(self.params.enabled)
+
+    def set_enabled(self, flag: bool) -> None:
+        self.params.enabled = bool(flag)
+        self._obs.set_enabled(bool(flag))
+        if not flag:
+            self.tau_ext = np.zeros(self.nv, dtype=float)
+
+    def set_gains(self, k_force: float, k_torque: float, k_arm: float) -> None:
+        self.params.k_force = float(max(0.0, k_force))
+        self.params.k_torque = float(max(0.0, k_torque))
+        self.params.k_arm = float(max(0.0, k_arm))
+        self._obs.set_gains(self.params.k_force, self.params.k_torque, self.params.k_arm)
+
+    def reset(self, q: Optional[np.ndarray] = None, v: Optional[np.ndarray] = None) -> None:
+        """重置内核；给定 (q,v) 时用当前广义动量 seed（抓取事件软重置）。"""
+        self._obs.reset(q, v)
+        self.tau_ext = np.zeros(self.nv, dtype=float)
+
+    # ──────────────────────────────────────────────────────────────────────
+    def step(self, q: np.ndarray, v: np.ndarray,
+             tau_applied: np.ndarray, dt: float) -> np.ndarray:
+        """推进一拍，返回机体系广义外力估计 τ̂_ext (nv,)，已限幅。
+
+        ``tau_applied`` 为**名义**施加广义力（base 机体系 rotor wrench [0,0,Fz,Mx,My,Mz]
+        叠加臂关节力矩），与 aba/动量观测器输入同口径。未启用/dt<=0 时返回上拍值。
+        """
+        if not self.params.enabled or dt <= 0.0:
+            return self.tau_ext.copy()
+        r = self._obs.step(q, v, tau_applied, dt)
+        self.tau_ext = self._clip(np.asarray(r, dtype=float))
+        return self.tau_ext.copy()
+
+    def _clip(self, r: np.ndarray) -> np.ndarray:
+        out = np.asarray(r, dtype=float).reshape(self.nv).copy()
+        p = self.params
+        if p.max_force > 0.0:
+            out[:3] = np.clip(out[:3], -p.max_force, p.max_force)
+        if p.max_torque > 0.0:
+            out[3:6] = np.clip(out[3:6], -p.max_torque, p.max_torque)
+        if self.nv > 6 and p.max_arm > 0.0:
+            out[6:] = np.clip(out[6:], -p.max_arm, p.max_arm)
+        return out
+
+    # ──────────────────────────────────────────────────────────────────────
+    def tau_ext_body(self) -> np.ndarray:
+        """机体系完整广义外力估计 (nv,)。"""
+        return self.tau_ext.copy()
+
+    def base_wrench_body(self) -> np.ndarray:
+        """base 机体系外部 wrench [F_b(3); M_b(3)] = τ̂_ext[:6]。"""
+        return self.tau_ext[:6].copy()
+
+    def base_wrench_world(self, R_bw: np.ndarray) -> np.ndarray:
+        """base 世界系外部 wrench [F_w(3); M_w(3)]，R_bw 为机体→世界旋转。"""
+        R = np.asarray(R_bw, dtype=float).reshape(3, 3)
+        out = np.zeros(6, dtype=float)
+        out[:3] = R @ self.tau_ext[:3]
+        out[3:6] = R @ self.tau_ext[3:6]
+        return out
+
+    def arm_torque_ext(self) -> np.ndarray:
+        """臂关节外部力矩估计 τ̂_ext[6:]（关节空间，无坐标变换）。"""
+        return self.tau_ext[6:].copy() if self.nv > 6 else np.zeros(0, dtype=float)

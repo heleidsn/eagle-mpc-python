@@ -1025,6 +1025,25 @@ def _acados_solve_with_optional_live_log(
     return int(status), n_live, cost_trace
 
 
+def _warm_start_simple_trajectory_solver(
+    solver,
+    start_state: np.ndarray,
+    target_state: np.ndarray,
+    N: int,
+):
+    """Linear 17D interpolation + hover thrust; avoids all-zero default guess."""
+    cfg = load_s500_config()
+    m_th = (cfg["platform"]["min_thrust"] + cfg["platform"]["max_thrust"]) / 2.0
+    u_hover = np.array([m_th] * 4 + [0.0, 0.0], dtype=float)
+    s17 = np.asarray(start_state, dtype=float).reshape(17)
+    e17 = np.asarray(target_state, dtype=float).reshape(17)
+    for i in range(N + 1):
+        alpha = float(i) / float(N) if N > 0 else 0.0
+        solver.set(i, "x", _interp_robot_state_17(alpha, s17, e17))
+    for i in range(N):
+        solver.set(i, "u", u_hover)
+
+
 def run_simple_trajectory(
     start_state: np.ndarray = None,
     target_state: np.ndarray = None,
@@ -1054,6 +1073,8 @@ def run_simple_trajectory(
         is_waypoint=True,
         max_iter=max_iter,
     )
+    N = max(1, int(round(duration / dt)))
+    _warm_start_simple_trajectory_solver(solver, start_state, target_state, N)
     hdr = _segment_label if _segment_label else "direct"
     t0 = time.perf_counter()
     status, n_live_steps, cost_trace = _acados_solve_with_optional_live_log(
@@ -1086,7 +1107,7 @@ def run_simple_trajectory(
         skip_statistics_table=(n_live_steps is not None),
     )
 
-    if status != 0:
+    if status not in (0, 2):
         print(f"acados solver returned status {status}")
         return None, None, None, None, None
 
