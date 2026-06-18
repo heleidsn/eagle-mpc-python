@@ -15,6 +15,8 @@ catkin_install_python(PROGRAMS
   scripts/ros_nodes/groundtruth_pub.py
   scripts/ros_nodes/reference_path_pub.py
   scripts/ros_nodes/pose_to_tf_pub.py
+  scripts/ros_nodes/gazebo_unpause_after_arm_ready.py
+  scripts/ros_nodes/gazebo_disturbance_viz_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

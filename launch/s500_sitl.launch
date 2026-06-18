@@ -41,10 +41,15 @@
         <arg name="respawn_gazebo" value="$(arg respawn_gazebo)"/>
     </include>
     <!-- MAVROS -->
-    <include file="$(find mavros)/launch/px4.launch">
-        <!-- GCS link is provided by SITL -->
-        <arg name="gcs_url" value=""/>
+    <include file="$(find mavros)/launch/node.launch">
+        <arg name="pluginlists_yaml" value="$(find eagle_mpc_python)/config/mavros/px4_sitl_pluginlists.yaml"/>
+        <arg name="config_yaml" value="$(find mavros)/launch/px4_config.yaml"/>
         <arg name="fcu_url" value="$(arg fcu_url)"/>
+        <arg name="gcs_url" value=""/>
+        <arg name="tgt_system" value="1"/>
+        <arg name="tgt_component" value="1"/>
+        <arg name="log_output" value="screen"/>
+        <arg name="fcu_protocol" value="v2.0"/>
         <arg name="respawn_mavros" value="$(arg respawn_mavros)"/>
     </include>
 

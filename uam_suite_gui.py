@@ -176,7 +176,7 @@ def _set_mplot3d_equal_xyz(ax, *xyz_arrays: np.ndarray | None, margin: float = 0
     except Exception:
         pass
 
-
+        
 def _set_2d_path_equal_meters(ax, *xy2: np.ndarray, margin: float = 0.06) -> None:
     """XY 或 XZ 路径：横纵轴采用相同米制比例（取包络正方形）。"""
     xs: list[np.ndarray] = []
@@ -1470,8 +1470,99 @@ class TrackEeCrocWorker(QThread):
             self.finished.emit(False, traceback.format_exc(), None)
 
 
+def _meshcat_rgb(color_rgb: tuple[int, int, int]) -> int:
+    return (int(color_rgb[0]) << 16) | (int(color_rgb[1]) << 8) | int(color_rgb[2])
+
+
+def _meshcat_quat_to_R(quat_xyzw: np.ndarray) -> np.ndarray:
+    """四元数 [qx,qy,qz,qw] -> R（世界<-机体）。"""
+    q = np.asarray(quat_xyzw, dtype=float).reshape(4)
+    n = float(np.linalg.norm(q))
+    if n < 1e-12:
+        return np.eye(3)
+    x, y, z, w = q / n
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=float,
+    )
+
+
+def _meshcat_arrow_segment_points(
+    origin: np.ndarray,
+    vector: np.ndarray,
+    *,
+    length_scale: float = 0.002,
+    min_len: float = 0.04,
+    max_len: float = 0.45,
+) -> np.ndarray | None:
+    """Return 3×(2·n) point pairs for a force/torque arrow (world frame)."""
+    o = np.asarray(origin, dtype=float).reshape(3)
+    v = np.asarray(vector, dtype=float).reshape(3)
+    mag = float(np.linalg.norm(v))
+    if mag < 1e-9:
+        return None
+    direction = v / mag
+    length = float(np.clip(length_scale * mag, min_len, max_len))
+    tip = o + direction * length
+    head_len = 0.18 * length
+    head_w = 0.10 * length
+    ref = np.array([0.0, 0.0, 1.0], dtype=float)
+    if abs(float(np.dot(direction, ref))) > 0.92:
+        ref = np.array([0.0, 1.0, 0.0], dtype=float)
+    perp = np.cross(direction, ref)
+    pn = float(np.linalg.norm(perp))
+    if pn < 1e-9:
+        return None
+    perp /= pn
+    perp2 = np.cross(direction, perp)
+    h1 = tip - direction * head_len + perp * head_w
+    h2 = tip - direction * head_len - perp * head_w
+    h3 = tip - direction * head_len + perp2 * head_w
+    h4 = tip - direction * head_len - perp2 * head_w
+    pairs = np.array(
+        [o, tip, tip, h1, tip, h2, tip, h3, tip, h4],
+        dtype=float,
+    )
+    return pairs.T
+
+
+def _meshcat_playback_frame_indices(
+    n_states: int,
+    times: np.ndarray | None,
+    dt: float,
+    target_fps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Subsample state indices for real-time playback (~target_fps, 1× sim speed)."""
+    n = int(n_states)
+    if n <= 1:
+        return np.array([0], dtype=int), np.array([0.0], dtype=float)
+    if times is not None and len(times) == n:
+        t_arr = np.asarray(times, dtype=float).flatten()
+    else:
+        t_arr = np.arange(n, dtype=float) * float(max(1e-4, dt))
+    fps = float(max(5.0, target_fps))
+    frame_dt = 1.0 / fps
+    t_end = float(t_arr[-1])
+    indices: list[int] = [0]
+    sim_t = 0.0
+    while sim_t < t_end - 1e-9:
+        sim_t += frame_dt
+        idx = int(np.searchsorted(t_arr, sim_t, side="right")) - 1
+        idx = int(np.clip(idx, 0, n - 1))
+        if idx != indices[-1]:
+            indices.append(idx)
+    if indices[-1] != n - 1:
+        indices.append(n - 1)
+    return np.asarray(indices, dtype=int), t_arr
+
+
 class MeshcatPlaybackWorker(QThread):
     finished = pyqtSignal(bool, str)
+    progress = pyqtSignal(float, float, float, int)  # sim_t, progress_pct, display_fps, loop_idx
 
     def __init__(
         self,
@@ -1479,12 +1570,18 @@ class MeshcatPlaybackWorker(QThread):
         states: np.ndarray,
         dt: float,
         traj_points: dict[str, np.ndarray] | None = None,
+        times: np.ndarray | None = None,
+        disturbance: dict[str, np.ndarray] | None = None,
+        target_fps: float = 30.0,
     ):
         super().__init__()
         self.urdf_path = urdf_path
         self.states = np.asarray(states, dtype=float)
         self.dt = float(max(1e-4, dt))
         self.traj_points = traj_points or {}
+        self.times = np.asarray(times, dtype=float).flatten() if times is not None else None
+        self.disturbance = disturbance or {}
+        self.target_fps = float(max(5.0, target_fps))
 
     def run(self):
         try:
@@ -1532,6 +1629,7 @@ class MeshcatPlaybackWorker(QThread):
             viz.initViewer(open=True)
             viz.loadViewerModel("s500_uam")
             # Draw planned/generated trajectories (if meshcat geometry API is available).
+            g = None
             try:
                 import meshcat.geometry as g
 
@@ -1540,7 +1638,7 @@ class MeshcatPlaybackWorker(QThread):
                     if P.ndim != 2 or P.shape[1] != 3 or len(P) < 2:
                         return
                     pos = P.T
-                    color = (int(color_rgb[0]) << 16) | (int(color_rgb[1]) << 8) | int(color_rgb[2])
+                    color = _meshcat_rgb(color_rgb)
                     geom = g.Line(g.PointsGeometry(pos), g.LineBasicMaterial(color=color, linewidth=2.0))
                     viz.viewer[f"s500_uam_paths/{name}"].set_object(geom)
 
@@ -1553,6 +1651,73 @@ class MeshcatPlaybackWorker(QThread):
             if self.states.ndim != 2 or self.states.shape[0] == 0:
                 raise ValueError("No states to visualize.")
             n = int(self.states.shape[0])
+            frame_indices, t_arr = _meshcat_playback_frame_indices(
+                n, self.times, self.dt, self.target_fps
+            )
+            n_frames = int(frame_indices.size)
+            frame_interval = 1.0 / self.target_fps
+
+            force_log = self.disturbance.get("force_world")
+            force_body_log = self.disturbance.get("force_body")
+            torque_log = self.disturbance.get("torque_world")
+            torque_body_log = self.disturbance.get("torque_body")
+            if force_log is not None:
+                force_log = np.asarray(force_log, dtype=float)
+            if force_body_log is not None:
+                force_body_log = np.asarray(force_body_log, dtype=float)
+            if torque_log is not None:
+                torque_log = np.asarray(torque_log, dtype=float)
+            if torque_body_log is not None:
+                torque_body_log = np.asarray(torque_body_log, dtype=float)
+
+            def _dist_at(idx: int, q: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+                """用本帧姿态把机体系 wrench 旋到世界系，与机器人显示同拍对齐。"""
+                log_lens = [
+                    int(a.shape[0])
+                    for a in (force_log, force_body_log, torque_log, torque_body_log)
+                    if a is not None and a.ndim == 2 and a.shape[0] > 0
+                ]
+                ki = min(max(int(idx), 0), max(log_lens) - 1) if log_lens else 0
+                R = _meshcat_quat_to_R(q[3:7])
+
+                def _world(body_arr, world_arr):
+                    if body_arr is not None and body_arr.ndim == 2 and body_arr.shape[0] > 0:
+                        return R @ np.asarray(body_arr[ki], dtype=float).reshape(3)
+                    if world_arr is not None and world_arr.ndim == 2 and world_arr.shape[0] > 0:
+                        return np.asarray(world_arr[ki], dtype=float).reshape(3)
+                    return None
+
+                return _world(force_body_log, force_log), _world(torque_body_log, torque_log)
+
+            def _set_wrench_arrows(idx: int, origin: np.ndarray, q: np.ndarray) -> None:
+                if g is None:
+                    return
+                fw, ft = _dist_at(idx, q)
+                for name, vec, color, scale in (
+                    ("force", fw, (220, 50, 47), 0.005),
+                    ("torque", ft, (155, 89, 182), 0.025),
+                ):
+                    path = f"s500_uam_dist/{name}"
+                    if vec is None:
+                        continue
+                    pts = _meshcat_arrow_segment_points(
+                        origin,
+                        vec,
+                        length_scale=scale,
+                        min_len=0.15,
+                        max_len=0.85,
+                    )
+                    if pts is None:
+                        try:
+                            viz.viewer[path].delete()
+                        except Exception:
+                            pass
+                        continue
+                    geom = g.LineSegments(
+                        g.PointsGeometry(pts),
+                        g.LineBasicMaterial(color=_meshcat_rgb(color), linewidth=5.0),
+                    )
+                    viz.viewer[path].set_object(geom)
 
             def _viewer_closed() -> bool:
                 viewer = getattr(viz, "viewer", None)
@@ -1572,20 +1737,43 @@ class MeshcatPlaybackWorker(QThread):
                             return True
                 return False
 
-            i = 0
+            import time as _time
+
+            loop_idx = 0
+            frames_done = 0
+            t_play0 = _time.perf_counter()
+            t_last_emit = t_play0
             while True:
-                if self.isInterruptionRequested():
+                if self.isInterruptionRequested() or _viewer_closed():
                     break
-                if _viewer_closed():
-                    break
-                q = np.asarray(self.states[i % n, :nq], dtype=float).flatten()
-                try:
-                    viz.display(q)
-                except Exception:
-                    # If browser/server connection is gone, stop playback.
-                    break
-                time.sleep(self.dt)
-                i += 1
+                for fi, idx in enumerate(frame_indices):
+                    if self.isInterruptionRequested() or _viewer_closed():
+                        break
+                    q = np.asarray(self.states[idx, :nq], dtype=float).flatten()
+                    origin = q[:3].copy()
+                    try:
+                        viz.display(q)
+                        _set_wrench_arrows(idx, origin, q)
+                    except Exception:
+                        loop_idx = -1
+                        break
+                    frames_done += 1
+                    sim_t = float(t_arr[idx])
+                    pct = 100.0 * fi / max(1, n_frames - 1)
+                    now = _time.perf_counter()
+                    if (now - t_last_emit) >= 0.08 or fi == n_frames - 1:
+                        wall = max(1e-6, now - t_play0)
+                        disp_fps = frames_done / wall
+                        self.progress.emit(sim_t, pct, float(disp_fps), int(loop_idx))
+                        t_last_emit = now
+                    deadline = t_play0 + frames_done * frame_interval
+                    sleep_t = deadline - _time.perf_counter()
+                    if sleep_t > 1e-4:
+                        _time.sleep(sleep_t)
+                else:
+                    loop_idx += 1
+                    continue
+                break
             self.finished.emit(True, warn_msg)
         except Exception:
             self.finished.emit(False, traceback.format_exc())
@@ -1601,6 +1789,7 @@ class UamSuiteGUI(QMainWindow):
         self._track_worker = None
         self._meshcat_worker = None
         self._last_track_res: dict | None = None
+        self._last_track_out: dict | None = None
         self._manual_ref_overlay: dict | None = None
         self._params_path: Path = DEFAULT_PARAMS_PATH
         self._last_plan_sorted_wp_rows: list | None = None
@@ -2466,6 +2655,10 @@ class UamSuiteGUI(QMainWindow):
         self.meshcat_plan_btn.clicked.connect(self._visualize_planned_meshcat)
         self.meshcat_plan_btn.setEnabled(False)
         plan_actions_row2.addWidget(self.meshcat_plan_btn)
+        self.meshcat_stop_plan_btn = QPushButton("Stop Meshcat")
+        self.meshcat_stop_plan_btn.clicked.connect(self._stop_meshcat_playback)
+        self.meshcat_stop_plan_btn.setEnabled(False)
+        plan_actions_row2.addWidget(self.meshcat_stop_plan_btn)
         self.save_plan_params_btn = QPushButton("Save Planning parameters")
         self.save_plan_params_btn.clicked.connect(lambda: self._save_tab_params(TAB_PLAN))
         self.save_plan_params_as_btn = QPushButton("Save Planning parameters as")
@@ -3037,7 +3230,14 @@ class UamSuiteGUI(QMainWindow):
         _tr_run_row = QHBoxLayout()
         _tr_run_row.addWidget(self.run_track_btn)
         _tr_run_row.addWidget(self.meshcat_track_btn)
+        self.meshcat_stop_btn = QPushButton("Stop Meshcat")
+        self.meshcat_stop_btn.clicked.connect(self._stop_meshcat_playback)
+        self.meshcat_stop_btn.setEnabled(False)
+        _tr_run_row.addWidget(self.meshcat_stop_btn)
         tr_lay.addLayout(_tr_run_row)
+        self.meshcat_status_label = QLabel("Meshcat: idle")
+        self.meshcat_status_label.setStyleSheet("color: palette(mid);")
+        tr_lay.addWidget(self.meshcat_status_label)
 
         track_param_btns = QHBoxLayout()
         self.save_track_params_btn = QPushButton("Save Tracking parameters")
@@ -3438,9 +3638,121 @@ class UamSuiteGUI(QMainWindow):
 
         ros_node_layout.addLayout(rn_grid)
 
-        # ── ROS MPC Parameters ────────────────────────────────────────────────
-        rn_mpc_group = QGroupBox("MPC Parameters")
-        rn_mpc_vbox = QVBoxLayout()
+        # ── Gazebo 外力扰动（仿真测试，调用 /gazebo/apply_body_wrench）────────────
+        rn_gz_dist_group = QGroupBox("Gazebo Disturbance  (apply / clear wrench)")
+        rn_gz_dist_vbox = QVBoxLayout(rn_gz_dist_group)
+        _gzd_hint = QLabel(
+            "通过 Gazebo 服务在 base_link 或 gripper_link 上施加恒定力/力矩；"
+            "RViz 话题 /suite_mpc/disturbance_markers（由 gazebo_disturbance_viz 节点发布）；"
+            "红箭头长度 ∝ 力大小（约 8 cm/N），蓝箭头 ∝ 力矩；带 Disturbance 文字标签。"
+        )
+        _gzd_hint.setWordWrap(True)
+        _gzd_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        rn_gz_dist_vbox.addWidget(_gzd_hint)
+
+        rn_gz_dist_grid = QGridLayout()
+        rn_gz_dist_grid.setColumnStretch(1, 1)
+        rn_gz_dist_grid.setColumnStretch(3, 1)
+
+        rn_gz_dist_grid.addWidget(QLabel("Gazebo model"), 0, 0)
+        self.rn_gz_dist_model = QLineEdit("s500_uam")
+        self.rn_gz_dist_model.setToolTip("Gazebo 模型名（与 launch 中 vehicle 一致）")
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_model, 0, 1)
+
+        rn_gz_dist_grid.addWidget(QLabel("Apply to"), 0, 2)
+        self.rn_gz_dist_target = QComboBox()
+        self.rn_gz_dist_target.addItems(["base_link", "gripper_link (EE)"])
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_target, 0, 3)
+
+        rn_gz_dist_grid.addWidget(QLabel("Wrench frame"), 1, 0)
+        self.rn_gz_dist_frame = QComboBox()
+        self.rn_gz_dist_frame.addItems(["world", "link"])
+        self.rn_gz_dist_frame.setToolTip(
+            "world: 力/力矩在世界系定义；link: 在目标 link 机体系定义。"
+        )
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_frame, 1, 1)
+
+        self.rn_gz_dist_fx = QDoubleSpinBox()
+        self.rn_gz_dist_fy = QDoubleSpinBox()
+        self.rn_gz_dist_fz = QDoubleSpinBox()
+        for sp, val in zip(
+            (self.rn_gz_dist_fx, self.rn_gz_dist_fy, self.rn_gz_dist_fz),
+            (5.0, 0.0, 0.0),
+        ):
+            sp.setRange(-200.0, 200.0)
+            sp.setDecimals(2)
+            sp.setSingleStep(0.5)
+            sp.setValue(val)
+        rn_gz_dist_grid.addWidget(QLabel("Fx [N]"), 2, 0)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_fx, 2, 1)
+        rn_gz_dist_grid.addWidget(QLabel("Fy [N]"), 2, 2)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_fy, 2, 3)
+        rn_gz_dist_grid.addWidget(QLabel("Fz [N]"), 3, 0)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_fz, 3, 1)
+
+        self.rn_gz_dist_mx = QDoubleSpinBox()
+        self.rn_gz_dist_my = QDoubleSpinBox()
+        self.rn_gz_dist_mz = QDoubleSpinBox()
+        for sp in (self.rn_gz_dist_mx, self.rn_gz_dist_my, self.rn_gz_dist_mz):
+            sp.setRange(-50.0, 50.0)
+            sp.setDecimals(3)
+            sp.setSingleStep(0.05)
+            sp.setValue(0.0)
+        rn_gz_dist_grid.addWidget(QLabel("Mx [N·m]"), 3, 2)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_mx, 3, 3)
+        rn_gz_dist_grid.addWidget(QLabel("My [N·m]"), 4, 0)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_my, 4, 1)
+        rn_gz_dist_grid.addWidget(QLabel("Mz [N·m]"), 4, 2)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_mz, 4, 3)
+
+        rn_gz_dist_vbox.addLayout(rn_gz_dist_grid)
+
+        rn_gz_dist_btn_row = QHBoxLayout()
+        self.rn_gz_dist_apply_btn = QPushButton("Apply disturbance")
+        self.rn_gz_dist_apply_btn.setStyleSheet(
+            "QPushButton { background-color: #1565c0; color: white; font-weight: bold; }"
+        )
+        self.rn_gz_dist_apply_btn.setToolTip(
+            "调用 /gazebo/apply_body_wrench 持续施力（duration=-1），Clear 前一直有效。"
+        )
+        self.rn_gz_dist_apply_btn.clicked.connect(self._rn_apply_gazebo_disturbance)
+        rn_gz_dist_btn_row.addWidget(self.rn_gz_dist_apply_btn)
+
+        self.rn_gz_dist_clear_btn = QPushButton("Clear disturbance")
+        self.rn_gz_dist_clear_btn.setStyleSheet(
+            "QPushButton { background-color: #546e7a; color: white; }"
+        )
+        self.rn_gz_dist_clear_btn.setToolTip("调用 /gazebo/clear_body_wrenches 并清除 RViz 箭头。")
+        self.rn_gz_dist_clear_btn.clicked.connect(self._rn_clear_gazebo_disturbance)
+        rn_gz_dist_btn_row.addWidget(self.rn_gz_dist_clear_btn)
+        rn_gz_dist_vbox.addLayout(rn_gz_dist_btn_row)
+
+        self.rn_gz_dist_status = QLabel("Disturbance: none")
+        self.rn_gz_dist_status.setStyleSheet("color: gray; font-size: 11px;")
+        rn_gz_dist_vbox.addWidget(self.rn_gz_dist_status)
+        ros_node_layout.addWidget(rn_gz_dist_group)
+
+        self._rn_gz_dist_active: dict | None = None
+        self._rn_gz_dist_cmd_pub = None
+        self._rn_gz_dist_viz_process = None
+
+        # ── ROS MPC Parameters（可折叠，默认收起）────────────────────────────
+        self.rn_mpc_toggle_btn = QPushButton("▶  MPC Parameters  (click to expand)")
+        self.rn_mpc_toggle_btn.setCheckable(True)
+        self.rn_mpc_toggle_btn.setChecked(False)
+        self.rn_mpc_toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; font-weight: bold; padding: 6px 8px; }"
+        )
+        self.rn_mpc_toggle_btn.setToolTip(
+            "MPC 权重、Acados 求解器、L1 等不常改动的参数。\n"
+            "展开后编辑；改完用底部「Save controller parameters」持久化到磁盘。"
+        )
+        self.rn_mpc_toggle_btn.toggled.connect(self._on_rn_mpc_panel_toggled)
+        ros_node_layout.addWidget(self.rn_mpc_toggle_btn)
+
+        self._rn_mpc_panel = QWidget()
+        self._rn_mpc_panel.setVisible(False)
+        rn_mpc_vbox = QVBoxLayout(self._rn_mpc_panel)
         rn_mpc_vbox.setSpacing(4)
 
         # 公共参数（两种模式均显示）
@@ -3875,8 +4187,7 @@ class UamSuiteGUI(QMainWindow):
         self.rn_save_ctrl_params_btn.clicked.connect(self._rn_save_controller_profiles)
         rn_mpc_vbox.addWidget(self.rn_save_ctrl_params_btn)
 
-        rn_mpc_group.setLayout(rn_mpc_vbox)
-        ros_node_layout.addWidget(rn_mpc_group)
+        ros_node_layout.addWidget(self._rn_mpc_panel)
 
         # Crocoddyl / Acados 各维护一套代价权重（切换 controller mode 时自动保存/加载）
         self._RN_FS_WEIGHT_KEYS = (
@@ -5854,6 +6165,7 @@ class UamSuiteGUI(QMainWindow):
             return False
         self._plan_bundle = pb
         self._last_track_res = None
+        self._last_track_out = None
         # Planning tab may call this before Tracking widgets (sim_dt, etc.) exist.
         if hasattr(self, "fig_states") and hasattr(self, "sim_dt"):
             self._redraw_combined_views(None)
@@ -5956,10 +6268,12 @@ class UamSuiteGUI(QMainWindow):
             self._plan_bundle = None
             self._full_plan_result = None
             self._last_track_res = None
+            self._last_track_out = None
             return
         self._plan_bundle = None
         self._full_plan_result = None
         self._last_track_res = None
+        self._last_track_out = None
         for fig, cv in (
             (self.fig_states, self.cv_states),
             (self.fig_control, self.cv_control),
@@ -8647,8 +8961,32 @@ class UamSuiteGUI(QMainWindow):
         self._plan_worker.finished.connect(self._on_plan_finished)
         self._plan_worker.start()
 
+    def _set_meshcat_stop_enabled(self, enabled: bool) -> None:
+        for attr in ("meshcat_stop_btn", "meshcat_stop_plan_btn"):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setEnabled(bool(enabled))
+
+    def _stop_meshcat_playback(self) -> None:
+        if self._meshcat_worker is None or not self._meshcat_worker.isRunning():
+            self._set_meshcat_stop_enabled(False)
+            self.meshcat_status_label.setText("Meshcat: idle")
+            return
+        self._meshcat_worker.requestInterruption()
+        if not self._meshcat_worker.wait(1500):
+            self._meshcat_worker.terminate()
+            self._meshcat_worker.wait(500)
+        self._set_meshcat_stop_enabled(False)
+        self.meshcat_status_label.setText("Meshcat: stopped")
+        self.log("Meshcat playback stopped by user.")
+
     def _start_meshcat_playback(
-        self, X: np.ndarray, dt: float, traj_points: dict[str, np.ndarray] | None = None
+        self,
+        X: np.ndarray,
+        dt: float,
+        traj_points: dict[str, np.ndarray] | None = None,
+        times: np.ndarray | None = None,
+        disturbance: dict[str, np.ndarray] | None = None,
     ):
         if self._meshcat_worker is not None and self._meshcat_worker.isRunning():
             # Browser-close events are not always detectable across backends;
@@ -8663,19 +9001,43 @@ class UamSuiteGUI(QMainWindow):
             urdf_path = str(self.planner.urdf_path)
         if urdf_path is None:
             urdf_path = self._selected_robot_urdf_path()
-        self._meshcat_worker = MeshcatPlaybackWorker(urdf_path, X, dt, traj_points=traj_points)
+        self._meshcat_worker = MeshcatPlaybackWorker(
+            urdf_path,
+            X,
+            dt,
+            traj_points=traj_points,
+            times=times,
+            disturbance=disturbance,
+            target_fps=30.0,
+        )
+        self._meshcat_worker.progress.connect(self._on_meshcat_progress)
         self._meshcat_worker.finished.connect(self._on_meshcat_finished)
         self._meshcat_worker.start()
-        self.log("Started Meshcat playback...")
+        self._set_meshcat_stop_enabled(True)
+        hint = ""
+        if disturbance and (disturbance.get("force_world") is not None or disturbance.get("torque_world") is not None):
+            hint = "  |  red=base force, purple=base torque"
+        self.meshcat_status_label.setText(f"Meshcat: starting…{hint}")
+        self.log(f"Started Meshcat playback (30 FPS, 1× sim speed, loop){hint}…")
+
+    def _on_meshcat_progress(self, sim_t: float, pct: float, fps: float, loop_idx: int = 0):
+        loop_txt = f"  loop {loop_idx + 1}" if loop_idx >= 0 else ""
+        self.meshcat_status_label.setText(
+            f"Meshcat: t={sim_t:6.2f}s  ({pct:4.0f}%)  {fps:5.0f} FPS{loop_txt}"
+        )
 
     def _on_meshcat_finished(self, ok: bool, err: str):
+        self._set_meshcat_stop_enabled(False)
         if not ok:
+            self.meshcat_status_label.setText("Meshcat: error")
             self.log(err)
             QMessageBox.critical(self, "Meshcat error", err[:2000])
             return
         if err:
             self.log(err)
-        self.log("Meshcat playback finished.")
+        self.meshcat_status_label.setText("Meshcat: stopped")
+        self._set_meshcat_stop_enabled(False)
+        self.log("Meshcat playback stopped.")
 
     def _visualize_planned_meshcat(self):
         pb = self._plan_bundle
@@ -8715,7 +9077,7 @@ class UamSuiteGUI(QMainWindow):
                 traj["ee"] = np.asarray(ee, dtype=float)
             except Exception:
                 pass
-        self._start_meshcat_playback(X, dt, traj_points=traj)
+        self._start_meshcat_playback(X, dt, traj_points=traj, times=t if t.size == X.shape[0] else None)
 
     def _visualize_tracked_meshcat(self):
         if self._last_track_res is None:
@@ -8733,7 +9095,23 @@ class UamSuiteGUI(QMainWindow):
             traj["ref"] = np.asarray(self._last_track_res.get("p_ref"), dtype=float)
         except Exception:
             pass
-        self._start_meshcat_playback(X, dt, traj_points=traj)
+        disturbance = None
+        out = self._last_track_out
+        if isinstance(out, dict) and out.get("disturbance_active"):
+            fw = out.get("dist_force_world")
+            fb = out.get("dist_force_body")
+            tw = out.get("dist_torque_world")
+            tb = out.get("dist_torque_body")
+            if fw is not None or fb is not None or tw is not None or tb is not None:
+                disturbance = {
+                    "force_world": np.asarray(fw, dtype=float) if fw is not None else None,
+                    "force_body": np.asarray(fb, dtype=float) if fb is not None else None,
+                    "torque_world": np.asarray(tw, dtype=float) if tw is not None else None,
+                    "torque_body": np.asarray(tb, dtype=float) if tb is not None else None,
+                }
+        self._start_meshcat_playback(
+            X, dt, traj_points=traj, times=t if t.size == X.shape[0] else None, disturbance=disturbance
+        )
 
     def _hover_control_for_state(self, x_state: np.ndarray, n_u: int) -> "np.ndarray | None":
         """悬停配平控制：四旋翼等推力 m·g/4，机械臂关节用该位形的广义重力补偿力矩。
@@ -8946,6 +9324,7 @@ class UamSuiteGUI(QMainWindow):
             if getattr(pl, "_plot_cache", None) is not None:
                 cache = pl._plot_cache
         self._last_track_res = None
+        self._last_track_out = None
         self._redraw_combined_views(None)
         self._update_track_mode_enabled()
         self.run_track_btn.setEnabled(self._plan_bundle is not None)
@@ -9161,6 +9540,7 @@ class UamSuiteGUI(QMainWindow):
         }
         self._plan_bundle = self._apply_plan_hover_padding(self._plan_bundle)
         self._last_track_res = None
+        self._last_track_out = None
         self._redraw_combined_views(None)
         self._update_track_mode_enabled()
         self.run_track_btn.setEnabled(True)
@@ -9204,6 +9584,7 @@ class UamSuiteGUI(QMainWindow):
         }
         self._plan_bundle = self._apply_plan_hover_padding(self._plan_bundle)
         self._last_track_res = None
+        self._last_track_out = None
         self._redraw_combined_views(None)
         self._update_track_mode_enabled()
         self.run_track_btn.setEnabled(True)
@@ -9617,6 +9998,287 @@ class UamSuiteGUI(QMainWindow):
             running = self._rn_process is not None and self._rn_process.poll() is None
             self._set_node_service_buttons_enabled(bool(running))
 
+    def _on_rn_mpc_panel_toggled(self, expanded: bool) -> None:
+        """折叠/展开 MPC Parameters 面板。"""
+        if hasattr(self, "_rn_mpc_panel"):
+            self._rn_mpc_panel.setVisible(bool(expanded))
+        if hasattr(self, "rn_mpc_toggle_btn"):
+            self.rn_mpc_toggle_btn.setText(
+                "▼  MPC Parameters  (click to collapse)"
+                if expanded
+                else "▶  MPC Parameters  (click to expand)"
+            )
+
+    def _rn_gazebo_disturbance_config(self) -> dict:
+        target = self.rn_gz_dist_target.currentText()
+        link = "gripper_link" if "gripper" in target.lower() or "ee" in target.lower() else "base_link"
+        model = self.rn_gz_dist_model.text().strip()
+        if not model and hasattr(self, "task_robot_combo"):
+            model = self.task_robot_combo.currentText().strip()
+        if not model:
+            model = "s500_uam"
+        return {
+            "model": model,
+            "link": link,
+            "frame": self.rn_gz_dist_frame.currentText().strip().lower(),
+            "force": [
+                float(self.rn_gz_dist_fx.value()),
+                float(self.rn_gz_dist_fy.value()),
+                float(self.rn_gz_dist_fz.value()),
+            ],
+            "torque": [
+                float(self.rn_gz_dist_mx.value()),
+                float(self.rn_gz_dist_my.value()),
+                float(self.rn_gz_dist_mz.value()),
+            ],
+        }
+
+    def _ensure_gazebo_disturbance_viz_node(self) -> bool:
+        """确保 disturbance viz 节点在跑（launch 或 GUI 子进程）。"""
+        try:
+            r = subprocess.run(
+                ["rosnode", "list"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            if r.returncode == 0 and "/gazebo_disturbance_viz" in r.stdout:
+                return True
+        except Exception:
+            pass
+        proc = getattr(self, "_rn_gz_dist_viz_process", None)
+        if proc is not None and proc.poll() is None:
+            return True
+        script = (
+            Path(__file__).resolve().parent
+            / "scripts"
+            / "ros_nodes"
+            / "gazebo_disturbance_viz_node.py"
+        )
+        if not script.exists():
+            self.log(f"[gazebo_dist] viz node not found: {script}")
+            return False
+        try:
+            self._rn_gz_dist_viz_process = subprocess.Popen(
+                [sys.executable, str(script)],
+                cwd=str(Path(__file__).resolve().parent),
+                env=os.environ.copy(),
+            )
+            self.log(
+                f"[gazebo_dist] started viz node PID={self._rn_gz_dist_viz_process.pid}"
+            )
+            return True
+        except Exception as e:
+            self.log(f"[gazebo_dist] failed to start viz node: {e!r}")
+            return False
+
+    def _rn_ensure_gazebo_disturbance_ros(self) -> bool:
+        if not self._ensure_ros_node():
+            return False
+        if not self._ensure_gazebo_disturbance_viz_node():
+            return False
+        try:
+            import rospy
+            from std_msgs.msg import String
+
+            from gazebo_disturbance_helper import DISTURBANCE_CMD_TOPIC
+
+            if self._rn_gz_dist_cmd_pub is None:
+                self._rn_gz_dist_cmd_pub = rospy.Publisher(
+                    DISTURBANCE_CMD_TOPIC, String, queue_size=1, latch=True
+                )
+                rospy.sleep(0.05)
+            return True
+        except Exception as e:
+            self.log(f"[gazebo_dist] ROS init failed: {e}")
+            return False
+
+    def _rn_set_disturbance_cmd(self, cfg: dict | None) -> None:
+        """写入 rosparam + 话题，由 gazebo_disturbance_viz 发布 RViz 箭头。"""
+        if not self._ensure_ros_node():
+            return
+        import json
+
+        import rospy
+        from std_msgs.msg import String
+
+        from gazebo_disturbance_helper import (
+            DISTURBANCE_CMD_TOPIC,
+            DISTURBANCE_CONFIG_PARAM,
+        )
+
+        payload = {"active": False} if cfg is None else {**cfg, "active": True}
+        try:
+            rospy.set_param(DISTURBANCE_CONFIG_PARAM, payload)
+        except Exception as e:
+            self.log(f"[gazebo_dist] set_param failed: {e}")
+            return
+        if self._rn_gz_dist_cmd_pub is None:
+            self._rn_gz_dist_cmd_pub = rospy.Publisher(
+                DISTURBANCE_CMD_TOPIC, String, queue_size=1, latch=True
+            )
+            rospy.sleep(0.05)
+        self._rn_gz_dist_cmd_pub.publish(String(data=json.dumps(payload)))
+        self.log(f"[gazebo_dist] config -> {DISTURBANCE_CONFIG_PARAM}")
+
+    def _rn_pulse_disturbance_cmd(self, cfg: dict) -> None:
+        """非 latched 再发一条 cmd，避免 viz 节点错过 GUI 的 latched 首包。"""
+        if not self._rn_ensure_gazebo_disturbance_ros():
+            return
+        import json
+
+        from std_msgs.msg import String
+
+        from gazebo_disturbance_helper import DISTURBANCE_CMD_TOPIC
+
+        try:
+            import rospy
+
+            pulse_pub = rospy.Publisher(
+                DISTURBANCE_CMD_TOPIC, String, queue_size=1, latch=False
+            )
+            rospy.sleep(0.05)
+            pulse_pub.publish(
+                String(data=json.dumps({**cfg, "active": True}))
+            )
+        except Exception as e:
+            self.log(f"[gazebo_dist] cmd pulse failed: {e}")
+
+    def _rn_pulse_disturbance_cmd_clear(self) -> None:
+        """非 latched 发一条 active=false，确保 viz 节点立即清除。"""
+        if not self._ensure_ros_node():
+            return
+        import json
+
+        import rospy
+        from std_msgs.msg import String
+
+        from gazebo_disturbance_helper import DISTURBANCE_CMD_TOPIC
+
+        try:
+            pulse_pub = rospy.Publisher(
+                DISTURBANCE_CMD_TOPIC, String, queue_size=1, latch=False
+            )
+            rospy.sleep(0.05)
+            pulse_pub.publish(String(data=json.dumps({"active": False})))
+        except Exception as e:
+            self.log(f"[gazebo_dist] cmd clear pulse failed: {e}")
+
+    def _rn_apply_gazebo_disturbance(self) -> None:
+        """调用 Gazebo apply_body_wrench；RViz 箭头立即通过 rosparam 更新。"""
+        import threading
+
+        cfg = self._rn_gazebo_disturbance_config()
+        if not self._rn_ensure_gazebo_disturbance_ros():
+            QMessageBox.warning(self, "Gazebo disturbance", "ROS master 不可用，请先启动 Gazebo。")
+            return
+
+        # 主线程立即更新 RViz（不等待 wrench 服务，避免 Qt/rospy 线程问题）
+        self._rn_gz_dist_active = dict(cfg)
+        self._rn_set_disturbance_cmd(cfg)
+        self._rn_pulse_disturbance_cmd(cfg)
+        self._rn_set_gz_dist_status(
+            f"Disturbance applying: {cfg['model']}::{cfg['link']} "
+            f"F={cfg['force']} τ={cfg['torque']} ({cfg['frame']} frame)"
+        )
+
+        def _run():
+            try:
+                from gazebo_disturbance_helper import apply_gazebo_wrench
+
+                ok, msg = apply_gazebo_wrench(
+                    cfg["model"],
+                    cfg["link"],
+                    cfg["force"],
+                    cfg["torque"],
+                    frame=cfg["frame"],
+                )
+                from PyQt5.QtCore import QTimer
+
+                def _ui_done():
+                    if ok:
+                        status = (
+                            f"Disturbance ON: {cfg['model']}::{cfg['link']} "
+                            f"F={cfg['force']} τ={cfg['torque']} ({cfg['frame']} frame)"
+                        )
+                    else:
+                        status = f"Disturbance wrench FAIL (RViz OK): {msg}"
+                    self._rn_set_gz_dist_status(status)
+                    self.log(f"[gazebo_dist] apply {msg}")
+
+                QTimer.singleShot(0, _ui_done)
+            except Exception as e:
+                from PyQt5.QtCore import QTimer
+
+                QTimer.singleShot(0, lambda: self._rn_set_gz_dist_status(f"Disturbance ERROR: {e}"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _rn_clear_gazebo_disturbance(self) -> None:
+        import threading
+
+        cfg = self._rn_gazebo_disturbance_config()
+        model = cfg["model"]
+        link = cfg["link"]
+
+        # 主线程立即清除 RViz 箭头（不等待 Gazebo clear 服务）
+        self._rn_gz_dist_active = None
+        if self._ensure_ros_node():
+            self._rn_set_disturbance_cmd(None)
+            self._rn_pulse_disturbance_cmd_clear()
+        self._rn_set_gz_dist_status("Disturbance: clearing…")
+
+        def _run():
+            try:
+                from gazebo_disturbance_helper import clear_gazebo_wrenches
+
+                ok, msg = clear_gazebo_wrenches(model, link)
+                from PyQt5.QtCore import QTimer
+
+                def _ui_done():
+                    status = "Disturbance: cleared" if ok else f"Clear wrench FAIL (RViz cleared): {msg}"
+                    self._rn_set_gz_dist_status(status)
+                    self.log(f"[gazebo_dist] clear {msg}")
+
+                QTimer.singleShot(0, _ui_done)
+            except Exception as e:
+                from PyQt5.QtCore import QTimer
+
+                QTimer.singleShot(0, lambda: self._rn_set_gz_dist_status(f"Clear ERROR: {e}"))
+
+        if self._ensure_ros_node():
+            threading.Thread(target=_run, daemon=True).start()
+        else:
+            self._rn_set_gz_dist_status("Disturbance: cleared (no ROS)")
+
+    def _stop_gazebo_disturbance_viz_node(self) -> None:
+        proc = getattr(self, "_rn_gz_dist_viz_process", None)
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            self._rn_gz_dist_viz_process = None
+
+    def _rn_set_gz_dist_status(self, text: str) -> None:
+        if hasattr(self, "rn_gz_dist_status"):
+            self.rn_gz_dist_status.setText(text)
+            active = self._rn_gz_dist_active is not None
+            self.rn_gz_dist_status.setStyleSheet(
+                "color: #c62828; font-size: 11px; font-weight: bold;"
+                if active
+                else "color: gray; font-size: 11px;"
+            )
+
     def _start_rviz_viz_node(self) -> None:
         """Launch the standalone robot/EE RViz visualizer (decoupled from MPC node)."""
         if self._viz_process is not None and self._viz_process.poll() is None:
@@ -9773,16 +10435,25 @@ class UamSuiteGUI(QMainWindow):
         for _delay in (1500, 3000, 5000):
             QTimer.singleShot(_delay, self._ensure_gazebo_state_subscription)
         QTimer.singleShot(2000, self._start_rviz_viz_node)
+        QTimer.singleShot(2500, self._rn_reset_disturbance_on_gazebo_start)
+
+    def _rn_reset_disturbance_on_gazebo_start(self) -> None:
+        """Gazebo 启动后清除上次会话残留的扰动 rosparam / RViz 箭头。"""
+        self._rn_gz_dist_active = None
+        if self._ensure_ros_node():
+            self._rn_set_disturbance_cmd(None)
+            self._rn_pulse_disturbance_cmd_clear()
 
     def _stop_ros_gazebo(self) -> None:
         try:
             self._gazebo_states_subscribed = False
             self._gazebo_pose = None
             self._gazebo_pose_t = 0.0
-            # 0) 关闭独立 RViz 可视化节点
+            # 0) 关闭独立 RViz / 扰动可视化节点
             self._stop_rviz_viz_node()
+            self._stop_gazebo_disturbance_viz_node()
             subprocess.run(
-                ["rosnode", "kill", "/suite_rviz_state_node"],
+                ["rosnode", "kill", "/suite_rviz_state_node", "/gazebo_disturbance_viz"],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -12743,6 +13414,7 @@ class UamSuiteGUI(QMainWindow):
 
     def _render_tracking_figures(self, res: dict, control_mode: str, out: dict | None = None):
         self._last_track_res = res
+        self._last_track_out = out if isinstance(out, dict) else None
         em = self._ee_mpc
         if em is None:
             self.fig_states.clear()

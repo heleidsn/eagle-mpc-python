@@ -20,6 +20,9 @@
     <arg name="debug" default="false"/>
     <arg name="verbose" default="false"/>
     <arg name="paused" default="true"/>
+    <!-- s500_uam 带臂：须先 pause 再加载控制器，否则 spawn 后关节无力矩会砸地弹跳。
+         auto_unpause 在臂 position 控制器就绪并预置关节角后自动 unpause。 -->
+    <arg name="auto_unpause" default="true"/>
     <arg name="respawn_gazebo" default="false"/>
     <arg name="launch_rviz" default="true"/>
     <arg name="launch_reference_path_pub" default="true"/>
@@ -59,9 +62,15 @@
     <!-- gazebo model -->
     <node name="$(anon vehicle_spawn)" pkg="gazebo_ros" type="spawn_model" output="screen" args="-sdf -file $(arg sdf_file) -model $(arg vehicle) -x $(arg x) -y $(arg y) -z $(arg z) -J joint_1 $(arg joint_1_pos) -J joint_2 $(arg joint_2_pos) -J joint_3 $(arg joint_3_pos) -J joint_4 $(arg joint_4_pos)" />
 
-    <include file="$(find mavros)/launch/px4.launch">
-        <arg name="gcs_url" value=""/>
+    <include file="$(find mavros)/launch/node.launch">
+        <arg name="pluginlists_yaml" value="$(find eagle_mpc_python)/config/mavros/px4_sitl_pluginlists.yaml"/>
+        <arg name="config_yaml" value="$(find mavros)/launch/px4_config.yaml"/>
         <arg name="fcu_url" value="$(arg fcu_url)"/>
+        <arg name="gcs_url" value=""/>
+        <arg name="tgt_system" value="1"/>
+        <arg name="tgt_component" value="1"/>
+        <arg name="log_output" value="screen"/>
+        <arg name="fcu_protocol" value="v2.0"/>
         <arg name="respawn_mavros" value="$(arg respawn_mavros)"/>
     </include>
 
@@ -85,6 +94,22 @@
         <param name="use_sim_time" value="true"/>
     </node>
 
+    <node pkg="eagle_mpc_python" type="gazebo_unpause_after_arm_ready.py"
+          name="gazebo_unpause_after_arm_ready" output="screen"
+          if="$(arg auto_unpause)"
+          launch-prefix="bash -c 'sleep 2.0; exec $0 $@' ">
+        <param name="auto_unpause" value="$(arg auto_unpause)"/>
+        <param name="controller_ns" value="arm_controller"/>
+        <param name="hold_sec" value="0.5"/>
+        <param name="post_unpause_hold_sec" value="1.5"/>
+        <param name="switch_timeout_sec" value="4.0"/>
+        <param name="controller_wait_sec" value="90.0"/>
+        <param name="joint_1" value="$(arg joint_1_pos)"/>
+        <param name="joint_2" value="$(arg joint_2_pos)"/>
+        <param name="joint_3" value="$(arg joint_3_pos)"/>
+        <param name="joint_4" value="$(arg joint_4_pos)"/>
+    </node>
+
     <!-- Launch Joint PID Controller -->
     <!-- <node name="joint_pid_controller" pkg="eagle_mpc_python" type="joint_pid_controller.py" output="screen">
     </node> -->
@@ -95,6 +120,14 @@
     <!-- gazebo state-->
     <node pkg="eagle_mpc_python" type="groundtruth_pub.py" name="groundtruth_pub" output="screen">
         <param name="model_name" value="$(arg vehicle)" />
+    </node>
+
+    <!-- 默认无扰动，避免上次会话 rosparam 残留导致 RViz 一启动就有箭头 -->
+    <rosparam param="/suite_mpc/disturbance_config">{active: false}</rosparam>
+
+    <node pkg="eagle_mpc_python" type="gazebo_disturbance_viz_node.py"
+          name="gazebo_disturbance_viz" output="screen">
+        <param name="publish_hz" value="10"/>
     </node>
 
     <node pkg="eagle_mpc_python" type="reference_path_pub.py" name="reference_path_pub" output="screen" if="$(arg launch_reference_path_pub)">

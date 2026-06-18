@@ -7,7 +7,7 @@ Panels:
         - /EE axes1/Namespaces1
         - /Axes1
       Splitter Ratio: 0.5
-    Tree Height: 320
+    Tree Height: 1430
   - Class: rviz/Selection
     Name: Selection
   - Class: rviz/Tool Properties
@@ -49,7 +49,7 @@ Visualization Manager:
       Reference Frame: <Fixed Frame>
       Value: true
     - Alpha: 1
-      Axes Length: 0.20000000298023224
+      Axes Length: 0.10000000149011612
       Axes Radius: 0.019999999552965164
       Class: rviz/Pose
       Color: 255; 50; 50
@@ -225,8 +225,8 @@ Visualization Manager:
       Unreliable: false
       Value: true
     - Alpha: 1
-      Axes Length: 0.30000001192092896
-      Axes Radius: 0.029999999329447746
+      Axes Length: 0.15000000596046448
+      Axes Radius: 0.009999999776482582
       Class: rviz/Pose
       Color: 255; 25; 0
       Enabled: true
@@ -253,8 +253,17 @@ Visualization Manager:
       Marker Topic: /suite_mpc/ee_axes
       Name: EE axes
       Namespaces:
-        {}
+        suite_mpc_ee_axes: true
       Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /suite_mpc/disturbance_markers
+      Name: Gazebo disturbance
+      Namespaces:
+        suite_mpc_dist_anchor: true
+        suite_mpc_dist_force: true
+      Queue Size: 10
       Value: true
     - Alpha: 1
       Class: rviz/Axes
@@ -293,7 +302,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 8.026748657226562
+      Distance: 3.4575045108795166
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -301,17 +310,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 0.14269079267978668
-        Y: 0.10047255456447601
-        Z: 1.1888973712921143
+        X: -0.9285361766815186
+        Y: 0.02295253612101078
+        Z: 0.5316901206970215
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.08479742705821991
+      Pitch: 0.17479752004146576
       Target Frame: map
-      Yaw: 4.683149814605713
+      Yaw: 4.728157043457031
     Saved: ~
 Window Geometry:
   Displays:
@@ -319,7 +328,7 @@ Window Geometry:
   Height: 2123
   Hide Left Dock: true
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd0000000200000000000003cb00000400fc0200000004fb000000100044006900730070006c0061007900730000000056000002ce0000012600fffffffb0000001200530065006c0065006300740069006f006e000000032d000000910000008600fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007300000003c70000008f0000008600fffffffb0000000a0056006900650077007300000002a3000000ec000000ec00ffffff000000030000075c0000004bfc0100000001fb0000000800540069006d006501000000000000075c0000054300ffffff0000075c0000077b00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000200000000000003cb0000077bfc0200000004fb000000100044006900730070006c0061007900730000000056000006540000012600fffffffb0000001200530065006c0065006300740069006f006e00000006b3000000860000008600fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007300000007420000008f0000008600fffffffb0000000a0056006900650077007300000002a3000000ec000000ec00ffffff000000030000075a0000004bfc0100000001fb0000000800540069006d006501000000000000075a0000054300ffffff0000075a0000077b00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Selection:
     collapsed: true
   Time:
@@ -328,6 +337,6 @@ Window Geometry:
     collapsed: true
   Views:
     collapsed: false
-  Width: 1884
-  X: 5796
+  Width: 1882
+  X: 5798
   Y: 0
