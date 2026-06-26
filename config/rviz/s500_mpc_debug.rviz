@@ -7,7 +7,7 @@ Panels:
         - /EE axes1/Namespaces1
         - /Axes1
       Splitter Ratio: 0.5
-    Tree Height: 1430
+    Tree Height: 320
   - Class: rviz/Selection
     Name: Selection
   - Class: rviz/Tool Properties
@@ -258,11 +258,18 @@ Visualization Manager:
       Value: true
     - Class: rviz/MarkerArray
       Enabled: true
+      Marker Topic: /suite_mpc/tracking_error_markers
+      Name: Tracking error
+      Namespaces:
+        suite_mpc_track_err: true
+      Queue Size: 10
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
       Marker Topic: /suite_mpc/disturbance_markers
       Name: Gazebo disturbance
       Namespaces:
-        suite_mpc_dist_anchor: true
-        suite_mpc_dist_force: true
+        {}
       Queue Size: 10
       Value: true
     - Alpha: 1
@@ -302,7 +309,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 3.4575045108795166
+      Distance: 4.857544898986816
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -310,17 +317,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -0.9285361766815186
-        Y: 0.02295253612101078
-        Z: 0.5316901206970215
+        X: -0.40474608540534973
+        Y: 0.0859147310256958
+        Z: 0.4462587833404541
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.17479752004146576
+      Pitch: 0.0947975143790245
       Target Frame: map
-      Yaw: 4.728157043457031
+      Yaw: 4.7831573486328125
     Saved: ~
 Window Geometry:
   Displays:

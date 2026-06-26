@@ -415,9 +415,15 @@ def _align_ocp_with_cached_json(ocp: "AcadosOcp", json_path: Path) -> bool:
 
     cost = data.get("cost") or {}
     if cost.get("W"):
-        ocp.cost.W = np.array(cost["W"], dtype=float)
+        W_cached = np.array(cost["W"], dtype=float)
+        cur_w = getattr(ocp.cost, "W", None)
+        if cur_w is not None and np.asarray(cur_w).shape == W_cached.shape:
+            ocp.cost.W = W_cached
     if cost.get("W_e"):
-        ocp.cost.W_e = np.array(cost["W_e"], dtype=float)
+        W_e_cached = np.array(cost["W_e"], dtype=float)
+        cur_we = getattr(ocp.cost, "W_e", None)
+        if cur_we is not None and np.asarray(cur_we).shape == W_e_cached.shape:
+            ocp.cost.W_e = W_e_cached
 
     solver_opts = data.get("solver_options") or {}
     for key in ("nlp_solver_max_iter", "qp_solver_iter_max"):

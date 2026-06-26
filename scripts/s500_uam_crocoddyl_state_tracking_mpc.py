@@ -119,8 +119,27 @@ class EETrackingWeights:
     w_vel_ang_yaw: float = 1.0
     w_u: float = 0.0
     w_terminal_scale: float = 3.0
+    # 弱基座参考（沿 x_plan，不锁关节）：抑制 EE 零空间漂移
+    w_base_pos: float = 0.0
+    w_base_yaw: float = 0.0
     w_state_reg: float = 0.0
     w_state_track: float = 0.0
+    # x_plan 分项激活（仅当 w_state_track > 0）；关节权宜小，避免锁死臂
+    w_st_pos: float = 1.0
+    w_st_att: float = 1.0
+    w_st_joint: float = 0.2
+    w_st_vel: float = 0.1
+    w_st_omega: float = 0.1
+    w_st_joint_vel: float = 0.05
+
+
+BASE_FRAME_NAME = "base_link"
+
+
+def _yaw_from_full_state(x: np.ndarray) -> float:
+    q = np.asarray(x, dtype=float).flatten()[3:7]
+    R = pin.Quaternion(q).toRotationMatrix()
+    return float(np.arctan2(float(R[1, 0]), float(R[0, 0])))
 
 
 def interp_ref_pose(
@@ -334,6 +353,12 @@ class UAMCrocoddylTrackingMPC:
         self.robot_data = self._planner.robot_data
         self.s500_config = self._planner.s500_config
         self.ee_frame_id = self._planner.ee_frame_id
+        try:
+            self.base_frame_id = int(self.robot_model.getFrameId(BASE_FRAME_NAME))
+        except Exception:
+            self.base_frame_id = -1
+        if self.base_frame_id < 0 or self.base_frame_id >= len(self.robot_model.frames):
+            self.base_frame_id = -1
         self.nu = self.actuation.nu
         self.nq = self.robot_model.nq
         self.nv = self.robot_model.nv
@@ -375,6 +400,40 @@ class UAMCrocoddylTrackingMPC:
 
     # ----- Full-state costs -----
 
+    def _state_track_activation_weights(self) -> np.ndarray:
+        """Per-tangent weights for optional x_plan state track (EE or full-state)."""
+        n_joint_q = max(0, int(self.nq) - 7)
+        n_joint_v = max(0, int(self.nv) - 6)
+        if self.mode == self.MODE_EE_POSE:
+            w = self.w
+            w_pos = float(w.w_st_pos)
+            w_att = float(w.w_st_att)
+            w_joint = float(w.w_st_joint)
+            w_vel = float(w.w_st_vel)
+            w_omega = float(w.w_st_omega)
+            w_joint_vel = float(w.w_st_joint_vel)
+        else:
+            w_pos = float(self.w_pos)
+            w_att = float(self.w_att)
+            w_joint = float(self.w_joint)
+            w_vel = float(self.w_vel)
+            w_omega = float(self.w_omega)
+            w_joint_vel = float(self.w_joint_vel)
+        act = (
+            [w_pos] * 3
+            + [w_att] * 3
+            + [w_joint] * n_joint_q
+            + [w_vel] * 3
+            + [w_omega] * 3
+            + [w_joint_vel] * n_joint_v
+        )
+        act = np.asarray(act, dtype=np.float64)
+        if act.size != int(self.state.ndx):
+            raise ValueError(
+                f"state track activation size mismatch: got {act.size}, expected ndx={self.state.ndx}"
+            )
+        return act
+
     def _full_state_activation_weights(self) -> np.ndarray:
         """Weights on state tangent [pos(3), att(3), joints, vel(3), omega(3), joint_vels]."""
         n_joint_q = max(0, int(self.nq) - 7)
@@ -402,6 +461,58 @@ class UAMCrocoddylTrackingMPC:
         if self.nu >= 6:
             w_u[4:6] = float(self.w_u_joint_torque)
         return w_u
+
+    def update_cost_weights(self, **kw) -> None:
+        """在线更新代价权重（下一拍 build_shooting_problem 即生效，无需重建模型）。"""
+        if self.mode == self.MODE_FULL_STATE:
+            for name in (
+                "w_state_track",
+                "w_state_reg",
+                "w_control",
+                "w_terminal_track",
+                "w_pos",
+                "w_att",
+                "w_joint",
+                "w_vel",
+                "w_omega",
+                "w_joint_vel",
+                "w_u_thrust",
+                "w_u_joint_torque",
+            ):
+                if name in kw and kw[name] is not None:
+                    setattr(self, name, float(kw[name]))
+            if "dt_mpc" in kw and kw["dt_mpc"] is not None:
+                self.dt_mpc = float(kw["dt_mpc"])
+            if "horizon" in kw and kw["horizon"] is not None:
+                self.horizon = int(kw["horizon"])
+            return
+        w = self.w
+        for name in (
+            "w_pos",
+            "w_rot_rp",
+            "w_rot_yaw",
+            "w_vel_lin",
+            "w_vel_ang_rp",
+            "w_vel_ang_yaw",
+            "w_u",
+            "w_terminal_scale",
+            "w_base_pos",
+            "w_base_yaw",
+            "w_state_reg",
+            "w_state_track",
+            "w_st_pos",
+            "w_st_att",
+            "w_st_joint",
+            "w_st_vel",
+            "w_st_omega",
+            "w_st_joint_vel",
+        ):
+            if name in kw and kw[name] is not None:
+                setattr(w, name, float(kw[name]))
+        if "dt_mpc" in kw and kw["dt_mpc"] is not None:
+            self.dt_mpc = float(kw["dt_mpc"])
+        if "horizon" in kw and kw["horizon"] is not None:
+            self.horizon = int(kw["horizon"])
 
     def _make_running_cost_state(self, x_ref: np.ndarray, x_nom: np.ndarray) -> crocoddyl.CostModelSum:
         """Full-state tracking 的 running cost（每个 MPC 时域节点都会用）.
@@ -496,6 +607,8 @@ class UAMCrocoddylTrackingMPC:
         v_lin_des: np.ndarray,
         w_ang_des: np.ndarray,
         x_ref: Optional[np.ndarray] = None,
+        p_base_des: Optional[np.ndarray] = None,
+        yaw_base_des: Optional[float] = None,
         *,
         cost_scale: float = 1.0,
     ) -> crocoddyl.CostModelSum:
@@ -505,6 +618,7 @@ class UAMCrocoddylTrackingMPC:
           - ee_pos: EE 位置跟踪
           - ee_rot: EE 姿态跟踪（roll/pitch/yaw 可分权）
           - ee_vel: EE 线速度/角速度跟踪（通常用于抓取前减速）
+          - base_pos / base_yaw: 弱基座参考（沿 plan，不锁关节）
           - u_reg:  控制正则（参考悬停）
           - x_reg:  状态正则（默认更弱）
           - x_track_ref: 可选全状态参考跟踪
@@ -576,6 +690,38 @@ class UAMCrocoddylTrackingMPC:
                 crocoddyl.CostModelResidual(self.state, vel_act, vel_res),
                 sc,
             )
+        if (
+            w.w_base_pos > 0
+            and p_base_des is not None
+            and int(getattr(self, "base_frame_id", -1)) >= 0
+        ):
+            p_b = np.asarray(p_base_des, dtype=float).reshape(3)
+            base_pos_res = crocoddyl.ResidualModelFrameTranslation(
+                self.state, self.base_frame_id, p_b, nu
+            )
+            c.addCost(
+                "base_pos",
+                crocoddyl.CostModelResidual(self.state, base_pos_res),
+                sc * float(w.w_base_pos),
+            )
+        if (
+            w.w_base_yaw > 0
+            and yaw_base_des is not None
+            and int(getattr(self, "base_frame_id", -1)) >= 0
+        ):
+            R_b = _yaw_to_rotation_matrix(float(yaw_base_des))
+            T_b = pin.SE3(R_b, np.zeros(3, dtype=float))
+            base_yaw_act = crocoddyl.ActivationModelWeightedQuad(
+                np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=float)
+            )
+            base_rot_res = crocoddyl.ResidualModelFramePlacement(
+                self.state, self.base_frame_id, T_b, nu
+            )
+            c.addCost(
+                "base_yaw",
+                crocoddyl.CostModelResidual(self.state, base_yaw_act, base_rot_res),
+                sc * float(w.w_base_yaw),
+            )
         if w.w_u > 0:
             w_u = np.ones(nu, dtype=np.float64)
             if nu >= 6:
@@ -604,7 +750,9 @@ class UAMCrocoddylTrackingMPC:
             )
         if x_ref is not None and float(w.w_state_track) > 0.0:
             xr = np.asarray(x_ref, dtype=float).flatten()
-            act_x = crocoddyl.ActivationModelQuad(self.state.ndx)
+            act_x = crocoddyl.ActivationModelWeightedQuad(
+                self._state_track_activation_weights()
+            )
             x_track_res = crocoddyl.ResidualModelState(self.state, xr, nu)
             c.addCost(
                 "x_track_ref",
@@ -620,10 +768,19 @@ class UAMCrocoddylTrackingMPC:
         v_lin_des: np.ndarray,
         w_ang_des: np.ndarray,
         x_ref: Optional[np.ndarray] = None,
+        p_base_des: Optional[np.ndarray] = None,
+        yaw_base_des: Optional[float] = None,
     ) -> crocoddyl.CostModelSum:
         ts = float(self.w.w_terminal_scale)
         return self._make_running_cost_ee(
-            p_des, yaw_des, v_lin_des, w_ang_des, x_ref=x_ref, cost_scale=ts
+            p_des,
+            yaw_des,
+            v_lin_des,
+            w_ang_des,
+            x_ref=x_ref,
+            p_base_des=p_base_des,
+            yaw_base_des=yaw_base_des,
+            cost_scale=ts,
         )
 
     def _make_integrated_running_ee(
@@ -633,9 +790,18 @@ class UAMCrocoddylTrackingMPC:
         v_lin_des: np.ndarray,
         w_ang_des: np.ndarray,
         x_ref: Optional[np.ndarray] = None,
+        p_base_des: Optional[np.ndarray] = None,
+        yaw_base_des: Optional[float] = None,
     ) -> crocoddyl.IntegratedActionModelEuler:
         cost = self._make_running_cost_ee(
-            p_des, yaw_des, v_lin_des, w_ang_des, x_ref=x_ref, cost_scale=1.0
+            p_des,
+            yaw_des,
+            v_lin_des,
+            w_ang_des,
+            x_ref=x_ref,
+            p_base_des=p_base_des,
+            yaw_base_des=yaw_base_des,
+            cost_scale=1.0,
         )
         diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, cost)
         inte = crocoddyl.IntegratedActionModelEuler(diff, self.dt_mpc)
@@ -650,8 +816,18 @@ class UAMCrocoddylTrackingMPC:
         v_lin_des: np.ndarray,
         w_ang_des: np.ndarray,
         x_ref: Optional[np.ndarray] = None,
+        p_base_des: Optional[np.ndarray] = None,
+        yaw_base_des: Optional[float] = None,
     ) -> crocoddyl.IntegratedActionModelEuler:
-        cost = self._make_terminal_cost_ee(p_des, yaw_des, v_lin_des, w_ang_des, x_ref=x_ref)
+        cost = self._make_terminal_cost_ee(
+            p_des,
+            yaw_des,
+            v_lin_des,
+            w_ang_des,
+            x_ref=x_ref,
+            p_base_des=p_base_des,
+            yaw_base_des=yaw_base_des,
+        )
         diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, cost)
         return crocoddyl.IntegratedActionModelEuler(diff, 0.0)
 
@@ -703,14 +879,34 @@ class UAMCrocoddylTrackingMPC:
         if self.mode != self.MODE_EE_POSE:
             raise RuntimeError("build_shooting_problem_along_ee_ref is only valid in EE-pose mode")
         x0 = np.asarray(x0, dtype=float).flatten()
-        use_x_plan = (
+        use_plan_aux = (
             t_plan is not None
             and x_plan is not None
-            and float(self.w.w_state_track) > 0.0
+            and (
+                float(self.w.w_state_track) > 0.0
+                or float(self.w.w_base_pos) > 0.0
+                or float(self.w.w_base_yaw) > 0.0
+            )
         )
-        if use_x_plan:
+        if use_plan_aux:
             t_plan = np.asarray(t_plan, dtype=float).flatten()
             x_plan = np.asarray(x_plan, dtype=float)
+
+        def _plan_aux_at(tk: float) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
+            if not use_plan_aux:
+                return None, None, None
+            xk = interp_full_state_piecewise(tk, t_plan, x_plan, self.robot_model)
+            x_ref_k = xk if float(self.w.w_state_track) > 0.0 else None
+            p_base_k = (
+                np.asarray(xk[:3], dtype=float).reshape(3)
+                if float(self.w.w_base_pos) > 0.0
+                else None
+            )
+            yaw_base_k = (
+                _yaw_from_full_state(xk) if float(self.w.w_base_yaw) > 0.0 else None
+            )
+            return x_ref_k, p_base_k, yaw_base_k
+
         running: List[crocoddyl.IntegratedActionModelEuler] = []
         for k in range(self.horizon):
             tk = float(t_start + k * self.dt_mpc)
@@ -725,12 +921,16 @@ class UAMCrocoddylTrackingMPC:
             )
             yaw_rate_k = float(np.interp(tk, t_ref, dyaw_ref))
             w_ang_k = np.array([0.0, 0.0, yaw_rate_k], dtype=float)
-            x_ref_k = None
-            if use_x_plan:
-                x_ref_k = interp_full_state_piecewise(tk, t_plan, x_plan, self.robot_model)
+            x_ref_k, p_base_k, yaw_base_k = _plan_aux_at(tk)
             running.append(
                 self._make_integrated_running_ee(
-                    p_des_k, yaw_des_k, v_lin_k, w_ang_k, x_ref=x_ref_k
+                    p_des_k,
+                    yaw_des_k,
+                    v_lin_k,
+                    w_ang_k,
+                    x_ref=x_ref_k,
+                    p_base_des=p_base_k,
+                    yaw_base_des=yaw_base_k,
                 )
             )
         tN = float(t_start + self.horizon * self.dt_mpc)
@@ -745,11 +945,15 @@ class UAMCrocoddylTrackingMPC:
         )
         yaw_rate_N = float(np.interp(tN, t_ref, dyaw_ref))
         w_ang_N = np.array([0.0, 0.0, yaw_rate_N], dtype=float)
-        x_ref_N = None
-        if use_x_plan:
-            x_ref_N = interp_full_state_piecewise(tN, t_plan, x_plan, self.robot_model)
+        x_ref_N, p_base_N, yaw_base_N = _plan_aux_at(tN)
         terminal = self._make_integrated_terminal_ee(
-            p_des_N, yaw_des_N, v_lin_N, w_ang_N, x_ref=x_ref_N
+            p_des_N,
+            yaw_des_N,
+            v_lin_N,
+            w_ang_N,
+            x_ref=x_ref_N,
+            p_base_des=p_base_N,
+            yaw_base_des=yaw_base_N,
         )
         return crocoddyl.ShootingProblem(x0, running, terminal)
 

@@ -21,8 +21,9 @@
     <arg name="verbose" default="false"/>
     <arg name="paused" default="true"/>
     <!-- s500_uam 带臂：须先 pause 再加载控制器，否则 spawn 后关节无力矩会砸地弹跳。
-         auto_unpause 在臂 position 控制器就绪并预置关节角后自动 unpause。 -->
+         auto_unpause 在 unpause_delay_sec 到达后自动 unpause（期间尽力预置臂关节角）。 -->
     <arg name="auto_unpause" default="true"/>
+    <arg name="unpause_delay_sec" default="3.0"/>
     <arg name="respawn_gazebo" default="false"/>
     <arg name="launch_rviz" default="true"/>
     <arg name="launch_reference_path_pub" default="true"/>
@@ -96,18 +97,17 @@
 
     <node pkg="eagle_mpc_python" type="gazebo_unpause_after_arm_ready.py"
           name="gazebo_unpause_after_arm_ready" output="screen"
-          if="$(arg auto_unpause)"
-          launch-prefix="bash -c 'sleep 2.0; exec $0 $@' ">
-        <param name="auto_unpause" value="$(arg auto_unpause)"/>
-        <param name="controller_ns" value="arm_controller"/>
-        <param name="hold_sec" value="0.5"/>
-        <param name="post_unpause_hold_sec" value="1.5"/>
-        <param name="switch_timeout_sec" value="4.0"/>
-        <param name="controller_wait_sec" value="90.0"/>
-        <param name="joint_1" value="$(arg joint_1_pos)"/>
-        <param name="joint_2" value="$(arg joint_2_pos)"/>
-        <param name="joint_3" value="$(arg joint_3_pos)"/>
-        <param name="joint_4" value="$(arg joint_4_pos)"/>
+          if="$(arg auto_unpause)">
+        <!-- Phase-1 用环境变量，避免 rospy 在 /clock 为空时卡死 -->
+        <env name="UNPAUSE_AUTO" value="$(arg auto_unpause)"/>
+        <env name="UNPAUSE_DELAY_SEC" value="$(arg unpause_delay_sec)"/>
+        <env name="UNPAUSE_CONTROLLER_NS" value="arm_controller"/>
+        <env name="UNPAUSE_POST_HOLD_SEC" value="1.5"/>
+        <env name="UNPAUSE_SWITCH_TIMEOUT_SEC" value="4.0"/>
+        <env name="UNPAUSE_JOINT_1" value="$(arg joint_1_pos)"/>
+        <env name="UNPAUSE_JOINT_2" value="$(arg joint_2_pos)"/>
+        <env name="UNPAUSE_JOINT_3" value="$(arg joint_3_pos)"/>
+        <env name="UNPAUSE_JOINT_4" value="$(arg joint_4_pos)"/>
     </node>
 
     <!-- Launch Joint PID Controller -->
