@@ -1,195 +1,226 @@
 #!/usr/bin/env python3
-"""Unpause Gazebo after s500_uam arm controllers are ready.
+"""Unpause Gazebo after wall-clock delay (works when /clock is silent while paused).
 
-When ``paused:=true``, spawn is safe but controllers may stay ``loaded`` (not
-``running``) until physics runs — ``controller_manager/spawner`` can block on
-``switch_controller`` while the world is paused.
+With ``use_sim_time`` and Gazebo ``paused:=true``, ``/clock`` often has **no
+messages**.  Any ``rospy.init_node()`` then blocks forever waiting for sim time.
 
-This node:
+Strategy:
 
-  1. Waits until joint controllers appear in controller_manager (loaded).
-  2. Tries to start them (switch_controller), with a short timeout while paused.
-  3. Latches initial joint position commands.
-  4. Calls /gazebo/unpause_physics.
-  5. Re-primes joint commands briefly after unpause so position loops engage.
+  1. **Phase 1 (no rospy):** wall-clock sleep, then unpause via ``gz world -p 0``
+     (direct Gazebo API) with ``rosservice`` fallback.
+  2. **Phase 2 (rospy):** after physics runs, ``/clock`` is published — init rospy
+     and best-effort switch arm controllers + prime joint setpoints.
+
+Launch passes ``UNPAUSE_DELAY_SEC`` etc. via ``<env>`` so phase 1 needs no rosparam.
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import threading
-
-import rospy
-from controller_manager_msgs.srv import ListControllers, SwitchController
-from std_msgs.msg import Float64
-from std_srvs.srv import Empty
-
-# controller_manager_msgs/SwitchController: STRICT=2, BEST_EFFORT=1
-_SWITCH_BEST_EFFORT = 1
+import time
 
 
-def _list_controller_states(ns: str) -> dict[str, str]:
-    svc = rospy.ServiceProxy(f"/{ns}/controller_manager/list_controllers", ListControllers)
-    resp = svc()
-    return {c.name: c.state for c in resp.controller}
+def _log(msg: str) -> None:
+    print(f"[unpause_arm] {msg}", flush=True)
 
 
-def _wait_for_controllers_loaded(ns: str, names: list[str], timeout: float) -> bool:
-    svc_name = f"/{ns}/controller_manager/list_controllers"
-    rospy.wait_for_service(svc_name, timeout=timeout)
-    want = set(names)
-    deadline = rospy.Time.now() + rospy.Duration(timeout)
-    rate = rospy.Rate(10)
-    while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-        try:
-            states = _list_controller_states(ns)
-            if want.issubset(states.keys()):
-                rospy.loginfo(
-                    f"[unpause_arm] Controllers loaded: "
-                    + ", ".join(f"{k}={states[k]}" for k in sorted(want))
-                )
-                return True
-        except Exception as e:
-            rospy.logwarn_throttle(2.0, f"[unpause_arm] list_controllers: {e}")
-        rate.sleep()
-    return False
+def _wall_sleep(sec: float) -> None:
+    if sec > 0.0:
+        time.sleep(sec)
 
 
-def _switch_controllers(ns: str, names: list[str], timeout: float) -> bool:
-    """Start controllers; return False if switch call does not finish in time."""
+def _run(cmd: list[str], *, timeout: float = 10.0) -> tuple[bool, str]:
     try:
-        states = _list_controller_states(ns)
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=float(timeout),
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        return r.returncode == 0, out.strip()
+    except subprocess.TimeoutExpired:
+        return False, f"timeout after {timeout:.1f}s"
+    except FileNotFoundError:
+        return False, f"command not found: {cmd[0]}"
     except Exception as e:
-        rospy.logwarn(f"[unpause_arm] list before switch: {e}")
-        states = {}
-    to_start = [n for n in names if states.get(n) != "running"]
-    if not to_start:
+        return False, str(e)
+
+
+def _unpause_gazebo_no_ros() -> bool:
+    """Unpause without rospy (safe when /clock is absent)."""
+    ok, out = _run(["gz", "world", "-p", "0"], timeout=5.0)
+    if ok:
+        _log("gz world -p 0 OK (unpause)")
+        return True
+    _log(f"gz world -p 0 failed ({out}); trying rosservice ...")
+
+    ok, out = _run(
+        ["timeout", "5", "rosservice", "call", "/gazebo/unpause_physics", "{}"],
+        timeout=8.0,
+    )
+    if ok:
+        _log("rosservice /gazebo/unpause_physics OK")
         return True
 
-    switch = rospy.ServiceProxy(
-        f"/{ns}/controller_manager/switch_controller", SwitchController
-    )
-    rospy.wait_for_service(f"/{ns}/controller_manager/switch_controller", timeout=5.0)
-
-    result = {"ok": False, "err": None}
-
-    def _call():
-        try:
-            resp = switch(to_start, [], _SWITCH_BEST_EFFORT, False, 0.0)
-            result["ok"] = bool(getattr(resp, "ok", 0))
-        except Exception as e:
-            result["err"] = str(e)
-
-    th = threading.Thread(target=_call, daemon=True)
-    th.start()
-    th.join(timeout=max(0.5, float(timeout)))
-    if th.is_alive():
-        rospy.logwarn(
-            f"[unpause_arm] switch_controller timed out after {timeout:.1f}s "
-            f"(common while paused); will unpause and retry."
-        )
-        return False
-    if result["err"]:
-        rospy.logwarn(f"[unpause_arm] switch_controller error: {result['err']}")
-    elif result["ok"]:
-        rospy.loginfo(f"[unpause_arm] Started controllers: {', '.join(to_start)}")
-    else:
-        rospy.logwarn(f"[unpause_arm] switch_controller returned not-ok for {to_start}")
-    return bool(result["ok"])
-
-
-def _wait_for_controllers_running(ns: str, names: list[str], timeout: float) -> bool:
-    want = set(names)
-    deadline = rospy.Time.now() + rospy.Duration(timeout)
-    rate = rospy.Rate(20)
-    while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-        try:
-            states = _list_controller_states(ns)
-            running = {n for n, st in states.items() if st == "running"}
-            if want.issubset(running):
-                return True
-        except Exception as e:
-            rospy.logwarn_throttle(1.0, f"[unpause_arm] list_controllers: {e}")
-        rate.sleep()
+    _log(f"rosservice unpause failed: {out}")
     return False
 
 
-def _prime_joint_commands(ns: str, joints: list[tuple[str, float]], hold_sec: float) -> None:
-    pubs = []
-    for jname, pos in joints:
-        topic = f"/{ns}/{jname}_controller/command"
-        pub = rospy.Publisher(topic, Float64, queue_size=1, latch=True)
-        pubs.append((pub, float(pos)))
-    rospy.sleep(0.2)
-    if hold_sec <= 0.0:
-        for pub, pos in pubs:
-            pub.publish(Float64(data=pos))
-        return
-    rate = rospy.Rate(50)
-    t_end = rospy.Time.now() + rospy.Duration(hold_sec)
-    while not rospy.is_shutdown() and rospy.Time.now() < t_end:
-        for pub, pos in pubs:
-            pub.publish(Float64(data=pos))
-        rate.sleep()
-    for pub, pos in pubs:
-        pub.publish(Float64(data=pos))
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
 
 
-def _unpause_physics() -> bool:
-    rospy.wait_for_service("/gazebo/unpause_physics", timeout=15.0)
-    rospy.ServiceProxy("/gazebo/unpause_physics", Empty)()
-    return True
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
+def _phase1_wall_clock_unpause() -> bool:
+    if not _env_bool("UNPAUSE_AUTO", True):
+        _log("UNPAUSE_AUTO=false, exiting.")
+        return False
+
+    delay = max(0.5, _env_float("UNPAUSE_DELAY_SEC", 8.0))
+    _log(
+        f"Phase-1: wait {delay:.1f}s wall clock "
+        "(no rospy — /clock may be empty while paused) ..."
+    )
+    _wall_sleep(delay)
+
+    for attempt in range(1, 16):
+        if _unpause_gazebo_no_ros():
+            return True
+        _log(f"unpause retry {attempt}/15 in 0.5s ...")
+        _wall_sleep(0.5)
+
+    _log("ERROR: could not unpause Gazebo")
+    return False
+
+
+def _wait_for_clock(timeout_wall: float = 15.0) -> bool:
+    """Block until /clock appears (needs rospy + sim time running)."""
+    import rospy
+    from rosgraph_msgs.msg import Clock
+
+    deadline = time.monotonic() + float(timeout_wall)
+    while time.monotonic() < deadline:
+        try:
+            rospy.wait_for_message("/clock", Clock, timeout=0.5)
+            return True
+        except Exception:
+            if rospy.is_shutdown():
+                return False
+    return False
+
+
+def _phase2_rospy_arm_prep() -> None:
+    import rospy
+    from controller_manager_msgs.srv import ListControllers, SwitchController
+    from std_msgs.msg import Float64
+    from std_srvs.srv import Empty
+
+    rospy.init_node("gazebo_unpause_after_arm_ready")
+
+    ns = os.environ.get("UNPAUSE_CONTROLLER_NS", "arm_controller").strip().strip("/")
+    post_hold = _env_float("UNPAUSE_POST_HOLD_SEC", 1.5)
+    switch_timeout = _env_float("UNPAUSE_SWITCH_TIMEOUT_SEC", 4.0)
+    joint_names = ["joint_1", "joint_2", "joint_3", "joint_4"]
+    joints = [
+        (j, _env_float(f"UNPAUSE_{j.upper()}", 0.0)) for j in joint_names
+    ]
+    pos_ctrl = [f"{j}_controller" for j in joint_names]
+
+    if not _wait_for_clock(15.0):
+        rospy.logwarn("[unpause_arm] /clock not seen after unpause; arm prep may be flaky.")
+
+    def _list_states() -> dict[str, str]:
+        svc = rospy.ServiceProxy(
+            f"/{ns}/controller_manager/list_controllers", ListControllers
+        )
+        return {c.name: c.state for c in svc().controller}
+
+    def _switch(names: list[str]) -> bool:
+        try:
+            states = _list_states()
+        except Exception as e:
+            rospy.logwarn(f"[unpause_arm] list_controllers: {e}")
+            return False
+        to_start = [n for n in names if states.get(n) != "running"]
+        if not to_start:
+            return True
+        switch = rospy.ServiceProxy(
+            f"/{ns}/controller_manager/switch_controller", SwitchController
+        )
+        result: dict = {"ok": False, "err": None}
+
+        def _call():
+            try:
+                resp = switch(to_start, [], 1, False, 0.0)
+                result["ok"] = bool(getattr(resp, "ok", 0))
+            except Exception as e:
+                result["err"] = str(e)
+
+        th = threading.Thread(target=_call, daemon=True)
+        th.start()
+        th.join(timeout=max(0.5, switch_timeout))
+        if th.is_alive():
+            rospy.logwarn("[unpause_arm] switch_controller timed out")
+            return False
+        if result["err"]:
+            rospy.logwarn(f"[unpause_arm] switch_controller: {result['err']}")
+        elif result["ok"]:
+            rospy.loginfo(f"[unpause_arm] Started: {', '.join(to_start)}")
+        return bool(result["ok"])
+
+    # Ensure unpause via ROS too (idempotent).
+    try:
+        rospy.wait_for_service("/gazebo/unpause_physics", timeout=3.0)
+        rospy.ServiceProxy("/gazebo/unpause_physics", Empty)()
+    except Exception:
+        pass
+
+    _switch(pos_ctrl)
+
+    if post_hold > 0.0:
+        pubs = []
+        for jname, pos in joints:
+            topic = f"/{ns}/{jname}_controller/command"
+            pubs.append((rospy.Publisher(topic, Float64, queue_size=1, latch=True), pos))
+        _wall_sleep(0.2)
+        rate = rospy.Rate(50)
+        t_end = rospy.Time.now() + rospy.Duration(post_hold)
+        while not rospy.is_shutdown() and rospy.Time.now() < t_end:
+            for pub, pos in pubs:
+                pub.publish(Float64(data=float(pos)))
+            rate.sleep()
+        for pub, pos in pubs:
+            pub.publish(Float64(data=float(pos)))
+        rospy.loginfo(f"[unpause_arm] Post-unpause joint hold ({post_hold:.1f}s) done.")
+
+    rospy.loginfo("[unpause_arm] Done.")
 
 
 def main() -> None:
-    rospy.init_node("gazebo_unpause_after_arm_ready")
-
-    if not bool(rospy.get_param("~auto_unpause", True)):
-        rospy.loginfo("[unpause_arm] auto_unpause=false, exiting.")
-        return
-
-    ns = str(rospy.get_param("~controller_ns", "arm_controller")).strip().strip("/")
-    hold_sec = float(rospy.get_param("~hold_sec", 1.0))
-    post_hold_sec = float(rospy.get_param("~post_unpause_hold_sec", 1.0))
-    wait_sec = float(rospy.get_param("~controller_wait_sec", 90.0))
-    switch_timeout = float(rospy.get_param("~switch_timeout_sec", 4.0))
-    joint_names = ["joint_1", "joint_2", "joint_3", "joint_4"]
-    joints = [
-        (jname, float(rospy.get_param(f"~{jname}", 0.0))) for jname in joint_names
-    ]
-    pos_ctrl_names = [f"{j}_controller" for j in joint_names]
-    all_ctrl_names = pos_ctrl_names + ["joint_state_controller"]
-
-    rospy.loginfo(
-        f"[unpause_arm] Waiting for arm controllers in /{ns} "
-        f"(joint targets: {[p for _, p in joints]})..."
-    )
-    if not _wait_for_controllers_loaded(ns, all_ctrl_names, wait_sec):
-        rospy.logerr("[unpause_arm] Timed out waiting for controllers to load; not unpausing.")
-        return
-
-    # While paused: try switch (may time out) and latch joint setpoints.
-    _switch_controllers(ns, pos_ctrl_names, switch_timeout)
-    rospy.loginfo(f"[unpause_arm] Priming joint commands ({hold_sec:.1f}s, paused)...")
-    _prime_joint_commands(ns, joints, hold_sec)
-
+    if not _phase1_wall_clock_unpause():
+        sys.exit(1)
+    # Let Gazebo start publishing /clock before rospy init.
+    _wall_sleep(0.3)
     try:
-        _unpause_physics()
-        rospy.loginfo("[unpause_arm] /gazebo/unpause_physics OK — simulation running.")
+        _phase2_rospy_arm_prep()
     except Exception as e:
-        rospy.logerr(f"[unpause_arm] unpause failed: {e}")
-        return
-
-    # After unpause: switch again if needed, wait for running, then hold joints.
-    _switch_controllers(ns, pos_ctrl_names, switch_timeout)
-    if not _wait_for_controllers_running(ns, pos_ctrl_names, timeout=8.0):
-        rospy.logwarn(
-            "[unpause_arm] Position controllers not all 'running' after unpause; "
-            "continuing with joint command priming."
-        )
-    if post_hold_sec > 0.0:
-        rospy.loginfo(f"[unpause_arm] Post-unpause joint hold ({post_hold_sec:.1f}s)...")
-        _prime_joint_commands(ns, joints, post_hold_sec)
-    rospy.loginfo("[unpause_arm] Done.")
+        _log(f"Phase-2 rospy arm prep failed (sim may still be running): {e}")
 
 
 if __name__ == "__main__":
