@@ -73,6 +73,10 @@ APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "uam_suite_icon.png
 # Local GUI state/cache files are consolidated under a single hidden directory to
 # keep the working tree tidy. Legacy files at the repo root are migrated on first run.
 GUI_STATE_DIR = Path(__file__).resolve().parent / ".gui_state"
+# 与 run_tracking_controller.L1_RUNTIME_UPDATE_PARAM 一致
+L1_RUNTIME_UPDATE_PARAM = "/suite_mpc/l1_runtime_update"
+GUI_ROS_NODE_NAME = "uam_flight_studio_gui"
+TRACKING_NODE_NAME = "suite_tracking_controller"
 
 
 def _gui_state_path(filename: str) -> Path:
@@ -3424,7 +3428,27 @@ class UamSuiteGUI(QMainWindow):
         self.gz_stop_btn.clicked.connect(self._stop_ros_gazebo)
         gz_btn_row.addWidget(self.gz_start_btn)
         gz_btn_row.addWidget(self.gz_stop_btn)
+        self.gz_kill_roscore_btn = QPushButton("Stop roscore")
+        self.gz_kill_roscore_btn.setToolTip(
+            "手动关闭 rosmaster（roscore）。\n"
+            "以 rosnode list 判断是否有节点在跑；rostopic list 里的 /gazebo/*\n"
+            "在节点死后可能仍是 rosmaster 上的幽灵注册，只有重启 roscore 才会消失。\n"
+            "会断开 PlotJuggler 的 ROS 连接并清空 rosparam。"
+        )
+        self.gz_kill_roscore_btn.clicked.connect(self._on_stop_roscore_clicked)
+        gz_btn_row.addWidget(self.gz_kill_roscore_btn)
         gz.addLayout(gz_btn_row, 3, 0, 1, 4)
+        self.gz_stop_roscore_when_idle = QCheckBox(
+            "Stop Gazebo / 退出 GUI 时：若仅剩 PlotJuggler 等非仿真节点则自动关闭 roscore"
+        )
+        self.gz_stop_roscore_when_idle.setChecked(False)
+        self.gz_stop_roscore_when_idle.setToolTip(
+            "Gazebo 关闭后 roscore 默认会继续运行（ROS 设计如此）。\n"
+            "PlotJuggler 订阅 topic 时也会保持与 rosmaster 的连接，但不负责启动 roscore。\n"
+            "勾选后：Stop Gazebo 或关闭本 GUI 时，若检测到无 Gazebo/MPC/MAVROS 等节点，"
+            "将自动 kill rosmaster。"
+        )
+        gz.addWidget(self.gz_stop_roscore_when_idle, 4, 0, 1, 4)
         gazebo_group.setLayout(gz)
         rtt.addWidget(gazebo_group)
 
@@ -3583,11 +3607,19 @@ class UamSuiteGUI(QMainWindow):
         rn_grid.addWidget(QLabel("Controller mode"), 0, 0)
         self.rn_controller_combo = QComboBox()
         self.rn_controller_combo.addItems(
-            ["croc_full_state", "acados_full_state", "croc_ee_pose", "px4", "geometric"]
+            [
+                "croc_full_state",
+                "acados_full_state",
+                "acados_ee_pose",
+                "croc_ee_pose",
+                "px4",
+                "geometric",
+            ]
         )
         self.rn_controller_combo.setToolTip(
             "croc_full_state:   Crocoddyl 全状态跟踪 (build_shooting_problem_along_plan)\n"
             "acados_full_state: Acados NMPC 全状态跟踪（实时，s500 与 s500_uam 均支持）\n"
+            "acados_ee_pose:    Acados NMPC EE 位置+航向跟踪（实时 RTI，需机械臂）\n"
             "croc_ee_pose:      Crocoddyl EE 位姿跟踪 (build_shooting_problem_along_ee_ref)\n"
             "px4:             run_tracking_controller 内部发送 PositionTarget 给 PX4\n"
             "geometric:       run_tracking_controller 内置 geometric（body_rate + thrust）"
@@ -3628,7 +3660,7 @@ class UamSuiteGUI(QMainWindow):
         self.rn_max_thrust_total.setRange(1.0, 500.0)
         self.rn_max_thrust_total.setDecimals(2)
         self.rn_max_thrust_total.setSingleStep(1.0)
-        self.rn_max_thrust_total.setValue(7.43 * 4)
+        self.rn_max_thrust_total.setValue(28.0)
         self.rn_max_thrust_total.setToolTip(
             "CTBR 总推力归一化的分母（全部旋翼最大推力之和，单位 N）。\n"
             "thrust_cmd = sum(rotor_thrust_N) / max_thrust_total，再 clip 到 [0,1]。\n"
@@ -3638,104 +3670,6 @@ class UamSuiteGUI(QMainWindow):
 
         ros_node_layout.addLayout(rn_grid)
 
-        # ── Gazebo 外力扰动（仿真测试，调用 /gazebo/apply_body_wrench）────────────
-        rn_gz_dist_group = QGroupBox("Gazebo Disturbance  (apply / clear wrench)")
-        rn_gz_dist_vbox = QVBoxLayout(rn_gz_dist_group)
-        _gzd_hint = QLabel(
-            "通过 Gazebo 服务在 base_link 或 gripper_link 上施加恒定力/力矩；"
-            "RViz 话题 /suite_mpc/disturbance_markers（由 gazebo_disturbance_viz 节点发布）；"
-            "红箭头长度 ∝ 力大小（约 8 cm/N），蓝箭头 ∝ 力矩；带 Disturbance 文字标签。"
-        )
-        _gzd_hint.setWordWrap(True)
-        _gzd_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-        rn_gz_dist_vbox.addWidget(_gzd_hint)
-
-        rn_gz_dist_grid = QGridLayout()
-        rn_gz_dist_grid.setColumnStretch(1, 1)
-        rn_gz_dist_grid.setColumnStretch(3, 1)
-
-        rn_gz_dist_grid.addWidget(QLabel("Gazebo model"), 0, 0)
-        self.rn_gz_dist_model = QLineEdit("s500_uam")
-        self.rn_gz_dist_model.setToolTip("Gazebo 模型名（与 launch 中 vehicle 一致）")
-        rn_gz_dist_grid.addWidget(self.rn_gz_dist_model, 0, 1)
-
-        rn_gz_dist_grid.addWidget(QLabel("Apply to"), 0, 2)
-        self.rn_gz_dist_target = QComboBox()
-        self.rn_gz_dist_target.addItems(["base_link", "gripper_link (EE)"])
-        rn_gz_dist_grid.addWidget(self.rn_gz_dist_target, 0, 3)
-
-        rn_gz_dist_grid.addWidget(QLabel("Wrench frame"), 1, 0)
-        self.rn_gz_dist_frame = QComboBox()
-        self.rn_gz_dist_frame.addItems(["world", "link"])
-        self.rn_gz_dist_frame.setToolTip(
-            "world: 力/力矩在世界系定义；link: 在目标 link 机体系定义。"
-        )
-        rn_gz_dist_grid.addWidget(self.rn_gz_dist_frame, 1, 1)
-
-        self.rn_gz_dist_fx = QDoubleSpinBox()
-        self.rn_gz_dist_fy = QDoubleSpinBox()
-        self.rn_gz_dist_fz = QDoubleSpinBox()
-        for sp, val in zip(
-            (self.rn_gz_dist_fx, self.rn_gz_dist_fy, self.rn_gz_dist_fz),
-            (5.0, 0.0, 0.0),
-        ):
-            sp.setRange(-200.0, 200.0)
-            sp.setDecimals(2)
-            sp.setSingleStep(0.5)
-            sp.setValue(val)
-        rn_gz_dist_grid.addWidget(QLabel("Fx [N]"), 2, 0)
-        rn_gz_dist_grid.addWidget(self.rn_gz_dist_fx, 2, 1)
-        rn_gz_dist_grid.addWidget(QLabel("Fy [N]"), 2, 2)
-        rn_gz_dist_grid.addWidget(self.rn_gz_dist_fy, 2, 3)
-        rn_gz_dist_grid.addWidget(QLabel("Fz [N]"), 3, 0)
-        rn_gz_dist_grid.addWidget(self.rn_gz_dist_fz, 3, 1)
-
-        self.rn_gz_dist_mx = QDoubleSpinBox()
-        self.rn_gz_dist_my = QDoubleSpinBox()
-        self.rn_gz_dist_mz = QDoubleSpinBox()
-        for sp in (self.rn_gz_dist_mx, self.rn_gz_dist_my, self.rn_gz_dist_mz):
-            sp.setRange(-50.0, 50.0)
-            sp.setDecimals(3)
-            sp.setSingleStep(0.05)
-            sp.setValue(0.0)
-        rn_gz_dist_grid.addWidget(QLabel("Mx [N·m]"), 3, 2)
-        rn_gz_dist_grid.addWidget(self.rn_gz_dist_mx, 3, 3)
-        rn_gz_dist_grid.addWidget(QLabel("My [N·m]"), 4, 0)
-        rn_gz_dist_grid.addWidget(self.rn_gz_dist_my, 4, 1)
-        rn_gz_dist_grid.addWidget(QLabel("Mz [N·m]"), 4, 2)
-        rn_gz_dist_grid.addWidget(self.rn_gz_dist_mz, 4, 3)
-
-        rn_gz_dist_vbox.addLayout(rn_gz_dist_grid)
-
-        rn_gz_dist_btn_row = QHBoxLayout()
-        self.rn_gz_dist_apply_btn = QPushButton("Apply disturbance")
-        self.rn_gz_dist_apply_btn.setStyleSheet(
-            "QPushButton { background-color: #1565c0; color: white; font-weight: bold; }"
-        )
-        self.rn_gz_dist_apply_btn.setToolTip(
-            "调用 /gazebo/apply_body_wrench 持续施力（duration=-1），Clear 前一直有效。"
-        )
-        self.rn_gz_dist_apply_btn.clicked.connect(self._rn_apply_gazebo_disturbance)
-        rn_gz_dist_btn_row.addWidget(self.rn_gz_dist_apply_btn)
-
-        self.rn_gz_dist_clear_btn = QPushButton("Clear disturbance")
-        self.rn_gz_dist_clear_btn.setStyleSheet(
-            "QPushButton { background-color: #546e7a; color: white; }"
-        )
-        self.rn_gz_dist_clear_btn.setToolTip("调用 /gazebo/clear_body_wrenches 并清除 RViz 箭头。")
-        self.rn_gz_dist_clear_btn.clicked.connect(self._rn_clear_gazebo_disturbance)
-        rn_gz_dist_btn_row.addWidget(self.rn_gz_dist_clear_btn)
-        rn_gz_dist_vbox.addLayout(rn_gz_dist_btn_row)
-
-        self.rn_gz_dist_status = QLabel("Disturbance: none")
-        self.rn_gz_dist_status.setStyleSheet("color: gray; font-size: 11px;")
-        rn_gz_dist_vbox.addWidget(self.rn_gz_dist_status)
-        ros_node_layout.addWidget(rn_gz_dist_group)
-
-        self._rn_gz_dist_active: dict | None = None
-        self._rn_gz_dist_cmd_pub = None
-        self._rn_gz_dist_viz_process = None
-
         # ── ROS MPC Parameters（可折叠，默认收起）────────────────────────────
         self.rn_mpc_toggle_btn = QPushButton("▶  MPC Parameters  (click to expand)")
         self.rn_mpc_toggle_btn.setCheckable(True)
@@ -3744,7 +3678,7 @@ class UamSuiteGUI(QMainWindow):
             "QPushButton { text-align: left; font-weight: bold; padding: 6px 8px; }"
         )
         self.rn_mpc_toggle_btn.setToolTip(
-            "MPC 权重、Acados 求解器、L1 等不常改动的参数。\n"
+            "MPC 权重、Acados 求解器等不常改动的参数。\n"
             "展开后编辑；改完用底部「Save controller parameters」持久化到磁盘。"
         )
         self.rn_mpc_toggle_btn.toggled.connect(self._on_rn_mpc_panel_toggled)
@@ -3893,55 +3827,208 @@ class UamSuiteGUI(QMainWindow):
         rn_ee_grid.setColumnStretch(1, 1)
         rn_ee_grid.setColumnStretch(3, 1)
 
-        rn_ee_grid.addWidget(QLabel("ee w_pos"), 0, 0)
+        self.rn_ee_acados_cost_hint = QLabel(
+            "Acados EE: L1 [p_ee, cos/sin ψ_ee] + L2 [p_base, ψ_base, q_joint, q̇_joint 沿 x_plan] "
+            "+ L3 [u→hover]. Croc 另有 EE rot/vel 与全状态 st w_pos/att/…"
+        )
+        self.rn_ee_acados_cost_hint.setWordWrap(True)
+        self.rn_ee_acados_cost_hint.setStyleSheet("color: #1565c0; font-size: 11px;")
+        rn_ee_grid.addWidget(self.rn_ee_acados_cost_hint, 0, 0, 1, 4)
+
+        _ee_task_lbl = QLabel("L1 — EE task (acados + croc)")
+        _ee_task_lbl.setStyleSheet("color: palette(mid); font-size: 11px;")
+        rn_ee_grid.addWidget(_ee_task_lbl, 1, 0, 1, 4)
+
+        rn_ee_grid.addWidget(QLabel("ee w_pos"), 2, 0)
         self.rn_ee_w_pos = QDoubleSpinBox()
         self.rn_ee_w_pos.setRange(0.0, 5000.0)
         self.rn_ee_w_pos.setValue(400.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_pos, 0, 1)
+        self.rn_ee_w_pos.setToolTip("L1: EE 世界系位置权重（acados w_ee_pos）")
+        rn_ee_grid.addWidget(self.rn_ee_w_pos, 2, 1)
 
-        rn_ee_grid.addWidget(QLabel("ee w_rot_rp"), 0, 2)
+        self._rn_lbl_ee_rot_rp = QLabel("ee w_rot_rp")
+        rn_ee_grid.addWidget(self._rn_lbl_ee_rot_rp, 2, 2)
         self.rn_ee_w_rot_rp = QDoubleSpinBox()
         self.rn_ee_w_rot_rp.setRange(0.0, 2000.0)
         self.rn_ee_w_rot_rp.setValue(1.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_rot_rp, 0, 3)
+        self.rn_ee_w_rot_rp.setToolTip("Croc only: EE roll/pitch 姿态")
+        rn_ee_grid.addWidget(self.rn_ee_w_rot_rp, 2, 3)
 
-        rn_ee_grid.addWidget(QLabel("ee w_rot_yaw"), 1, 0)
+        rn_ee_grid.addWidget(QLabel("ee w_rot_yaw"), 3, 0)
         self.rn_ee_w_rot_yaw = QDoubleSpinBox()
         self.rn_ee_w_rot_yaw.setRange(0.0, 2000.0)
         self.rn_ee_w_rot_yaw.setValue(200.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_rot_yaw, 1, 1)
+        self.rn_ee_w_rot_yaw.setToolTip("L1: EE 航向权重（acados w_ee_yaw；用 cos/sin 表示）")
+        rn_ee_grid.addWidget(self.rn_ee_w_rot_yaw, 3, 1)
 
-        rn_ee_grid.addWidget(QLabel("ee w_vel_lin"), 1, 2)
+        self._rn_lbl_ee_vel_lin = QLabel("ee w_vel_lin")
+        rn_ee_grid.addWidget(self._rn_lbl_ee_vel_lin, 3, 2)
         self.rn_ee_w_vel_lin = QDoubleSpinBox()
         self.rn_ee_w_vel_lin.setRange(0.0, 5000.0)
         self.rn_ee_w_vel_lin.setValue(1.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_vel_lin, 1, 3)
+        rn_ee_grid.addWidget(self.rn_ee_w_vel_lin, 3, 3)
 
-        rn_ee_grid.addWidget(QLabel("ee w_vel_ang_rp"), 2, 0)
+        self._rn_lbl_ee_vel_ang_rp = QLabel("ee w_vel_ang_rp")
+        rn_ee_grid.addWidget(self._rn_lbl_ee_vel_ang_rp, 4, 0)
         self.rn_ee_w_vel_ang_rp = QDoubleSpinBox()
         self.rn_ee_w_vel_ang_rp.setRange(0.0, 5000.0)
         self.rn_ee_w_vel_ang_rp.setValue(1.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_vel_ang_rp, 2, 1)
+        rn_ee_grid.addWidget(self.rn_ee_w_vel_ang_rp, 4, 1)
 
-        rn_ee_grid.addWidget(QLabel("ee w_vel_ang_yaw"), 2, 2)
+        self._rn_lbl_ee_vel_ang_yaw = QLabel("ee w_vel_ang_yaw")
+        rn_ee_grid.addWidget(self._rn_lbl_ee_vel_ang_yaw, 4, 2)
         self.rn_ee_w_vel_ang_yaw = QDoubleSpinBox()
         self.rn_ee_w_vel_ang_yaw.setRange(0.0, 5000.0)
         self.rn_ee_w_vel_ang_yaw.setValue(1.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_vel_ang_yaw, 2, 3)
+        rn_ee_grid.addWidget(self.rn_ee_w_vel_ang_yaw, 4, 3)
 
-        rn_ee_grid.addWidget(QLabel("ee w_u"), 3, 0)
+        _ee_l3_lbl = QLabel("L3 — control regularization (acados + croc)")
+        _ee_l3_lbl.setStyleSheet("color: palette(mid); font-size: 11px;")
+        rn_ee_grid.addWidget(_ee_l3_lbl, 5, 0, 1, 4)
+
+        rn_ee_grid.addWidget(QLabel("ee w_u"), 6, 0)
         self.rn_ee_w_u = QDoubleSpinBox()
         self.rn_ee_w_u.setRange(0.0, 100.0)
         self.rn_ee_w_u.setDecimals(6)
-        self.rn_ee_w_u.setValue(0.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_u, 3, 1)
+        self.rn_ee_w_u.setValue(0.001)
+        self.rn_ee_w_u.setToolTip("L3: 控制正则（悬停推力）；acados w_control")
+        rn_ee_grid.addWidget(self.rn_ee_w_u, 6, 1)
 
-        rn_ee_grid.addWidget(QLabel("ee w_terminal"), 3, 2)
+        rn_ee_grid.addWidget(QLabel("ee w_terminal"), 6, 2)
         self.rn_ee_w_terminal = QDoubleSpinBox()
         self.rn_ee_w_terminal.setRange(0.0, 100.0)
         self.rn_ee_w_terminal.setDecimals(3)
         self.rn_ee_w_terminal.setValue(3.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_terminal, 3, 3)
+        self.rn_ee_w_terminal.setToolTip("终端 L1 放大倍数（acados w_terminal_scale）")
+        rn_ee_grid.addWidget(self.rn_ee_w_terminal, 6, 3)
+
+        self._rn_lbl_ee_aux = QLabel("L2 — null-space aux along x_plan (acados + croc)")
+        self._rn_lbl_ee_aux.setStyleSheet("color: palette(mid); font-size: 11px;")
+        rn_ee_grid.addWidget(self._rn_lbl_ee_aux, 7, 0, 1, 4)
+
+        rn_ee_grid.addWidget(QLabel("ee w_base_pos"), 8, 0)
+        self.rn_ee_w_base_pos = QDoubleSpinBox()
+        self.rn_ee_w_base_pos.setRange(0.0, 500.0)
+        self.rn_ee_w_base_pos.setDecimals(3)
+        self.rn_ee_w_base_pos.setValue(3.0)
+        self.rn_ee_w_base_pos.setToolTip(
+            "L2: 弱跟踪 plan 基座位置；0=关闭（会改 OCP 结构，需重编）"
+        )
+        rn_ee_grid.addWidget(self.rn_ee_w_base_pos, 8, 1)
+
+        rn_ee_grid.addWidget(QLabel("ee w_base_yaw"), 8, 2)
+        self.rn_ee_w_base_yaw = QDoubleSpinBox()
+        self.rn_ee_w_base_yaw.setRange(0.0, 500.0)
+        self.rn_ee_w_base_yaw.setDecimals(3)
+        self.rn_ee_w_base_yaw.setValue(2.0)
+        self.rn_ee_w_base_yaw.setToolTip(
+            "L2: 弱跟踪 plan 机体 yaw（cos/sin）；0=关闭（会改 OCP 结构）"
+        )
+        rn_ee_grid.addWidget(self.rn_ee_w_base_yaw, 8, 3)
+
+        self._rn_lbl_st_joint = QLabel("st w_joint")
+        rn_ee_grid.addWidget(self._rn_lbl_st_joint, 9, 0)
+        self.rn_ee_w_st_joint = QDoubleSpinBox()
+        self.rn_ee_w_st_joint.setRange(0.0, 100.0)
+        self.rn_ee_w_st_joint.setDecimals(3)
+        self.rn_ee_w_st_joint.setValue(0.2)
+        self.rn_ee_w_st_joint.setToolTip(
+            "L2: 沿 x_plan 关节角（acados w_joint_track / croc 分项）；宜 0.1–0.5；0=关闭需重编"
+        )
+        rn_ee_grid.addWidget(self.rn_ee_w_st_joint, 9, 1)
+
+        self._rn_lbl_st_joint_vel = QLabel("st w_joint_vel")
+        rn_ee_grid.addWidget(self._rn_lbl_st_joint_vel, 9, 2)
+        self.rn_ee_w_st_joint_vel = QDoubleSpinBox()
+        self.rn_ee_w_st_joint_vel.setRange(0.0, 100.0)
+        self.rn_ee_w_st_joint_vel.setDecimals(3)
+        self.rn_ee_w_st_joint_vel.setValue(0.05)
+        self.rn_ee_w_st_joint_vel.setToolTip(
+            "L2: 沿 x_plan 关节角速度（acados）；通常小于 st w_joint；0=关闭需重编"
+        )
+        rn_ee_grid.addWidget(self.rn_ee_w_st_joint_vel, 9, 3)
+
+        self._rn_lbl_ee_state_track = QLabel("ee w_state_track")
+        rn_ee_grid.addWidget(self._rn_lbl_ee_state_track, 10, 0)
+        self.rn_ee_w_state_track = QDoubleSpinBox()
+        self.rn_ee_w_state_track.setRange(0.0, 500.0)
+        self.rn_ee_w_state_track.setDecimals(3)
+        self.rn_ee_w_state_track.setValue(2.0)
+        self.rn_ee_w_state_track.setToolTip(
+            "Croc only: 沿 x_plan 全状态跟踪总权重；0=关闭"
+        )
+        rn_ee_grid.addWidget(self.rn_ee_w_state_track, 10, 1)
+
+        self._rn_lbl_ee_state_reg = QLabel("ee w_state_reg")
+        rn_ee_grid.addWidget(self._rn_lbl_ee_state_reg, 10, 2)
+        self.rn_ee_w_state_reg = QDoubleSpinBox()
+        self.rn_ee_w_state_reg.setRange(0.0, 100.0)
+        self.rn_ee_w_state_reg.setDecimals(4)
+        self.rn_ee_w_state_reg.setValue(0.05)
+        self.rn_ee_w_state_reg.setToolTip(
+            "Croc only: 向悬停名义状态弱正则（非 plan）"
+        )
+        rn_ee_grid.addWidget(self.rn_ee_w_state_reg, 10, 3)
+
+        self._rn_lbl_ee_st = QLabel("x_plan state track — per-group activation (croc only)")
+        self._rn_lbl_ee_st.setStyleSheet("color: palette(mid); font-size: 11px;")
+        rn_ee_grid.addWidget(self._rn_lbl_ee_st, 11, 0, 1, 4)
+
+        self._rn_lbl_st_pos = QLabel("st w_pos")
+        rn_ee_grid.addWidget(self._rn_lbl_st_pos, 12, 0)
+        self.rn_ee_w_st_pos = QDoubleSpinBox()
+        self.rn_ee_w_st_pos.setRange(0.0, 100.0)
+        self.rn_ee_w_st_pos.setDecimals(3)
+        self.rn_ee_w_st_pos.setValue(1.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_st_pos, 12, 1)
+
+        self._rn_lbl_st_att = QLabel("st w_att")
+        rn_ee_grid.addWidget(self._rn_lbl_st_att, 12, 2)
+        self.rn_ee_w_st_att = QDoubleSpinBox()
+        self.rn_ee_w_st_att.setRange(0.0, 100.0)
+        self.rn_ee_w_st_att.setDecimals(3)
+        self.rn_ee_w_st_att.setValue(1.0)
+        rn_ee_grid.addWidget(self.rn_ee_w_st_att, 12, 3)
+
+        self._rn_lbl_st_vel = QLabel("st w_vel")
+        rn_ee_grid.addWidget(self._rn_lbl_st_vel, 13, 0)
+        self.rn_ee_w_st_vel = QDoubleSpinBox()
+        self.rn_ee_w_st_vel.setRange(0.0, 100.0)
+        self.rn_ee_w_st_vel.setDecimals(3)
+        self.rn_ee_w_st_vel.setValue(0.1)
+        rn_ee_grid.addWidget(self.rn_ee_w_st_vel, 13, 1)
+
+        self._rn_lbl_st_omega = QLabel("st w_omega")
+        rn_ee_grid.addWidget(self._rn_lbl_st_omega, 13, 2)
+        self.rn_ee_w_st_omega = QDoubleSpinBox()
+        self.rn_ee_w_st_omega.setRange(0.0, 100.0)
+        self.rn_ee_w_st_omega.setDecimals(3)
+        self.rn_ee_w_st_omega.setValue(0.1)
+        rn_ee_grid.addWidget(self.rn_ee_w_st_omega, 13, 3)
+
+        self._rn_ee_croc_only_widgets = [
+            self._rn_lbl_ee_rot_rp,
+            self.rn_ee_w_rot_rp,
+            self._rn_lbl_ee_vel_lin,
+            self.rn_ee_w_vel_lin,
+            self._rn_lbl_ee_vel_ang_rp,
+            self.rn_ee_w_vel_ang_rp,
+            self._rn_lbl_ee_vel_ang_yaw,
+            self.rn_ee_w_vel_ang_yaw,
+            self._rn_lbl_ee_state_track,
+            self.rn_ee_w_state_track,
+            self._rn_lbl_ee_state_reg,
+            self.rn_ee_w_state_reg,
+            self._rn_lbl_ee_st,
+            self._rn_lbl_st_pos,
+            self.rn_ee_w_st_pos,
+            self._rn_lbl_st_att,
+            self.rn_ee_w_st_att,
+            self._rn_lbl_st_vel,
+            self.rn_ee_w_st_vel,
+            self._rn_lbl_st_omega,
+            self.rn_ee_w_st_omega,
+        ]
 
         rn_mpc_vbox.addWidget(self._rn_ee_panel)
 
@@ -3989,194 +4076,6 @@ class UamSuiteGUI(QMainWindow):
 
         rn_mpc_vbox.addWidget(self._rn_geo_panel)
 
-        # ── L1 自适应增广（与任意 baseline 叠加：u = u_b + u_ac）────────────────
-        self._rn_l1_group = QGroupBox("L1 Adaptive Augmentation  (u = u_baseline + u_ac)")
-        rn_l1_vbox = QVBoxLayout(self._rn_l1_group)
-        rn_l1_row0 = QHBoxLayout()
-        self.rn_l1_enabled = QCheckBox("Enable L1 (launch / update_controller_params)")
-        self.rn_l1_enabled.setToolTip(
-            "勾选后节点启动或「在线更新参数」时启用 L1 扰动估计与补偿。\n"
-            "可与 croc / acados / geometric / px4 任意 baseline 组合。"
-        )
-        rn_l1_row0.addWidget(self.rn_l1_enabled)
-        self.rn_l1_svc_on_btn = QPushButton("rosservice: /set_l1_enabled ON")
-        self.rn_l1_svc_on_btn.setToolTip(
-            "节点运行中立即开启 L1（std_srvs/SetBool data=true），无需重启。"
-        )
-        self.rn_l1_svc_on_btn.clicked.connect(lambda: self._call_set_l1_enabled_service(True))
-        self.rn_l1_svc_on_btn.setEnabled(False)
-        rn_l1_row0.addWidget(self.rn_l1_svc_on_btn)
-        self.rn_l1_svc_off_btn = QPushButton("OFF")
-        self.rn_l1_svc_off_btn.setToolTip("节点运行中立即关闭 L1（SetBool data=false）。")
-        self.rn_l1_svc_off_btn.clicked.connect(lambda: self._call_set_l1_enabled_service(False))
-        self.rn_l1_svc_off_btn.setEnabled(False)
-        rn_l1_row0.addWidget(self.rn_l1_svc_off_btn)
-        rn_l1_vbox.addLayout(rn_l1_row0)
-
-        self.rn_l1_status_label = QLabel("L1: —")
-        self.rn_l1_status_label.setStyleSheet("color: gray; font-size: 11px;")
-        rn_l1_vbox.addWidget(self.rn_l1_status_label)
-
-        # 实时估计的扰动力（世界系，N）= m·σ̂
-        self.rn_l1_force_label = QLabel("F_est: —")
-        self.rn_l1_force_label.setToolTip(
-            "L1 估计的集总扰动力（世界系，N）= m·σ̂。\n"
-            "Fx/Fy/Fz 为各轴分量，|F| 为模长；反映未建模外力/推力不匹配/负载等。"
-        )
-        self.rn_l1_force_label.setStyleSheet("color: gray; font-size: 11px;")
-        rn_l1_vbox.addWidget(self.rn_l1_force_label)
-
-        # 真值阻力前馈补偿（对照实验，与 L1 互斥）
-        rn_dragff_row = QHBoxLayout()
-        self.rn_drag_ff_enabled = QCheckBox("Compensate with TRUE drag (feedforward, no L1)")
-        self.rn_drag_ff_enabled.setToolTip(
-            "不开 L1，直接用解析重建的 Gazebo 转子阻力真值 -F_drag/m 作为补偿加速度，\n"
-            "注入与 L1 相同的 CTBR 通道。用于检验“扰动估计完全准确时”的补偿上限效果。\n"
-            "与 L1 互斥：勾选后启动/在线更新时会自动关闭 L1。"
-        )
-        rn_dragff_row.addWidget(self.rn_drag_ff_enabled)
-        self.rn_drag_ff_svc_on_btn = QPushButton("rosservice: /set_drag_ff_enabled ON")
-        self.rn_drag_ff_svc_on_btn.setToolTip("节点运行中立即开启真值阻力前馈（SetBool data=true）。")
-        self.rn_drag_ff_svc_on_btn.clicked.connect(lambda: self._call_set_drag_ff_enabled_service(True))
-        self.rn_drag_ff_svc_on_btn.setEnabled(False)
-        rn_dragff_row.addWidget(self.rn_drag_ff_svc_on_btn)
-        self.rn_drag_ff_svc_off_btn = QPushButton("OFF")
-        self.rn_drag_ff_svc_off_btn.setToolTip("节点运行中立即关闭真值阻力前馈（SetBool data=false）。")
-        self.rn_drag_ff_svc_off_btn.clicked.connect(lambda: self._call_set_drag_ff_enabled_service(False))
-        self.rn_drag_ff_svc_off_btn.setEnabled(False)
-        rn_dragff_row.addWidget(self.rn_drag_ff_svc_off_btn)
-        rn_l1_vbox.addLayout(rn_dragff_row)
-
-        # L1 与真值前馈互斥：勾选其一时取消另一个
-        def _l1_excl(checked):
-            if checked and self.rn_drag_ff_enabled.isChecked():
-                self.rn_drag_ff_enabled.setChecked(False)
-
-        def _dragff_excl(checked):
-            if checked and self.rn_l1_enabled.isChecked():
-                self.rn_l1_enabled.setChecked(False)
-
-        self.rn_l1_enabled.toggled.connect(_l1_excl)
-        self.rn_drag_ff_enabled.toggled.connect(_dragff_excl)
-
-        rn_l1_grid = QGridLayout()
-        rn_l1_grid.setColumnStretch(1, 1)
-        rn_l1_grid.setColumnStretch(3, 1)
-
-        rn_l1_grid.addWidget(QLabel("l1_as_gain"), 0, 0)
-        self.rn_l1_as_gain = QDoubleSpinBox()
-        self.rn_l1_as_gain.setRange(0.5, 50.0)
-        self.rn_l1_as_gain.setDecimals(2)
-        self.rn_l1_as_gain.setValue(8.0)
-        self.rn_l1_as_gain.setToolTip("状态预测器速率 a_s（越大收敛越快，对噪声更敏感）")
-        rn_l1_grid.addWidget(self.rn_l1_as_gain, 0, 1)
-
-        rn_l1_grid.addWidget(QLabel("l1_wc_xy"), 0, 2)
-        self.rn_l1_wc_xy = QDoubleSpinBox()
-        self.rn_l1_wc_xy.setRange(0.0, 50.0)
-        self.rn_l1_wc_xy.setDecimals(2)
-        self.rn_l1_wc_xy.setValue(6.0)
-        self.rn_l1_wc_xy.setToolTip("水平补偿低通截止频率 (rad/s)")
-        rn_l1_grid.addWidget(self.rn_l1_wc_xy, 0, 3)
-
-        rn_l1_grid.addWidget(QLabel("l1_wc_z"), 1, 0)
-        self.rn_l1_wc_z = QDoubleSpinBox()
-        self.rn_l1_wc_z.setRange(0.0, 50.0)
-        self.rn_l1_wc_z.setDecimals(2)
-        self.rn_l1_wc_z.setValue(6.0)
-        rn_l1_grid.addWidget(self.rn_l1_wc_z, 1, 1)
-
-        rn_l1_grid.addWidget(QLabel("l1_tilt_gain"), 1, 2)
-        self.rn_l1_tilt_gain = QDoubleSpinBox()
-        self.rn_l1_tilt_gain.setRange(0.0, 20.0)
-        self.rn_l1_tilt_gain.setDecimals(2)
-        self.rn_l1_tilt_gain.setValue(3.0)
-        self.rn_l1_tilt_gain.setToolTip("将横向补偿加速度映射为体角速度修正的增益")
-        rn_l1_grid.addWidget(self.rn_l1_tilt_gain, 1, 3)
-
-        rn_l1_grid.addWidget(QLabel("l1_max_accel_xy"), 2, 0)
-        self.rn_l1_max_accel_xy = QDoubleSpinBox()
-        self.rn_l1_max_accel_xy.setRange(0.0, 30.0)
-        self.rn_l1_max_accel_xy.setDecimals(2)
-        self.rn_l1_max_accel_xy.setValue(6.0)
-        rn_l1_grid.addWidget(self.rn_l1_max_accel_xy, 2, 1)
-
-        rn_l1_grid.addWidget(QLabel("l1_max_accel_z"), 2, 2)
-        self.rn_l1_max_accel_z = QDoubleSpinBox()
-        self.rn_l1_max_accel_z.setRange(0.0, 30.0)
-        self.rn_l1_max_accel_z.setDecimals(2)
-        self.rn_l1_max_accel_z.setValue(6.0)
-        rn_l1_grid.addWidget(self.rn_l1_max_accel_z, 2, 3)
-
-        rn_l1_grid.addWidget(QLabel("l1_max_sigma"), 3, 0)
-        self.rn_l1_max_sigma = QDoubleSpinBox()
-        self.rn_l1_max_sigma.setRange(0.0, 100.0)
-        self.rn_l1_max_sigma.setDecimals(2)
-        self.rn_l1_max_sigma.setValue(25.0)
-        self.rn_l1_max_sigma.setToolTip("扰动估计 σ̂ 幅值上限 (m/s²)")
-        rn_l1_grid.addWidget(self.rn_l1_max_sigma, 3, 1)
-
-        rn_l1_vbox.addLayout(rn_l1_grid)
-
-        # 位置误差积分增广（兜底消除补偿残差的稳态位置误差）
-        self.rn_l1_pos_fb = QCheckBox("Position-error integral (eliminate residual steady-state error)")
-        self.rn_l1_pos_fb.setToolTip(
-            "在 L1 扰动补偿之外并联一个对跟踪位置误差的积分通道：\n"
-            "a_ac += -k_i·∫(p - p_ref)。\n"
-            "当 σ̂ 因带宽/姿态滞后无法完全收敛时，用于消除残留稳态位置误差。"
-        )
-        rn_l1_vbox.addWidget(self.rn_l1_pos_fb)
-
-        rn_l1_grid2 = QGridLayout()
-        rn_l1_grid2.setColumnStretch(1, 1)
-        rn_l1_grid2.setColumnStretch(3, 1)
-        rn_l1_grid2.addWidget(QLabel("l1_k_pos_i_xy"), 0, 0)
-        self.rn_l1_k_pos_i_xy = QDoubleSpinBox()
-        self.rn_l1_k_pos_i_xy.setRange(0.0, 10.0)
-        self.rn_l1_k_pos_i_xy.setDecimals(3)
-        self.rn_l1_k_pos_i_xy.setValue(0.6)
-        self.rn_l1_k_pos_i_xy.setToolTip("水平位置误差积分增益 (1/s²)")
-        rn_l1_grid2.addWidget(self.rn_l1_k_pos_i_xy, 0, 1)
-
-        rn_l1_grid2.addWidget(QLabel("l1_k_pos_i_z"), 0, 2)
-        self.rn_l1_k_pos_i_z = QDoubleSpinBox()
-        self.rn_l1_k_pos_i_z.setRange(0.0, 10.0)
-        self.rn_l1_k_pos_i_z.setDecimals(3)
-        self.rn_l1_k_pos_i_z.setValue(0.8)
-        self.rn_l1_k_pos_i_z.setToolTip("竖直位置误差积分增益 (1/s²)")
-        rn_l1_grid2.addWidget(self.rn_l1_k_pos_i_z, 0, 3)
-
-        rn_l1_grid2.addWidget(QLabel("l1_max_pos_integral"), 1, 0)
-        self.rn_l1_max_pos_integral = QDoubleSpinBox()
-        self.rn_l1_max_pos_integral.setRange(0.0, 20.0)
-        self.rn_l1_max_pos_integral.setDecimals(2)
-        self.rn_l1_max_pos_integral.setValue(1.5)
-        self.rn_l1_max_pos_integral.setToolTip("位置误差积分量 anti-windup 上限 (m·s)")
-        rn_l1_grid2.addWidget(self.rn_l1_max_pos_integral, 1, 1)
-
-        rn_l1_vbox.addLayout(rn_l1_grid2)
-
-        self.rn_l1_sim_btn = QPushButton("Run offline L1 compare (matplotlib)")
-        self.rn_l1_sim_btn.setToolTip(
-            "运行 scripts/example/l1_geometric_tracking_sim.py：\n"
-            "固定扰动（阻力+常值风+质量阶跃）下对比 baseline / baseline+L1，\n"
-            "结果保存到 results/l1_geometric_tracking_compare.png"
-        )
-        self.rn_l1_sim_btn.clicked.connect(self._run_l1_offline_compare)
-        rn_l1_vbox.addWidget(self.rn_l1_sim_btn)
-
-        self.rn_l1_acados_sim_btn = QPushButton("Run acados hover + mass-jump L1 test")
-        self.rn_l1_acados_sim_btn.setToolTip(
-            "运行 scripts/example/l1_acados_hover_mass_jump_sim.py：\n"
-            "acados 悬停 NMPC + 质量突变，对比 MPC only / MPC+L1，\n"
-            "验证 L1 能否估计附加质量并让悬停误差归零。\n"
-            "结果保存到 results/l1_acados_hover_mass_jump.png（需 eagle_mpc 环境）"
-        )
-        self.rn_l1_acados_sim_btn.clicked.connect(self._run_l1_acados_hover_test)
-        rn_l1_vbox.addWidget(self.rn_l1_acados_sim_btn)
-
-        rn_mpc_vbox.addWidget(self._rn_l1_group)
-
         # ── 保存控制器参数（每个算法各自一套，持久化到磁盘，跨重启复用）──────
         self.rn_save_ctrl_params_btn = QPushButton("Save controller parameters")
         self.rn_save_ctrl_params_btn.setToolTip(
@@ -4199,7 +4098,7 @@ class UamSuiteGUI(QMainWindow):
             "acados_solver_mode", "acados_integrator", "acados_hpipm_mode", "acados_qp_iter_max",
         )
         self._rn_mpc_weight_profiles: dict = {
-            "croc_full_state": {}, "acados_full_state": {},
+            "croc_full_state": {}, "acados_full_state": {}, "acados_ee_pose": {},
             "croc_ee_pose": {}, "px4": {}, "geometric": {},
         }
         self._rn_mpc_profile_mode: str | None = None
@@ -4333,9 +4232,413 @@ class UamSuiteGUI(QMainWindow):
         ros_param_btns.addWidget(self.save_ros_params_as_btn)
         rtt.addLayout(ros_param_btns)
 
-        # ── Regulation Target 设置组 ──────────────────────────────────────────
-        reg_group = QGroupBox("Regulation Target  (MPC 镇定目标)")
-        reg_layout = QVBoxLayout()
+        # ── L1 / 扰动估计与补偿（可折叠，位于 Gazebo Disturbance 上方）────────
+        self.rn_l1_toggle_btn = QPushButton("▶  L1 / Disturbance Estimation & Compensation")
+        self.rn_l1_toggle_btn.setCheckable(True)
+        self.rn_l1_toggle_btn.setChecked(False)
+        self.rn_l1_toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; font-weight: bold; padding: 6px 8px; }"
+        )
+        self.rn_l1_toggle_btn.setToolTip(
+            "扰动估计（L1 / Gazebo wrench 真值 / 气动阻力真值）与扰动补偿（bolt-on 或增广 MPC）。"
+        )
+        self.rn_l1_toggle_btn.toggled.connect(self._on_rn_l1_panel_toggled)
+        rtt.addWidget(self.rn_l1_toggle_btn)
+
+        self._rn_l1_panel = QWidget()
+        self._rn_l1_panel.setVisible(False)
+        rn_l1_outer = QVBoxLayout(self._rn_l1_panel)
+
+        _rn_l1_hint = QLabel(
+            "与数值仿真 Tracking 页结构一致：先选扰动估计来源，再选补偿方式。\n"
+            "bolt-on：MPC 解完后叠加 CTBR 补偿；in-model（增广 MPC）：仅 acados_full_state，"
+            "把估计/真值 wrench 喂进 OCP 参数（需重新生成 acados 代码）。"
+        )
+        _rn_l1_hint.setWordWrap(True)
+        _rn_l1_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        rn_l1_outer.addWidget(_rn_l1_hint)
+
+        # ── 运行状态（GUI 设置 vs 节点回报）──────────────────────────────────
+        rn_l1_state_box = QGroupBox("运行状态")
+        rn_l1_state_grid = QGridLayout(rn_l1_state_box)
+        rn_l1_state_grid.setColumnStretch(1, 1)
+        self.rn_l1_gui_state_label = QLabel("GUI 设置: —")
+        self.rn_l1_gui_state_label.setWordWrap(True)
+        self.rn_l1_gui_state_label.setStyleSheet("font-size: 11px;")
+        rn_l1_state_grid.addWidget(QLabel("GUI"), 0, 0)
+        rn_l1_state_grid.addWidget(self.rn_l1_gui_state_label, 0, 1)
+        self.rn_l1_node_state_label = QLabel("节点回报: —")
+        self.rn_l1_node_state_label.setWordWrap(True)
+        self.rn_l1_node_state_label.setStyleSheet("font-size: 11px;")
+        rn_l1_state_grid.addWidget(QLabel("节点"), 1, 0)
+        rn_l1_state_grid.addWidget(self.rn_l1_node_state_label, 1, 1)
+        self.rn_l1_sync_label = QLabel("同步: —")
+        self.rn_l1_sync_label.setWordWrap(True)
+        self.rn_l1_sync_label.setStyleSheet("font-size: 11px; color: gray;")
+        rn_l1_state_grid.addWidget(QLabel("同步"), 2, 0)
+        rn_l1_state_grid.addWidget(self.rn_l1_sync_label, 2, 1)
+        self.rn_l1_apply_label = QLabel("操作: —")
+        self.rn_l1_apply_label.setWordWrap(True)
+        self.rn_l1_apply_label.setStyleSheet("font-size: 11px; color: #1565c0;")
+        rn_l1_state_grid.addWidget(QLabel("提示"), 3, 0)
+        rn_l1_state_grid.addWidget(self.rn_l1_apply_label, 3, 1)
+        rn_l1_outer.addWidget(rn_l1_state_box)
+        self._rn_dist_comp_state = None
+        self._rn_dist_comp_t = 0.0
+        self._rn_l1_pending_apply = False
+        self._rn_l1_last_apply_ok = None
+        self._rn_l1_last_apply_msg = ""
+
+        # 兼容旧刷新逻辑（隐藏，由运行状态区接管展示）
+        self.rn_l1_status_label = QLabel()
+        self.rn_l1_status_label.setVisible(False)
+
+        self.rn_l1_force_label = QLabel("F_est: —")
+        self.rn_l1_force_label.setToolTip(
+            "估计扰动力（世界系，N）：L1 为 m·σ̂；oracle 为 Gazebo 施加 wrench；drag 为气动阻力真值。"
+        )
+        self.rn_l1_force_label.setStyleSheet("color: gray; font-size: 11px;")
+        rn_l1_outer.addWidget(self.rn_l1_force_label)
+
+        # ── 扰动估计 ─────────────────────────────────────────────────────────
+        rn_est_box = QGroupBox("扰动估计 (estimation)")
+        rn_est_grid = QGridLayout(rn_est_box)
+        rn_est_grid.setColumnStretch(1, 1)
+        rn_est_grid.setColumnStretch(3, 1)
+
+        self.rn_l1_enabled = QCheckBox("启用扰动估计")
+        self.rn_l1_enabled.setToolTip(
+            "勾选后在线估计扰动（L1 / oracle / drag）。\n"
+            "节点运行中勾选/取消会立即生效；launch 前勾选则写入启动参数。\n"
+            "GUI 重启后若已勾选，会自动同步到节点；若无效请先取消再重新勾选。"
+        )
+        rn_est_grid.addWidget(self.rn_l1_enabled, 0, 0, 1, 4)
+
+        self.rn_l1_comp_mode = QComboBox()
+        self.rn_l1_comp_mode.addItem("L1 自适应估计")
+        self.rn_l1_comp_mode.addItem("扰动真值 (oracle: Gazebo wrench)")
+        self.rn_l1_comp_mode.addItem("TRUE drag (aero oracle)")
+        self.rn_l1_comp_mode.setToolTip(
+            "估计来源：\n"
+            "• L1 自适应：在线估计集总扰动加速度 σ̂（需数秒收敛；无扰动时接近 0）。\n"
+            "• oracle：读取 Gazebo Disturbance 施加的 wrench 真值（/suite_mpc/disturbance_config）；"
+            "施加恒定力后应立刻在 force_world 看到非零。\n"
+            "• TRUE drag：解析重建 Gazebo 转子阻力真值（对照实验）。\n"
+            "节点运行中切换会立即生效。"
+        )
+        rn_est_grid.addWidget(QLabel("估计来源"), 1, 0)
+        rn_est_grid.addWidget(self.rn_l1_comp_mode, 1, 1, 1, 3)
+
+        rn_est_grid.addWidget(QLabel("l1_as_gain"), 2, 0)
+        self.rn_l1_as_gain = QDoubleSpinBox()
+        self.rn_l1_as_gain.setRange(0.5, 50.0)
+        self.rn_l1_as_gain.setDecimals(2)
+        self.rn_l1_as_gain.setValue(8.0)
+        self.rn_l1_as_gain.setToolTip("状态预测器速率 a_s（仅 L1 估计）")
+        rn_est_grid.addWidget(self.rn_l1_as_gain, 2, 1)
+
+        rn_est_grid.addWidget(QLabel("l1_max_sigma"), 2, 2)
+        self.rn_l1_max_sigma = QDoubleSpinBox()
+        self.rn_l1_max_sigma.setRange(0.0, 100.0)
+        self.rn_l1_max_sigma.setDecimals(2)
+        self.rn_l1_max_sigma.setValue(25.0)
+        self.rn_l1_max_sigma.setToolTip("扰动估计 σ̂ 幅值上限 (m/s²)")
+        rn_est_grid.addWidget(self.rn_l1_max_sigma, 2, 3)
+
+        rn_est_grid.addWidget(QLabel("l1_wc_xy"), 3, 0)
+        self.rn_l1_wc_xy = QDoubleSpinBox()
+        self.rn_l1_wc_xy.setRange(0.0, 50.0)
+        self.rn_l1_wc_xy.setDecimals(2)
+        self.rn_l1_wc_xy.setValue(6.0)
+        rn_est_grid.addWidget(self.rn_l1_wc_xy, 3, 1)
+
+        rn_est_grid.addWidget(QLabel("l1_wc_z"), 3, 2)
+        self.rn_l1_wc_z = QDoubleSpinBox()
+        self.rn_l1_wc_z.setRange(0.0, 50.0)
+        self.rn_l1_wc_z.setDecimals(2)
+        self.rn_l1_wc_z.setValue(6.0)
+        rn_est_grid.addWidget(self.rn_l1_wc_z, 3, 3)
+        rn_l1_outer.addWidget(rn_est_box)
+
+        # 兼容旧参数/服务：隐藏 drag_ff 勾选，由估计来源下拉同步
+        self.rn_drag_ff_enabled = QCheckBox()
+        self.rn_drag_ff_enabled.setVisible(False)
+        self.rn_drag_ff_svc_on_btn = QPushButton()
+        self.rn_drag_ff_svc_on_btn.setVisible(False)
+        self.rn_drag_ff_svc_off_btn = QPushButton()
+        self.rn_drag_ff_svc_off_btn.setVisible(False)
+
+        # ── 扰动补偿 ─────────────────────────────────────────────────────────
+        self.rn_l1_comp_box = QGroupBox("扰动补偿 (compensation)")
+        rn_comp_vbox = QVBoxLayout(self.rn_l1_comp_box)
+        self.rn_l1_comp_enabled_chk = QCheckBox("启用扰动补偿（取消勾选 = 仅估计不补偿）")
+        self.rn_l1_comp_enabled_chk.setChecked(False)
+        self.rn_l1_comp_enabled_chk.setToolTip(
+            "需同时开启扰动估计。勾选后注入 bolt-on / 增广 MPC 补偿；\n"
+            "节点运行中勾选/取消会立即生效。"
+        )
+        rn_comp_vbox.addWidget(self.rn_l1_comp_enabled_chk)
+        rn_comp_grid = QGridLayout()
+        rn_comp_grid.setColumnStretch(1, 1)
+        rn_comp_grid.setColumnStretch(3, 1)
+
+        self.rn_l1_comp_strategy = QComboBox()
+        self.rn_l1_comp_strategy.addItem("bolt-on (u = u_b + u_ad)")
+        self.rn_l1_comp_strategy.addItem("in-model (增广 MPC)")
+        self.rn_l1_comp_strategy.setToolTip(
+            "bolt-on：MPC 解完后经 CTBR 叠加补偿（所有 baseline）。\n"
+            "in-model：把 wrench 参数喂进 acados OCP（仅 acados_full_state；切换时需重建 MPC）。"
+        )
+        rn_comp_grid.addWidget(QLabel("补偿方式"), 0, 0)
+        rn_comp_grid.addWidget(self.rn_l1_comp_strategy, 0, 1, 1, 3)
+
+        rn_comp_grid.addWidget(QLabel("l1_tilt_gain"), 1, 0)
+        self.rn_l1_tilt_gain = QDoubleSpinBox()
+        self.rn_l1_tilt_gain.setRange(0.0, 20.0)
+        self.rn_l1_tilt_gain.setDecimals(2)
+        self.rn_l1_tilt_gain.setValue(3.0)
+        self.rn_l1_tilt_gain.setToolTip("横向补偿加速度 → 体角速度修正（bolt-on）")
+        rn_comp_grid.addWidget(self.rn_l1_tilt_gain, 1, 1)
+
+        rn_comp_grid.addWidget(QLabel("l1_max_accel_xy"), 1, 2)
+        self.rn_l1_max_accel_xy = QDoubleSpinBox()
+        self.rn_l1_max_accel_xy.setRange(0.0, 30.0)
+        self.rn_l1_max_accel_xy.setDecimals(2)
+        self.rn_l1_max_accel_xy.setValue(6.0)
+        rn_comp_grid.addWidget(self.rn_l1_max_accel_xy, 1, 3)
+
+        rn_comp_grid.addWidget(QLabel("l1_max_accel_z"), 2, 0)
+        self.rn_l1_max_accel_z = QDoubleSpinBox()
+        self.rn_l1_max_accel_z.setRange(0.0, 30.0)
+        self.rn_l1_max_accel_z.setDecimals(2)
+        self.rn_l1_max_accel_z.setValue(6.0)
+        rn_comp_grid.addWidget(self.rn_l1_max_accel_z, 2, 1)
+        rn_comp_vbox.addLayout(rn_comp_grid)
+        rn_l1_outer.addWidget(self.rn_l1_comp_box)
+
+        self.rn_arm_ee_comp_chk = QCheckBox(
+            "悬停 EE 零空间补偿（regulation：臂 IK 保持末端位置）"
+        )
+        self.rn_arm_ee_comp_chk.setChecked(False)
+        self.rn_arm_ee_comp_chk.setToolTip(
+            "仅在 regulation/悬停模式下生效：基座用增广 MPC 抗扰后，"
+            "机械臂用零空间 IK 把 EE 世界位置拉回 Regulation Target 对应的末端点。\n"
+            "仅补偿位置（不单独控姿态）；y 向扰动引起的横滚型偏移平面臂无法消除。\n"
+            "节点运行中勾选/取消会通过 apply_l1_params 立即生效。"
+        )
+        rn_l1_outer.addWidget(self.rn_arm_ee_comp_chk)
+
+        # 位置误差积分（独立通道）
+        self.rn_l1_pos_fb = QCheckBox("Position-error integral (eliminate residual steady-state error)")
+        self.rn_l1_pos_fb.setToolTip(
+            "独立于扰动估计/补偿：并联位置误差积分 a_pos = -k_i·∫(p - p_ref)。"
+            "可单独开启，也可与 L1/oracle 扰动补偿叠加。"
+        )
+        rn_l1_outer.addWidget(self.rn_l1_pos_fb)
+
+        rn_l1_grid2 = QGridLayout()
+        rn_l1_grid2.setColumnStretch(1, 1)
+        rn_l1_grid2.setColumnStretch(3, 1)
+        rn_l1_grid2.addWidget(QLabel("l1_k_pos_i_xy"), 0, 0)
+        self.rn_l1_k_pos_i_xy = QDoubleSpinBox()
+        self.rn_l1_k_pos_i_xy.setRange(0.0, 10.0)
+        self.rn_l1_k_pos_i_xy.setDecimals(3)
+        self.rn_l1_k_pos_i_xy.setValue(0.6)
+        rn_l1_grid2.addWidget(self.rn_l1_k_pos_i_xy, 0, 1)
+        rn_l1_grid2.addWidget(QLabel("l1_k_pos_i_z"), 0, 2)
+        self.rn_l1_k_pos_i_z = QDoubleSpinBox()
+        self.rn_l1_k_pos_i_z.setRange(0.0, 10.0)
+        self.rn_l1_k_pos_i_z.setDecimals(3)
+        self.rn_l1_k_pos_i_z.setValue(0.8)
+        rn_l1_grid2.addWidget(self.rn_l1_k_pos_i_z, 0, 3)
+        rn_l1_grid2.addWidget(QLabel("l1_max_pos_integral"), 1, 0)
+        self.rn_l1_max_pos_integral = QDoubleSpinBox()
+        self.rn_l1_max_pos_integral.setRange(0.0, 20.0)
+        self.rn_l1_max_pos_integral.setDecimals(2)
+        self.rn_l1_max_pos_integral.setValue(1.5)
+        rn_l1_grid2.addWidget(self.rn_l1_max_pos_integral, 1, 1)
+        rn_l1_outer.addLayout(rn_l1_grid2)
+
+        rn_l1_offline_row = QHBoxLayout()
+        self.rn_l1_sim_btn = QPushButton("Offline L1 compare")
+        self.rn_l1_sim_btn.clicked.connect(self._run_l1_offline_compare)
+        rn_l1_offline_row.addWidget(self.rn_l1_sim_btn)
+        self.rn_l1_acados_sim_btn = QPushButton("Acados mass-jump L1 test")
+        self.rn_l1_acados_sim_btn.clicked.connect(self._run_l1_acados_hover_test)
+        rn_l1_offline_row.addWidget(self.rn_l1_acados_sim_btn)
+        rn_l1_outer.addLayout(rn_l1_offline_row)
+
+        def _rn_sync_l1_comp_mode_widgets():
+            idx = int(self.rn_l1_comp_mode.currentIndex())
+            l1_on = idx == 0
+            for w in (
+                self.rn_l1_as_gain, self.rn_l1_wc_xy, self.rn_l1_wc_z, self.rn_l1_max_sigma,
+            ):
+                w.setEnabled(l1_on)
+            self.rn_drag_ff_enabled.setChecked(idx == 2)
+            if hasattr(self, "rn_l1_comp_enabled_chk") and hasattr(self, "rn_l1_enabled"):
+                self.rn_l1_comp_enabled_chk.setEnabled(self.rn_l1_enabled.isChecked())
+            in_model = self.rn_l1_comp_strategy.currentIndex() == 1
+            acados = self.rn_controller_combo.currentText() in (
+                "acados_full_state",
+                "acados_ee_pose",
+            )
+            if in_model and not acados:
+                self.rn_l1_comp_strategy.setToolTip(
+                    "in-model 仅 acados_full_state / acados_ee_pose 生效；当前算法将回退为 bolt-on。"
+                )
+            else:
+                self.rn_l1_comp_strategy.setToolTip(
+                    "bolt-on：MPC 解完后经 CTBR 叠加补偿（所有 baseline）。\n"
+                    "in-model：把 wrench 参数喂进 acados OCP（acados_full_state / acados_ee_pose）。\n"
+                    "节点运行中切换会立即生效。"
+                )
+            if hasattr(self, "rn_arm_ee_comp_chk"):
+                uam = not self._is_s500_mode()
+                self.rn_arm_ee_comp_chk.setEnabled(uam)
+                if not uam:
+                    self.rn_arm_ee_comp_chk.setChecked(False)
+
+        self._rn_sync_l1_comp_mode_widgets = _rn_sync_l1_comp_mode_widgets
+        self.rn_l1_comp_mode.currentIndexChanged.connect(self._on_rn_l1_config_changed)
+        self.rn_controller_combo.currentIndexChanged.connect(self._on_rn_l1_controller_changed)
+        self.rn_l1_comp_strategy.currentIndexChanged.connect(self._on_rn_l1_config_changed)
+        self._rn_l1_runtime_guard = False
+        self.rn_l1_enabled.toggled.connect(self._on_rn_l1_est_checkbox_toggled)
+        self.rn_l1_comp_enabled_chk.toggled.connect(self._on_rn_l1_comp_checkbox_toggled)
+        self.rn_arm_ee_comp_chk.toggled.connect(self._on_rn_l1_config_changed)
+        _rn_sync_l1_comp_mode_widgets()
+        self._refresh_rn_l1_runtime_status()
+
+        rtt.addWidget(self._rn_l1_panel)
+
+        # ── Gazebo Disturbance（可折叠，默认收起）────────────────────────────
+        self.rn_gz_dist_toggle_btn = QPushButton("▶  Gazebo Disturbance  (click to expand)")
+        self.rn_gz_dist_toggle_btn.setCheckable(True)
+        self.rn_gz_dist_toggle_btn.setChecked(False)
+        self.rn_gz_dist_toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; font-weight: bold; padding: 6px 8px; }"
+        )
+        self.rn_gz_dist_toggle_btn.setToolTip(
+            "在 Gazebo base_link / gripper_link 上施加或清除外力；RViz 显示扰动箭头。"
+        )
+        self.rn_gz_dist_toggle_btn.toggled.connect(self._on_rn_gz_dist_panel_toggled)
+        rtt.addWidget(self.rn_gz_dist_toggle_btn)
+
+        self._rn_gz_dist_panel = QWidget()
+        self._rn_gz_dist_panel.setVisible(False)
+        rn_gz_dist_vbox = QVBoxLayout(self._rn_gz_dist_panel)
+        _gzd_hint = QLabel(
+            "通过 Gazebo 服务在 base_link 或 gripper_link 上施加恒定力/力矩；"
+            "RViz 话题 /suite_mpc/disturbance_markers（由 gazebo_disturbance_viz 节点发布）；"
+            "红箭头长度 ∝ 力大小（约 8 cm/N），蓝箭头 ∝ 力矩；带 Disturbance 文字标签。"
+        )
+        _gzd_hint.setWordWrap(True)
+        _gzd_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        rn_gz_dist_vbox.addWidget(_gzd_hint)
+
+        rn_gz_dist_grid = QGridLayout()
+        rn_gz_dist_grid.setColumnStretch(1, 1)
+        rn_gz_dist_grid.setColumnStretch(3, 1)
+
+        rn_gz_dist_grid.addWidget(QLabel("Gazebo model"), 0, 0)
+        self.rn_gz_dist_model = QLineEdit("s500_uam")
+        self.rn_gz_dist_model.setToolTip("Gazebo 模型名（与 launch 中 vehicle 一致）")
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_model, 0, 1)
+
+        rn_gz_dist_grid.addWidget(QLabel("Apply to"), 0, 2)
+        self.rn_gz_dist_target = QComboBox()
+        self.rn_gz_dist_target.addItems(["base_link", "gripper_link (EE)"])
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_target, 0, 3)
+
+        rn_gz_dist_grid.addWidget(QLabel("Wrench frame"), 1, 0)
+        self.rn_gz_dist_frame = QComboBox()
+        self.rn_gz_dist_frame.addItems(["world", "link"])
+        self.rn_gz_dist_frame.setToolTip(
+            "world: 力/力矩在世界系定义；link: 在目标 link 机体系定义。"
+        )
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_frame, 1, 1)
+
+        self.rn_gz_dist_fx = QDoubleSpinBox()
+        self.rn_gz_dist_fy = QDoubleSpinBox()
+        self.rn_gz_dist_fz = QDoubleSpinBox()
+        for sp, val in zip(
+            (self.rn_gz_dist_fx, self.rn_gz_dist_fy, self.rn_gz_dist_fz),
+            (5.0, 0.0, 0.0),
+        ):
+            sp.setRange(-200.0, 200.0)
+            sp.setDecimals(2)
+            sp.setSingleStep(0.5)
+            sp.setValue(val)
+        rn_gz_dist_grid.addWidget(QLabel("Fx [N]"), 2, 0)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_fx, 2, 1)
+        rn_gz_dist_grid.addWidget(QLabel("Fy [N]"), 2, 2)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_fy, 2, 3)
+        rn_gz_dist_grid.addWidget(QLabel("Fz [N]"), 3, 0)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_fz, 3, 1)
+
+        self.rn_gz_dist_mx = QDoubleSpinBox()
+        self.rn_gz_dist_my = QDoubleSpinBox()
+        self.rn_gz_dist_mz = QDoubleSpinBox()
+        for sp in (self.rn_gz_dist_mx, self.rn_gz_dist_my, self.rn_gz_dist_mz):
+            sp.setRange(-50.0, 50.0)
+            sp.setDecimals(3)
+            sp.setSingleStep(0.05)
+            sp.setValue(0.0)
+        rn_gz_dist_grid.addWidget(QLabel("Mx [N·m]"), 3, 2)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_mx, 3, 3)
+        rn_gz_dist_grid.addWidget(QLabel("My [N·m]"), 4, 0)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_my, 4, 1)
+        rn_gz_dist_grid.addWidget(QLabel("Mz [N·m]"), 4, 2)
+        rn_gz_dist_grid.addWidget(self.rn_gz_dist_mz, 4, 3)
+
+        rn_gz_dist_vbox.addLayout(rn_gz_dist_grid)
+
+        rn_gz_dist_btn_row = QHBoxLayout()
+        self.rn_gz_dist_apply_btn = QPushButton("Apply disturbance")
+        self.rn_gz_dist_apply_btn.setStyleSheet(
+            "QPushButton { background-color: #1565c0; color: white; font-weight: bold; }"
+        )
+        self.rn_gz_dist_apply_btn.setToolTip(
+            "调用 /gazebo/apply_body_wrench 持续施力（duration=-1），Clear 前一直有效。"
+        )
+        self.rn_gz_dist_apply_btn.clicked.connect(self._rn_apply_gazebo_disturbance)
+        rn_gz_dist_btn_row.addWidget(self.rn_gz_dist_apply_btn)
+
+        self.rn_gz_dist_clear_btn = QPushButton("Clear disturbance")
+        self.rn_gz_dist_clear_btn.setStyleSheet(
+            "QPushButton { background-color: #546e7a; color: white; }"
+        )
+        self.rn_gz_dist_clear_btn.setToolTip("调用 /gazebo/clear_body_wrenches 并清除 RViz 箭头。")
+        self.rn_gz_dist_clear_btn.clicked.connect(self._rn_clear_gazebo_disturbance)
+        rn_gz_dist_btn_row.addWidget(self.rn_gz_dist_clear_btn)
+        rn_gz_dist_vbox.addLayout(rn_gz_dist_btn_row)
+
+        self.rn_gz_dist_status = QLabel("Disturbance: none")
+        self.rn_gz_dist_status.setStyleSheet("color: gray; font-size: 11px;")
+        rn_gz_dist_vbox.addWidget(self.rn_gz_dist_status)
+        rtt.addWidget(self._rn_gz_dist_panel)
+
+        self._rn_gz_dist_active: dict | None = None
+        self._rn_gz_dist_cmd_pub = None
+        self._rn_gz_dist_viz_process = None
+
+        # ── Regulation Target（可折叠，默认收起）──────────────────────────────
+        self.rn_reg_target_toggle_btn = QPushButton("▶  Regulation Target  (click to expand)")
+        self.rn_reg_target_toggle_btn.setCheckable(True)
+        self.rn_reg_target_toggle_btn.setChecked(False)
+        self.rn_reg_target_toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; font-weight: bold; padding: 6px 8px; }"
+        )
+        self.rn_reg_target_toggle_btn.setToolTip(
+            "设置 MPC regulation 镇定目标（x/y/z、yaw、j1、j2）。"
+        )
+        self.rn_reg_target_toggle_btn.toggled.connect(self._on_rn_reg_target_panel_toggled)
+        rtt.addWidget(self.rn_reg_target_toggle_btn)
+
+        self._rn_reg_target_panel = QWidget()
+        self._rn_reg_target_panel.setVisible(False)
+        reg_layout = QVBoxLayout(self._rn_reg_target_panel)
 
         _reg_hint = QLabel(
             "设置 MPC regulation 的目标状态（速度默认为 0）。\n"
@@ -4347,7 +4650,6 @@ class UamSuiteGUI(QMainWindow):
         _reg_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
         reg_layout.addWidget(_reg_hint)
 
-        # 两排布局：第 0 排 x / y / z；第 1 排 yaw / j1 / j2
         reg_grid = QGridLayout()
         for c in (1, 3, 5):
             reg_grid.setColumnStretch(c, 1)
@@ -4399,8 +4701,7 @@ class UamSuiteGUI(QMainWindow):
         reg_btn_row.addWidget(self.rn_set_reg_btn)
         reg_layout.addLayout(reg_btn_row)
 
-        reg_group.setLayout(reg_layout)
-        rtt.addWidget(reg_group)
+        rtt.addWidget(self._rn_reg_target_panel)
         rtt.addStretch(1)
 
         # ----- Right: plots -----
@@ -4471,6 +4772,26 @@ class UamSuiteGUI(QMainWindow):
             self.plan_info_text.verticalScrollBar().setValue(
                 self.plan_info_text.verticalScrollBar().maximum()
             )
+
+    @_pyqtSlot(bool, str)
+    def _rn_on_l1_apply_finished(self, ok: bool, msg: str) -> None:
+        """主线程：L1 配置下发完成，更新运行状态区。"""
+        self._rn_l1_pending_apply = False
+        self._rn_l1_last_apply_ok = bool(ok)
+        self._rn_l1_last_apply_msg = str(msg)
+        self._refresh_rn_l1_runtime_status()
+        self.log(msg)
+
+    @_pyqtSlot(bool, str)
+    def _rn_on_update_ctrl_finished(self, ok: bool, msg: str) -> None:
+        """主线程：update_controller_params 完成反馈。"""
+        self.log(msg)
+        from PyQt5.QtWidgets import QMessageBox
+
+        if ok:
+            QMessageBox.information(self, "Update controller params", msg)
+        else:
+            QMessageBox.warning(self, "Update controller params", msg)
 
     @staticmethod
     def _mixed_rows_to_plot_xyz(
@@ -5546,8 +5867,105 @@ class UamSuiteGUI(QMainWindow):
         except Exception:
             pass
 
+    def _cleanup_ros_stack_on_gui_exit(self) -> None:
+        """关闭 GUI 时终止本程序拉起的 ROS 子进程与节点（不杀 rosmaster）。"""
+        cleaned = []
+
+        if self._kill_tracking_node_quiet():
+            cleaned.append("tracking")
+
+        self._gazebo_states_subscribed = False
+        self._gazebo_pose = None
+        self._gazebo_pose_t = 0.0
+        try:
+            leftover = self._teardown_gazebo_stack(rounds=4)
+            cleaned.append("gazebo" if not leftover else f"gazebo_left:{','.join(leftover)}")
+        except Exception:
+            pass
+
+        try:
+            subprocess.run(
+                [
+                    "rosnode",
+                    "kill",
+                    f"/{GUI_ROS_NODE_NAME}",
+                    "/suite_tracking_controller",
+                    "/suite_rviz_state_node",
+                    "/gazebo_disturbance_viz",
+                    "/gazebo",
+                    "/gazebo_gui",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=4,
+            )
+            cleaned.append("rosnodes")
+        except Exception:
+            pass
+
+        # rospy 关闭后再清一次 OS 进程（避免插件节点仍挂在 master 上）
+        try:
+            self._hard_kill_gazebo_os_processes()
+            subprocess.run(
+                ["rosnode", "kill", "/gazebo", "/gazebo_gui"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except Exception:
+            pass
+
+        if getattr(self, "_ros_node_inited", False):
+            try:
+                import rospy
+
+                rospy.signal_shutdown("GUI closing")
+                self._ros_node_inited = False
+                cleaned.append("gui_rospy")
+            except Exception:
+                pass
+
+        if cleaned:
+            try:
+                print(f"[uam_suite_gui] exit cleanup: {', '.join(cleaned)}", flush=True)
+            except Exception:
+                pass
+
+        leftover = self._gazebo_related_nodes_remaining()
+        if leftover:
+            try:
+                print(
+                    "[uam_suite_gui] WARNING: leftover rosnode after exit: "
+                    + ", ".join(leftover)
+                    + " — run: killall -9 gzserver gzclient; rosnode kill /gazebo; "
+                    "or Stop roscore to reset master.",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+        if (
+            hasattr(self, "gz_stop_roscore_when_idle")
+            and self.gz_stop_roscore_when_idle.isChecked()
+        ):
+            self._try_stop_roscore_if_idle(context="GUI 退出")
+        elif leftover or any(
+            "gazebo" in n.lower() for n in self._ros_list_node_names()
+        ):
+            try:
+                print(
+                    "[uam_suite_gui] tip: /gazebo on rosnode list after exit is often a "
+                    "stale master registration — use Stop roscore or: killall rosmaster",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
     def closeEvent(self, event):
         self._save_last_session_selection()
+        self._cleanup_ros_stack_on_gui_exit()
         super().closeEvent(event)
 
     def _is_s500_mode(self) -> bool:
@@ -8015,12 +8433,25 @@ class UamSuiteGUI(QMainWindow):
             "rn_ee_w_vel_ang_yaw": float(self.rn_ee_w_vel_ang_yaw.value()),
             "rn_ee_w_u": float(self.rn_ee_w_u.value()),
             "rn_ee_w_terminal": float(self.rn_ee_w_terminal.value()),
+            "rn_ee_w_base_pos": float(self.rn_ee_w_base_pos.value()),
+            "rn_ee_w_base_yaw": float(self.rn_ee_w_base_yaw.value()),
+            "rn_ee_w_state_reg": float(self.rn_ee_w_state_reg.value()),
+            "rn_ee_w_state_track": float(self.rn_ee_w_state_track.value()),
+            "rn_ee_w_st_pos": float(self.rn_ee_w_st_pos.value()),
+            "rn_ee_w_st_att": float(self.rn_ee_w_st_att.value()),
+            "rn_ee_w_st_joint": float(self.rn_ee_w_st_joint.value()),
+            "rn_ee_w_st_vel": float(self.rn_ee_w_st_vel.value()),
+            "rn_ee_w_st_omega": float(self.rn_ee_w_st_omega.value()),
+            "rn_ee_w_st_joint_vel": float(self.rn_ee_w_st_joint_vel.value()),
             "rn_geo_kp_pos": float(self.rn_geo_kp_pos.value()),
             "rn_geo_kd_vel": float(self.rn_geo_kd_vel.value()),
             "rn_geo_kR": float(self.rn_geo_kR.value()),
             "rn_geo_kOmega": float(self.rn_geo_kOmega.value()),
             "rn_geo_max_tilt_deg": float(self.rn_geo_max_tilt_deg.value()),
             "rn_l1_enabled": bool(self.rn_l1_enabled.isChecked()),
+            "rn_l1_comp_mode_index": int(self.rn_l1_comp_mode.currentIndex()),
+            "rn_l1_comp_enabled": bool(self.rn_l1_comp_enabled_chk.isChecked()),
+            "rn_l1_comp_strategy_index": int(self.rn_l1_comp_strategy.currentIndex()),
             "rn_l1_as_gain": float(self.rn_l1_as_gain.value()),
             "rn_l1_wc_xy": float(self.rn_l1_wc_xy.value()),
             "rn_l1_wc_z": float(self.rn_l1_wc_z.value()),
@@ -8042,6 +8473,9 @@ class UamSuiteGUI(QMainWindow):
             "gz_model_type_index": int(self.gz_model_type_combo.currentIndex()),
             "gz_world_index": int(self.gz_world_combo.currentIndex()),
             "gz_enable_gui": bool(self.gz_enable_gui.isChecked()),
+            "gz_stop_roscore_when_idle": bool(
+                self.gz_stop_roscore_when_idle.isChecked()
+            ),
         }
 
     def _apply_params(self, p: dict) -> None:
@@ -8199,13 +8633,50 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("rn_ee_w_vel_ang_yaw", self.rn_ee_w_vel_ang_yaw)
         _set_spin("rn_ee_w_u", self.rn_ee_w_u)
         _set_spin("rn_ee_w_terminal", self.rn_ee_w_terminal)
+        _set_spin("rn_ee_w_base_pos", self.rn_ee_w_base_pos)
+        _set_spin("rn_ee_w_base_yaw", self.rn_ee_w_base_yaw)
+        _set_spin("rn_ee_w_state_reg", self.rn_ee_w_state_reg)
+        _set_spin("rn_ee_w_state_track", self.rn_ee_w_state_track)
+        _set_spin("rn_ee_w_st_pos", self.rn_ee_w_st_pos)
+        _set_spin("rn_ee_w_st_att", self.rn_ee_w_st_att)
+        _set_spin("rn_ee_w_st_joint", self.rn_ee_w_st_joint)
+        _set_spin("rn_ee_w_st_vel", self.rn_ee_w_st_vel)
+        _set_spin("rn_ee_w_st_omega", self.rn_ee_w_st_omega)
+        _set_spin("rn_ee_w_st_joint_vel", self.rn_ee_w_st_joint_vel)
         _set_spin("rn_geo_kp_pos", self.rn_geo_kp_pos)
         _set_spin("rn_geo_kd_vel", self.rn_geo_kd_vel)
         _set_spin("rn_geo_kR", self.rn_geo_kR)
         _set_spin("rn_geo_kOmega", self.rn_geo_kOmega)
         _set_spin("rn_geo_max_tilt_deg", self.rn_geo_max_tilt_deg)
         if "rn_l1_enabled" in p:
-            self.rn_l1_enabled.setChecked(bool(p["rn_l1_enabled"]))
+            self._rn_l1_runtime_guard = True
+            try:
+                self.rn_l1_enabled.setChecked(bool(p["rn_l1_enabled"]))
+            finally:
+                self._rn_l1_runtime_guard = False
+        if "rn_l1_comp_mode_index" in p and hasattr(self, "rn_l1_comp_mode"):
+            self._rn_l1_runtime_guard = True
+            try:
+                self.rn_l1_comp_mode.setCurrentIndex(int(p["rn_l1_comp_mode_index"]))
+            finally:
+                self._rn_l1_runtime_guard = False
+        elif "rn_drag_ff_enabled" in p and bool(p["rn_drag_ff_enabled"]) and hasattr(self, "rn_l1_comp_mode"):
+            self.rn_l1_comp_mode.setCurrentIndex(2)
+        if "rn_l1_comp_enabled" in p and hasattr(self, "rn_l1_comp_enabled_chk"):
+            self._rn_l1_runtime_guard = True
+            try:
+                self.rn_l1_comp_enabled_chk.setChecked(bool(p["rn_l1_comp_enabled"]))
+            finally:
+                self._rn_l1_runtime_guard = False
+        elif "rn_l1_comp_enabled" in p and hasattr(self, "rn_l1_comp_box"):
+            # 兼容旧版可折叠 QGroupBox 保存的参数
+            self.rn_l1_comp_enabled_chk.setChecked(bool(p["rn_l1_comp_enabled"]))
+        if "rn_l1_comp_strategy_index" in p and hasattr(self, "rn_l1_comp_strategy"):
+            self._rn_l1_runtime_guard = True
+            try:
+                self.rn_l1_comp_strategy.setCurrentIndex(int(p["rn_l1_comp_strategy_index"]))
+            finally:
+                self._rn_l1_runtime_guard = False
         _set_spin("rn_l1_as_gain", self.rn_l1_as_gain)
         _set_spin("rn_l1_wc_xy", self.rn_l1_wc_xy)
         _set_spin("rn_l1_wc_z", self.rn_l1_wc_z)
@@ -8218,7 +8689,7 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("rn_l1_k_pos_i_xy", self.rn_l1_k_pos_i_xy)
         _set_spin("rn_l1_k_pos_i_z", self.rn_l1_k_pos_i_z)
         _set_spin("rn_l1_max_pos_integral", self.rn_l1_max_pos_integral)
-        if "rn_drag_ff_enabled" in p:
+        if "rn_drag_ff_enabled" in p and hasattr(self, "rn_drag_ff_enabled"):
             self.rn_drag_ff_enabled.setChecked(bool(p["rn_drag_ff_enabled"]))
         if isinstance(p.get("rn_mpc_weight_profiles"), dict) and hasattr(
             self, "_rn_mpc_weight_profiles"
@@ -8242,6 +8713,12 @@ class UamSuiteGUI(QMainWindow):
         _set_combo_text("gz_world", self.gz_world_combo)
         if "gz_enable_gui" in p:
             self.gz_enable_gui.setChecked(bool(p["gz_enable_gui"]))
+        if "gz_stop_roscore_when_idle" in p and hasattr(
+            self, "gz_stop_roscore_when_idle"
+        ):
+            self.gz_stop_roscore_when_idle.setChecked(
+                bool(p["gz_stop_roscore_when_idle"])
+            )
 
         def _set_combo(name: str, widget):
             if name in p:
@@ -8349,6 +8826,9 @@ class UamSuiteGUI(QMainWindow):
         self._on_ee_plan_type_changed()
         self._on_reg_mode_changed()
         self._update_track_mode_enabled()
+        self._schedule_rn_l1_sync_to_node()
+        self._push_rn_l1_runtime_param_to_ros()
+        self._refresh_rn_l1_runtime_status()
 
     def _load_params_from_path(self, path: Path, silent_if_missing: bool = False) -> bool:
         if not path.exists():
@@ -8545,12 +9025,25 @@ class UamSuiteGUI(QMainWindow):
                 "rn_ee_w_vel_ang_yaw",
                 "rn_ee_w_u",
                 "rn_ee_w_terminal",
+                "rn_ee_w_base_pos",
+                "rn_ee_w_base_yaw",
+                "rn_ee_w_state_reg",
+                "rn_ee_w_state_track",
+                "rn_ee_w_st_pos",
+                "rn_ee_w_st_att",
+                "rn_ee_w_st_joint",
+                "rn_ee_w_st_vel",
+                "rn_ee_w_st_omega",
+                "rn_ee_w_st_joint_vel",
                 "rn_geo_kp_pos",
                 "rn_geo_kd_vel",
                 "rn_geo_kR",
                 "rn_geo_kOmega",
                 "rn_geo_max_tilt_deg",
                 "rn_l1_enabled",
+                "rn_l1_comp_mode_index",
+                "rn_l1_comp_enabled",
+                "rn_l1_comp_strategy_index",
                 "rn_l1_as_gain",
                 "rn_l1_wc_xy",
                 "rn_l1_wc_z",
@@ -8572,6 +9065,7 @@ class UamSuiteGUI(QMainWindow):
                 "gz_model_type_index",
                 "gz_world_index",
                 "gz_enable_gui",
+                "gz_stop_roscore_when_idle",
             }
         return {"version"}
 
@@ -9835,6 +10329,16 @@ class UamSuiteGUI(QMainWindow):
             "ee_w_vel_ang_yaw": self.rn_ee_w_vel_ang_yaw,
             "ee_w_u": self.rn_ee_w_u,
             "ee_w_terminal": self.rn_ee_w_terminal,
+            "ee_w_base_pos": self.rn_ee_w_base_pos,
+            "ee_w_base_yaw": self.rn_ee_w_base_yaw,
+            "ee_w_state_reg": self.rn_ee_w_state_reg,
+            "ee_w_state_track": self.rn_ee_w_state_track,
+            "ee_w_st_pos": self.rn_ee_w_st_pos,
+            "ee_w_st_att": self.rn_ee_w_st_att,
+            "ee_w_st_joint": self.rn_ee_w_st_joint,
+            "ee_w_st_vel": self.rn_ee_w_st_vel,
+            "ee_w_st_omega": self.rn_ee_w_st_omega,
+            "ee_w_st_joint_vel": self.rn_ee_w_st_joint_vel,
             "geo_kp_pos": self.rn_geo_kp_pos,
             "geo_kd_vel": self.rn_geo_kd_vel,
             "geo_kR": self.rn_geo_kR,
@@ -9901,6 +10405,40 @@ class UamSuiteGUI(QMainWindow):
         acados["acados_hpipm_mode"] = "SPEED"
         acados["acados_qp_iter_max"] = 20
         self._rn_mpc_weight_profiles["acados_full_state"] = acados
+        ee_acados = dict(acados)
+        ee_acados["ee_w_pos"] = 500.0
+        ee_acados["ee_w_rot_yaw"] = 200.0
+        ee_acados["ee_w_u"] = 1e-4
+        ee_acados["ee_w_terminal"] = 3.0
+        ee_acados["ee_w_base_pos"] = 3.0
+        ee_acados["ee_w_base_yaw"] = 2.0
+        ee_acados["ee_w_state_reg"] = 0.05
+        ee_acados["ee_w_state_track"] = 2.0
+        ee_acados["ee_w_st_pos"] = 1.0
+        ee_acados["ee_w_st_att"] = 1.0
+        ee_acados["ee_w_st_joint"] = 0.2
+        ee_acados["ee_w_st_vel"] = 0.1
+        ee_acados["ee_w_st_omega"] = 0.1
+        ee_acados["ee_w_st_joint_vel"] = 0.05
+        self._rn_mpc_weight_profiles["acados_ee_pose"] = ee_acados
+        croc_ee = dict(croc)
+        croc_ee["ee_w_pos"] = 400.0
+        croc_ee["ee_w_rot_yaw"] = 200.0
+        croc_ee["ee_w_u"] = 1e-3
+        croc_ee["ee_w_terminal"] = 3.0
+        croc_ee["ee_w_base_pos"] = 3.0
+        croc_ee["ee_w_base_yaw"] = 2.0
+        croc_ee["ee_w_state_reg"] = 0.05
+        croc_ee["ee_w_state_track"] = 2.0
+        croc_ee["ee_w_st_pos"] = 1.0
+        croc_ee["ee_w_st_att"] = 1.0
+        croc_ee["ee_w_st_joint"] = 0.2
+        croc_ee["ee_w_st_vel"] = 0.1
+        croc_ee["ee_w_st_omega"] = 0.1
+        croc_ee["ee_w_st_joint_vel"] = 0.05
+        croc_ee["w_state_track"] = 0.0
+        croc_ee["w_state_reg"] = 0.0
+        self._rn_mpc_weight_profiles["croc_ee_pose"] = croc_ee
 
     def _rn_save_controller_profiles(self) -> None:
         """将每个算法各自的控制器参数持久化到磁盘（跨重启复用，无需重新调参）。"""
@@ -9969,6 +10507,8 @@ class UamSuiteGUI(QMainWindow):
         self._rn_mpc_profile_mode = new_mode
         if new_mode == "acados_full_state":
             self.rn_fs_weights_title.setText("Cost weights — Acados profile")
+        elif new_mode == "acados_ee_pose":
+            self.rn_fs_weights_title.setText("Cost weights — Acados EE profile")
         elif new_mode == "croc_full_state":
             self.rn_fs_weights_title.setText("Cost weights — Crocoddyl profile")
         else:
@@ -9979,16 +10519,28 @@ class UamSuiteGUI(QMainWindow):
         """根据 controller mode 切换 full-state / EE 参数面板可见性。"""
         mode = self.rn_controller_combo.currentText()
         is_full = mode in ("croc_full_state", "acados_full_state")
-        is_ee = mode == "croc_ee_pose"
+        is_ee = mode in ("croc_ee_pose", "acados_ee_pose")
         is_geo = mode == "geometric"
-        is_acados = mode == "acados_full_state"
+        is_acados = mode in ("acados_full_state", "acados_ee_pose")
         self._rn_fs_panel.setVisible(is_full)
         self._rn_acados_panel.setVisible(is_acados)
         self.rn_fs_weights_title.setVisible(is_full)
         self._rn_ee_panel.setVisible(is_ee)
+        is_acados_ee = mode == "acados_ee_pose"
+        is_croc_ee = mode == "croc_ee_pose"
+        if hasattr(self, "rn_ee_acados_cost_hint"):
+            self.rn_ee_acados_cost_hint.setVisible(is_acados_ee)
+        if hasattr(self, "_rn_ee_croc_only_widgets"):
+            for w in self._rn_ee_croc_only_widgets:
+                w.setVisible(is_croc_ee)
         self._rn_geo_panel.setVisible(is_geo)
         # px4 / geometric 模式不使用此处 MPC 参数
-        use_mpc_params = mode in ("croc_full_state", "acados_full_state", "croc_ee_pose")
+        use_mpc_params = mode in (
+            "croc_full_state",
+            "acados_full_state",
+            "acados_ee_pose",
+            "croc_ee_pose",
+        )
         self.rn_dt_mpc.setEnabled(use_mpc_params)
         self.rn_horizon.setEnabled(use_mpc_params)
         self.rn_mpc_max_iter.setEnabled(use_mpc_params)
@@ -10007,6 +10559,82 @@ class UamSuiteGUI(QMainWindow):
                 "▼  MPC Parameters  (click to collapse)"
                 if expanded
                 else "▶  MPC Parameters  (click to expand)"
+            )
+
+    def _on_rn_l1_panel_toggled(self, expanded: bool) -> None:
+        """折叠/展开 L1 / 扰动估计与补偿面板。"""
+        if hasattr(self, "_rn_l1_panel"):
+            self._rn_l1_panel.setVisible(bool(expanded))
+        if hasattr(self, "rn_l1_toggle_btn"):
+            self.rn_l1_toggle_btn.setText(
+                "▼  L1 / Disturbance Estimation & Compensation"
+                if expanded
+                else "▶  L1 / Disturbance Estimation & Compensation"
+            )
+
+    def _rn_l1_backend_mode(self) -> str:
+        """GUI 估计来源 → run_tracking_controller l1_mode。"""
+        idx = int(self.rn_l1_comp_mode.currentIndex())
+        if idx == 1:
+            return "oracle"
+        if idx == 2:
+            return "drag_ff"
+        return "adaptive"
+
+    def _rn_l1_backend_inject(self) -> str:
+        if (
+            self.rn_l1_comp_strategy.currentIndex() == 1
+            and self.rn_controller_combo.currentText()
+            in ("acados_full_state", "acados_ee_pose")
+        ):
+            return "in_model"
+        return "bolt_on"
+
+    def _rn_l1_dist_params_dict(self) -> dict:
+        """扰动估计/补偿参数（launch / update_controller_params 共用）。"""
+        mode = self._rn_l1_backend_mode()
+        master = bool(self.rn_l1_enabled.isChecked())
+        return {
+            "l1_dist_enabled": master,
+            "l1_mode": mode,
+            "l1_comp_enabled": bool(self.rn_l1_comp_enabled_chk.isChecked()),
+            "l1_inject": self._rn_l1_backend_inject(),
+            "l1_enabled": master and mode == "adaptive",
+            "l1_as_gain": float(self.rn_l1_as_gain.value()),
+            "l1_wc_xy": float(self.rn_l1_wc_xy.value()),
+            "l1_wc_z": float(self.rn_l1_wc_z.value()),
+            "l1_tilt_gain": float(self.rn_l1_tilt_gain.value()),
+            "l1_max_accel_xy": float(self.rn_l1_max_accel_xy.value()),
+            "l1_max_accel_z": float(self.rn_l1_max_accel_z.value()),
+            "l1_max_sigma": float(self.rn_l1_max_sigma.value()),
+            "l1_use_pos_feedback": bool(self.rn_l1_pos_fb.isChecked()),
+            "l1_k_pos_i_xy": float(self.rn_l1_k_pos_i_xy.value()),
+            "l1_k_pos_i_z": float(self.rn_l1_k_pos_i_z.value()),
+            "l1_max_pos_integral": float(self.rn_l1_max_pos_integral.value()),
+            "drag_ff_enabled": master and mode == "drag_ff",
+            "arm_ee_compensate": bool(self.rn_arm_ee_comp_chk.isChecked()),
+        }
+
+    def _on_rn_gz_dist_panel_toggled(self, expanded: bool) -> None:
+        """折叠/展开 Gazebo Disturbance 面板。"""
+        if hasattr(self, "_rn_gz_dist_panel"):
+            self._rn_gz_dist_panel.setVisible(bool(expanded))
+        if hasattr(self, "rn_gz_dist_toggle_btn"):
+            self.rn_gz_dist_toggle_btn.setText(
+                "▼  Gazebo Disturbance  (click to collapse)"
+                if expanded
+                else "▶  Gazebo Disturbance  (click to expand)"
+            )
+
+    def _on_rn_reg_target_panel_toggled(self, expanded: bool) -> None:
+        """折叠/展开 Regulation Target 面板。"""
+        if hasattr(self, "_rn_reg_target_panel"):
+            self._rn_reg_target_panel.setVisible(bool(expanded))
+        if hasattr(self, "rn_reg_target_toggle_btn"):
+            self.rn_reg_target_toggle_btn.setText(
+                "▼  Regulation Target  (click to collapse)"
+                if expanded
+                else "▶  Regulation Target  (click to expand)"
             )
 
     def _rn_gazebo_disturbance_config(self) -> dict:
@@ -10181,6 +10809,10 @@ class UamSuiteGUI(QMainWindow):
         self._rn_set_gz_dist_status(
             f"Disturbance applying: {cfg['model']}::{cfg['link']} "
             f"F={cfg['force']} τ={cfg['torque']} ({cfg['frame']} frame)"
+        )
+        self.log(
+            "[gazebo_dist] 已写入 /suite_mpc/disturbance_config；"
+            "查看 force_world 请将估计来源设为 oracle 并启用扰动估计。"
         )
 
         def _run():
@@ -10425,7 +11057,12 @@ class UamSuiteGUI(QMainWindow):
                 models_dir + (os.pathsep + prev_model_path if prev_model_path else "")
             )
         try:
-            self._gazebo_process = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), env=gz_env)
+            self._gazebo_process = subprocess.Popen(
+                cmd,
+                cwd=str(Path(__file__).resolve().parent),
+                env=gz_env,
+                start_new_session=True,
+            )
             self.log(f"Started Gazebo: {' '.join(cmd)} (PID={self._gazebo_process.pid})")
         except Exception as e:
             QMessageBox.critical(self, "Launch failed", str(e)[:2000])
@@ -10444,94 +11081,436 @@ class UamSuiteGUI(QMainWindow):
             self._rn_set_disturbance_cmd(None)
             self._rn_pulse_disturbance_cmd_clear()
 
+    def _terminate_process_tree(
+        self, proc: subprocess.Popen | None, *, label: str = "process", timeout: float = 5.0
+    ) -> None:
+        """终止子进程及其进程组（roslaunch → gzserver/gzclient 等）。"""
+        if proc is None or proc.poll() is not None:
+            return
+        import signal
+
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            proc.wait(timeout=timeout)
+            return
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                proc.terminate()
+                proc.wait(timeout=timeout)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    _GAZEBO_SIM_NODE_MARKERS = (
+        "gazebo",
+        "spawn",
+        "vehicle_spawn",
+        "robot_state",
+        "joint_state",
+        "groundtruth",
+        "gazebo_unpause",
+        "gazebo_disturbance",
+        "sitl",
+        "mavros",
+        "px4",
+        "controller_manager",
+        "controller_spawner",
+    )
+
+    def _ros_kill_nodes_by_markers(self, markers: tuple[str, ...]) -> list[str]:
+        """按名称关键字 rosnode kill（返回尝试杀掉的节点名）。"""
+        targets: list[str] = []
+        for name in self._ros_list_node_names():
+            key = name.lstrip("/").lower()
+            if any(m in key for m in markers):
+                targets.append(name)
+        for name in targets:
+            try:
+                subprocess.run(
+                    ["rosnode", "kill", name],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                )
+            except Exception:
+                pass
+        return targets
+
+    def _hard_kill_gazebo_os_processes(self) -> None:
+        """强杀 gzserver/gzclient 及常见 roslaunch 仿真进程。"""
+        pkg = (
+            self.gz_pkg_combo.currentText().strip()
+            if hasattr(self, "gz_pkg_combo")
+            else ""
+        )
+        launch = (
+            self.gz_launch_combo.currentText().strip()
+            if hasattr(self, "gz_launch_combo")
+            else ""
+        )
+        term_patterns = [
+            r"roslaunch .*(gazebo|empty_world|sitl|s500)",
+            r"gzserver",
+            r"gzclient",
+            r"gazebo_ros",
+            r"gazebo_unpause",
+            r"gazebo_disturbance",
+        ]
+        if pkg:
+            term_patterns.append(rf"roslaunch {pkg}")
+        if launch:
+            term_patterns.append(rf"roslaunch .*{launch}")
+        for pat in term_patterns:
+            try:
+                subprocess.run(
+                    ["pkill", "-TERM", "-f", pat],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+            except Exception:
+                pass
+        time.sleep(0.6)
+        for cmd in (
+            ["killall", "-9", "gzserver", "gzclient", "gazebo", "gazebo_gui"],
+            ["pkill", "-9", "-f", r"roslaunch .*(gazebo|empty_world|sitl|s500)"],
+            ["pkill", "-9", "-f", r"gazebo_unpause|gazebo_disturbance"],
+        ):
+            try:
+                subprocess.run(
+                    cmd,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+            except Exception:
+                pass
+        if pkg:
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-f", rf"roslaunch {pkg}"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+            except Exception:
+                pass
+
+    def _gazebo_related_nodes_remaining(self) -> list[str]:
+        return [
+            n
+            for n in self._ros_list_node_names()
+            if any(m in n.lstrip("/").lower() for m in self._GAZEBO_SIM_NODE_MARKERS)
+        ]
+
+    def _teardown_gazebo_stack(self, *, rounds: int = 4) -> list[str]:
+        """多轮终止 Gazebo 进程树与 /gazebo 等仿真节点；返回仍残留的节点名。"""
+        self._stop_rviz_viz_node()
+        self._stop_gazebo_disturbance_viz_node()
+        subprocess.run(
+            [
+                "rosnode",
+                "kill",
+                "/suite_rviz_state_node",
+                "/gazebo_disturbance_viz",
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        self._terminate_process_tree(
+            getattr(self, "_gazebo_process", None), label="roslaunch"
+        )
+        self._gazebo_process = None
+
+        leftover: list[str] = []
+        for attempt in range(max(1, int(rounds))):
+            self._ros_kill_nodes_by_markers(self._GAZEBO_SIM_NODE_MARKERS)
+            subprocess.run(
+                [
+                    "rosnode",
+                    "kill",
+                    "/gazebo",
+                    "/gazebo_gui",
+                    "/rviz",
+                    "/rviz_gui",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            self._hard_kill_gazebo_os_processes()
+            leftover = self._gazebo_related_nodes_remaining()
+            if not leftover:
+                break
+            if attempt < rounds - 1:
+                time.sleep(0.8)
+
+        subprocess.run(
+            ["killall", "-q", "-9", "rviz", "rviz_gui"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        time.sleep(0.3)
+        return self._gazebo_related_nodes_remaining()
+
+    def _kill_tracking_node_quiet(self) -> bool:
+        """终止 tracking 子进程（供 Stop Gazebo 联动调用）。"""
+        proc = getattr(self, "_rn_process", None)
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._rn_process = None
+        self._invalidate_rn_tracking_svc_cache()
+        if hasattr(self, "rn_status_label"):
+            self.rn_status_label.setText("节点状态：已停止")
+            self.rn_status_label.setStyleSheet("color: gray;")
+        if hasattr(self, "rn_kill_btn"):
+            self.rn_kill_btn.setEnabled(False)
+        self._set_node_service_buttons_enabled(False)
+        try:
+            subprocess.run(
+                ["rosnode", "kill", "/suite_tracking_controller"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except Exception:
+            pass
+        return True
+
+    def _log_ros_graph_after_sim_stop(self) -> None:
+        """Stop Gazebo 后汇报活跃节点，并说明 rostopic 幽灵注册。"""
+        nodes = self._ros_list_node_names()
+        node_txt = ", ".join(nodes) if nodes else "（无）"
+        blocking, _ = self._ros_nodes_blocking_roscore_stop()
+        self.log(
+            f"[Stop Gazebo] 当前活跃 rosnode: {node_txt}。"
+        )
+        if blocking:
+            self.log(
+                f"[Stop Gazebo] 仍有非空闲节点: {', '.join(blocking)}。"
+            )
+        else:
+            self.log(
+                "[Stop Gazebo] 仿真节点已清空（仅剩 rosout / 本 GUI / PlotJuggler 等）。"
+                " rostopic list 中的 /gazebo/*、/mavros/*、/suite_mpc/* 多为 rosmaster "
+                "残留注册，并非仍在发布；点 Stop roscore 可彻底清空 topic 列表。"
+            )
+
     def _stop_ros_gazebo(self) -> None:
         try:
+            if self._kill_tracking_node_quiet():
+                self.log("[Stop Gazebo] 已一并停止 ROS tracking 节点。")
+
             self._gazebo_states_subscribed = False
             self._gazebo_pose = None
             self._gazebo_pose_t = 0.0
-            # 0) 关闭独立 RViz / 扰动可视化节点
-            self._stop_rviz_viz_node()
-            self._stop_gazebo_disturbance_viz_node()
-            subprocess.run(
-                ["rosnode", "kill", "/suite_rviz_state_node", "/gazebo_disturbance_viz"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            # 1) 优先关闭当前 GUI 记录的 roslaunch 进程
-            if self._gazebo_process is not None:
-                try:
-                    self._gazebo_process.terminate()
-                    self._gazebo_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._gazebo_process.kill()
-                    self._gazebo_process.wait(timeout=2)
-                except Exception:
-                    try:
-                        self._gazebo_process.kill()
-                    except Exception:
-                        pass
-                finally:
-                    self._gazebo_process = None
-
-            # 2) 清理常见仿真相关 ROS 节点（忽略不存在的节点）
-            ros_nodes = [
-                "/gazebo",
-                "/gazebo_gui",
-                "/rviz",
-                "/rviz_gui",
-                "/robot_state_publisher",
-                "/joint_state_publisher",
-                "/joint_state_publisher_gui",
-                "/move_group",
-                "/controller_spawner",
-                "/controller_manager",
-                "/groundtruth_pub",
-            ]
-            subprocess.run(
-                ["rosnode", "kill", *ros_nodes],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
-            # 3) 清理残留进程（避免下次启动端口/资源冲突）
-            subprocess.run(
-                ["killall", "-q", "-9", "gazebo", "gzserver", "gzclient", "gazebo_gui"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            subprocess.run(
-                ["killall", "-q", "-9", "rviz", "rviz_gui"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            subprocess.run(
-                ["killall", "-q", "-9", "px4"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            subprocess.run(
-                ["pkill", "-9", "-f", "python.*simulation"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
-            # 给系统一点时间完成资源回收
-            time.sleep(1.0)
-            self.log("Gazebo stopped (clean shutdown + residual process cleanup).")
+            leftover = self._teardown_gazebo_stack(rounds=4)
+            if leftover:
+                self.log(
+                    f"Gazebo stopped with warnings; leftover nodes: {', '.join(leftover)}"
+                )
+            else:
+                self.log("Gazebo stopped (process tree + nodes cleaned).")
+            self._log_ros_graph_after_sim_stop()
+            if (
+                hasattr(self, "gz_stop_roscore_when_idle")
+                and self.gz_stop_roscore_when_idle.isChecked()
+            ):
+                self._try_stop_roscore_if_idle(context="Stop Gazebo")
+            elif not self._ros_nodes_blocking_roscore_stop()[0]:
+                self.log(
+                    "[Stop Gazebo] 提示：可勾选「空闲时自动关闭 roscore」或点 Stop roscore，"
+                    "以清除 rostopic list 中的幽灵 topic。"
+                )
         except Exception as e:
             self.log(f"Failed to stop Gazebo cleanly: {e!r}")
+
+    # ── roscore 空闲检测与关闭 ───────────────────────────────────────────────
+    _ROS_IDLE_NODE_MARKERS = (
+        "rosout",
+        "plotjuggler",
+        "rostopic_",
+        "uam_flight_studio_gui",
+    )
+
+    def _ros_list_node_names(self) -> list[str]:
+        try:
+            out = subprocess.run(
+                ["rosnode", "list"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=4,
+            )
+            if out.returncode != 0:
+                return []
+            return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        except Exception:
+            return []
+
+    def _ros_nodes_blocking_roscore_stop(self) -> tuple[list[str], list[str]]:
+        """返回 (阻止关闭 roscore 的节点, 全部节点)。"""
+        all_nodes = self._ros_list_node_names()
+        blocking: list[str] = []
+        for name in all_nodes:
+            key = name.lstrip("/").lower()
+            if any(m in key for m in self._ROS_IDLE_NODE_MARKERS):
+                continue
+            blocking.append(name)
+        return blocking, all_nodes
+
+    @staticmethod
+    def _ros_master_online() -> bool:
+        try:
+            import rosgraph
+
+            return bool(rosgraph.is_master_online())
+        except Exception:
+            return False
+
+    def _kill_rosmaster_processes(self) -> bool:
+        """终止 rosmaster / roscore 启动器（不杀其它 ROS 节点）。"""
+        ok = False
+        for cmd in (
+            ["killall", "-q", "rosmaster"],
+            ["killall", "-q", "roscore"],
+        ):
+            try:
+                r = subprocess.run(
+                    cmd, check=False, capture_output=True, text=True, timeout=3
+                )
+                ok = ok or r.returncode == 0
+            except Exception:
+                pass
+        return ok
+
+    def _try_stop_roscore_if_idle(
+        self, *, context: str = "", ask_user: bool = False
+    ) -> bool:
+        """若无仿真/控制节点则关闭 roscore；PlotJuggler 单独连接视为可关闭。"""
+        if not self._ros_master_online():
+            if context:
+                self.log(f"[{context}] roscore 未运行，跳过。")
+            return False
+
+        blocking, all_nodes = self._ros_nodes_blocking_roscore_stop()
+        if blocking:
+            msg = (
+                f"[{context}] roscore 仍在运行：另有 {len(blocking)} 个节点 "
+                f"({', '.join(blocking[:5])}{'…' if len(blocking) > 5 else ''})，未关闭。"
+            )
+            if context:
+                self.log(msg)
+            return False
+
+        idle_desc = ", ".join(all_nodes) if all_nodes else "仅 rosmaster"
+        if ask_user:
+            from PyQt5.QtWidgets import QMessageBox
+
+            ans = QMessageBox.question(
+                self,
+                "关闭 roscore",
+                f"当前节点：{idle_desc or '—'}\n\n"
+                "关闭 roscore 会断开 PlotJuggler 等工具的 ROS 连接，"
+                "并清空 rosparam（含 l1_runtime_update）。\n\n是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return False
+
+        if getattr(self, "_ros_node_inited", False):
+            try:
+                import rospy
+
+                rospy.signal_shutdown(f"{context} stop roscore")
+            except Exception:
+                pass
+            self._ros_node_inited = False
+
+        killed = self._kill_rosmaster_processes()
+        if killed:
+            self.log(
+                f"[{context or 'roscore'}] 已关闭 roscore（原节点: {idle_desc}）。"
+                " rostopic list 中的幽灵 topic 已一并清除；下次仿真前请重新 roscore。"
+            )
+        else:
+            self.log(f"[{context or 'roscore'}] 尝试关闭 roscore 失败（进程未找到？）。")
+        return killed
+
+    def _on_stop_roscore_clicked(self) -> None:
+        blocking, _all_nodes = self._ros_nodes_blocking_roscore_stop()
+        if blocking:
+            from PyQt5.QtWidgets import QMessageBox
+
+            gz_only = all(
+                any(
+                    m in name.lstrip("/").lower()
+                    for m in self._GAZEBO_SIM_NODE_MARKERS
+                )
+                for name in blocking
+            )
+            if gz_only:
+                ans = QMessageBox.question(
+                    self,
+                    "Gazebo 残留",
+                    "以下节点仍在运行（多为 Stop Gazebo 未杀净的 gzserver）：\n\n"
+                    + "\n".join(blocking)
+                    + "\n\n是否强制清理 Gazebo 后再尝试关闭 roscore？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if ans == QMessageBox.Yes:
+                    self._hard_kill_gazebo_os_processes()
+                    self._ros_kill_nodes_by_markers(self._GAZEBO_SIM_NODE_MARKERS)
+                    time.sleep(1.0)
+                    blocking, _ = self._ros_nodes_blocking_roscore_stop()
+            if blocking:
+                QMessageBox.warning(
+                    self,
+                    "无法关闭 roscore",
+                    "以下节点仍在运行：\n\n"
+                    + "\n".join(blocking[:12])
+                    + ("\n…" if len(blocking) > 12 else "")
+                    + "\n\n请先 Stop Gazebo / Kill tracking / 关闭 PlotJuggler 等。",
+                )
+                return
+        self._try_stop_roscore_if_idle(context="手动", ask_user=True)
 
     def _full_state_ros_plan_from_ee_snap(self, pb: dict) -> dict:
         """Convert ee_snap (world p, dp, ddp, yaw) to a full-state plan for ROS / Meshcat."""
@@ -10685,8 +11664,12 @@ class UamSuiteGUI(QMainWindow):
         traj_name = self._current_trajectory_save_name()
         use_sim = "true" if self.rn_use_sim_check.isChecked() else "false"
         is_s500 = self._is_s500_mode()
-        if is_s500 and ctrl_mode == "croc_ee_pose":
-            QMessageBox.warning(self, "Notice", "s500 模式无机械臂，不支持 croc_ee_pose，请选择 croc_full_state / px4 / geometric。")
+        if is_s500 and ctrl_mode in ("croc_ee_pose", "acados_ee_pose"):
+            QMessageBox.warning(
+                self,
+                "Notice",
+                f"s500 模式无机械臂，不支持 {ctrl_mode}，请选择 croc_full_state / acados_full_state / px4 / geometric。",
+            )
             return
 
         script = root / "run_tracking_controller.py"
@@ -10734,24 +11717,42 @@ class UamSuiteGUI(QMainWindow):
             f"_ee_w_vel_ang_yaw:={self.rn_ee_w_vel_ang_yaw.value()}",
             f"_ee_w_u:={self.rn_ee_w_u.value()}",
             f"_ee_w_terminal:={self.rn_ee_w_terminal.value()}",
+            f"_ee_w_base_pos:={self.rn_ee_w_base_pos.value()}",
+            f"_ee_w_base_yaw:={self.rn_ee_w_base_yaw.value()}",
+            f"_ee_w_state_reg:={self.rn_ee_w_state_reg.value()}",
+            f"_ee_w_state_track:={self.rn_ee_w_state_track.value()}",
+            f"_ee_w_st_pos:={self.rn_ee_w_st_pos.value()}",
+            f"_ee_w_st_att:={self.rn_ee_w_st_att.value()}",
+            f"_ee_w_st_joint:={self.rn_ee_w_st_joint.value()}",
+            f"_ee_w_st_vel:={self.rn_ee_w_st_vel.value()}",
+            f"_ee_w_st_omega:={self.rn_ee_w_st_omega.value()}",
+            f"_ee_w_st_joint_vel:={self.rn_ee_w_st_joint_vel.value()}",
             f"_geo_kp_pos:={self.rn_geo_kp_pos.value()}",
             f"_geo_kd_vel:={self.rn_geo_kd_vel.value()}",
             f"_geo_kR:={self.rn_geo_kR.value()}",
             f"_geo_kOmega:={self.rn_geo_kOmega.value()}",
             f"_geo_max_tilt_deg:={self.rn_geo_max_tilt_deg.value()}",
-            f"_l1_enabled:={'true' if self.rn_l1_enabled.isChecked() else 'false'}",
-            f"_l1_as_gain:={self.rn_l1_as_gain.value()}",
-            f"_l1_wc_xy:={self.rn_l1_wc_xy.value()}",
-            f"_l1_wc_z:={self.rn_l1_wc_z.value()}",
-            f"_l1_tilt_gain:={self.rn_l1_tilt_gain.value()}",
-            f"_l1_max_accel_xy:={self.rn_l1_max_accel_xy.value()}",
-            f"_l1_max_accel_z:={self.rn_l1_max_accel_z.value()}",
-            f"_l1_max_sigma:={self.rn_l1_max_sigma.value()}",
-            f"_l1_use_pos_feedback:={'true' if self.rn_l1_pos_fb.isChecked() else 'false'}",
-            f"_l1_k_pos_i_xy:={self.rn_l1_k_pos_i_xy.value()}",
-            f"_l1_k_pos_i_z:={self.rn_l1_k_pos_i_z.value()}",
-            f"_l1_max_pos_integral:={self.rn_l1_max_pos_integral.value()}",
-            f"_drag_ff_enabled:={'true' if self.rn_drag_ff_enabled.isChecked() else 'false'}",
+        ]
+        _l1p = self._rn_l1_dist_params_dict()
+        cmd += [
+            f"_l1_dist_enabled:={'true' if _l1p['l1_dist_enabled'] else 'false'}",
+            f"_l1_mode:={_l1p['l1_mode']}",
+            f"_l1_comp_enabled:={'true' if _l1p['l1_comp_enabled'] else 'false'}",
+            f"_l1_inject:={_l1p['l1_inject']}",
+            f"_l1_enabled:={'true' if _l1p['l1_enabled'] else 'false'}",
+            f"_l1_as_gain:={_l1p['l1_as_gain']}",
+            f"_l1_wc_xy:={_l1p['l1_wc_xy']}",
+            f"_l1_wc_z:={_l1p['l1_wc_z']}",
+            f"_l1_tilt_gain:={_l1p['l1_tilt_gain']}",
+            f"_l1_max_accel_xy:={_l1p['l1_max_accel_xy']}",
+            f"_l1_max_accel_z:={_l1p['l1_max_accel_z']}",
+            f"_l1_max_sigma:={_l1p['l1_max_sigma']}",
+            f"_l1_use_pos_feedback:={'true' if _l1p['l1_use_pos_feedback'] else 'false'}",
+            f"_l1_k_pos_i_xy:={_l1p['l1_k_pos_i_xy']}",
+            f"_l1_k_pos_i_z:={_l1p['l1_k_pos_i_z']}",
+            f"_l1_max_pos_integral:={_l1p['l1_max_pos_integral']}",
+            f"_drag_ff_enabled:={'true' if _l1p['drag_ff_enabled'] else 'false'}",
+            f"_arm_ee_compensate:={'true' if _l1p['arm_ee_compensate'] else 'false'}",
             "_viz_robot_markers:=false",
             "_viz_ee_axes:=false",
         ]
@@ -10769,11 +11770,14 @@ class UamSuiteGUI(QMainWindow):
             self.log(f"ROS tracking launch failed: {e!r}")
             return
 
+        self._invalidate_rn_tracking_svc_cache()
         self.rn_status_label.setText(f"节点状态：运行中  (PID {self._rn_process.pid})")
         self.rn_status_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
         self.rn_kill_btn.setEnabled(True)
         self._set_node_service_buttons_enabled(True)
         self._init_drone_status_monitor()
+        self._schedule_rn_l1_sync_to_node(delay_ms=2500, retries=10)
+        self._refresh_rn_l1_runtime_status()
         self.log(
             f"Launched run_tracking_controller.py | PID={self._rn_process.pid} | "
             f"mode={ctrl_mode} odom={odom_src} rate={ctrl_rate}Hz | plan={npz_path}\n"
@@ -10804,21 +11808,8 @@ class UamSuiteGUI(QMainWindow):
 
     def _kill_tracking_node(self):
         """终止 ROS Tracking 子进程（新节点或 PX4 入口）。"""
-        if self._rn_process is None:
+        if not self._kill_tracking_node_quiet():
             return
-        try:
-            self._rn_process.terminate()
-            self._rn_process.wait(timeout=3)
-        except Exception:
-            try:
-                self._rn_process.kill()
-            except Exception:
-                pass
-        self._rn_process = None
-        self.rn_status_label.setText("节点状态：已停止")
-        self.rn_status_label.setStyleSheet("color: gray;")
-        self.rn_kill_btn.setEnabled(False)
-        self._set_node_service_buttons_enabled(False)
         self.log("ROS tracking process terminated.")
         # 确保 Gazebo 驱动的 RViz 可视化仍在运行（重启 viz 以 DELETEALL 旧 latched marker）
         if self._gazebo_process is not None and self._gazebo_process.poll() is None:
@@ -10842,9 +11833,30 @@ class UamSuiteGUI(QMainWindow):
         try:
             import rospy
 
-            rospy.init_node(
-                "uam_flight_studio_gui", anonymous=True, disable_signals=True
-            )
+            try:
+                rospy.init_node(
+                    GUI_ROS_NODE_NAME,
+                    anonymous=False,
+                    disable_signals=True,
+                )
+            except rospy.ROSException:
+                # 上次 GUI 异常退出可能留下僵尸注册，清掉后重试一次
+                try:
+                    subprocess.run(
+                        ["rosnode", "kill", f"/{GUI_ROS_NODE_NAME}"],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+                rospy.init_node(
+                    GUI_ROS_NODE_NAME,
+                    anonymous=False,
+                    disable_signals=True,
+                )
             self._ros_node_inited = True
             return True
         except Exception as e:
@@ -10907,6 +11919,17 @@ class UamSuiteGUI(QMainWindow):
             rospy.Subscriber(
                 "/suite_mpc/stats", _StringMsg, _stats_cb, queue_size=5
             )
+
+            def _dist_comp_cb(msg):
+                try:
+                    self._rn_dist_comp_state = _json.loads(msg.data)
+                    self._rn_dist_comp_t = _time.monotonic()
+                except Exception:
+                    pass
+
+            rospy.Subscriber(
+                "/suite_mpc/dist_comp/state", _StringMsg, _dist_comp_cb, queue_size=5
+            )
         except Exception as e:
             self.log(f"[mavros] status subscribe failed: {e}")
             return
@@ -10914,6 +11937,7 @@ class UamSuiteGUI(QMainWindow):
         self._status_timer.timeout.connect(self._update_drone_status)
         self._status_timer.start(300)
         self._status_monitor_inited = True
+        self._push_rn_l1_runtime_param_to_ros()
         self.log("[mavros] drone status monitor active.")
 
     def _update_drone_status(self) -> None:
@@ -11058,52 +12082,22 @@ class UamSuiteGUI(QMainWindow):
                 % ("#2e7d32" if epos <= 0.10 else ("#e65100" if epos <= 0.30 else "#b71c1c"))
             )
 
-        if hasattr(self, "rn_l1_status_label"):
-            if not ms_fresh:
-                self.rn_l1_status_label.setText("L1: —")
-                self.rn_l1_status_label.setStyleSheet("color: gray; font-size: 11px;")
-            elif ms.get("l1_enabled"):
-                sig = float(ms.get("l1_sigma_norm", 0.0))
-                ac = float(ms.get("l1_a_ac_norm", 0.0))
-                self.rn_l1_status_label.setText(
-                    f"L1 ON  |σ̂|={sig:.2f} m/s²  |a_ac|={ac:.2f} m/s²"
-                )
-                self.rn_l1_status_label.setStyleSheet("color: #2e7d32; font-size: 11px;")
-            elif ms.get("drag_ff_enabled"):
-                self.rn_l1_status_label.setText("TRUE-DRAG feedforward ON (L1 off)")
-                self.rn_l1_status_label.setStyleSheet("color: #6a1b9a; font-size: 11px;")
-            else:
-                self.rn_l1_status_label.setText("L1 OFF")
-                self.rn_l1_status_label.setStyleSheet("color: gray; font-size: 11px;")
-
         if hasattr(self, "rn_l1_force_label"):
-            if ms_fresh and ms.get("l1_enabled"):
-                fx = float(ms.get("l1_force_x", 0.0))
-                fy = float(ms.get("l1_force_y", 0.0))
-                fz = float(ms.get("l1_force_z", 0.0))
-                fn = float(ms.get("l1_force_norm", 0.0))
-                self.rn_l1_force_label.setText(
-                    f"F_est: Fx={fx:+.2f}  Fy={fy:+.2f}  Fz={fz:+.2f}  |F|={fn:.2f} N"
+            last_l1 = float(getattr(self, "_rn_l1_status_refresh_t", 0.0))
+            if ms_fresh or (now - last_l1) >= 1.0:
+                self._rn_l1_status_refresh_t = now
+                self._refresh_rn_l1_runtime_status(
+                    ms_fresh=ms_fresh,
+                    ms=ms if ms_fresh else None,
                 )
-                self.rn_l1_force_label.setStyleSheet(
-                    "color: #1565c0; font-size: 11px; font-weight: bold;"
-                )
-            elif ms_fresh and ms.get("drag_ff_enabled"):
-                fx = float(ms.get("drag_force_x", 0.0))
-                fy = float(ms.get("drag_force_y", 0.0))
-                fz = float(ms.get("drag_force_z", 0.0))
-                fn = float(np.linalg.norm([fx, fy, fz]))
-                self.rn_l1_force_label.setText(
-                    f"F_drag(true): Fx={fx:+.2f}  Fy={fy:+.2f}  Fz={fz:+.2f}  |F|={fn:.2f} N"
-                )
-                self.rn_l1_force_label.setStyleSheet(
-                    "color: #6a1b9a; font-size: 11px; font-weight: bold;"
-                )
-            else:
-                self.rn_l1_force_label.setText("F_est: —")
-                self.rn_l1_force_label.setStyleSheet("color: gray; font-size: 11px;")
 
-        running = self._rn_process is not None and self._rn_process.poll() is None
+        proc = getattr(self, "_rn_process", None)
+        if proc is not None and proc.poll() is None:
+            running = True
+        elif hasattr(self, "_ros_node_inited") and self._ros_node_inited:
+            running = self._rn_tracking_services_available(use_cache=True)
+        else:
+            running = False
         self.rn_st_track.setText("node on" if running else "node off")
         self.rn_st_track.setStyleSheet(
             "font-weight: bold; color: %s;" % ("#2e7d32" if running else "gray")
@@ -11225,6 +12219,51 @@ class UamSuiteGUI(QMainWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _tracking_service_candidates(self, short_name: str) -> list:
+        """全局名 + 节点私有名（兼容旧 tracking 进程）。"""
+        s = str(short_name).lstrip("/")
+        return [f"/{s}", f"/{TRACKING_NODE_NAME}/{s}"]
+
+    def _wait_tracking_service(self, short_name: str, timeout: float = 5.0) -> str:
+        """等待 tracking 服务上线，返回实际可用的全名。"""
+        import time as _time
+
+        import rospy
+
+        candidates = self._tracking_service_candidates(short_name)
+        deadline = _time.monotonic() + float(timeout)
+        last_err = None
+        while _time.monotonic() < deadline and not rospy.is_shutdown():
+            for srv in candidates:
+                remain = max(0.05, deadline - _time.monotonic())
+                try:
+                    rospy.wait_for_service(srv, timeout=remain)
+                    return srv
+                except rospy.ROSException as e:
+                    last_err = e
+            _time.sleep(0.05)
+        raise rospy.ROSException(
+            f"tracking service {short_name!r} unavailable (tried {candidates}): {last_err}"
+        )
+
+    def _tracking_service_reachable(self, short_name: str) -> bool:
+        """非阻塞探测 tracking 服务是否已注册。"""
+        try:
+            import rosgraph
+
+            if not rosgraph.is_master_online():
+                return False
+            master = rosgraph.Master(f"/{GUI_ROS_NODE_NAME}")
+            for srv in self._tracking_service_candidates(short_name):
+                try:
+                    master.lookupService(srv)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
     def _set_node_service_buttons_enabled(self, enabled: bool) -> None:
         """Enable/disable all ROS-node-dependent service buttons in one place."""
         ctrl_mode = (
@@ -11233,12 +12272,16 @@ class UamSuiteGUI(QMainWindow):
             else ""
         )
         support_reg = ctrl_mode in (
-            "croc_full_state", "acados_full_state", "croc_ee_pose", "px4", "geometric"
+            "croc_full_state",
+            "acados_full_state",
+            "acados_ee_pose",
+            "croc_ee_pose",
+            "px4",
+            "geometric",
         )
         for name in (
             "rn_start_svc_btn", "rn_stop_svc_btn", "rn_save_svc_btn",
             "rn_update_ctrl_btn", "rn_update_traj_btn",
-            "rn_l1_svc_on_btn", "rn_l1_svc_off_btn",
             "rn_drag_ff_svc_on_btn", "rn_drag_ff_svc_off_btn",
         ):
             btn = getattr(self, name, None)
@@ -11253,16 +12296,19 @@ class UamSuiteGUI(QMainWindow):
         """在后台线程中调用一个无参数的 ROS Trigger 服务，结果通过日志反馈。"""
         import threading
 
+        short = str(srv_name).lstrip("/")
+
         def _call():
             try:
                 import rospy
                 from std_srvs.srv import Trigger
-                rospy.wait_for_service(srv_name, timeout=3.0)
-                svc = rospy.ServiceProxy(srv_name, Trigger)
+
+                resolved = self._wait_tracking_service(short, timeout=3.0)
+                svc = rospy.ServiceProxy(resolved, Trigger)
                 resp = svc()
-                msg = f"[{srv_name}] {'OK' if resp.success else 'FAIL'}: {resp.message}"
+                msg = f"[{resolved}] {'OK' if resp.success else 'FAIL'}: {resp.message}"
             except Exception as e:
-                msg = f"[{srv_name}] ERROR: {e}"
+                msg = f"[/{short}] ERROR: {e}"
             rospy.loginfo(msg) if "OK" in msg else rospy.logwarn(msg)
             # Log 到 GUI（需在主线程；用 QMetaObject 保证线程安全）
             from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
@@ -11586,38 +12632,428 @@ class UamSuiteGUI(QMainWindow):
             import traceback
             self.log(f"[motor-step] 失败: {e}\n{traceback.format_exc()}")
 
-    def _call_set_l1_enabled_service(self, enabled: bool):
-        """调用 /set_l1_enabled (std_srvs/SetBool) 在线开关 L1 增广。"""
-        import threading
-        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+    def _rn_l1_mode_display(self, mode: str) -> str:
+        m = str(mode).strip().lower()
+        if m == "oracle":
+            return "oracle (Gazebo真值)"
+        if m == "drag_ff":
+            return "TRUE drag"
+        return "L1 adaptive"
 
-        def _run():
-            try:
-                import rospy
-                from std_srvs.srv import SetBool
+    def _rn_l1_inject_display(self, inject: str) -> str:
+        return "in-model" if str(inject).lower() == "in_model" else "bolt-on"
 
-                if not self._ensure_ros_node():
-                    msg = "[/set_l1_enabled] ERROR: ROS master 不可用"
-                else:
-                    rospy.wait_for_service("/set_l1_enabled", timeout=5.0)
-                    resp = rospy.ServiceProxy("/set_l1_enabled", SetBool)(bool(enabled))
-                    state = "ON" if enabled else "OFF"
-                    msg = (
-                        f"[/set_l1_enabled {state}] "
-                        f"{'OK' if resp.success else 'FAIL'}: {resp.message}"
+    def _rn_l1_normalize_inject(self, inject: str) -> str:
+        """非 acados 时 in-model 在节点侧等效 bolt-on。"""
+        inj = str(inject).lower()
+        if inj != "in_model":
+            return "bolt_on"
+        if (
+            hasattr(self, "rn_controller_combo")
+            and self.rn_controller_combo.currentText()
+            in ("acados_full_state", "acados_ee_pose")
+        ):
+            return "in_model"
+        return "bolt_on"
+
+    def _rn_l1_gui_state_dict(self) -> dict:
+        mode = self._rn_l1_backend_mode()
+        return {
+            "dist_enabled": bool(self.rn_l1_enabled.isChecked()),
+            "comp_enabled": bool(self.rn_l1_comp_enabled_chk.isChecked()),
+            "mode": mode,
+            "inject": self._rn_l1_backend_inject(),
+        }
+
+    def _rn_l1_node_state_dict(self, ms: dict | None = None) -> dict | None:
+        import time as _time
+
+        now = _time.monotonic()
+        snap = getattr(self, "_rn_dist_comp_state", None)
+        if isinstance(snap, dict) and (now - float(getattr(self, "_rn_dist_comp_t", 0.0))) < 5.0:
+            est = snap.get("estimation") or {}
+            return {
+                "dist_enabled": bool(snap.get("dist_enabled")),
+                "comp_enabled": bool(snap.get("comp_enabled")),
+                "mode": str(snap.get("l1_mode", "")),
+                "inject": str(snap.get("l1_inject", "")),
+                "force_norm": float(est.get("force_norm", 0.0)),
+                "source": str(est.get("source", "")),
+            }
+        if ms is None:
+            ms = getattr(self, "_mpc_stats", None)
+        if isinstance(ms, dict) and (now - float(getattr(self, "_mpc_stats_t", 0.0))) < 5.0:
+            return {
+                "dist_enabled": bool(
+                    ms.get("l1_dist_enabled") or ms.get("l1_enabled") or ms.get("drag_ff_enabled")
+                ),
+                "comp_enabled": bool(ms.get("l1_comp_enabled")),
+                "mode": str(ms.get("l1_mode", "adaptive")),
+                "inject": str(ms.get("l1_inject", "bolt_on")),
+                "force_norm": float(ms.get("l1_force_norm", 0.0)),
+                "source": str(ms.get("l1_mode", "")),
+            }
+        return None
+
+    def _rn_l1_format_state_line(self, st: dict, *, prefix_est: str = "估计") -> str:
+        on = "开" if st.get("dist_enabled") else "关"
+        comp = "开" if st.get("comp_enabled") else "关"
+        mode = self._rn_l1_mode_display(st.get("mode", "adaptive"))
+        inj = self._rn_l1_inject_display(st.get("inject", "bolt_on"))
+        fn = float(st.get("force_norm", 0.0))
+        extra = f"  |F|={fn:.2f}N" if st.get("dist_enabled") else ""
+        src = st.get("source")
+        if src and str(src) not in ("none", "", str(st.get("mode", ""))):
+            extra += f"  src={src}"
+        return f"{prefix_est}[{on}]  来源[{mode}]  补偿[{comp}]  方式[{inj}]{extra}"
+
+    def _rn_l1_states_match(self, gui: dict, node: dict) -> tuple:
+        if node is None:
+            svc = self._rn_tracking_services_available(use_cache=True)
+            if not svc:
+                return False, "tracking 节点未运行（配置已保存，Launch 后生效）"
+            return False, "等待节点回报…"
+        diffs = []
+        if bool(gui["dist_enabled"]) != bool(node["dist_enabled"]):
+            diffs.append(
+                f"估计 GUI={'开' if gui['dist_enabled'] else '关'}"
+                f" 节点={'开' if node['dist_enabled'] else '关'}"
+            )
+        if gui["dist_enabled"] or node["dist_enabled"]:
+            if str(gui["mode"]) != str(node["mode"]):
+                diffs.append(
+                    f"来源 GUI={self._rn_l1_mode_display(gui['mode'])}"
+                    f" 节点={self._rn_l1_mode_display(node['mode'])}"
+                )
+            if gui["dist_enabled"] and node["dist_enabled"]:
+                if bool(gui["comp_enabled"]) != bool(node["comp_enabled"]):
+                    diffs.append(
+                        f"补偿 GUI={'开' if gui['comp_enabled'] else '关'}"
+                        f" 节点={'开' if node['comp_enabled'] else '关'}"
                     )
-                    if resp.success:
-                        QMetaObject.invokeMethod(
-                            self.rn_l1_enabled,
-                            "setChecked",
-                            Qt.QueuedConnection,
-                            Q_ARG(bool, bool(enabled)),
-                        )
-            except Exception as e:
-                msg = f"[/set_l1_enabled] ERROR: {e}"
-            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+                gi = self._rn_l1_normalize_inject(gui["inject"])
+                ni = self._rn_l1_normalize_inject(node["inject"])
+                if gi != ni:
+                    diffs.append(
+                        f"方式 GUI={self._rn_l1_inject_display(gui['inject'])}"
+                        f" 节点={self._rn_l1_inject_display(node['inject'])}"
+                    )
+        if diffs:
+            return False, "不一致: " + "; ".join(diffs)
+        return True, "已与节点一致"
 
-        threading.Thread(target=_run, daemon=True).start()
+    def _refresh_rn_l1_runtime_status(
+        self,
+        *,
+        action: str | None = None,
+        ms_fresh: bool = False,
+        ms: dict | None = None,
+    ) -> None:
+        if not hasattr(self, "rn_l1_gui_state_label"):
+            return
+        gui = self._rn_l1_gui_state_dict()
+        node = self._rn_l1_node_state_dict(ms if ms_fresh else None)
+        self.rn_l1_gui_state_label.setText(self._rn_l1_format_state_line(gui, prefix_est="设置"))
+        if node is None:
+            self.rn_l1_node_state_label.setText("节点回报: —（未收到 /suite_mpc/dist_comp/state）")
+            self.rn_l1_node_state_label.setStyleSheet("font-size: 11px; color: gray;")
+        else:
+            self.rn_l1_node_state_label.setText(
+                self._rn_l1_format_state_line(node, prefix_est="估计")
+            )
+            self.rn_l1_node_state_label.setStyleSheet("font-size: 11px; color: #2e7d32;")
+        ok_sync, sync_msg = self._rn_l1_states_match(gui, node)
+        if getattr(self, "_rn_l1_pending_apply", False):
+            sync_msg = "下发中…"
+            ok_sync = False
+        self.rn_l1_sync_label.setText(f"同步: {sync_msg}")
+        self.rn_l1_sync_label.setStyleSheet(
+            "font-size: 11px; font-weight: bold; color: %s;"
+            % ("#2e7d32" if ok_sync else ("#e65100" if node else "gray"))
+        )
+        if action is not None:
+            apply_line = f"[{action}] 下发中…"
+        elif getattr(self, "_rn_l1_pending_apply", False):
+            apply_line = "下发中…"
+        elif self._rn_l1_last_apply_ok is True:
+            apply_line = f"最近下发: 成功 — {self._rn_l1_last_apply_msg}"
+        elif self._rn_l1_last_apply_ok is False:
+            apply_line = f"最近下发: 失败 — {self._rn_l1_last_apply_msg}"
+        else:
+            apply_line = "操作: 勾选或切换下拉将自动下发到 tracking 节点"
+        self.rn_l1_apply_label.setText(apply_line)
+        self.rn_l1_apply_label.setStyleSheet(
+            "font-size: 11px; color: %s;"
+            % (
+                "#1565c0"
+                if getattr(self, "_rn_l1_pending_apply", False)
+                else ("#2e7d32" if self._rn_l1_last_apply_ok is True else ("#b71c1c" if self._rn_l1_last_apply_ok is False else "gray"))
+            )
+        )
+        if hasattr(self, "rn_l1_force_label"):
+            if node and node.get("dist_enabled"):
+                fn = float(node.get("force_norm", 0.0))
+                mode = str(node.get("mode", ""))
+                if mode == "oracle":
+                    lbl, color = "F_oracle", "#6a1b9a"
+                elif mode == "drag_ff":
+                    lbl, color = "F_drag", "#6a1b9a"
+                else:
+                    lbl, color = "F_est", "#1565c0"
+                self.rn_l1_force_label.setText(f"{lbl}: |F|={fn:.2f} N")
+                self.rn_l1_force_label.setStyleSheet(
+                    f"color: {color}; font-size: 11px; font-weight: bold;"
+                )
+            else:
+                self.rn_l1_force_label.setText("F_est: —")
+                self.rn_l1_force_label.setStyleSheet("color: gray; font-size: 11px;")
+
+    def _on_rn_l1_est_checkbox_toggled(self, checked: bool) -> None:
+        if getattr(self, "_rn_l1_runtime_guard", False):
+            return
+        if hasattr(self, "rn_l1_comp_enabled_chk"):
+            self.rn_l1_comp_enabled_chk.setEnabled(bool(checked))
+            if not checked:
+                self._rn_l1_runtime_guard = True
+                try:
+                    self.rn_l1_comp_enabled_chk.setChecked(False)
+                finally:
+                    self._rn_l1_runtime_guard = False
+        action = "开启扰动估计" if checked else "关闭扰动估计"
+        self._apply_rn_l1_runtime_to_node(action)
+
+    def _on_rn_l1_comp_checkbox_toggled(self, checked: bool) -> None:
+        if getattr(self, "_rn_l1_runtime_guard", False):
+            return
+        action = "开启扰动补偿" if checked else "关闭扰动补偿"
+        self._apply_rn_l1_runtime_to_node(action)
+
+    def _on_rn_l1_config_changed(self, _index: int = 0) -> None:
+        """估计来源 / 补偿方式下拉变更 → 即时下发节点。"""
+        if getattr(self, "_rn_l1_runtime_guard", False):
+            return
+        sync = getattr(self, "_rn_sync_l1_comp_mode_widgets", None)
+        if callable(sync):
+            sync()
+        sender = self.sender()
+        if sender is getattr(self, "rn_l1_comp_mode", None):
+            mode = self._rn_l1_backend_mode()
+            action = f"切换估计来源 → {self._rn_l1_mode_display(mode)}"
+        elif sender is getattr(self, "rn_l1_comp_strategy", None):
+            inj = self._rn_l1_backend_inject()
+            action = f"切换补偿方式 → {self._rn_l1_inject_display(inj)}"
+        else:
+            action = "更新 L1 配置"
+        self._apply_rn_l1_runtime_to_node(action)
+
+    def _on_rn_l1_controller_changed(self, _index: int = 0) -> None:
+        """控制器切换可能影响 in-model 是否可用 → 同步 UI 并下发。"""
+        sync = getattr(self, "_rn_sync_l1_comp_mode_widgets", None)
+        if callable(sync):
+            sync()
+        if hasattr(self, "rn_l1_enabled") and self.rn_l1_enabled.isChecked():
+            self._apply_rn_l1_runtime_to_node("切换控制器（同步 L1 配置）")
+
+    def _apply_rn_l1_runtime_to_node(self, action: str = "更新 L1 配置") -> None:
+        """勾选框 / 下拉框 → apply_l1_params。"""
+        self._rn_l1_pending_action = str(action)
+        if not hasattr(self, "_rn_l1_apply_timer"):
+            from PyQt5.QtCore import QTimer
+
+            self._rn_l1_apply_timer = QTimer(self)
+            self._rn_l1_apply_timer.setSingleShot(True)
+            self._rn_l1_apply_timer.timeout.connect(self._do_apply_rn_l1_runtime_to_node)
+        self._refresh_rn_l1_runtime_status(action=action)
+        self._rn_l1_apply_timer.start(200)
+
+    def _do_apply_rn_l1_runtime_to_node(self) -> None:
+        self._init_drone_status_monitor()
+        l1_cfg = self._rn_l1_dist_params_dict()
+        action = getattr(self, "_rn_l1_pending_action", "更新 L1 配置")
+        self._rn_l1_pending_apply = True
+        self._refresh_rn_l1_runtime_status(action=action)
+        from PyQt5.QtCore import QTimer
+
+        QTimer.singleShot(0, lambda: self._rn_ros_apply_l1_cfg_on_main_thread(l1_cfg, action))
+
+    def _rn_write_l1_runtime_param(self, l1_cfg: dict) -> bool:
+        """主线程写 l1_runtime_update 并读回校验（避免后台线程 set_param 静默失败）。"""
+        if not self._ensure_ros_node():
+            return False
+        try:
+            import rospy
+
+            rospy.set_param(L1_RUNTIME_UPDATE_PARAM, l1_cfg)
+            try:
+                rospy.set_param(
+                    "/suite_tracking_controller/l1_runtime_update", l1_cfg
+                )
+            except Exception:
+                pass
+            rb = rospy.get_param(L1_RUNTIME_UPDATE_PARAM, None)
+            if not isinstance(rb, dict):
+                return False
+            return (
+                bool(rb.get("l1_dist_enabled")) == bool(l1_cfg.get("l1_dist_enabled"))
+                and str(rb.get("l1_mode", "")) == str(l1_cfg.get("l1_mode", ""))
+                and bool(rb.get("l1_comp_enabled"))
+                == bool(l1_cfg.get("l1_comp_enabled"))
+                and str(rb.get("l1_inject", "")) == str(l1_cfg.get("l1_inject", ""))
+            )
+        except Exception:
+            return False
+
+    def _push_rn_l1_runtime_param_to_ros(self) -> None:
+        """把当前 GUI L1 面板写入 rosparam（不调用 apply），清除残留配置。"""
+        if not hasattr(self, "rn_l1_enabled"):
+            return
+        self._rn_write_l1_runtime_param(self._rn_l1_dist_params_dict())
+
+    def _rn_ros_apply_l1_cfg_on_main_thread(
+        self, l1_cfg: dict, action: str = "更新 L1 配置"
+    ) -> None:
+        """主线程：写 param → apply_l1_params / SetBool 回退，刷新运行状态区。"""
+        mode = l1_cfg.get("l1_mode", "?")
+        inj = l1_cfg.get("l1_inject", "?")
+        est = "on" if l1_cfg.get("l1_dist_enabled") else "off"
+        comp = "on" if l1_cfg.get("l1_comp_enabled") else "off"
+        detail = f"mode={mode} inject={inj} est={est} comp={comp}"
+        ok = False
+        msg = ""
+        try:
+            from std_srvs.srv import SetBool, Trigger
+
+            if not self._ensure_ros_node():
+                msg = f"ROS master 不可用（{detail}）"
+            elif not self._rn_write_l1_runtime_param(l1_cfg):
+                msg = f"写 param 失败或读回不一致（{detail}）"
+            else:
+                svc_up = self._rn_tracking_services_available(
+                    use_cache=False, block=True, timeout=5.0
+                )
+                parts = []
+                if svc_up:
+                    try:
+                        import rospy
+
+                        apply_srv = self._wait_tracking_service(
+                            "apply_l1_params", timeout=15.0
+                        )
+                        resp = rospy.ServiceProxy(apply_srv, Trigger)()
+                        if resp.success:
+                            parts.append(resp.message)
+                            ok = True
+                        else:
+                            parts.append(f"FAIL: {resp.message}")
+                    except Exception as e:
+                        parts.append(f"apply_l1_params 异常: {e}")
+                if svc_up and not ok:
+                    import rospy
+
+                    setbool_ok = False
+                    for svc, key in (
+                        ("set_l1_dist_enabled", "l1_dist_enabled"),
+                        ("set_l1_comp_enabled", "l1_comp_enabled"),
+                    ):
+                        try:
+                            resolved = self._wait_tracking_service(svc, timeout=2.0)
+                            r = rospy.ServiceProxy(resolved, SetBool)(
+                                bool(l1_cfg.get(key, False))
+                            )
+                            if r.success:
+                                parts.append(f"{svc} OK")
+                                setbool_ok = True
+                        except Exception:
+                            pass
+                    if setbool_ok:
+                        try:
+                            apply_srv = self._wait_tracking_service(
+                                "apply_l1_params", timeout=5.0
+                            )
+                            resp = rospy.ServiceProxy(apply_srv, Trigger)()
+                            if resp.success:
+                                parts.append(resp.message)
+                                ok = True
+                            else:
+                                parts.append(f"apply after SetBool FAIL: {resp.message}")
+                        except Exception as e:
+                            parts.append(f"apply after SetBool 异常: {e}")
+                if svc_up and not ok:
+                    try:
+                        import rospy
+
+                        upd_srv = self._wait_tracking_service(
+                            "update_controller_params", timeout=5.0
+                        )
+                        cfg = self._build_ros_controller_update_cfg(include_l1=True)
+                        if not self._rn_write_controller_update_param(cfg):
+                            parts.append("写 controller_update_data 失败或读回不一致")
+                        else:
+                            resp = rospy.ServiceProxy(upd_srv, Trigger)()
+                            if resp.success:
+                                parts.append(resp.message)
+                                ok = True
+                            else:
+                                parts.append(f"update FAIL: {resp.message}")
+                    except Exception as e:
+                        parts.append(f"update_controller_params: {e}")
+                if not svc_up:
+                    if self._rn_tracking_node_alive():
+                        msg = (
+                            f"失败 — tracking 在跑但服务不可达，请重启 ROS Tracking 节点 "
+                            f"({detail})"
+                        )
+                        ok = False
+                    else:
+                        msg = f"已保存（tracking 未运行，Launch 后生效）({detail})"
+                        ok = True
+                elif ok:
+                    msg = f"成功 — {' | '.join(parts)} ({detail})"
+                elif parts:
+                    msg = f"失败 — {' | '.join(parts)} ({detail})"
+                else:
+                    msg = f"未找到 tracking 服务 ({detail})"
+        except Exception as e:
+            msg = f"ERROR: {e} ({detail})"
+        self._rn_on_l1_apply_finished(bool(ok), f"[{action}] {msg}")
+
+    def _invoke_ros_l1_runtime_update(self, l1_cfg: dict, log_prefix: str = "L1 runtime") -> None:
+        """兼容旧名：转主线程执行。"""
+        from PyQt5.QtCore import QTimer
+
+        QTimer.singleShot(
+            0, lambda: self._rn_ros_apply_l1_cfg_on_main_thread(l1_cfg, log_prefix)
+        )
+
+    def _apply_rn_l1_runtime_flags_to_node(self) -> None:
+        """兼容旧名。"""
+        self._apply_rn_l1_runtime_to_node()
+
+    def _call_set_l1_dist_enabled_service(self, enabled: bool):
+        """兼容旧调用：同步勾选框并下发节点。"""
+        if hasattr(self, "rn_l1_enabled"):
+            self._rn_l1_runtime_guard = True
+            try:
+                self.rn_l1_enabled.setChecked(bool(enabled))
+            finally:
+                self._rn_l1_runtime_guard = False
+        self._apply_rn_l1_runtime_flags_to_node()
+
+    def _call_set_l1_comp_enabled_service(self, enabled: bool):
+        """兼容旧调用：同步勾选框并下发节点。"""
+        if hasattr(self, "rn_l1_comp_enabled_chk"):
+            self._rn_l1_runtime_guard = True
+            try:
+                self.rn_l1_comp_enabled_chk.setChecked(bool(enabled))
+            finally:
+                self._rn_l1_runtime_guard = False
+        self._apply_rn_l1_runtime_flags_to_node()
+
+    def _call_set_l1_enabled_service(self, enabled: bool):
+        """兼容旧调用：强制 adaptive 后转调 set_l1_dist_enabled。"""
+        if enabled and hasattr(self, "rn_l1_comp_mode"):
+            self.rn_l1_comp_mode.setCurrentIndex(0)
+        self._call_set_l1_dist_enabled_service(enabled)
 
     def _call_set_drag_ff_enabled_service(self, enabled: bool):
         """调用 /set_drag_ff_enabled (std_srvs/SetBool) 在线开关真值阻力前馈补偿。"""
@@ -11767,12 +13203,16 @@ class UamSuiteGUI(QMainWindow):
         self.log("[take_off] 导出规划并刷新轨迹，随后启动起飞序列…")
         threading.Thread(target=_run, daemon=True).start()
 
-    def _build_ros_controller_update_cfg(self) -> dict:
-        """组装 /update_controller_params 所需配置（含当前 Croc/Acados profile）。"""
+    def _build_ros_controller_update_cfg(self, *, include_l1: bool = False) -> dict:
+        """组装 /update_controller_params 所需配置（含当前 Croc/Acados profile）。
+
+        ``include_l1=False``（默认）：仅 MPC/几何权重与求解器选项，避免误改 L1/in-model
+        触发 acados 结构重建。L1 请走 apply_l1_params 或在 fallback 时显式 include_l1=True。
+        """
         mode = self.rn_controller_combo.currentText()
         if hasattr(self, "_rn_mpc_weight_profiles") and mode in self._rn_mpc_weight_profiles:
             self._rn_mpc_weight_profiles[mode] = self._rn_mpc_weight_snapshot()
-        return {
+        cfg = {
             "controller_mode": mode,
             "control_rate": float(self.rn_control_rate.value()),
             "max_thrust": float(self.rn_max_thrust_total.value()),
@@ -11804,66 +13244,155 @@ class UamSuiteGUI(QMainWindow):
             "ee_w_vel_ang_yaw": float(self.rn_ee_w_vel_ang_yaw.value()),
             "ee_w_u": float(self.rn_ee_w_u.value()),
             "ee_w_terminal": float(self.rn_ee_w_terminal.value()),
+            "ee_w_base_pos": float(self.rn_ee_w_base_pos.value()),
+            "ee_w_base_yaw": float(self.rn_ee_w_base_yaw.value()),
+            "ee_w_state_reg": float(self.rn_ee_w_state_reg.value()),
+            "ee_w_state_track": float(self.rn_ee_w_state_track.value()),
+            "ee_w_st_pos": float(self.rn_ee_w_st_pos.value()),
+            "ee_w_st_att": float(self.rn_ee_w_st_att.value()),
+            "ee_w_st_joint": float(self.rn_ee_w_st_joint.value()),
+            "ee_w_st_vel": float(self.rn_ee_w_st_vel.value()),
+            "ee_w_st_omega": float(self.rn_ee_w_st_omega.value()),
+            "ee_w_st_joint_vel": float(self.rn_ee_w_st_joint_vel.value()),
             "geo_kp_pos": float(self.rn_geo_kp_pos.value()),
             "geo_kd_vel": float(self.rn_geo_kd_vel.value()),
             "geo_kR": float(self.rn_geo_kR.value()),
             "geo_kOmega": float(self.rn_geo_kOmega.value()),
             "geo_max_tilt_deg": float(self.rn_geo_max_tilt_deg.value()),
-            "l1_enabled": bool(self.rn_l1_enabled.isChecked()),
-            "l1_as_gain": float(self.rn_l1_as_gain.value()),
-            "l1_wc_xy": float(self.rn_l1_wc_xy.value()),
-            "l1_wc_z": float(self.rn_l1_wc_z.value()),
-            "l1_tilt_gain": float(self.rn_l1_tilt_gain.value()),
-            "l1_max_accel_xy": float(self.rn_l1_max_accel_xy.value()),
-            "l1_max_accel_z": float(self.rn_l1_max_accel_z.value()),
-            "l1_max_sigma": float(self.rn_l1_max_sigma.value()),
-            "l1_use_pos_feedback": bool(self.rn_l1_pos_fb.isChecked()),
-            "l1_k_pos_i_xy": float(self.rn_l1_k_pos_i_xy.value()),
-            "l1_k_pos_i_z": float(self.rn_l1_k_pos_i_z.value()),
-            "l1_max_pos_integral": float(self.rn_l1_max_pos_integral.value()),
-            "drag_ff_enabled": bool(self.rn_drag_ff_enabled.isChecked()),
         }
+        if include_l1:
+            cfg.update(self._rn_l1_dist_params_dict())
+        return cfg
+
+    def _rn_tracking_node_alive(self) -> bool:
+        p = getattr(self, "_rn_process", None)
+        return p is not None and p.poll() is None
+
+    def _invalidate_rn_tracking_svc_cache(self) -> None:
+        self._rn_tracking_svc_cache = None
+
+    def _rn_tracking_services_available(
+        self, *, use_cache: bool = True, block: bool = False, timeout: float = 15.0
+    ) -> bool:
+        """tracking 服务是否在线。默认非阻塞 + 缓存，避免状态栏定时器卡 UI。"""
+        import time as _time
+
+        now = _time.monotonic()
+        if use_cache and not block:
+            cached = getattr(self, "_rn_tracking_svc_cache", None)
+            if cached is not None and (now - float(cached[1])) < 2.0:
+                return bool(cached[0])
+
+        proc = getattr(self, "_rn_process", None)
+        if proc is not None and proc.poll() is None:
+            self._rn_tracking_svc_cache = (True, now)
+            return True
+
+        if not getattr(self, "_ros_node_inited", False):
+            if not self._ensure_ros_node():
+                self._rn_tracking_svc_cache = (False, now)
+                return False
+
+        ok = False
+        try:
+            if block:
+                import rospy
+
+                self._wait_tracking_service("apply_l1_params", timeout=float(timeout))
+                ok = True
+            else:
+                ok = self._tracking_service_reachable("apply_l1_params")
+        except Exception:
+            ok = False
+
+        self._rn_tracking_svc_cache = (ok, now)
+        return ok
+
+    def _schedule_rn_l1_sync_to_node(self, delay_ms: int = 800, retries: int = 8) -> None:
+        """参数/配置恢复或 Launch 后，把 L1 面板同步到 tracking 节点（带重试）。"""
+        self._rn_l1_sync_retries_left = int(retries)
+        QTimer.singleShot(int(delay_ms), self._sync_rn_l1_to_node_if_needed)
+
+    def _sync_rn_l1_to_node_if_needed(self) -> None:
+        if not hasattr(self, "rn_l1_enabled"):
+            return
+        if not self._rn_tracking_services_available(use_cache=True):
+            retries = int(getattr(self, "_rn_l1_sync_retries_left", 0))
+            if retries > 0:
+                self._rn_l1_sync_retries_left = retries - 1
+                QTimer.singleShot(2000, self._sync_rn_l1_to_node_if_needed)
+            self._refresh_rn_l1_runtime_status()
+            return
+        self._apply_rn_l1_runtime_to_node("配置恢复后自动同步")
+
+    def _rn_write_controller_update_param(self, cfg: dict) -> bool:
+        """主线程写 controller_update_data 并读回校验。"""
+        if not self._ensure_ros_node():
+            return False
+        try:
+            import rospy
+
+            path = f"/{TRACKING_NODE_NAME}/controller_update_data"
+            rospy.set_param(path, cfg)
+            rb = rospy.get_param(path, None)
+            if not isinstance(rb, dict):
+                return False
+            for key in ("controller_mode", "w_state_track", "w_pos", "l1_mode", "l1_inject"):
+                if key in cfg and str(rb.get(key)) != str(cfg.get(key)):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _rn_ros_apply_controller_cfg_on_main_thread(
+        self, cfg: dict, log_prefix: str = "update_controller_params"
+    ) -> None:
+        """主线程：写 param → 调 update_controller_params。"""
+        mode = str(cfg.get("controller_mode", "?"))
+        wst = cfg.get("w_state_track", "?")
+        wpos = cfg.get("w_pos", "?")
+        detail = f"mode={mode} w_state_track={wst} w_pos={wpos}"
+        ok = False
+        msg = ""
+        try:
+            from std_srvs.srv import Trigger
+
+            if not self._ensure_ros_node():
+                msg = f"[{log_prefix}] ERROR: ROS master 不可用 ({detail})"
+            elif not self._rn_write_controller_update_param(cfg):
+                msg = f"[{log_prefix}] FAIL: 写 controller_update_data 失败或读回不一致 ({detail})"
+            else:
+                import rospy
+
+                upd_srv = self._wait_tracking_service(
+                    "update_controller_params", timeout=8.0
+                )
+                resp = rospy.ServiceProxy(upd_srv, Trigger)()
+                if resp.success:
+                    ok = True
+                    msg = f"[{log_prefix}] OK via {upd_srv}: {resp.message}"
+                else:
+                    msg = f"[{log_prefix}] FAIL via {upd_srv} ({detail}): {resp.message}"
+        except Exception as e:
+            msg = f"[{log_prefix}] ERROR ({detail}): {e}"
+        self._rn_on_update_ctrl_finished(bool(ok), msg)
+
+    def _invoke_ros_update_controller_params(self, cfg: dict, log_prefix: str = "update_controller_params") -> None:
+        """主线程调度：写 controller_update_data 并调用 update_controller_params。"""
+        from PyQt5.QtCore import QTimer
+
+        QTimer.singleShot(
+            0,
+            lambda: self._rn_ros_apply_controller_cfg_on_main_thread(cfg, log_prefix),
+        )
 
     def _call_update_controller_params(self):
         """
         将当前 ROS Tracking 参数写入节点私有参数后，
         调用 /update_controller_params 在线更新控制器。
         """
-        import threading
-
         cfg = self._build_ros_controller_update_cfg()
-
-        def _run():
-            try:
-                import rospy
-                from std_srvs.srv import Trigger
-
-                if not self._ensure_ros_node():
-                    log_msg = "[update_controller_params] ERROR: ROS master 不可用"
-                    from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
-                    QMetaObject.invokeMethod(
-                        self, "log", Qt.QueuedConnection, Q_ARG(str, log_msg)
-                    )
-                    return
-
-                param_path = "/suite_tracking_controller/controller_update_data"
-                rospy.set_param(param_path, cfg)
-
-                svc_name = "/update_controller_params"
-                rospy.wait_for_service(svc_name, timeout=60.0)
-                svc = rospy.ServiceProxy(svc_name, Trigger)
-                resp = svc()
-                if resp.success:
-                    log_msg = f"[update_controller_params] OK: {resp.message}"
-                else:
-                    log_msg = f"[update_controller_params] FAIL: {resp.message}"
-            except Exception as e:
-                log_msg = f"[update_controller_params] ERROR: {e}"
-
-            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
-            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, log_msg))
-
-        threading.Thread(target=_run, daemon=True).start()
+        self._invoke_ros_update_controller_params(cfg)
 
     def _call_set_regulation_target(self):
         """

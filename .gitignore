@@ -87,3 +87,4 @@ trajectory/traj_planned*.csv
 trajectory/racing_s500_new.csv
 .cursor/rules/maintain-memory.mdc
 MEMORY.md
+research/
