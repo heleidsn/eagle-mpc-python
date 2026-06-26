@@ -51,6 +51,13 @@ try:
         _ACADOS_CODEGEN_QP_ITER_MAX,
         _align_ocp_with_cached_json,
         _apply_runtime_solver_options,
+        ACADOS_OK_STATUSES,
+        MpcRefErrorLimits,
+        acados_mpc_extract_solution,
+        acados_mpc_run_solve,
+        acados_solution_finite,
+        clamp_mpc_state_reference,
+        sanitize_mpc_state,
     )
     from s500_uam_acados_trajectory import (
         STATE_LIMITS,
@@ -114,6 +121,7 @@ class AcadosFullStateRealtimeMPC:
         sim_num_steps: int = 1,
         as_rti_iter: int = 0,
         dist_aware: bool = False,
+        ref_error_limits: Optional[MpcRefErrorLimits] = None,
     ):
         if not ACADOS_AVAILABLE:
             raise ImportError("acados_template not installed")
@@ -135,6 +143,7 @@ class AcadosFullStateRealtimeMPC:
         self.sim_num_steps = int(sim_num_steps)   # 每个 shooting 区间内积分子步数（>1 提升离散精度）
         self.as_rti_iter = int(as_rti_iter)       # AS-RTI 迭代次数（0=普通 RTI）
         self.dist_aware = bool(dist_aware)
+        self.ref_error_limits = ref_error_limits
 
         self.s500_config = load_s500_config()
         if self.dist_aware:
@@ -529,12 +538,13 @@ class AcadosFullStateRealtimeMPC:
         nlp_type = str(
             getattr(ocp.solver_options, "nlp_solver_type", "SQP_RTI")
         )
-        _apply_runtime_solver_options(self.solver, int(max_iter), solver_type=nlp_type)
-        if hasattr(self.solver, "options_set"):
-            try:
-                self.solver.options_set("qp_solver_iter_max", int(self.qp_iter_max))
-            except Exception:
-                pass
+        _apply_runtime_solver_options(
+            self.solver,
+            int(max_iter),
+            solver_type=nlp_type,
+            qp_iter_max=int(self.qp_iter_max),
+            levenberg_marquardt=1e-3,
+        )
 
     def _apply_runtime_solver_weights(self) -> None:
         """Push current W / W_e to loaded solver (no codegen)."""
@@ -570,7 +580,7 @@ class AcadosFullStateRealtimeMPC:
         ``p_dist`` (6,) 世界系 base wrench [Fx,Fy,Fz,Mx,My,Mz]；仅 ``dist_aware=True``
         时写入 OCP 参数，实现增广 MPC（offset-free）。
         """
-        x_now = np.asarray(x_now, dtype=float).flatten()[: self.nx]
+        x_now = sanitize_mpc_state(x_now, nq=self.nq, nv=self.nv)
         N = self.horizon
         dt = self.dt_mpc
         rm = self.robot_model
@@ -587,12 +597,18 @@ class AcadosFullStateRealtimeMPC:
             x_ref_i = interp_full_state_piecewise(
                 t_query + i * dt, t_plan, x_plan, rm
             )
+            x_ref_i = clamp_mpc_state_reference(
+                x_ref_i, x_now, self.ref_error_limits, nq=self.nq, nv=self.nv
+            )
             yref = np.concatenate([self._state_to_y(x_ref_i), self.u_hover])
             yref_running.append(yref.copy())
             self.solver.set(i, "yref", yref)
             if self.dist_aware and self.n_dist_param > 0:
                 self.solver.set(i, "p", p_stage)
         x_ref_N = interp_full_state_piecewise(t_query + N * dt, t_plan, x_plan, rm)
+        x_ref_N = clamp_mpc_state_reference(
+            x_ref_N, x_now, self.ref_error_limits, nq=self.nq, nv=self.nv
+        )
         yref_terminal = self._state_to_y(x_ref_N)
         self.solver.set(N, "yref", yref_terminal)
 
@@ -613,21 +629,22 @@ class AcadosFullStateRealtimeMPC:
             for i in range(N):
                 self.solver.set(i, "u", self._us_guess[i])
 
-        status = int(self.solver.solve())
-        u_opt = np.asarray(self.solver.get(0, "u"), dtype=float).copy()
-        x_next = np.asarray(self.solver.get(1, "x"), dtype=float).copy()
+        status = acados_mpc_run_solve(self.solver)
+        u_opt, x_next, xs, us = acados_mpc_extract_solution(self.solver, N)
 
-        # Full solved horizon (for RViz planned-path visualization)
-        xs = [np.asarray(self.solver.get(i, "x"), dtype=float).copy() for i in range(N + 1)]
-        us = [np.asarray(self.solver.get(i, "u"), dtype=float).copy() for i in range(N)]
+        if status not in ACADOS_OK_STATUSES or not acados_solution_finite(
+            u_opt, x_next, xs
+        ):
+            for i in range(N + 1):
+                self.solver.set(i, "x", x_now.copy())
+            for i in range(N):
+                self.solver.set(i, "u", self.u_hover.copy())
+            status = acados_mpc_run_solve(self.solver, retry_lm=0.1)
+            u_opt, x_next, xs, us = acados_mpc_extract_solution(self.solver, N)
 
         # Reject a diverged/failed solve: never publish NaN and never poison the
-        # warm start. Drop the guess (cold-start next time) and return a safe hover.
-        finite = (
-            np.all(np.isfinite(u_opt))
-            and np.all(np.isfinite(x_next))
-            and all(np.all(np.isfinite(x)) for x in xs)
-        )
+        # warm start. Drop the guess (cold-start next time) and return None so the
+        # controller keeps the previous _u_hold.
         self.last_status = status
         self.last_sqp_iter = int(self._get_stat("sqp_iter"))
         self.last_qp_iter = int(self._get_stat("qp_iter"))
@@ -637,12 +654,14 @@ class AcadosFullStateRealtimeMPC:
         except Exception:
             self.last_cost = float("nan")
 
-        if status not in (0, 2) or not finite:
+        if status not in ACADOS_OK_STATUSES or not acados_solution_finite(
+            u_opt, x_next, xs
+        ):
             self._xs_guess = None
             self._us_guess = None
             self.last_xs = None
             self.last_cost_terms = {}
-            return self.u_hover.copy(), x_now.copy(), status
+            return None, None, status
 
         self.last_xs = xs
         # Shift warm start for next iteration

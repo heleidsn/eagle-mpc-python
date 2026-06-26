@@ -428,6 +428,24 @@ def _casadi_ee_heading_cs_expr(acados_model, pin_model, frame_id: int) -> tuple[
     return ca.cos(yaw), ca.sin(yaw)
 
 
+def _casadi_ee_rpy_zyx_expr(acados_model, pin_model, frame_id: int) -> "ca.SX":
+    """EE frame orientation as ``[yaw, roll, pitch]`` (rad), matching full-state cost layout."""
+    nq = pin_model.nq
+    q = acados_model.x[:nq]
+    quat = q[3:7]
+    quat_u = quat / ca.fmax(ca.norm_2(quat), 1e-9)
+    q_fk = ca.vertcat(q[0:3], quat_u, q[7:nq])
+    cmodel = cpin.Model(pin_model)
+    cdata = cmodel.createData()
+    cpin.forwardKinematics(cmodel, cdata, q_fk)
+    cpin.updateFramePlacements(cmodel, cdata)
+    R = cdata.oMf[frame_id].rotation
+    roll = ca.atan2(R[2, 1], R[2, 2])
+    pitch = ca.asin(ca.fmax(ca.fmin(-R[2, 0], 1.0), -1.0))
+    yaw = _casadi_matrix_to_yaw_world_z(R)
+    return ca.vertcat(yaw, roll, pitch)
+
+
 def _casadi_ee_translation_expr(acados_model, pin_model, frame_id: int):
     """CasADi expression for EE world position from state x = [q; v] (safe quaternion normalization to avoid IRK internal-point degeneracy)."""
     nq = pin_model.nq

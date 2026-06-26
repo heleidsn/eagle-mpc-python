@@ -15,8 +15,9 @@ from __future__ import annotations
 import json
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -399,6 +400,312 @@ def _build_cost_y_exprs(x_sym, u_sym, nq: int, n_arm: int):
 _ACADOS_CODEGEN_NLP_MAX_ITER = 80
 _ACADOS_CODEGEN_QP_ITER_MAX = 100
 
+# acados ocp_nlp_solver return codes (see acados/utils/types.h)
+ACADOS_OK_STATUSES = (0, 2)
+ACADOS_RETRY_STATUSES = (1, 4, 9)  # NAN_DETECTED, QP_FAILURE, INFEASIBLE
+
+
+@dataclass(frozen=True)
+class MpcRefErrorLimits:
+    """Clamp MPC tracking references relative to the current state (RTI QP conditioning).
+
+    Each limit is the max allowed delta between reference and anchor. ``<= 0`` disables
+    that component. Set ``enabled=False`` to skip all clamping.
+    """
+
+    enabled: bool = True
+    max_pos_m: float = 1.5
+    max_yaw_rad: float = math.pi / 2
+    max_roll_pitch_rad: float = math.pi / 4
+    max_lin_vel_mps: float = 2.0
+    max_omega_radps: float = 2.0
+    max_joint_rad: float = math.pi / 3
+    max_joint_vel_radps: float = 3.0
+    max_ee_pos_m: float = 1.5
+
+    @classmethod
+    def disabled(cls) -> "MpcRefErrorLimits":
+        return cls(
+            enabled=False,
+            max_pos_m=0.0,
+            max_yaw_rad=0.0,
+            max_roll_pitch_rad=0.0,
+            max_lin_vel_mps=0.0,
+            max_omega_radps=0.0,
+            max_joint_rad=0.0,
+            max_joint_vel_radps=0.0,
+            max_ee_pos_m=0.0,
+        )
+
+    def active(self) -> bool:
+        if not self.enabled:
+            return False
+        return any(
+            v > 0.0
+            for v in (
+                self.max_pos_m,
+                self.max_yaw_rad,
+                self.max_roll_pitch_rad,
+                self.max_lin_vel_mps,
+                self.max_omega_radps,
+                self.max_joint_rad,
+                self.max_joint_vel_radps,
+                self.max_ee_pos_m,
+            )
+        )
+
+
+def _wrap_pi(angle: float) -> float:
+    return float((angle + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def _clamp_vec3_toward(
+    ref: np.ndarray, anchor: np.ndarray, max_norm: float
+) -> np.ndarray:
+    ref = np.asarray(ref, dtype=float).reshape(3)
+    anchor = np.asarray(anchor, dtype=float).reshape(3)
+    if max_norm <= 0.0:
+        return ref.copy()
+    delta = ref - anchor
+    dist = float(np.linalg.norm(delta))
+    if dist > max_norm:
+        return anchor + delta * (max_norm / dist)
+    return ref.copy()
+
+
+def _clamp_scalar_toward(
+    ref: float,
+    anchor: float,
+    max_delta: float,
+    *,
+    wrap: bool = False,
+) -> float:
+    if max_delta <= 0.0:
+        return float(ref)
+    d = _wrap_pi(ref - anchor) if wrap else float(ref - anchor)
+    d = float(np.clip(d, -max_delta, max_delta))
+    return float(anchor + d)
+
+
+def _euler_zyx_to_quat_np(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    q = np.array([qx, qy, qz, qw], dtype=float)
+    qn = float(np.linalg.norm(q))
+    if qn > 1e-12:
+        q /= qn
+    return q
+
+
+def clamp_mpc_state_reference(
+    x_ref: np.ndarray,
+    x_anchor: np.ndarray,
+    limits: Optional[MpcRefErrorLimits],
+    *,
+    nq: int,
+    nv: int,
+) -> np.ndarray:
+    """Limit full-state MPC references relative to ``x_anchor`` (usually current ``x_now``)."""
+    x_ref = np.asarray(x_ref, dtype=float).flatten().copy()
+    x_anchor = np.asarray(x_anchor, dtype=float).flatten()
+    if limits is None or not limits.active():
+        return x_ref
+    nx = int(nq) + int(nv)
+    if x_ref.size < nx or x_anchor.size < nx:
+        return x_ref
+
+    out = x_ref.copy()
+    out[0:3] = _clamp_vec3_toward(x_ref[0:3], x_anchor[0:3], limits.max_pos_m)
+
+    roll_a, pitch_a, yaw_a = _quat_to_euler_zyx_np(
+        x_anchor[3], x_anchor[4], x_anchor[5], x_anchor[6]
+    )
+    roll_r, pitch_r, yaw_r = _quat_to_euler_zyx_np(
+        x_ref[3], x_ref[4], x_ref[5], x_ref[6]
+    )
+    yaw_c = _clamp_scalar_toward(yaw_r, yaw_a, limits.max_yaw_rad, wrap=True)
+    roll_c = _clamp_scalar_toward(
+        roll_r, roll_a, limits.max_roll_pitch_rad, wrap=False
+    )
+    pitch_c = _clamp_scalar_toward(
+        pitch_r, pitch_a, limits.max_roll_pitch_rad, wrap=False
+    )
+    out[3:7] = _euler_zyx_to_quat_np(roll_c, pitch_c, yaw_c)
+
+    n_arm = int(nq) - 7
+    if n_arm > 0 and limits.max_joint_rad > 0.0:
+        for j in range(n_arm):
+            out[7 + j] = _clamp_scalar_toward(
+                x_ref[7 + j], x_anchor[7 + j], limits.max_joint_rad
+            )
+
+    nq_i = int(nq)
+    if limits.max_lin_vel_mps > 0.0:
+        for j in range(3):
+            out[nq_i + j] = _clamp_scalar_toward(
+                x_ref[nq_i + j], x_anchor[nq_i + j], limits.max_lin_vel_mps
+            )
+    if limits.max_omega_radps > 0.0:
+        for j in range(3):
+            out[nq_i + 3 + j] = _clamp_scalar_toward(
+                x_ref[nq_i + 3 + j], x_anchor[nq_i + 3 + j], limits.max_omega_radps
+            )
+    if n_arm > 0 and limits.max_joint_vel_radps > 0.0:
+        for j in range(n_arm):
+            out[nq_i + 6 + j] = _clamp_scalar_toward(
+                x_ref[nq_i + 6 + j],
+                x_anchor[nq_i + 6 + j],
+                limits.max_joint_vel_radps,
+            )
+    return out
+
+
+def clamp_mpc_ee_pose_reference(
+    p_ref: np.ndarray,
+    yaw_ref: float,
+    roll_ref: float,
+    pitch_ref: float,
+    p_anchor: np.ndarray,
+    yaw_anchor: float,
+    roll_anchor: float,
+    pitch_anchor: float,
+    limits: Optional[MpcRefErrorLimits],
+) -> Tuple[np.ndarray, float, float, float]:
+    """Limit EE pose references relative to the current EE pose."""
+    if limits is None or not limits.active():
+        return (
+            np.asarray(p_ref, dtype=float).reshape(3).copy(),
+            float(yaw_ref),
+            float(roll_ref),
+            float(pitch_ref),
+        )
+    p_out = _clamp_vec3_toward(p_ref, p_anchor, limits.max_ee_pos_m)
+    yaw_out = _clamp_scalar_toward(
+        yaw_ref, yaw_anchor, limits.max_yaw_rad, wrap=True
+    )
+    roll_out = _clamp_scalar_toward(
+        roll_ref, roll_anchor, limits.max_roll_pitch_rad, wrap=False
+    )
+    pitch_out = _clamp_scalar_toward(
+        pitch_ref, pitch_anchor, limits.max_roll_pitch_rad, wrap=False
+    )
+    return p_out, yaw_out, roll_out, pitch_out
+
+
+def sanitize_mpc_state(
+    x: np.ndarray,
+    *,
+    nq: int,
+    nv: int,
+) -> np.ndarray:
+    """Normalize quaternion and clip arm q/qd before acados solve (reduces NaN in QP)."""
+    from s500_uam_acados_trajectory import STATE_LIMITS
+
+    x = np.asarray(x, dtype=float).reshape(-1).copy()
+    nx = int(nq) + int(nv)
+    if x.size < nx:
+        return x
+    x = x[:nx]
+    qn = float(np.linalg.norm(x[3:7]))
+    if qn > 1e-12:
+        x[3:7] /= qn
+    n_arm = int(nq) - 7
+    if n_arm > 0:
+        ja = float(STATE_LIMITS["j_angle_max"])
+        jv = float(STATE_LIMITS["j_vel_max"])
+        x[7 : 7 + n_arm] = np.clip(x[7 : 7 + n_arm], -ja, ja)
+        x[nq + 6 : nq + 6 + n_arm] = np.clip(x[nq + 6 : nq + 6 + n_arm], -jv, jv)
+    return x
+
+
+def acados_solution_finite(
+    u_opt: np.ndarray,
+    x_next: np.ndarray,
+    xs: Optional[List[np.ndarray]] = None,
+) -> bool:
+    if not (np.all(np.isfinite(u_opt)) and np.all(np.isfinite(x_next))):
+        return False
+    if xs is not None:
+        return all(np.all(np.isfinite(x)) for x in xs)
+    return True
+
+
+def acados_mpc_extract_solution(
+    solver: "AcadosOcpSolver",
+    N: int,
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
+    u_opt = np.asarray(solver.get(0, "u"), dtype=float).copy()
+    x_next = np.asarray(solver.get(1, "x"), dtype=float).copy()
+    xs = [np.asarray(solver.get(i, "x"), dtype=float).copy() for i in range(N + 1)]
+    us = [np.asarray(solver.get(i, "u"), dtype=float).copy() for i in range(N)]
+    return u_opt, x_next, xs, us
+
+
+def acados_mpc_run_solve(
+    solver: "AcadosOcpSolver",
+    *,
+    retry_lm: Optional[float] = None,
+) -> int:
+    """Run ``solver.solve()``; optionally retry once with higher Levenberg–Marquardt."""
+    status = int(solver.solve())
+    if retry_lm is None:
+        return status
+    prev_lm: Optional[float] = None
+    try:
+        prev_lm = float(solver.options_get("levenberg_marquardt"))
+    except Exception:
+        pass
+    try:
+        solver.options_set("levenberg_marquardt", float(retry_lm))
+    except Exception:
+        return status
+    status = int(solver.solve())
+    if prev_lm is not None:
+        try:
+            solver.options_set("levenberg_marquardt", prev_lm)
+        except Exception:
+            pass
+    return status
+
+
+def _apply_runtime_solver_options(
+    solver: "AcadosOcpSolver",
+    max_iter: int,
+    *,
+    solver_type: str = "SQP",
+    qp_iter_max: Optional[int] = None,
+    levenberg_marquardt: Optional[float] = None,
+) -> None:
+    """Runtime solver knobs (RTI: QP iter / LM; SQP: NLP max iter)."""
+    st = str(solver_type or "SQP").upper()
+    if qp_iter_max is not None:
+        try:
+            solver.options_set("qp_solver_iter_max", int(qp_iter_max))
+        except Exception:
+            pass
+    if levenberg_marquardt is not None:
+        try:
+            solver.options_set("levenberg_marquardt", float(levenberg_marquardt))
+        except Exception:
+            pass
+    if st == "SQP_RTI":
+        return
+    want = int(max_iter)
+    try:
+        baked = int(solver.__solver_options.get("nlp_solver_max_iter", want))
+    except Exception:
+        baked = want
+    if want <= baked:
+        try:
+            solver.options_set("nlp_solver_max_iter", want)
+        except Exception:
+            pass
+
 
 def _align_ocp_with_cached_json(ocp: "AcadosOcp", json_path: Path) -> bool:
     """把参与 OCP 哈希、但运行时可改的字段对齐到已缓存 ocp.json，避免无谓 codegen。
@@ -436,24 +743,6 @@ def _align_ocp_with_cached_json(ocp: "AcadosOcp", json_path: Path) -> bool:
         if vals is not None and len(vals) > 0 and hasattr(ocp.constraints, key):
             setattr(ocp.constraints, key, np.array(vals, dtype=float))
     return True
-
-
-def _apply_runtime_solver_options(
-    solver: "AcadosOcpSolver", max_iter: int, *, solver_type: str = "SQP"
-) -> None:
-    """在已编译上界内下调 NLP 迭代次数（SQP 专用；RTI 每步固定 1 次 QP）。"""
-    if str(solver_type or "SQP").upper() == "SQP_RTI":
-        return
-    want = int(max_iter)
-    try:
-        baked = int(solver.__solver_options.get("nlp_solver_max_iter", want))
-    except Exception:
-        baked = want
-    if want <= baked:
-        try:
-            solver.options_set("nlp_solver_max_iter", want)
-        except Exception:
-            pass
 
 
 def create_full_state_tracking_mpc_solver(

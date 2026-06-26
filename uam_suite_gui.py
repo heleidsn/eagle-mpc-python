@@ -1374,10 +1374,7 @@ class TrackEeCrocWorker(QThread):
                 w_vel_lin=float(p.get("croc_ee_w_vel_lin", 1.0)),
                 w_vel_ang_rp=float(p.get("croc_ee_w_vel_ang_rp", 1.0)),
                 w_vel_ang_yaw=float(p.get("croc_ee_w_vel_ang_yaw", 1.0)),
-                w_u=float(p.get("croc_ee_w_u", 0.0)),
                 w_terminal_scale=float(p.get("croc_ee_w_terminal", 3.0)),
-                w_state_reg=float(p.get("w_state_reg", 0.0)),
-                w_state_track=float(p.get("w_state_track", 0.0)),
             )
             out = run_closed_loop_ee_pose_tracking(
                 x0=p["x0"],
@@ -1391,6 +1388,18 @@ class TrackEeCrocWorker(QThread):
                 max_iter=p["mpc_max_iter"],
                 use_thrust_constraints=bool(p.get("use_thrust_constraints", True)),
                 weights=weights,
+                w_state_track=float(p.get("w_state_track", 0.0)),
+                w_state_reg=float(p.get("w_state_reg", 0.0)),
+                w_control=float(p.get("w_control", p.get("croc_ee_w_u", 1e-3))),
+                w_pos=float(p.get("w_pos", 1.0)),
+                w_att=float(p.get("w_att", 1.0)),
+                w_joint=float(p.get("w_joint", 1.0)),
+                w_vel=float(p.get("w_vel", 1.0)),
+                w_omega=float(p.get("w_omega", 1.0)),
+                w_joint_vel=float(p.get("w_joint_vel", 1.0)),
+                w_u_thrust=float(p.get("w_u_thrust", 1.0)),
+                w_u_joint_torque=float(p.get("w_u_joint_torque", 1.0)),
+                w_terminal_track=float(p.get("w_terminal_track", 100.0)),
                 verbose=False,
                 use_actuator_first_order=bool(p.get("use_actuator_first_order", False)),
                 tau_thrust=float(p.get("tau_thrust", 0.06)),
@@ -3752,6 +3761,41 @@ class UamSuiteGUI(QMainWindow):
         self.rn_acados_qp_iter.setRange(5, 500)
         self.rn_acados_qp_iter.setValue(20)
         rn_acados_grid.addWidget(self.rn_acados_qp_iter, 1, 3)
+        rn_acados_grid.addWidget(QLabel("ref clamp"), 2, 0)
+        self.rn_mpc_ref_clamp_en = QCheckBox("enable")
+        self.rn_mpc_ref_clamp_en.setChecked(True)
+        self.rn_mpc_ref_clamp_en.setToolTip(
+            "限幅送入 MPC 的参考相对当前状态的误差，减轻大偏差时 RTI QP 病态"
+        )
+        rn_acados_grid.addWidget(self.rn_mpc_ref_clamp_en, 2, 1)
+        rn_acados_grid.addWidget(QLabel("pos / ee pos (m)"), 2, 2)
+        self.rn_mpc_ref_clamp_pos = QDoubleSpinBox()
+        self.rn_mpc_ref_clamp_pos.setRange(0.0, 20.0)
+        self.rn_mpc_ref_clamp_pos.setDecimals(2)
+        self.rn_mpc_ref_clamp_pos.setValue(1.5)
+        self.rn_mpc_ref_clamp_ee_pos = QDoubleSpinBox()
+        self.rn_mpc_ref_clamp_ee_pos.setRange(0.0, 20.0)
+        self.rn_mpc_ref_clamp_ee_pos.setDecimals(2)
+        self.rn_mpc_ref_clamp_ee_pos.setValue(1.5)
+        _rn_clamp_pos = QWidget()
+        _rn_clamp_pos_l = QHBoxLayout(_rn_clamp_pos)
+        _rn_clamp_pos_l.setContentsMargins(0, 0, 0, 0)
+        _rn_clamp_pos_l.addWidget(self.rn_mpc_ref_clamp_pos)
+        _rn_clamp_pos_l.addWidget(self.rn_mpc_ref_clamp_ee_pos)
+        rn_acados_grid.addWidget(_rn_clamp_pos, 2, 3)
+        rn_acados_grid.addWidget(QLabel("yaw / rp (deg)"), 3, 0)
+        self.rn_mpc_ref_clamp_yaw = QDoubleSpinBox()
+        self.rn_mpc_ref_clamp_yaw.setRange(0.0, 180.0)
+        self.rn_mpc_ref_clamp_yaw.setValue(90.0)
+        self.rn_mpc_ref_clamp_rp = QDoubleSpinBox()
+        self.rn_mpc_ref_clamp_rp.setRange(0.0, 90.0)
+        self.rn_mpc_ref_clamp_rp.setValue(45.0)
+        _rn_clamp_att = QWidget()
+        _rn_clamp_att_l = QHBoxLayout(_rn_clamp_att)
+        _rn_clamp_att_l.setContentsMargins(0, 0, 0, 0)
+        _rn_clamp_att_l.addWidget(self.rn_mpc_ref_clamp_yaw)
+        _rn_clamp_att_l.addWidget(self.rn_mpc_ref_clamp_rp)
+        rn_acados_grid.addWidget(_rn_clamp_att, 3, 1)
         rn_mpc_vbox.addWidget(self._rn_acados_panel)
 
         # ── full-state 代价权重（Crocoddyl / Acados 各一套 profile，切换算法时自动换）──
@@ -3828,14 +3872,14 @@ class UamSuiteGUI(QMainWindow):
         rn_ee_grid.setColumnStretch(3, 1)
 
         self.rn_ee_acados_cost_hint = QLabel(
-            "Acados EE: L1 [p_ee, cos/sin ψ_ee] + L2 [p_base, ψ_base, q_joint, q̇_joint 沿 x_plan] "
-            "+ L3 [u→hover]. Croc 另有 EE rot/vel 与全状态 st w_pos/att/…"
+            "EE-centric = State reference (x_plan, 上方面板) + EE task（本面板）。"
+            "w_state_track=0 → 纯 EE 代价 + 控制正则。"
         )
         self.rn_ee_acados_cost_hint.setWordWrap(True)
         self.rn_ee_acados_cost_hint.setStyleSheet("color: #1565c0; font-size: 11px;")
         rn_ee_grid.addWidget(self.rn_ee_acados_cost_hint, 0, 0, 1, 4)
 
-        _ee_task_lbl = QLabel("L1 — EE task (acados + croc)")
+        _ee_task_lbl = QLabel("EE task")
         _ee_task_lbl.setStyleSheet("color: palette(mid); font-size: 11px;")
         rn_ee_grid.addWidget(_ee_task_lbl, 1, 0, 1, 4)
 
@@ -3843,7 +3887,7 @@ class UamSuiteGUI(QMainWindow):
         self.rn_ee_w_pos = QDoubleSpinBox()
         self.rn_ee_w_pos.setRange(0.0, 5000.0)
         self.rn_ee_w_pos.setValue(400.0)
-        self.rn_ee_w_pos.setToolTip("L1: EE 世界系位置权重（acados w_ee_pos）")
+        self.rn_ee_w_pos.setToolTip("EE 世界系位置权重（acados w_ee_pos / croc EE task）")
         rn_ee_grid.addWidget(self.rn_ee_w_pos, 2, 1)
 
         self._rn_lbl_ee_rot_rp = QLabel("ee w_rot_rp")
@@ -3851,14 +3895,14 @@ class UamSuiteGUI(QMainWindow):
         self.rn_ee_w_rot_rp = QDoubleSpinBox()
         self.rn_ee_w_rot_rp.setRange(0.0, 2000.0)
         self.rn_ee_w_rot_rp.setValue(1.0)
-        self.rn_ee_w_rot_rp.setToolTip("Croc only: EE roll/pitch 姿态")
+        self.rn_ee_w_rot_rp.setToolTip("EE roll/pitch 姿态（acados w_ee_rot_rp；croc w_rot_rp）")
         rn_ee_grid.addWidget(self.rn_ee_w_rot_rp, 2, 3)
 
         rn_ee_grid.addWidget(QLabel("ee w_rot_yaw"), 3, 0)
         self.rn_ee_w_rot_yaw = QDoubleSpinBox()
         self.rn_ee_w_rot_yaw.setRange(0.0, 2000.0)
         self.rn_ee_w_rot_yaw.setValue(200.0)
-        self.rn_ee_w_rot_yaw.setToolTip("L1: EE 航向权重（acados w_ee_yaw；用 cos/sin 表示）")
+        self.rn_ee_w_rot_yaw.setToolTip("EE 航向（acados w_ee_yaw；croc w_rot_yaw）")
         rn_ee_grid.addWidget(self.rn_ee_w_rot_yaw, 3, 1)
 
         self._rn_lbl_ee_vel_lin = QLabel("ee w_vel_lin")
@@ -3882,152 +3926,45 @@ class UamSuiteGUI(QMainWindow):
         self.rn_ee_w_vel_ang_yaw.setValue(1.0)
         rn_ee_grid.addWidget(self.rn_ee_w_vel_ang_yaw, 4, 3)
 
-        _ee_l3_lbl = QLabel("L3 — control regularization (acados + croc)")
-        _ee_l3_lbl.setStyleSheet("color: palette(mid); font-size: 11px;")
-        rn_ee_grid.addWidget(_ee_l3_lbl, 5, 0, 1, 4)
-
-        rn_ee_grid.addWidget(QLabel("ee w_u"), 6, 0)
-        self.rn_ee_w_u = QDoubleSpinBox()
-        self.rn_ee_w_u.setRange(0.0, 100.0)
-        self.rn_ee_w_u.setDecimals(6)
-        self.rn_ee_w_u.setValue(0.001)
-        self.rn_ee_w_u.setToolTip("L3: 控制正则（悬停推力）；acados w_control")
-        rn_ee_grid.addWidget(self.rn_ee_w_u, 6, 1)
-
-        rn_ee_grid.addWidget(QLabel("ee w_terminal"), 6, 2)
+        rn_ee_grid.addWidget(QLabel("ee w_terminal"), 5, 0)
         self.rn_ee_w_terminal = QDoubleSpinBox()
         self.rn_ee_w_terminal.setRange(0.0, 100.0)
         self.rn_ee_w_terminal.setDecimals(3)
         self.rn_ee_w_terminal.setValue(3.0)
-        self.rn_ee_w_terminal.setToolTip("终端 L1 放大倍数（acados w_terminal_scale）")
-        rn_ee_grid.addWidget(self.rn_ee_w_terminal, 6, 3)
+        self.rn_ee_w_terminal.setToolTip("终端 EE 代价放大倍数（w_terminal_scale）")
+        rn_ee_grid.addWidget(self.rn_ee_w_terminal, 5, 1)
 
-        self._rn_lbl_ee_aux = QLabel("L2 — null-space aux along x_plan (acados + croc)")
-        self._rn_lbl_ee_aux.setStyleSheet("color: palette(mid); font-size: 11px;")
-        rn_ee_grid.addWidget(self._rn_lbl_ee_aux, 7, 0, 1, 4)
+        _ee_joint_lbl = QLabel("State-ref joint override (x_plan)")
+        _ee_joint_lbl.setStyleSheet("color: palette(mid); font-size: 11px;")
+        rn_ee_grid.addWidget(_ee_joint_lbl, 6, 0, 1, 4)
 
-        rn_ee_grid.addWidget(QLabel("ee w_base_pos"), 8, 0)
-        self.rn_ee_w_base_pos = QDoubleSpinBox()
-        self.rn_ee_w_base_pos.setRange(0.0, 500.0)
-        self.rn_ee_w_base_pos.setDecimals(3)
-        self.rn_ee_w_base_pos.setValue(3.0)
-        self.rn_ee_w_base_pos.setToolTip(
-            "L2: 弱跟踪 plan 基座位置；0=关闭（会改 OCP 结构，需重编）"
+        self.rn_ee_override_joints = QCheckBox("Use fixed j1/j2 instead of planned joints")
+        self.rn_ee_override_joints.setToolTip(
+            "勾选后，state reference 中的关节角用下方 j1/j2 替代 x_plan 插值结果"
         )
-        rn_ee_grid.addWidget(self.rn_ee_w_base_pos, 8, 1)
+        rn_ee_grid.addWidget(self.rn_ee_override_joints, 7, 0, 1, 4)
 
-        rn_ee_grid.addWidget(QLabel("ee w_base_yaw"), 8, 2)
-        self.rn_ee_w_base_yaw = QDoubleSpinBox()
-        self.rn_ee_w_base_yaw.setRange(0.0, 500.0)
-        self.rn_ee_w_base_yaw.setDecimals(3)
-        self.rn_ee_w_base_yaw.setValue(2.0)
-        self.rn_ee_w_base_yaw.setToolTip(
-            "L2: 弱跟踪 plan 机体 yaw（cos/sin）；0=关闭（会改 OCP 结构）"
-        )
-        rn_ee_grid.addWidget(self.rn_ee_w_base_yaw, 8, 3)
+        rn_ee_grid.addWidget(QLabel("ee joint1 °"), 8, 0)
+        self.rn_ee_joint1_deg = QDoubleSpinBox()
+        self.rn_ee_joint1_deg.setRange(-180.0, 180.0)
+        self.rn_ee_joint1_deg.setDecimals(2)
+        self.rn_ee_joint1_deg.setValue(-45.0)
+        rn_ee_grid.addWidget(self.rn_ee_joint1_deg, 8, 1)
 
-        self._rn_lbl_st_joint = QLabel("st w_joint")
-        rn_ee_grid.addWidget(self._rn_lbl_st_joint, 9, 0)
-        self.rn_ee_w_st_joint = QDoubleSpinBox()
-        self.rn_ee_w_st_joint.setRange(0.0, 100.0)
-        self.rn_ee_w_st_joint.setDecimals(3)
-        self.rn_ee_w_st_joint.setValue(0.2)
-        self.rn_ee_w_st_joint.setToolTip(
-            "L2: 沿 x_plan 关节角（acados w_joint_track / croc 分项）；宜 0.1–0.5；0=关闭需重编"
-        )
-        rn_ee_grid.addWidget(self.rn_ee_w_st_joint, 9, 1)
-
-        self._rn_lbl_st_joint_vel = QLabel("st w_joint_vel")
-        rn_ee_grid.addWidget(self._rn_lbl_st_joint_vel, 9, 2)
-        self.rn_ee_w_st_joint_vel = QDoubleSpinBox()
-        self.rn_ee_w_st_joint_vel.setRange(0.0, 100.0)
-        self.rn_ee_w_st_joint_vel.setDecimals(3)
-        self.rn_ee_w_st_joint_vel.setValue(0.05)
-        self.rn_ee_w_st_joint_vel.setToolTip(
-            "L2: 沿 x_plan 关节角速度（acados）；通常小于 st w_joint；0=关闭需重编"
-        )
-        rn_ee_grid.addWidget(self.rn_ee_w_st_joint_vel, 9, 3)
-
-        self._rn_lbl_ee_state_track = QLabel("ee w_state_track")
-        rn_ee_grid.addWidget(self._rn_lbl_ee_state_track, 10, 0)
-        self.rn_ee_w_state_track = QDoubleSpinBox()
-        self.rn_ee_w_state_track.setRange(0.0, 500.0)
-        self.rn_ee_w_state_track.setDecimals(3)
-        self.rn_ee_w_state_track.setValue(2.0)
-        self.rn_ee_w_state_track.setToolTip(
-            "Croc only: 沿 x_plan 全状态跟踪总权重；0=关闭"
-        )
-        rn_ee_grid.addWidget(self.rn_ee_w_state_track, 10, 1)
-
-        self._rn_lbl_ee_state_reg = QLabel("ee w_state_reg")
-        rn_ee_grid.addWidget(self._rn_lbl_ee_state_reg, 10, 2)
-        self.rn_ee_w_state_reg = QDoubleSpinBox()
-        self.rn_ee_w_state_reg.setRange(0.0, 100.0)
-        self.rn_ee_w_state_reg.setDecimals(4)
-        self.rn_ee_w_state_reg.setValue(0.05)
-        self.rn_ee_w_state_reg.setToolTip(
-            "Croc only: 向悬停名义状态弱正则（非 plan）"
-        )
-        rn_ee_grid.addWidget(self.rn_ee_w_state_reg, 10, 3)
-
-        self._rn_lbl_ee_st = QLabel("x_plan state track — per-group activation (croc only)")
-        self._rn_lbl_ee_st.setStyleSheet("color: palette(mid); font-size: 11px;")
-        rn_ee_grid.addWidget(self._rn_lbl_ee_st, 11, 0, 1, 4)
-
-        self._rn_lbl_st_pos = QLabel("st w_pos")
-        rn_ee_grid.addWidget(self._rn_lbl_st_pos, 12, 0)
-        self.rn_ee_w_st_pos = QDoubleSpinBox()
-        self.rn_ee_w_st_pos.setRange(0.0, 100.0)
-        self.rn_ee_w_st_pos.setDecimals(3)
-        self.rn_ee_w_st_pos.setValue(1.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_st_pos, 12, 1)
-
-        self._rn_lbl_st_att = QLabel("st w_att")
-        rn_ee_grid.addWidget(self._rn_lbl_st_att, 12, 2)
-        self.rn_ee_w_st_att = QDoubleSpinBox()
-        self.rn_ee_w_st_att.setRange(0.0, 100.0)
-        self.rn_ee_w_st_att.setDecimals(3)
-        self.rn_ee_w_st_att.setValue(1.0)
-        rn_ee_grid.addWidget(self.rn_ee_w_st_att, 12, 3)
-
-        self._rn_lbl_st_vel = QLabel("st w_vel")
-        rn_ee_grid.addWidget(self._rn_lbl_st_vel, 13, 0)
-        self.rn_ee_w_st_vel = QDoubleSpinBox()
-        self.rn_ee_w_st_vel.setRange(0.0, 100.0)
-        self.rn_ee_w_st_vel.setDecimals(3)
-        self.rn_ee_w_st_vel.setValue(0.1)
-        rn_ee_grid.addWidget(self.rn_ee_w_st_vel, 13, 1)
-
-        self._rn_lbl_st_omega = QLabel("st w_omega")
-        rn_ee_grid.addWidget(self._rn_lbl_st_omega, 13, 2)
-        self.rn_ee_w_st_omega = QDoubleSpinBox()
-        self.rn_ee_w_st_omega.setRange(0.0, 100.0)
-        self.rn_ee_w_st_omega.setDecimals(3)
-        self.rn_ee_w_st_omega.setValue(0.1)
-        rn_ee_grid.addWidget(self.rn_ee_w_st_omega, 13, 3)
+        rn_ee_grid.addWidget(QLabel("ee joint2 °"), 8, 2)
+        self.rn_ee_joint2_deg = QDoubleSpinBox()
+        self.rn_ee_joint2_deg.setRange(-180.0, 180.0)
+        self.rn_ee_joint2_deg.setDecimals(2)
+        self.rn_ee_joint2_deg.setValue(-20.0)
+        rn_ee_grid.addWidget(self.rn_ee_joint2_deg, 8, 3)
 
         self._rn_ee_croc_only_widgets = [
-            self._rn_lbl_ee_rot_rp,
-            self.rn_ee_w_rot_rp,
             self._rn_lbl_ee_vel_lin,
             self.rn_ee_w_vel_lin,
             self._rn_lbl_ee_vel_ang_rp,
             self.rn_ee_w_vel_ang_rp,
             self._rn_lbl_ee_vel_ang_yaw,
             self.rn_ee_w_vel_ang_yaw,
-            self._rn_lbl_ee_state_track,
-            self.rn_ee_w_state_track,
-            self._rn_lbl_ee_state_reg,
-            self.rn_ee_w_state_reg,
-            self._rn_lbl_ee_st,
-            self._rn_lbl_st_pos,
-            self.rn_ee_w_st_pos,
-            self._rn_lbl_st_att,
-            self.rn_ee_w_st_att,
-            self._rn_lbl_st_vel,
-            self.rn_ee_w_st_vel,
-            self._rn_lbl_st_omega,
-            self.rn_ee_w_st_omega,
         ]
 
         rn_mpc_vbox.addWidget(self._rn_ee_panel)
@@ -8431,18 +8368,10 @@ class UamSuiteGUI(QMainWindow):
             "rn_ee_w_vel_lin": float(self.rn_ee_w_vel_lin.value()),
             "rn_ee_w_vel_ang_rp": float(self.rn_ee_w_vel_ang_rp.value()),
             "rn_ee_w_vel_ang_yaw": float(self.rn_ee_w_vel_ang_yaw.value()),
-            "rn_ee_w_u": float(self.rn_ee_w_u.value()),
             "rn_ee_w_terminal": float(self.rn_ee_w_terminal.value()),
-            "rn_ee_w_base_pos": float(self.rn_ee_w_base_pos.value()),
-            "rn_ee_w_base_yaw": float(self.rn_ee_w_base_yaw.value()),
-            "rn_ee_w_state_reg": float(self.rn_ee_w_state_reg.value()),
-            "rn_ee_w_state_track": float(self.rn_ee_w_state_track.value()),
-            "rn_ee_w_st_pos": float(self.rn_ee_w_st_pos.value()),
-            "rn_ee_w_st_att": float(self.rn_ee_w_st_att.value()),
-            "rn_ee_w_st_joint": float(self.rn_ee_w_st_joint.value()),
-            "rn_ee_w_st_vel": float(self.rn_ee_w_st_vel.value()),
-            "rn_ee_w_st_omega": float(self.rn_ee_w_st_omega.value()),
-            "rn_ee_w_st_joint_vel": float(self.rn_ee_w_st_joint_vel.value()),
+            "rn_ee_override_joints": bool(self.rn_ee_override_joints.isChecked()),
+            "rn_ee_joint1_deg": float(self.rn_ee_joint1_deg.value()),
+            "rn_ee_joint2_deg": float(self.rn_ee_joint2_deg.value()),
             "rn_geo_kp_pos": float(self.rn_geo_kp_pos.value()),
             "rn_geo_kd_vel": float(self.rn_geo_kd_vel.value()),
             "rn_geo_kR": float(self.rn_geo_kR.value()),
@@ -8631,18 +8560,11 @@ class UamSuiteGUI(QMainWindow):
         _set_spin("rn_ee_w_vel_lin", self.rn_ee_w_vel_lin)
         _set_spin("rn_ee_w_vel_ang_rp", self.rn_ee_w_vel_ang_rp)
         _set_spin("rn_ee_w_vel_ang_yaw", self.rn_ee_w_vel_ang_yaw)
-        _set_spin("rn_ee_w_u", self.rn_ee_w_u)
         _set_spin("rn_ee_w_terminal", self.rn_ee_w_terminal)
-        _set_spin("rn_ee_w_base_pos", self.rn_ee_w_base_pos)
-        _set_spin("rn_ee_w_base_yaw", self.rn_ee_w_base_yaw)
-        _set_spin("rn_ee_w_state_reg", self.rn_ee_w_state_reg)
-        _set_spin("rn_ee_w_state_track", self.rn_ee_w_state_track)
-        _set_spin("rn_ee_w_st_pos", self.rn_ee_w_st_pos)
-        _set_spin("rn_ee_w_st_att", self.rn_ee_w_st_att)
-        _set_spin("rn_ee_w_st_joint", self.rn_ee_w_st_joint)
-        _set_spin("rn_ee_w_st_vel", self.rn_ee_w_st_vel)
-        _set_spin("rn_ee_w_st_omega", self.rn_ee_w_st_omega)
-        _set_spin("rn_ee_w_st_joint_vel", self.rn_ee_w_st_joint_vel)
+        if "rn_ee_override_joints" in p:
+            self.rn_ee_override_joints.setChecked(bool(p["rn_ee_override_joints"]))
+        _set_spin("rn_ee_joint1_deg", self.rn_ee_joint1_deg)
+        _set_spin("rn_ee_joint2_deg", self.rn_ee_joint2_deg)
         _set_spin("rn_geo_kp_pos", self.rn_geo_kp_pos)
         _set_spin("rn_geo_kd_vel", self.rn_geo_kd_vel)
         _set_spin("rn_geo_kR", self.rn_geo_kR)
@@ -9023,18 +8945,10 @@ class UamSuiteGUI(QMainWindow):
                 "rn_ee_w_vel_lin",
                 "rn_ee_w_vel_ang_rp",
                 "rn_ee_w_vel_ang_yaw",
-                "rn_ee_w_u",
                 "rn_ee_w_terminal",
-                "rn_ee_w_base_pos",
-                "rn_ee_w_base_yaw",
-                "rn_ee_w_state_reg",
-                "rn_ee_w_state_track",
-                "rn_ee_w_st_pos",
-                "rn_ee_w_st_att",
-                "rn_ee_w_st_joint",
-                "rn_ee_w_st_vel",
-                "rn_ee_w_st_omega",
-                "rn_ee_w_st_joint_vel",
+                "rn_ee_override_joints",
+                "rn_ee_joint1_deg",
+                "rn_ee_joint2_deg",
                 "rn_geo_kp_pos",
                 "rn_geo_kd_vel",
                 "rn_geo_kR",
@@ -10312,6 +10226,11 @@ class UamSuiteGUI(QMainWindow):
             "acados_integrator": self.rn_acados_integrator.currentText(),
             "acados_hpipm_mode": self.rn_acados_hpipm.currentText(),
             "acados_qp_iter_max": int(self.rn_acados_qp_iter.value()),
+            "mpc_ref_clamp_enabled": bool(self.rn_mpc_ref_clamp_en.isChecked()),
+            "mpc_ref_clamp_pos_m": float(self.rn_mpc_ref_clamp_pos.value()),
+            "mpc_ref_clamp_yaw_deg": float(self.rn_mpc_ref_clamp_yaw.value()),
+            "mpc_ref_clamp_rp_deg": float(self.rn_mpc_ref_clamp_rp.value()),
+            "mpc_ref_clamp_ee_pos_m": float(self.rn_mpc_ref_clamp_ee_pos.value()),
         }
 
     def _rn_extra_param_widgets(self) -> dict:
@@ -10327,18 +10246,10 @@ class UamSuiteGUI(QMainWindow):
             "ee_w_vel_lin": self.rn_ee_w_vel_lin,
             "ee_w_vel_ang_rp": self.rn_ee_w_vel_ang_rp,
             "ee_w_vel_ang_yaw": self.rn_ee_w_vel_ang_yaw,
-            "ee_w_u": self.rn_ee_w_u,
             "ee_w_terminal": self.rn_ee_w_terminal,
-            "ee_w_base_pos": self.rn_ee_w_base_pos,
-            "ee_w_base_yaw": self.rn_ee_w_base_yaw,
-            "ee_w_state_reg": self.rn_ee_w_state_reg,
-            "ee_w_state_track": self.rn_ee_w_state_track,
-            "ee_w_st_pos": self.rn_ee_w_st_pos,
-            "ee_w_st_att": self.rn_ee_w_st_att,
-            "ee_w_st_joint": self.rn_ee_w_st_joint,
-            "ee_w_st_vel": self.rn_ee_w_st_vel,
-            "ee_w_st_omega": self.rn_ee_w_st_omega,
-            "ee_w_st_joint_vel": self.rn_ee_w_st_joint_vel,
+            "ee_override_joints": self.rn_ee_override_joints,
+            "ee_joint1_deg": self.rn_ee_joint1_deg,
+            "ee_joint2_deg": self.rn_ee_joint2_deg,
             "geo_kp_pos": self.rn_geo_kp_pos,
             "geo_kd_vel": self.rn_geo_kd_vel,
             "geo_kR": self.rn_geo_kR,
@@ -10354,9 +10265,12 @@ class UamSuiteGUI(QMainWindow):
             )
         snap.update(self._rn_acados_solver_snapshot())
         for k, w in self._rn_extra_param_widgets().items():
-            snap[k] = (
-                int(w.value()) if isinstance(w, QSpinBox) else float(w.value())
-            )
+            if isinstance(w, QCheckBox):
+                snap[k] = bool(w.isChecked())
+            elif isinstance(w, QSpinBox):
+                snap[k] = int(w.value())
+            else:
+                snap[k] = float(w.value())
         return snap
 
     def _rn_set_spin_value(self, widget, val) -> None:
@@ -10365,12 +10279,53 @@ class UamSuiteGUI(QMainWindow):
         else:
             widget.setValue(float(val))
 
+    def _rn_migrate_legacy_ee_profile(self, data: dict) -> dict:
+        """将旧版 EE 面板键映射到 state-ref + EE task 分区。"""
+        d = dict(data)
+        if "ee_w_state_track" in d:
+            d.setdefault("w_state_track", d.pop("ee_w_state_track"))
+        if "ee_w_state_reg" in d:
+            d.setdefault("w_state_reg", d.pop("ee_w_state_reg"))
+        if "ee_w_u" in d:
+            d.setdefault("w_control", d.pop("ee_w_u"))
+        for old, new in (
+            ("ee_w_st_pos", "w_pos"),
+            ("ee_w_st_att", "w_att"),
+            ("ee_w_st_joint", "w_joint"),
+            ("ee_w_st_vel", "w_vel"),
+            ("ee_w_st_omega", "w_omega"),
+            ("ee_w_st_joint_vel", "w_joint_vel"),
+        ):
+            if old in d:
+                d.setdefault(new, d.pop(old))
+        for obsolete in (
+            "ee_w_base_pos",
+            "ee_w_base_yaw",
+            "ee_w_st_pos",
+            "ee_w_st_att",
+            "ee_w_st_joint",
+            "ee_w_st_vel",
+            "ee_w_st_omega",
+            "ee_w_st_joint_vel",
+            "ee_w_state_track",
+            "ee_w_state_reg",
+            "ee_w_u",
+        ):
+            d.pop(obsolete, None)
+        return d
+
     def _rn_mpc_weight_apply(self, data: dict) -> None:
+        data = self._rn_migrate_legacy_ee_profile(data)
         extra = self._rn_extra_param_widgets()
         widgets = list(self._rn_fs_weight_widgets().values())
         widgets += [
             self.rn_acados_solver_mode, self.rn_acados_integrator, self.rn_acados_hpipm,
             self.rn_acados_qp_iter,
+            self.rn_mpc_ref_clamp_en,
+            self.rn_mpc_ref_clamp_pos,
+            self.rn_mpc_ref_clamp_ee_pos,
+            self.rn_mpc_ref_clamp_yaw,
+            self.rn_mpc_ref_clamp_rp,
         ]
         widgets += list(extra.values())
         for w in widgets:
@@ -10387,8 +10342,22 @@ class UamSuiteGUI(QMainWindow):
                 self.rn_acados_hpipm.setCurrentText(str(data["acados_hpipm_mode"]))
             if "acados_qp_iter_max" in data:
                 self.rn_acados_qp_iter.setValue(int(data["acados_qp_iter_max"]))
+            if "mpc_ref_clamp_enabled" in data:
+                self.rn_mpc_ref_clamp_en.setChecked(bool(data["mpc_ref_clamp_enabled"]))
+            if "mpc_ref_clamp_pos_m" in data:
+                self.rn_mpc_ref_clamp_pos.setValue(float(data["mpc_ref_clamp_pos_m"]))
+            if "mpc_ref_clamp_yaw_deg" in data:
+                self.rn_mpc_ref_clamp_yaw.setValue(float(data["mpc_ref_clamp_yaw_deg"]))
+            if "mpc_ref_clamp_rp_deg" in data:
+                self.rn_mpc_ref_clamp_rp.setValue(float(data["mpc_ref_clamp_rp_deg"]))
+            if "mpc_ref_clamp_ee_pos_m" in data:
+                self.rn_mpc_ref_clamp_ee_pos.setValue(float(data["mpc_ref_clamp_ee_pos_m"]))
             for k, w in extra.items():
-                if k in data:
+                if k not in data:
+                    continue
+                if isinstance(w, QCheckBox):
+                    w.setChecked(bool(data[k]))
+                else:
                     self._rn_set_spin_value(w, data[k])
         finally:
             for w in widgets:
@@ -10406,38 +10375,35 @@ class UamSuiteGUI(QMainWindow):
         acados["acados_qp_iter_max"] = 20
         self._rn_mpc_weight_profiles["acados_full_state"] = acados
         ee_acados = dict(acados)
+        ee_acados["w_state_track"] = 2.0
+        ee_acados["w_state_reg"] = 0.05
+        ee_acados["w_joint"] = 0.2
+        ee_acados["w_vel"] = 0.1
+        ee_acados["w_omega"] = 0.1
+        ee_acados["w_joint_vel"] = 0.05
+        ee_acados["w_control"] = 1e-4
         ee_acados["ee_w_pos"] = 500.0
+        ee_acados["ee_w_rot_rp"] = 1.0
         ee_acados["ee_w_rot_yaw"] = 200.0
-        ee_acados["ee_w_u"] = 1e-4
         ee_acados["ee_w_terminal"] = 3.0
-        ee_acados["ee_w_base_pos"] = 3.0
-        ee_acados["ee_w_base_yaw"] = 2.0
-        ee_acados["ee_w_state_reg"] = 0.05
-        ee_acados["ee_w_state_track"] = 2.0
-        ee_acados["ee_w_st_pos"] = 1.0
-        ee_acados["ee_w_st_att"] = 1.0
-        ee_acados["ee_w_st_joint"] = 0.2
-        ee_acados["ee_w_st_vel"] = 0.1
-        ee_acados["ee_w_st_omega"] = 0.1
-        ee_acados["ee_w_st_joint_vel"] = 0.05
+        ee_acados["ee_override_joints"] = False
+        ee_acados["ee_joint1_deg"] = -45.0
+        ee_acados["ee_joint2_deg"] = -20.0
         self._rn_mpc_weight_profiles["acados_ee_pose"] = ee_acados
         croc_ee = dict(croc)
+        croc_ee["w_state_track"] = 2.0
+        croc_ee["w_state_reg"] = 0.05
+        croc_ee["w_joint"] = 0.2
+        croc_ee["w_vel"] = 0.1
+        croc_ee["w_omega"] = 0.1
+        croc_ee["w_joint_vel"] = 0.05
         croc_ee["ee_w_pos"] = 400.0
+        croc_ee["ee_w_rot_rp"] = 1.0
         croc_ee["ee_w_rot_yaw"] = 200.0
-        croc_ee["ee_w_u"] = 1e-3
         croc_ee["ee_w_terminal"] = 3.0
-        croc_ee["ee_w_base_pos"] = 3.0
-        croc_ee["ee_w_base_yaw"] = 2.0
-        croc_ee["ee_w_state_reg"] = 0.05
-        croc_ee["ee_w_state_track"] = 2.0
-        croc_ee["ee_w_st_pos"] = 1.0
-        croc_ee["ee_w_st_att"] = 1.0
-        croc_ee["ee_w_st_joint"] = 0.2
-        croc_ee["ee_w_st_vel"] = 0.1
-        croc_ee["ee_w_st_omega"] = 0.1
-        croc_ee["ee_w_st_joint_vel"] = 0.05
-        croc_ee["w_state_track"] = 0.0
-        croc_ee["w_state_reg"] = 0.0
+        croc_ee["ee_override_joints"] = False
+        croc_ee["ee_joint1_deg"] = -45.0
+        croc_ee["ee_joint2_deg"] = -20.0
         self._rn_mpc_weight_profiles["croc_ee_pose"] = croc_ee
 
     def _rn_save_controller_profiles(self) -> None:
@@ -10508,9 +10474,11 @@ class UamSuiteGUI(QMainWindow):
         if new_mode == "acados_full_state":
             self.rn_fs_weights_title.setText("Cost weights — Acados profile")
         elif new_mode == "acados_ee_pose":
-            self.rn_fs_weights_title.setText("Cost weights — Acados EE profile")
+            self.rn_fs_weights_title.setText("State reference (x_plan) — Acados EE")
         elif new_mode == "croc_full_state":
             self.rn_fs_weights_title.setText("Cost weights — Crocoddyl profile")
+        elif new_mode == "croc_ee_pose":
+            self.rn_fs_weights_title.setText("State reference (x_plan) — Croc EE")
         else:
             self.rn_fs_weights_title.setText("Cost weights (full-state MPC)")
         self._rn_update_mpc_panel(index)
@@ -10522,9 +10490,9 @@ class UamSuiteGUI(QMainWindow):
         is_ee = mode in ("croc_ee_pose", "acados_ee_pose")
         is_geo = mode == "geometric"
         is_acados = mode in ("acados_full_state", "acados_ee_pose")
-        self._rn_fs_panel.setVisible(is_full)
+        self._rn_fs_panel.setVisible(is_full or is_ee)
         self._rn_acados_panel.setVisible(is_acados)
-        self.rn_fs_weights_title.setVisible(is_full)
+        self.rn_fs_weights_title.setVisible(is_full or is_ee)
         self._rn_ee_panel.setVisible(is_ee)
         is_acados_ee = mode == "acados_ee_pose"
         is_croc_ee = mode == "croc_ee_pose"
@@ -11709,24 +11677,21 @@ class UamSuiteGUI(QMainWindow):
             f"_acados_integrator:={self.rn_acados_integrator.currentText()}",
             f"_acados_hpipm_mode:={self.rn_acados_hpipm.currentText()}",
             f"_acados_qp_iter_max:={self.rn_acados_qp_iter.value()}",
+            f"_mpc_ref_clamp_enabled:={'true' if self.rn_mpc_ref_clamp_en.isChecked() else 'false'}",
+            f"_mpc_ref_clamp_pos_m:={self.rn_mpc_ref_clamp_pos.value()}",
+            f"_mpc_ref_clamp_yaw_deg:={self.rn_mpc_ref_clamp_yaw.value()}",
+            f"_mpc_ref_clamp_rp_deg:={self.rn_mpc_ref_clamp_rp.value()}",
+            f"_mpc_ref_clamp_ee_pos_m:={self.rn_mpc_ref_clamp_ee_pos.value()}",
             f"_ee_w_pos:={self.rn_ee_w_pos.value()}",
             f"_ee_w_rot_rp:={self.rn_ee_w_rot_rp.value()}",
             f"_ee_w_rot_yaw:={self.rn_ee_w_rot_yaw.value()}",
             f"_ee_w_vel_lin:={self.rn_ee_w_vel_lin.value()}",
             f"_ee_w_vel_ang_rp:={self.rn_ee_w_vel_ang_rp.value()}",
             f"_ee_w_vel_ang_yaw:={self.rn_ee_w_vel_ang_yaw.value()}",
-            f"_ee_w_u:={self.rn_ee_w_u.value()}",
             f"_ee_w_terminal:={self.rn_ee_w_terminal.value()}",
-            f"_ee_w_base_pos:={self.rn_ee_w_base_pos.value()}",
-            f"_ee_w_base_yaw:={self.rn_ee_w_base_yaw.value()}",
-            f"_ee_w_state_reg:={self.rn_ee_w_state_reg.value()}",
-            f"_ee_w_state_track:={self.rn_ee_w_state_track.value()}",
-            f"_ee_w_st_pos:={self.rn_ee_w_st_pos.value()}",
-            f"_ee_w_st_att:={self.rn_ee_w_st_att.value()}",
-            f"_ee_w_st_joint:={self.rn_ee_w_st_joint.value()}",
-            f"_ee_w_st_vel:={self.rn_ee_w_st_vel.value()}",
-            f"_ee_w_st_omega:={self.rn_ee_w_st_omega.value()}",
-            f"_ee_w_st_joint_vel:={self.rn_ee_w_st_joint_vel.value()}",
+            f"_ee_override_joints:={'true' if self.rn_ee_override_joints.isChecked() else 'false'}",
+            f"_ee_joint1:={np.deg2rad(self.rn_ee_joint1_deg.value())}",
+            f"_ee_joint2:={np.deg2rad(self.rn_ee_joint2_deg.value())}",
             f"_geo_kp_pos:={self.rn_geo_kp_pos.value()}",
             f"_geo_kd_vel:={self.rn_geo_kd_vel.value()}",
             f"_geo_kR:={self.rn_geo_kR.value()}",
@@ -13236,24 +13201,21 @@ class UamSuiteGUI(QMainWindow):
             "acados_integrator": self.rn_acados_integrator.currentText(),
             "acados_hpipm_mode": self.rn_acados_hpipm.currentText(),
             "acados_qp_iter_max": int(self.rn_acados_qp_iter.value()),
+            "mpc_ref_clamp_enabled": bool(self.rn_mpc_ref_clamp_en.isChecked()),
+            "mpc_ref_clamp_pos_m": float(self.rn_mpc_ref_clamp_pos.value()),
+            "mpc_ref_clamp_yaw_deg": float(self.rn_mpc_ref_clamp_yaw.value()),
+            "mpc_ref_clamp_rp_deg": float(self.rn_mpc_ref_clamp_rp.value()),
+            "mpc_ref_clamp_ee_pos_m": float(self.rn_mpc_ref_clamp_ee_pos.value()),
             "ee_w_pos": float(self.rn_ee_w_pos.value()),
             "ee_w_rot_rp": float(self.rn_ee_w_rot_rp.value()),
             "ee_w_rot_yaw": float(self.rn_ee_w_rot_yaw.value()),
             "ee_w_vel_lin": float(self.rn_ee_w_vel_lin.value()),
             "ee_w_vel_ang_rp": float(self.rn_ee_w_vel_ang_rp.value()),
             "ee_w_vel_ang_yaw": float(self.rn_ee_w_vel_ang_yaw.value()),
-            "ee_w_u": float(self.rn_ee_w_u.value()),
             "ee_w_terminal": float(self.rn_ee_w_terminal.value()),
-            "ee_w_base_pos": float(self.rn_ee_w_base_pos.value()),
-            "ee_w_base_yaw": float(self.rn_ee_w_base_yaw.value()),
-            "ee_w_state_reg": float(self.rn_ee_w_state_reg.value()),
-            "ee_w_state_track": float(self.rn_ee_w_state_track.value()),
-            "ee_w_st_pos": float(self.rn_ee_w_st_pos.value()),
-            "ee_w_st_att": float(self.rn_ee_w_st_att.value()),
-            "ee_w_st_joint": float(self.rn_ee_w_st_joint.value()),
-            "ee_w_st_vel": float(self.rn_ee_w_st_vel.value()),
-            "ee_w_st_omega": float(self.rn_ee_w_st_omega.value()),
-            "ee_w_st_joint_vel": float(self.rn_ee_w_st_joint_vel.value()),
+            "ee_override_joints": bool(self.rn_ee_override_joints.isChecked()),
+            "ee_joint1": float(np.deg2rad(self.rn_ee_joint1_deg.value())),
+            "ee_joint2": float(np.deg2rad(self.rn_ee_joint2_deg.value())),
             "geo_kp_pos": float(self.rn_geo_kp_pos.value()),
             "geo_kd_vel": float(self.rn_geo_kd_vel.value()),
             "geo_kR": float(self.rn_geo_kR.value()),

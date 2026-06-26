@@ -261,7 +261,7 @@ Visualization Manager:
       Marker Topic: /suite_mpc/tracking_error_markers
       Name: Tracking error
       Namespaces:
-        suite_mpc_track_err: true
+        {}
       Queue Size: 10
       Value: true
     - Class: rviz/MarkerArray
@@ -309,7 +309,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 4.857544898986816
+      Distance: 6.824500560760498
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -317,17 +317,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -0.40474608540534973
-        Y: 0.0859147310256958
-        Z: 0.4462587833404541
+        X: -0.04593752324581146
+        Y: 0.11940082162618637
+        Z: 0.5197152495384216
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.0947975143790245
+      Pitch: 0.05479750037193298
       Target Frame: map
-      Yaw: 4.7831573486328125
+      Yaw: 4.713155746459961
     Saved: ~
 Window Geometry:
   Displays:

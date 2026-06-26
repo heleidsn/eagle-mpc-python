@@ -306,6 +306,16 @@ class SuiteTrackingController:
         self.acados_sim_num_stages = int(rospy.get_param("~acados_sim_num_stages", 4))
         self.acados_sim_num_steps = int(rospy.get_param("~acados_sim_num_steps", 1))
         self.acados_as_rti_iter = int(rospy.get_param("~acados_as_rti_iter", 0))
+        # MPC 参考误差限幅（相对当前状态），减轻 RTI 大误差时 QP 病态 / NAN
+        self.mpc_ref_clamp_enabled = bool(rospy.get_param("~mpc_ref_clamp_enabled", True))
+        self.mpc_ref_clamp_pos_m = float(rospy.get_param("~mpc_ref_clamp_pos_m", 1.5))
+        self.mpc_ref_clamp_yaw_deg = float(rospy.get_param("~mpc_ref_clamp_yaw_deg", 90.0))
+        self.mpc_ref_clamp_rp_deg = float(rospy.get_param("~mpc_ref_clamp_rp_deg", 45.0))
+        self.mpc_ref_clamp_lin_vel = float(rospy.get_param("~mpc_ref_clamp_lin_vel", 2.0))
+        self.mpc_ref_clamp_omega = float(rospy.get_param("~mpc_ref_clamp_omega", 2.0))
+        self.mpc_ref_clamp_joint_deg = float(rospy.get_param("~mpc_ref_clamp_joint_deg", 60.0))
+        self.mpc_ref_clamp_joint_vel = float(rospy.get_param("~mpc_ref_clamp_joint_vel", 3.0))
+        self.mpc_ref_clamp_ee_pos_m = float(rospy.get_param("~mpc_ref_clamp_ee_pos_m", 1.5))
 
         # 全状态跟踪权重
         self.w_state_track = rospy.get_param("~w_state_track", 10.0)
@@ -328,20 +338,10 @@ class SuiteTrackingController:
         self.ee_w_vel_lin = rospy.get_param("~ee_w_vel_lin", 1.0)
         self.ee_w_vel_ang_rp = rospy.get_param("~ee_w_vel_ang_rp", 0.5)
         self.ee_w_vel_ang_yaw = rospy.get_param("~ee_w_vel_ang_yaw", 0.5)
-        self.ee_w_u = rospy.get_param("~ee_w_u", 1e-3)
         self.ee_w_terminal = rospy.get_param("~ee_w_terminal", 3.0)
-        # 弱基座参考（沿 x_plan）：抑制 EE 零空间漂移；勿与 ee_w_state_track 混用
-        self.ee_w_base_pos = float(rospy.get_param("~ee_w_base_pos", 3.0))
-        self.ee_w_base_yaw = float(rospy.get_param("~ee_w_base_yaw", 2.0))
-        # EE-centric 模式勿用全状态 w_state_track（会锁关节到 x_plan）；默认 0
-        self.ee_w_state_track = float(rospy.get_param("~ee_w_state_track", 2.0))
-        self.ee_w_state_reg = float(rospy.get_param("~ee_w_state_reg", 0.05))
-        self.ee_w_st_pos = float(rospy.get_param("~ee_w_st_pos", 1.0))
-        self.ee_w_st_att = float(rospy.get_param("~ee_w_st_att", 1.0))
-        self.ee_w_st_joint = float(rospy.get_param("~ee_w_st_joint", 0.2))
-        self.ee_w_st_vel = float(rospy.get_param("~ee_w_st_vel", 0.1))
-        self.ee_w_st_omega = float(rospy.get_param("~ee_w_st_omega", 0.1))
-        self.ee_w_st_joint_vel = float(rospy.get_param("~ee_w_st_joint_vel", 0.05))
+        self.ee_override_joints = bool(rospy.get_param("~ee_override_joints", False))
+        self.ee_joint1 = float(rospy.get_param("~ee_joint1", 0.0))
+        self.ee_joint2 = float(rospy.get_param("~ee_joint2", 0.0))
 
         # PX4 指令限制
         self.max_thrust_total = rospy.get_param("~max_thrust", DEFAULT_MAX_THRUST_TOTAL)  # N
@@ -459,6 +459,8 @@ class SuiteTrackingController:
         self.t_ref_ee: Optional[np.ndarray] = None
         self.p_ref_ee: Optional[np.ndarray] = None
         self.yaw_ref_ee: Optional[np.ndarray] = None
+        self.roll_ref_ee: Optional[np.ndarray] = None
+        self.pitch_ref_ee: Optional[np.ndarray] = None
         self.dp_ref_ee: Optional[np.ndarray] = None
         self.dyaw_ref_ee: Optional[np.ndarray] = None
 
@@ -673,6 +675,8 @@ class SuiteTrackingController:
         )
         self.t_ref_ee = self.t_plan.copy()
         self.p_ref_ee = ee_pos.copy()
+        self.roll_ref_ee = ee_rpy[:, 0].copy()
+        self.pitch_ref_ee = ee_rpy[:, 1].copy()
         self.yaw_ref_ee = ee_rpy[:, 2].copy()
         self.dp_ref_ee, self.dyaw_ref_ee = _compute_ee_vel_refs(
             self.t_ref_ee, self.p_ref_ee, self.yaw_ref_ee
@@ -905,10 +909,7 @@ class SuiteTrackingController:
             int(self.acados_sim_num_steps),
             int(self.acados_as_rti_iter),
             bool(dist_aware),
-            bool(float(getattr(self, "ee_w_base_pos", 0.0)) > 0.0),
-            bool(float(getattr(self, "ee_w_base_yaw", 0.0)) > 0.0),
-            bool(float(getattr(self, "ee_w_st_joint", 0.0)) > 0.0),
-            bool(float(getattr(self, "ee_w_st_joint_vel", 0.0)) > 0.0),
+            bool(float(self.w_state_track) > 0.0),
         )
 
     def _apply_cfg_weights_from_dict(self, cfg: dict) -> None:
@@ -941,6 +942,48 @@ class SuiteTrackingController:
             self.acados_sim_num_steps = int(cfg["acados_sim_num_steps"])
         if "acados_as_rti_iter" in cfg:
             self.acados_as_rti_iter = int(cfg["acados_as_rti_iter"])
+        if "mpc_ref_clamp_enabled" in cfg:
+            self.mpc_ref_clamp_enabled = bool(cfg["mpc_ref_clamp_enabled"])
+        if "mpc_ref_clamp_pos_m" in cfg:
+            self.mpc_ref_clamp_pos_m = float(cfg["mpc_ref_clamp_pos_m"])
+        if "mpc_ref_clamp_yaw_deg" in cfg:
+            self.mpc_ref_clamp_yaw_deg = float(cfg["mpc_ref_clamp_yaw_deg"])
+        if "mpc_ref_clamp_rp_deg" in cfg:
+            self.mpc_ref_clamp_rp_deg = float(cfg["mpc_ref_clamp_rp_deg"])
+        if "mpc_ref_clamp_lin_vel" in cfg:
+            self.mpc_ref_clamp_lin_vel = float(cfg["mpc_ref_clamp_lin_vel"])
+        if "mpc_ref_clamp_omega" in cfg:
+            self.mpc_ref_clamp_omega = float(cfg["mpc_ref_clamp_omega"])
+        if "mpc_ref_clamp_joint_deg" in cfg:
+            self.mpc_ref_clamp_joint_deg = float(cfg["mpc_ref_clamp_joint_deg"])
+        if "mpc_ref_clamp_joint_vel" in cfg:
+            self.mpc_ref_clamp_joint_vel = float(cfg["mpc_ref_clamp_joint_vel"])
+        if "mpc_ref_clamp_ee_pos_m" in cfg:
+            self.mpc_ref_clamp_ee_pos_m = float(cfg["mpc_ref_clamp_ee_pos_m"])
+        self._sync_mpc_ref_limits_to_solver()
+
+    def _mpc_ref_error_limits(self):
+        from s500_uam_acados_state_tracking_mpc import MpcRefErrorLimits
+
+        if not self.mpc_ref_clamp_enabled:
+            return MpcRefErrorLimits.disabled()
+        return MpcRefErrorLimits(
+            enabled=True,
+            max_pos_m=float(self.mpc_ref_clamp_pos_m),
+            max_yaw_rad=float(np.deg2rad(self.mpc_ref_clamp_yaw_deg)),
+            max_roll_pitch_rad=float(np.deg2rad(self.mpc_ref_clamp_rp_deg)),
+            max_lin_vel_mps=float(self.mpc_ref_clamp_lin_vel),
+            max_omega_radps=float(self.mpc_ref_clamp_omega),
+            max_joint_rad=float(np.deg2rad(self.mpc_ref_clamp_joint_deg)),
+            max_joint_vel_radps=float(self.mpc_ref_clamp_joint_vel),
+            max_ee_pos_m=float(self.mpc_ref_clamp_ee_pos_m),
+        )
+
+    def _sync_mpc_ref_limits_to_solver(self) -> None:
+        limits = self._mpc_ref_error_limits()
+        for mpc_obj in (self.mpc, self.mpc_reg):
+            if mpc_obj is not None and hasattr(mpc_obj, "ref_error_limits"):
+                mpc_obj.ref_error_limits = limits
 
     def _clear_mpc_warm_start(self) -> None:
         """权重/结构更新后丢弃旧 horizon 初值，避免热更新后行为看似不变。"""
@@ -981,6 +1024,7 @@ class SuiteTrackingController:
                 finally:
                     self._mpc_rebuilding = False
                 self.mpc_reg = self.mpc
+                self._sync_mpc_ref_limits_to_solver()
                 self._clear_mpc_warm_start()
                 return (
                     "acados cost weights updated (runtime cost_set); "
@@ -995,25 +1039,30 @@ class SuiteTrackingController:
                     self.mpc.update_cost_weights(
                         w_ee_pos=self.ee_w_pos,
                         w_ee_yaw=self.ee_w_rot_yaw,
-                        w_base_pos=self.ee_w_base_pos,
-                        w_base_yaw=self.ee_w_base_yaw,
-                        w_joint_track=self.ee_w_st_joint,
-                        w_joint_vel_track=self.ee_w_st_joint_vel,
-                        w_control=self.ee_w_u,
+                        w_ee_rot_rp=self.ee_w_rot_rp,
+                        w_state_track=self.w_state_track,
+                        w_pos=self.w_pos,
+                        w_att=self.w_att,
+                        w_joint=self.w_joint,
+                        w_vel=self.w_vel,
+                        w_omega=self.w_omega,
+                        w_joint_vel=self.w_joint_vel,
+                        w_control=self.w_control,
                         w_u_thrust=self.w_u_thrust,
                         w_u_joint_torque=self.w_u_joint_torque,
                         w_terminal_scale=self.ee_w_terminal,
+                        w_terminal_track=self.w_terminal_track,
                         max_iter=self.mpc_max_iter,
                     )
                 finally:
                     self._mpc_rebuilding = False
                 self.mpc_reg = self.mpc
+                self._sync_mpc_ref_limits_to_solver()
                 self._clear_mpc_warm_start()
                 return (
                     "acados-ee cost weights updated (runtime cost_set); "
                     f"ee_w_pos={self.ee_w_pos:g}, ee_w_yaw={self.ee_w_rot_yaw:g}, "
-                    f"ee_w_base_pos={self.ee_w_base_pos:g}, ee_w_base_yaw={self.ee_w_base_yaw:g}, "
-                    f"st_joint={self.ee_w_st_joint:g}, st_joint_vel={self.ee_w_st_joint_vel:g}"
+                    f"w_state_track={self.w_state_track:g}, w_joint={self.w_joint:g}"
                 )
         if self.controller_mode == "croc_full_state":
             if same_structure and hasattr(self.mpc, "update_cost_weights"):
@@ -1044,24 +1093,25 @@ class SuiteTrackingController:
         if self.controller_mode == "croc_ee_pose":
             if same_structure and hasattr(self.mpc, "update_cost_weights"):
                 self.mpc.update_cost_weights(
-                    w_pos=self.ee_w_pos,
-                    w_rot_rp=self.ee_w_rot_rp,
-                    w_rot_yaw=self.ee_w_rot_yaw,
-                    w_vel_lin=self.ee_w_vel_lin,
-                    w_vel_ang_rp=self.ee_w_vel_ang_rp,
-                    w_vel_ang_yaw=self.ee_w_vel_ang_yaw,
-                    w_u=self.ee_w_u,
-                    w_terminal_scale=self.ee_w_terminal,
-                    w_base_pos=self.ee_w_base_pos,
-                    w_base_yaw=self.ee_w_base_yaw,
-                    w_state_reg=self.ee_w_state_reg,
-                    w_state_track=self.ee_w_state_track,
-                    w_st_pos=self.ee_w_st_pos,
-                    w_st_att=self.ee_w_st_att,
-                    w_st_joint=self.ee_w_st_joint,
-                    w_st_vel=self.ee_w_st_vel,
-                    w_st_omega=self.ee_w_st_omega,
-                    w_st_joint_vel=self.ee_w_st_joint_vel,
+                    ee_w_pos=self.ee_w_pos,
+                    ee_w_rot_rp=self.ee_w_rot_rp,
+                    ee_w_rot_yaw=self.ee_w_rot_yaw,
+                    ee_w_vel_lin=self.ee_w_vel_lin,
+                    ee_w_vel_ang_rp=self.ee_w_vel_ang_rp,
+                    ee_w_vel_ang_yaw=self.ee_w_vel_ang_yaw,
+                    ee_w_terminal_scale=self.ee_w_terminal,
+                    w_state_track=self.w_state_track,
+                    w_state_reg=self.w_state_reg,
+                    w_control=self.w_control,
+                    w_terminal_track=self.w_terminal_track,
+                    w_pos=self.w_pos,
+                    w_att=self.w_att,
+                    w_joint=self.w_joint,
+                    w_vel=self.w_vel,
+                    w_omega=self.w_omega,
+                    w_joint_vel=self.w_joint_vel,
+                    w_u_thrust=self.w_u_thrust,
+                    w_u_joint_torque=self.w_u_joint_torque,
                     dt_mpc=self.dt_mpc,
                     horizon=self.horizon,
                 )
@@ -1069,8 +1119,7 @@ class SuiteTrackingController:
                 return (
                     "croc-ee cost weights updated (in-place); "
                     f"ee_w_pos={self.ee_w_pos:g}, ee_w_yaw={self.ee_w_rot_yaw:g}, "
-                    f"ee_w_base={self.ee_w_base_pos:g}, ee_w_base_yaw={self.ee_w_base_yaw:g}, "
-                    f"ee_w_state_track={self.ee_w_state_track:g}"
+                    f"w_state_track={self.w_state_track:g}, w_joint={self.w_joint:g}"
                 )
 
         self._build_mpc()
@@ -1159,6 +1208,7 @@ class SuiteTrackingController:
                 sim_num_steps=self.acados_sim_num_steps,
                 as_rti_iter=self.acados_as_rti_iter,
                 dist_aware=(str(self.l1_inject).lower() == "in_model"),
+                ref_error_limits=self._mpc_ref_error_limits(),
             )
             # acados full-state solver也用于 regulation（常值参考）
             self.mpc_reg = self.mpc
@@ -1188,14 +1238,19 @@ class SuiteTrackingController:
                 horizon=self.horizon,
                 w_ee_pos=self.ee_w_pos,
                 w_ee_yaw=self.ee_w_rot_yaw,
-                w_base_pos=self.ee_w_base_pos,
-                w_base_yaw=self.ee_w_base_yaw,
-                w_joint_track=self.ee_w_st_joint,
-                w_joint_vel_track=self.ee_w_st_joint_vel,
-                w_control=self.ee_w_u,
+                w_ee_rot_rp=self.ee_w_rot_rp,
+                w_state_track=self.w_state_track,
+                w_pos=self.w_pos,
+                w_att=self.w_att,
+                w_joint=self.w_joint,
+                w_vel=self.w_vel,
+                w_omega=self.w_omega,
+                w_joint_vel=self.w_joint_vel,
+                w_control=self.w_control,
                 w_u_thrust=self.w_u_thrust,
                 w_u_joint_torque=self.w_u_joint_torque,
                 w_terminal_scale=self.ee_w_terminal,
+                w_terminal_track=self.w_terminal_track,
                 max_iter=self.mpc_max_iter,
                 solver_mode=self.acados_solver_mode,
                 integrator_type=self.acados_integrator,
@@ -1206,6 +1261,7 @@ class SuiteTrackingController:
                 sim_num_steps=self.acados_sim_num_steps,
                 as_rti_iter=self.acados_as_rti_iter,
                 dist_aware=(str(self.l1_inject).lower() == "in_model"),
+                ref_error_limits=self._mpc_ref_error_limits(),
             )
             self.mpc_reg = self.mpc
             try:
@@ -1220,6 +1276,8 @@ class SuiteTrackingController:
                         self.t_ref_ee,
                         self.p_ref_ee,
                         self.yaw_ref_ee,
+                        self.roll_ref_ee,
+                        self.pitch_ref_ee,
                         iters=8,
                     )
                     self.mpc.reset_warm_start()
@@ -1243,30 +1301,17 @@ class SuiteTrackingController:
                 w_vel_lin=self.ee_w_vel_lin,
                 w_vel_ang_rp=self.ee_w_vel_ang_rp,
                 w_vel_ang_yaw=self.ee_w_vel_ang_yaw,
-                w_u=self.ee_w_u,
                 w_terminal_scale=self.ee_w_terminal,
-                w_base_pos=self.ee_w_base_pos,
-                w_base_yaw=self.ee_w_base_yaw,
-                w_state_reg=self.ee_w_state_reg,
-                w_state_track=self.ee_w_state_track,
-                w_st_pos=self.ee_w_st_pos,
-                w_st_att=self.ee_w_st_att,
-                w_st_joint=self.ee_w_st_joint,
-                w_st_vel=self.ee_w_st_vel,
-                w_st_omega=self.ee_w_st_omega,
-                w_st_joint_vel=self.ee_w_st_joint_vel,
             )
             rospy.loginfo(
-                "[croc_ee_pose] EE weights: w_pos=%.2f w_yaw=%.2f w_u=%.2g "
-                "w_base=%.2f w_base_yaw=%.2f w_state_track=%.2f (st_joint=%.2f) w_state_reg=%.2f",
+                "[croc_ee_pose] EE task w_pos=%.2f w_yaw=%.2f | state ref "
+                "w_state_track=%.2f w_joint=%.2f w_state_reg=%.2f w_control=%.2g",
                 float(self.ee_w_pos),
                 float(self.ee_w_rot_yaw),
-                float(self.ee_w_u),
-                float(self.ee_w_base_pos),
-                float(self.ee_w_base_yaw),
-                float(self.ee_w_state_track),
-                float(self.ee_w_st_joint),
-                float(self.ee_w_state_reg),
+                float(self.w_state_track),
+                float(self.w_joint),
+                float(self.w_state_reg),
+                float(self.w_control),
             )
             self.mpc = UAMEEPoseTrackingCrocoddylMPC(
                 s500_yaml_path=s500_yaml_path,
@@ -1274,6 +1319,18 @@ class SuiteTrackingController:
                 dt_mpc=self.dt_mpc,
                 horizon=self.horizon,
                 u_weights=ee_weights,
+                w_state_track=self.w_state_track,
+                w_state_reg=self.w_state_reg,
+                w_control=self.w_control,
+                w_terminal_track=self.w_terminal_track,
+                w_pos=self.w_pos,
+                w_att=self.w_att,
+                w_joint=self.w_joint,
+                w_vel=self.w_vel,
+                w_omega=self.w_omega,
+                w_joint_vel=self.w_joint_vel,
+                w_u_thrust=self.w_u_thrust,
+                w_u_joint_torque=self.w_u_joint_torque,
                 use_thrust_constraints=True,
             )
             # EE-pose 模式下，regulation 需要单独的全状态 MPC
@@ -1882,65 +1939,36 @@ class SuiteTrackingController:
     # =========================================================================
 
     def _ee_croc_use_plan_aux(self) -> bool:
-        """croc EE 是否需要 x_plan 提供弱基座/全状态辅助参考。"""
-        return (
-            float(self.ee_w_state_track) > 0.0
-            or float(self.ee_w_base_pos) > 0.0
-            or float(self.ee_w_base_yaw) > 0.0
-        )
+        """croc/acados EE 是否在代价中使用 x_plan 全状态参考。"""
+        return float(self.w_state_track) > 0.0
 
     def _ee_pose_ref_from_state(self, x_ref: np.ndarray) -> Tuple[np.ndarray, float]:
         """从全状态向量 FK 得到 EE 世界位置与 yaw（rad）。"""
-        p_ee = self._ee_world_from_full_state(x_ref)
-        if p_ee is None:
-            raise ValueError("EE FK unavailable for reference state")
-        _, _, yaw = euler_from_quaternion(
-            np.asarray(x_ref[3:7], dtype=float).reshape(4).tolist()
-        )
+        p_ee, _, _, yaw = self._ee_full_pose_ref_from_state(x_ref)
         return np.asarray(p_ee, dtype=float).reshape(3), float(yaw)
 
-    def _acados_ee_p_base_ref(self) -> Optional[np.ndarray]:
-        """可选弱基座位置参考（与 plan 同步）。"""
-        if float(self.ee_w_base_pos) <= 0.0 or self.x_plan is None:
-            return None
-        p = np.asarray(self.x_plan, dtype=float)
-        if p.ndim != 2 or p.shape[1] < 3:
-            return None
-        return p[:, 0:3].copy()
+    def _ee_full_pose_ref_from_state(
+        self, x_ref: np.ndarray
+    ) -> Tuple[np.ndarray, float, float, float]:
+        """FK：EE 位置 + roll/pitch/yaw（rad，Pinocchio RPY 顺序）。"""
+        x_ref = np.asarray(x_ref, dtype=float).flatten()
+        if self.mpc is None:
+            raise ValueError("MPC not initialized")
+        rm = self.mpc.robot_model
+        eid = int(self.mpc.ee_frame_id)
+        data = rm.createData()
+        p, _, rpy, _ = compute_ee_kinematics_along_trajectory(
+            x_ref.reshape(1, -1), rm, data, eid
+        )
+        return (
+            np.asarray(p[0], dtype=float).reshape(3),
+            float(rpy[0, 0]),
+            float(rpy[0, 1]),
+            float(rpy[0, 2]),
+        )
 
-    def _acados_ee_yaw_base_ref(self) -> Optional[np.ndarray]:
-        """可选弱基座 yaw 参考（与 plan 同步）。"""
-        if float(self.ee_w_base_yaw) <= 0.0 or self.x_plan is None:
-            return None
-        from s500_uam_crocoddyl_state_tracking_mpc import _yaw_from_full_state
-
-        x = np.asarray(self.x_plan, dtype=float)
-        if x.ndim != 2:
-            return None
-        return np.array([_yaw_from_full_state(x[i]) for i in range(x.shape[0])], dtype=float)
-
-    def _acados_ee_joint_refs(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """沿 x_plan 的关节角 / 关节角速度参考（与 t_ref_ee 时间轴一致）。"""
-        if self.x_plan is None:
-            return None, None
-        x = np.asarray(self.x_plan, dtype=float)
-        if x.ndim != 2:
-            return None, None
-        if hasattr(self, "mpc") and hasattr(self.mpc, "nq"):
-            nq = int(self.mpc.nq)
-            na = int(self.mpc.n_arm)
-        else:
-            nq = int(x.shape[1] // 2)
-            na = max(0, nq - 7)
-        if na <= 0:
-            return None, None
-        q_ref = None
-        qd_ref = None
-        if float(self.ee_w_st_joint) > 0.0:
-            q_ref = x[:, 7 : 7 + na].copy()
-        if float(self.ee_w_st_joint_vel) > 0.0:
-            qd_ref = x[:, nq + 6 : nq + 6 + na].copy()
-        return q_ref, qd_ref
+    def _ee_joint_override_q(self) -> Tuple[float, float]:
+        return float(self.ee_joint1), float(self.ee_joint2)
 
     def _solve_acados_ee(
         self,
@@ -1949,11 +1977,11 @@ class SuiteTrackingController:
         t_ee_ref: np.ndarray,
         p_ee_ref: np.ndarray,
         yaw_ee_ref: np.ndarray,
+        roll_ee_ref: np.ndarray,
+        pitch_ee_ref: np.ndarray,
         *,
-        p_base_ref: Optional[np.ndarray] = None,
-        yaw_base_ref: Optional[np.ndarray] = None,
-        joint_ref: Optional[np.ndarray] = None,
-        joint_vel_ref: Optional[np.ndarray] = None,
+        t_plan: Optional[np.ndarray] = None,
+        x_plan: Optional[np.ndarray] = None,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         try:
             thrust_hint = (
@@ -1962,20 +1990,28 @@ class SuiteTrackingController:
                 else 0.0
             )
             p_dist = self._dist_wrench_for_mpc(thrust_hint)
+            if t_plan is None and x_plan is None and self._ee_croc_use_plan_aux():
+                t_plan = self.t_plan
+                x_plan = self.x_plan
             u_opt, x_next, status = self.mpc.solve_step(
                 x_now,
                 t_query,
                 t_ee_ref,
                 p_ee_ref,
                 yaw_ee_ref,
-                p_base_ref=p_base_ref,
-                yaw_base_ref=yaw_base_ref,
-                joint_ref=joint_ref,
-                joint_vel_ref=joint_vel_ref,
+                roll_ee_ref,
+                pitch_ee_ref,
+                t_plan=t_plan,
+                x_plan=x_plan,
+                joint_override=bool(self.ee_override_joints),
+                joint_override_q=self._ee_joint_override_q(),
                 p_dist=p_dist,
             )
-            if status not in (0, 2):
+            if status not in (0, 2) or u_opt is None:
                 rospy.logwarn_throttle(1.0, f"[acados-ee] solve status={status}")
+                self._capture_acados_mpc_diagnostics(self.mpc, status)
+                self._mpc_xs_horizon = None
+                return None, None
             self._capture_acados_mpc_diagnostics(self.mpc, status)
             self._xs_guess = getattr(self.mpc, "last_xs", None)
             self._mpc_xs_horizon = getattr(self.mpc, "last_xs", None)
@@ -2004,10 +2040,13 @@ class SuiteTrackingController:
                 u_opt, x_next, status = self.mpc.solve_step(
                     x_now, t_query, self.t_plan, self.x_plan, p_dist=p_dist
                 )
-                if status not in (0, 2):
+                if status not in (0, 2) or u_opt is None:
                     rospy.logwarn_throttle(
                         1.0, f"[acados] solve status={status}"
                     )
+                    self._capture_acados_mpc_diagnostics(self.mpc, status)
+                    self._mpc_xs_horizon = None
+                    return None, None
                 self._capture_acados_mpc_diagnostics(self.mpc, status)
                 # expose full solved horizon for planned-path visualization (RViz)
                 self._xs_guess = getattr(self.mpc, "last_xs", None)
@@ -2020,17 +2059,14 @@ class SuiteTrackingController:
                 return None, None
 
         if self.controller_mode == "acados_ee_pose":
-            jref, jvref = self._acados_ee_joint_refs()
             return self._solve_acados_ee(
                 x_now,
                 t_query,
                 self.t_ref_ee,
                 self.p_ref_ee,
                 self.yaw_ref_ee,
-                p_base_ref=self._acados_ee_p_base_ref(),
-                yaw_base_ref=self._acados_ee_yaw_base_ref(),
-                joint_ref=jref,
-                joint_vel_ref=jvref,
+                self.roll_ref_ee,
+                self.pitch_ref_ee,
             )
 
         try:
@@ -2052,8 +2088,12 @@ class SuiteTrackingController:
                     self.yaw_ref_ee,
                     self.dp_ref_ee,
                     self.dyaw_ref_ee,
+                    self.roll_ref_ee,
+                    self.pitch_ref_ee,
                     t_plan=self.t_plan if use_xplan else None,
                     x_plan=self.x_plan if use_xplan else None,
+                    joint_override=bool(self.ee_override_joints),
+                    joint_override_q=self._ee_joint_override_q(),
                 )
 
             solver = crocoddyl.SolverBoxFDDP(prob)
@@ -2149,8 +2189,11 @@ class SuiteTrackingController:
                 u_opt, x_next, status = self.mpc.solve_step(
                     x_now, 0.0, t_reg, x_reg, p_dist=p_dist
                 )
-                if status not in (0, 2):
+                if status not in (0, 2) or u_opt is None:
                     rospy.logwarn_throttle(1.0, f"[acados-reg] solve status={status}")
+                    self._capture_acados_mpc_diagnostics(self.mpc, status)
+                    self._mpc_xs_horizon = None
+                    return None, None
                 self._capture_acados_mpc_diagnostics(self.mpc, status)
                 # expose full solved horizon for planned-path visualization (RViz)
                 self._reg_xs_guess = getattr(self.mpc, "last_xs", None)
@@ -2164,50 +2207,40 @@ class SuiteTrackingController:
 
         if self.controller_mode == "acados_ee_pose":
             try:
-                p_ee, yaw_ee = self._ee_pose_ref_from_state(x_tgt)
+                p_ee, roll_ee, pitch_ee, yaw_ee = self._ee_full_pose_ref_from_state(x_tgt)
             except Exception as e:
                 rospy.logwarn_throttle(1.0, f"[acados-ee-reg] EE ref failed: {e}")
                 return None, None
             t_const = np.array([0.0, float(H) * dt], dtype=float)
             p_const = np.vstack([p_ee, p_ee])
             yaw_const = np.array([yaw_ee, yaw_ee], dtype=float)
-            p_base = None
-            yaw_base = None
-            if float(self.ee_w_base_pos) > 0.0:
-                p_base = np.vstack([x_tgt[0:3], x_tgt[0:3]])
-            if float(self.ee_w_base_yaw) > 0.0:
-                from s500_uam_crocoddyl_state_tracking_mpc import _yaw_from_full_state
-
-                yb = float(_yaw_from_full_state(x_tgt))
-                yaw_base = np.array([yb, yb], dtype=float)
-            jref = None
-            jvref = None
-            na = int(getattr(self.mpc, "n_arm", 0))
-            nq = int(getattr(self.mpc, "nq", 0))
-            if na > 0 and float(self.ee_w_st_joint) > 0.0:
-                qj = np.asarray(x_tgt[7 : 7 + na], dtype=float).reshape(1, -1)
-                jref = np.vstack([qj, qj])
-            if na > 0 and float(self.ee_w_st_joint_vel) > 0.0:
-                qdj = np.asarray(x_tgt[nq + 6 : nq + 6 + na], dtype=float).reshape(1, -1)
-                jvref = np.vstack([qdj, qdj])
+            roll_const = np.array([roll_ee, roll_ee], dtype=float)
+            pitch_const = np.array([pitch_ee, pitch_ee], dtype=float)
+            t_plan = None
+            x_plan = None
+            if self._ee_croc_use_plan_aux():
+                t_plan = t_const
+                x_plan = np.vstack([x_tgt, x_tgt])
             return self._solve_acados_ee(
                 x_now,
                 0.0,
                 t_const,
                 p_const,
                 yaw_const,
-                p_base_ref=p_base,
-                yaw_base_ref=yaw_base,
-                joint_ref=jref,
-                joint_vel_ref=jvref,
+                roll_const,
+                pitch_const,
+                t_plan=t_plan,
+                x_plan=x_plan,
             )
 
         if self.controller_mode == "croc_ee_pose":
             try:
-                p_ee, yaw_ee = self._ee_pose_ref_from_state(x_tgt)
+                p_ee, roll_ee, pitch_ee, yaw_ee = self._ee_full_pose_ref_from_state(x_tgt)
                 t_const = np.array([0.0, max(float(H) * dt, 1e-3)], dtype=float)
                 p_const = np.vstack([p_ee, p_ee])
                 yaw_const = np.array([yaw_ee, yaw_ee], dtype=float)
+                roll_const = np.array([roll_ee, roll_ee], dtype=float)
+                pitch_const = np.array([pitch_ee, pitch_ee], dtype=float)
                 dp_const = np.zeros((2, 3), dtype=float)
                 dyaw_const = np.zeros(2, dtype=float)
                 use_xplan = self._ee_croc_use_plan_aux()
@@ -2219,8 +2252,12 @@ class SuiteTrackingController:
                     yaw_const,
                     dp_const,
                     dyaw_const,
+                    roll_const,
+                    pitch_const,
                     t_plan=t_reg if use_xplan else None,
                     x_plan=x_reg if use_xplan else None,
+                    joint_override=bool(self.ee_override_joints),
+                    joint_override_q=self._ee_joint_override_q(),
                 )
                 solver = crocoddyl.SolverBoxFDDP(prob)
                 solver.convergence_init = 1e-9
@@ -4651,7 +4688,13 @@ class SuiteTrackingController:
                 and hasattr(self, "p_ref_ee")
             ):
                 self.mpc.warmup(
-                    x0, self.t_ref_ee, self.p_ref_ee, self.yaw_ref_ee, iters=iters
+                    x0,
+                    self.t_ref_ee,
+                    self.p_ref_ee,
+                    self.yaw_ref_ee,
+                    self.roll_ref_ee,
+                    self.pitch_ref_ee,
+                    iters=iters,
                 )
                 self._xs_guess = getattr(self.mpc, "last_xs", None)
             else:
@@ -4998,24 +5041,12 @@ class SuiteTrackingController:
                 self.ee_w_vel_ang_yaw = float(
                     cfg.get("ee_w_vel_ang_yaw", self.ee_w_vel_ang_yaw)
                 )
-                self.ee_w_u = float(cfg.get("ee_w_u", self.ee_w_u))
                 self.ee_w_terminal = float(cfg.get("ee_w_terminal", self.ee_w_terminal))
-                self.ee_w_base_pos = float(cfg.get("ee_w_base_pos", self.ee_w_base_pos))
-                self.ee_w_base_yaw = float(cfg.get("ee_w_base_yaw", self.ee_w_base_yaw))
-                self.ee_w_state_track = float(
-                    cfg.get("ee_w_state_track", self.ee_w_state_track)
+                self.ee_override_joints = bool(
+                    cfg.get("ee_override_joints", self.ee_override_joints)
                 )
-                self.ee_w_state_reg = float(
-                    cfg.get("ee_w_state_reg", self.ee_w_state_reg)
-                )
-                self.ee_w_st_pos = float(cfg.get("ee_w_st_pos", self.ee_w_st_pos))
-                self.ee_w_st_att = float(cfg.get("ee_w_st_att", self.ee_w_st_att))
-                self.ee_w_st_joint = float(cfg.get("ee_w_st_joint", self.ee_w_st_joint))
-                self.ee_w_st_vel = float(cfg.get("ee_w_st_vel", self.ee_w_st_vel))
-                self.ee_w_st_omega = float(cfg.get("ee_w_st_omega", self.ee_w_st_omega))
-                self.ee_w_st_joint_vel = float(
-                    cfg.get("ee_w_st_joint_vel", self.ee_w_st_joint_vel)
-                )
+                self.ee_joint1 = float(cfg.get("ee_joint1", self.ee_joint1))
+                self.ee_joint2 = float(cfg.get("ee_joint2", self.ee_joint2))
 
                 self.geo_kp_pos = float(cfg.get("geo_kp_pos", self.geo_kp_pos))
                 self.geo_kd_vel = float(cfg.get("geo_kd_vel", self.geo_kd_vel))

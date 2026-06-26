@@ -1,27 +1,20 @@
 #!/usr/bin/env python3
 """Real-time Acados EE-centric NMPC for ROS tracking.
 
-Cost (NONLINEAR_LS, diagonal W) — three explicit layers
--------------------------------------------------------
-**L1 Task** (always, terminal + running):
-  ``[p_ee(3), cos(ψ_ee), sin(ψ_ee)]``  weights ``w_ee_pos``, ``w_ee_yaw`` (×2)
+Cost (NONLINEAR_LS, diagonal W) — two layers
+---------------------------------------------
+**EE task** (always, terminal × ``w_terminal_scale``):
+  ``[p_ee(3), yaw_ee, roll_ee, pitch_ee]``  weights ``w_ee_pos``, ``w_ee_yaw``, ``w_ee_rot_rp`` (×2)
 
-**L2 Null-space aux** (optional, from ``x_plan`` via ``yref``):
-  ``[p_base(3)]``           if ``w_base_pos > 0``
-  ``[cos(ψ_base), sin(ψ_base)]``  if ``w_base_yaw > 0``
-  ``[q_joint(n_a)]``        if ``w_joint_track > 0``
-  ``[q̇_joint(n_a)]``       if ``w_joint_vel_track > 0``
+**State reference** (optional, same layout as ``acados_full_state``; ``w_state_track=0`` → off):
+  ``[pos(3), yaw, roll, pitch, q_joint, v_lin(3), ω(3), q̇_joint]`` along ``x_plan``
+  weights ``w_state_track × {w_pos, w_att, w_joint, w_vel, w_omega, w_joint_vel}``;
+  terminal state block × ``w_terminal_track``.
 
-**L3 Control reg** (running stages only):
-  ``[u]``  thrust ``w_control * w_u_thrust``; joint torque ``w_control * w_u_joint_torque * 1e4``
-  ``yref`` for ``u`` = hover thrust (not plan controls).
+**Control reg** (running only):
+  ``[u]``  ``w_control × w_u_thrust / w_u_joint_torque``
 
-Terminal uses L1 (+ L2); L3 omitted at stage N.
-
-Unlike Croc ``croc_ee_pose``, there is no full-state ``x_track`` or EE roll/pitch/velocity
-in this OCP — tune null-space via L2 (base + joint refs along ``x_plan``).
-
-Counterpart of offline ``s500_uam_ee_snap_tracking_mpc.create_ee_tracking_mpc_solver``;
+Counterpart of offline ``s500_uam_ee_snap_tracking_mpc`` EE task + full-state aux;
 integrated with ``run_tracking_controller`` mode ``acados_ee_pose``.
 """
 
@@ -62,6 +55,14 @@ try:
         _ACADOS_CODEGEN_QP_ITER_MAX,
         _align_ocp_with_cached_json,
         _apply_runtime_solver_options,
+        ACADOS_OK_STATUSES,
+        MpcRefErrorLimits,
+        acados_mpc_extract_solution,
+        acados_mpc_run_solve,
+        acados_solution_finite,
+        clamp_mpc_ee_pose_reference,
+        clamp_mpc_state_reference,
+        sanitize_mpc_state,
     )
     from s500_uam_acados_trajectory import (
         STATE_LIMITS,
@@ -69,7 +70,7 @@ try:
     )
     from s500_uam_ee_snap_tracking_mpc import (
         EE_FRAME_NAME,
-        _casadi_ee_heading_cs_expr,
+        _casadi_ee_rpy_zyx_expr,
         _casadi_ee_translation_expr,
     )
 
@@ -93,40 +94,26 @@ class _CostSegment:
     weights: Tuple[float, ...]
 
 
-def _casadi_base_yaw_cs_expr(x_sym: "ca.SX") -> Tuple["ca.SX", "ca.SX"]:
-    """Base body yaw (world Z) as (cos, sin) — same convention as EE heading."""
+def _casadi_state_y_expr(x_sym: "ca.SX", nq: int, n_arm: int) -> "ca.SX":
+    """Full-state LS output (no controls); matches ``acados_full_state`` layout."""
     from s500_uam_acados_state_tracking_mpc import _quat_to_euler_zyx_ca
 
-    _roll, _pitch, yaw = _quat_to_euler_zyx_ca(x_sym[3:7])
-    return ca.cos(yaw), ca.sin(yaw)
+    quat = x_sym[3:7]
+    roll, pitch, yaw = _quat_to_euler_zyx_ca(quat)
+    pieces: List["ca.SX"] = [x_sym[0:3], ca.vertcat(yaw, roll, pitch)]
+    if n_arm > 0:
+        pieces.append(x_sym[7 : 7 + n_arm])
+    pieces.append(x_sym[nq : nq + 6])
+    if n_arm > 0:
+        pieces.append(x_sym[nq + 6 : nq + 6 + n_arm])
+    return ca.vertcat(*pieces)
 
 
-def _codegen_aux_suffix(
-    *,
-    w_base_pos: float,
-    w_base_yaw: float,
-    w_joint_track: float = 0.0,
-    w_joint_vel_track: float = 0.0,
-) -> str:
-    """Codegen cache dir tag for optional L2 aux blocks (structure-changing)."""
-    has_p = float(w_base_pos) > 0.0
-    has_y = float(w_base_yaw) > 0.0
-    has_j = float(w_joint_track) > 0.0
-    has_jv = float(w_joint_vel_track) > 0.0
-    if not (has_p or has_y or has_j or has_jv):
+def _codegen_state_suffix(*, w_state_track: float, n_arm: int) -> str:
+    """Codegen cache dir tag when optional state-reference block is enabled."""
+    if float(w_state_track) <= 0.0:
         return ""
-    if has_p and not (has_y or has_j or has_jv):
-        return "_bp"  # legacy cache name (base position only)
-    tag = "_aux"
-    if has_p:
-        tag += "p"
-    if has_y:
-        tag += "y"
-    if has_j:
-        tag += "j"
-    if has_jv:
-        tag += "v"
-    return tag
+    return f"_st{int(n_arm)}"
 
 
 def _interp_scalar(t: float, t_grid: np.ndarray, y_grid: np.ndarray) -> float:
@@ -147,6 +134,22 @@ def _interp_vec3(t: float, t_grid: np.ndarray, p_grid: np.ndarray) -> np.ndarray
         [_interp_scalar(t, t_grid, p[:, i]) for i in range(min(3, p.shape[1]))],
         dtype=float,
     )
+
+
+def _apply_plan_joint_override(
+    x_ref: Optional[np.ndarray],
+    *,
+    enabled: bool,
+    joint_q: Tuple[float, float],
+) -> Optional[np.ndarray]:
+    """Replace planned arm joint angles in ``x_ref`` when override is enabled."""
+    if not enabled or x_ref is None:
+        return x_ref
+    x = np.asarray(x_ref, dtype=float).reshape(-1).copy()
+    if x.size >= 9:
+        x[7] = float(joint_q[0])
+        x[8] = float(joint_q[1])
+    return x
 
 
 def _interp_rows(t: float, t_grid: np.ndarray, y_grid: np.ndarray) -> np.ndarray:
@@ -171,14 +174,19 @@ class AcadosEECentricRealtimeMPC:
         horizon: int,
         w_ee_pos: float = 500.0,
         w_ee_yaw: float = 200.0,
-        w_base_pos: float = 3.0,
-        w_base_yaw: float = 2.0,
-        w_joint_track: float = 0.2,
-        w_joint_vel_track: float = 0.05,
+        w_ee_rot_rp: float = 1.0,
+        w_state_track: float = 0.0,
+        w_pos: float = 1.0,
+        w_att: float = 1.0,
+        w_joint: float = 1.0,
+        w_vel: float = 1.0,
+        w_omega: float = 1.0,
+        w_joint_vel: float = 1.0,
         w_control: float = 1e-4,
         w_u_thrust: float = 1.0,
         w_u_joint_torque: float = 1.0,
-        w_terminal_scale: float = 2.0,
+        w_terminal_scale: float = 3.0,
+        w_terminal_track: float = 100.0,
         max_iter: int = 40,
         solver_mode: str = "rti",
         integrator_type: str = "ERK",
@@ -189,6 +197,7 @@ class AcadosEECentricRealtimeMPC:
         sim_num_steps: int = 1,
         as_rti_iter: int = 0,
         dist_aware: bool = False,
+        ref_error_limits: Optional[MpcRefErrorLimits] = None,
     ):
         if not ACADOS_AVAILABLE:
             raise ImportError("acados_template not installed")
@@ -208,6 +217,7 @@ class AcadosEECentricRealtimeMPC:
         self.sim_num_steps = int(sim_num_steps)
         self.as_rti_iter = int(as_rti_iter)
         self.dist_aware = bool(dist_aware)
+        self.ref_error_limits = ref_error_limits
 
         self.s500_config = load_s500_config()
         if self.dist_aware:
@@ -236,6 +246,7 @@ class AcadosEECentricRealtimeMPC:
         if fid < 0 or fid >= pin_model.nframes:
             raise ValueError(f"Frame '{EE_FRAME_NAME}' not found in URDF")
         self.ee_frame_id = fid
+        self._pin_data = pin_model.createData()
 
         plat = self.s500_config["platform"]
         self.min_thrust = float(plat["min_thrust"])
@@ -244,14 +255,19 @@ class AcadosEECentricRealtimeMPC:
         self._store_cost_weights(
             w_ee_pos=w_ee_pos,
             w_ee_yaw=w_ee_yaw,
-            w_base_pos=w_base_pos,
-            w_base_yaw=w_base_yaw,
-            w_joint_track=w_joint_track,
-            w_joint_vel_track=w_joint_vel_track,
+            w_ee_rot_rp=w_ee_rot_rp,
+            w_state_track=w_state_track,
+            w_pos=w_pos,
+            w_att=w_att,
+            w_joint=w_joint,
+            w_vel=w_vel,
+            w_omega=w_omega,
+            w_joint_vel=w_joint_vel,
             w_control=w_control,
             w_u_thrust=w_u_thrust,
             w_u_joint_torque=w_u_joint_torque,
             w_terminal_scale=w_terminal_scale,
+            w_terminal_track=w_terminal_track,
         )
         self._build_solver(max_iter=max_iter)
 
@@ -333,31 +349,32 @@ class AcadosEECentricRealtimeMPC:
         for k, v in kw.items():
             setattr(self, k, float(v))
 
-    def _use_base_pos(self) -> bool:
-        return float(self.w_base_pos) > 0.0
+    def _use_state_track(self) -> bool:
+        return float(self.w_state_track) > 0.0
 
-    def _use_base_yaw(self) -> bool:
-        return float(self.w_base_yaw) > 0.0
+    def _state_codegen_kwargs(self) -> dict:
+        return dict(w_state_track=float(self.w_state_track), n_arm=self.n_arm)
 
-    def _use_joint_track(self) -> bool:
-        return float(self.w_joint_track) > 0.0
-
-    def _use_joint_vel_track(self) -> bool:
-        return float(self.w_joint_vel_track) > 0.0
-
-    def _joint_q_slice(self) -> slice:
-        return slice(7, 7 + self.n_arm)
-
-    def _joint_v_slice(self) -> slice:
-        return slice(self.nq + 6, self.nq + 6 + self.n_arm)
-
-    def _aux_codegen_kwargs(self) -> dict:
-        return dict(
-            w_base_pos=float(self.w_base_pos),
-            w_base_yaw=float(self.w_base_yaw),
-            w_joint_track=float(self.w_joint_track),
-            w_joint_vel_track=float(self.w_joint_vel_track),
-        )
+    def _state_cost_segments(self, *, terminal: bool) -> List[_CostSegment]:
+        if not self._use_state_track():
+            return []
+        s = float(self.w_state_track)
+        if terminal:
+            s *= float(self.w_terminal_track)
+        na = self.n_arm
+        segs: List[_CostSegment] = [
+            _CostSegment("st_pos", 3, (float(self.w_pos) * s,) * 3),
+            _CostSegment("st_att", 3, (float(self.w_att) * s,) * 3),
+        ]
+        if na > 0:
+            wj = float(self.w_joint) * s
+            segs.append(_CostSegment("st_joint", na, (wj,) * na))
+        segs.append(_CostSegment("st_vel", 3, (float(self.w_vel) * s,) * 3))
+        segs.append(_CostSegment("st_omega", 3, (float(self.w_omega) * s,) * 3))
+        if na > 0:
+            wjv = float(self.w_joint_vel) * s
+            segs.append(_CostSegment("st_joint_vel", na, (wjv,) * na))
+        return segs
 
     def _task_aux_segments(self, *, terminal: bool) -> List[_CostSegment]:
         scale = float(self.w_terminal_scale) if terminal else 1.0
@@ -368,24 +385,16 @@ class AcadosEECentricRealtimeMPC:
                 (float(self.w_ee_pos) * scale,) * 3,
             ),
             _CostSegment(
-                "ee_yaw_cs",
-                2,
-                (float(self.w_ee_yaw) * scale, float(self.w_ee_yaw) * scale),
+                "ee_att",
+                3,
+                (
+                    float(self.w_ee_yaw) * scale,
+                    float(self.w_ee_rot_rp) * scale,
+                    float(self.w_ee_rot_rp) * scale,
+                ),
             ),
         ]
-        if self._use_base_pos():
-            w = float(self.w_base_pos) * scale
-            segs.append(_CostSegment("base_pos", 3, (w, w, w)))
-        if self._use_base_yaw():
-            w = float(self.w_base_yaw) * scale
-            segs.append(_CostSegment("base_yaw_cs", 2, (w, w)))
-        na = self.n_arm
-        if self._use_joint_track():
-            w = float(self.w_joint_track) * scale
-            segs.append(_CostSegment("joint_q", na, (w,) * na))
-        if self._use_joint_vel_track():
-            w = float(self.w_joint_vel_track) * scale
-            segs.append(_CostSegment("joint_v", na, (w,) * na))
+        segs.extend(self._state_cost_segments(terminal=terminal))
         return segs
 
     def _terminal_cost_segments(self) -> List[_CostSegment]:
@@ -422,21 +431,13 @@ class AcadosEECentricRealtimeMPC:
         )
 
     def _build_cost_y_exprs(self, ocp: "AcadosOcp") -> Tuple["ca.SX", "ca.SX"]:
-        """Assemble CasADi ``cost_y`` / ``cost_y_e`` from L1 task + L2 aux (+ u on running)."""
+        """Assemble CasADi ``cost_y`` / ``cost_y_e`` from EE task + optional state ref (+ u)."""
         ee_p = _casadi_ee_translation_expr(ocp.model, self.robot_model, self.ee_frame_id)
-        c_psi, s_psi = _casadi_ee_heading_cs_expr(ocp.model, self.robot_model, self.ee_frame_id)
-        task = [ee_p, c_psi, s_psi]
-        aux: List["ca.SX"] = []
-        if self._use_base_pos():
-            aux.append(ocp.model.x[0:3])
-        if self._use_base_yaw():
-            c_by, s_by = _casadi_base_yaw_cs_expr(ocp.model.x)
-            aux.extend([c_by, s_by])
-        if self._use_joint_track():
-            aux.append(ocp.model.x[self._joint_q_slice()])
-        if self._use_joint_vel_track():
-            aux.append(ocp.model.x[self._joint_v_slice()])
-        cost_y_e = ca.vertcat(*(task + aux))
+        ee_rpy = _casadi_ee_rpy_zyx_expr(ocp.model, self.robot_model, self.ee_frame_id)
+        task: List["ca.SX"] = [ee_p, ee_rpy]
+        if self._use_state_track():
+            task.append(_casadi_state_y_expr(ocp.model.x, self.nq, self.n_arm))
+        cost_y_e = ca.vertcat(*task)
         cost_y = ca.vertcat(cost_y_e, ocp.model.u)
         return cost_y, cost_y_e
 
@@ -450,37 +451,47 @@ class AcadosEECentricRealtimeMPC:
         *,
         w_ee_pos: Optional[float] = None,
         w_ee_yaw: Optional[float] = None,
-        w_base_pos: Optional[float] = None,
-        w_base_yaw: Optional[float] = None,
-        w_joint_track: Optional[float] = None,
-        w_joint_vel_track: Optional[float] = None,
+        w_ee_rot_rp: Optional[float] = None,
+        w_state_track: Optional[float] = None,
+        w_pos: Optional[float] = None,
+        w_att: Optional[float] = None,
+        w_joint: Optional[float] = None,
+        w_vel: Optional[float] = None,
+        w_omega: Optional[float] = None,
+        w_joint_vel: Optional[float] = None,
         w_control: Optional[float] = None,
         w_u_thrust: Optional[float] = None,
         w_u_joint_torque: Optional[float] = None,
         w_terminal_scale: Optional[float] = None,
+        w_terminal_track: Optional[float] = None,
         max_iter: Optional[int] = None,
     ) -> None:
         loc = {
             "w_ee_pos": w_ee_pos,
             "w_ee_yaw": w_ee_yaw,
-            "w_base_pos": w_base_pos,
-            "w_base_yaw": w_base_yaw,
-            "w_joint_track": w_joint_track,
-            "w_joint_vel_track": w_joint_vel_track,
+            "w_ee_rot_rp": w_ee_rot_rp,
+            "w_state_track": w_state_track,
+            "w_pos": w_pos,
+            "w_att": w_att,
+            "w_joint": w_joint,
+            "w_vel": w_vel,
+            "w_omega": w_omega,
+            "w_joint_vel": w_joint_vel,
             "w_control": w_control,
             "w_u_thrust": w_u_thrust,
             "w_u_joint_torque": w_u_joint_torque,
             "w_terminal_scale": w_terminal_scale,
+            "w_terminal_track": w_terminal_track,
         }
         for k, v in loc.items():
             if v is not None:
                 setattr(self, k, float(v))
         mi = int(max_iter) if max_iter is not None else int(getattr(self, "_last_max_iter", 40))
-        new_aux = _codegen_aux_suffix(**self._aux_codegen_kwargs())
-        old_aux = str(getattr(self, "_last_aux_suffix", new_aux))
+        new_suffix = _codegen_state_suffix(**self._state_codegen_kwargs())
+        old_suffix = str(getattr(self, "_last_state_suffix", new_suffix))
         need_rebuild = (
             (self.solver_mode != "rti" and mi != int(getattr(self, "_last_max_iter", mi)))
-            or new_aux != old_aux
+            or new_suffix != old_suffix
         )
         applied_runtime = False
         if not need_rebuild:
@@ -498,7 +509,7 @@ class AcadosEECentricRealtimeMPC:
 
     def _build_solver(self, *, max_iter: int):
         self._last_max_iter = int(max_iter)
-        self._last_aux_suffix = _codegen_aux_suffix(**self._aux_codegen_kwargs())
+        self._last_state_suffix = _codegen_state_suffix(**self._state_codegen_kwargs())
         nq, nv, nu, nx, na = self.nq, self.nv, self.nu, self.nx, self.n_arm
 
         ocp = AcadosOcp()
@@ -606,8 +617,8 @@ class AcadosEECentricRealtimeMPC:
                 ocp.solver_options.as_rti_level = 3
 
         da_tag = "_da" if self.dist_aware else ""
-        aux_tag = self._last_aux_suffix
-        code_export_dir = REPO_ROOT / "c_generated_code" / f"s500_uam_ee_rt_mpc{da_tag}{aux_tag}"
+        aux_tag = self._last_state_suffix
+        code_export_dir = REPO_ROOT / "c_generated_code" / f"s500_uam_ee_rt_rpy6_mpc{da_tag}{aux_tag}"
         code_export_dir.mkdir(parents=True, exist_ok=True)
         json_path = code_export_dir / "ocp.json"
         ocp.code_gen_opts.code_export_directory = str(code_export_dir)
@@ -644,12 +655,13 @@ class AcadosEECentricRealtimeMPC:
             )
         self._apply_runtime_solver_weights()
         nlp_type = str(getattr(ocp.solver_options, "nlp_solver_type", "SQP_RTI"))
-        _apply_runtime_solver_options(self.solver, int(max_iter), solver_type=nlp_type)
-        if hasattr(self.solver, "options_set"):
-            try:
-                self.solver.options_set("qp_solver_iter_max", int(self.qp_iter_max))
-            except Exception:
-                pass
+        _apply_runtime_solver_options(
+            self.solver,
+            int(max_iter),
+            solver_type=nlp_type,
+            qp_iter_max=int(self.qp_iter_max),
+            levenberg_marquardt=1e-3,
+        )
 
     def _apply_runtime_solver_weights(self) -> None:
         W, W_e = self._cost_W_and_W_e()
@@ -661,32 +673,44 @@ class AcadosEECentricRealtimeMPC:
         self,
         p_ee: np.ndarray,
         yaw: float,
+        roll: float,
+        pitch: float,
         *,
-        p_base: Optional[np.ndarray] = None,
-        yaw_base: Optional[float] = None,
-        q_joint_ref: Optional[np.ndarray] = None,
-        qd_joint_ref: Optional[np.ndarray] = None,
+        x_ref: Optional[np.ndarray] = None,
         u_ref: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        cy, sy = float(np.cos(yaw)), float(np.sin(yaw))
         parts: List[np.ndarray] = [
             np.asarray(p_ee, dtype=float).reshape(3),
-            np.array([cy, sy]),
+            np.array([float(yaw), float(roll), float(pitch)], dtype=float),
         ]
-        if self._use_base_pos() and p_base is not None:
-            parts.append(np.asarray(p_base, dtype=float).reshape(3))
-        if self._use_base_yaw() and yaw_base is not None:
-            cby, sby = float(np.cos(yaw_base)), float(np.sin(yaw_base))
-            parts.append(np.array([cby, sby]))
-        if self._use_joint_track() and q_joint_ref is not None:
-            parts.append(np.asarray(q_joint_ref, dtype=float).reshape(self.n_arm))
-        if self._use_joint_vel_track() and qd_joint_ref is not None:
-            parts.append(np.asarray(qd_joint_ref, dtype=float).reshape(self.n_arm))
+        if self._use_state_track() and x_ref is not None:
+            from s500_uam_acados_state_tracking_mpc import _state_to_y_np
+
+            parts.append(
+                _state_to_y_np(x_ref, self.nq, self.n_arm)
+            )
         y_e = np.concatenate(parts)
         if u_ref is None:
             u_ref = self.u_hover
         y = np.concatenate([y_e, np.asarray(u_ref, dtype=float).reshape(self.nu)])
         return y, y_e
+
+    def _current_ee_pose(self, x_now: np.ndarray) -> Tuple[np.ndarray, float, float, float]:
+        """FK: EE position + roll/pitch/yaw (rad, Pinocchio ZYX)."""
+        q = np.asarray(x_now, dtype=float).flatten()[: self.nq].copy()
+        qn = float(np.linalg.norm(q[3:7]))
+        if qn > 1e-12:
+            q[3:7] /= qn
+        pin.forwardKinematics(self.robot_model, self._pin_data, q)
+        pin.updateFramePlacements(self.robot_model, self._pin_data)
+        oMf = self._pin_data.oMf[self.ee_frame_id]
+        rpy = pin.rpy.matrixToRpy(oMf.rotation)
+        return (
+            np.asarray(oMf.translation, dtype=float).reshape(3),
+            float(rpy[2]),
+            float(rpy[0]),
+            float(rpy[1]),
+        )
 
     def solve_step(
         self,
@@ -695,17 +719,26 @@ class AcadosEECentricRealtimeMPC:
         t_ee_ref: np.ndarray,
         p_ee_ref: np.ndarray,
         yaw_ee_ref: np.ndarray,
+        roll_ee_ref: np.ndarray,
+        pitch_ee_ref: np.ndarray,
         *,
-        p_base_ref: Optional[np.ndarray] = None,
-        yaw_base_ref: Optional[np.ndarray] = None,
-        joint_ref: Optional[np.ndarray] = None,
-        joint_vel_ref: Optional[np.ndarray] = None,
+        t_plan: Optional[np.ndarray] = None,
+        x_plan: Optional[np.ndarray] = None,
+        joint_override: bool = False,
+        joint_override_q: Tuple[float, float] = (0.0, 0.0),
         p_dist: Optional[np.ndarray] = None,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
-        """One MPC step. EE refs are interpolated along ``t_ee_ref``."""
-        x_now = np.asarray(x_now, dtype=float).flatten()[: self.nx]
+        """One MPC step. EE refs along ``t_ee_ref``; state ref from ``x_plan`` when enabled."""
+        from s500_uam_crocoddyl_state_tracking_mpc import interp_full_state_piecewise
+
+        x_now = sanitize_mpc_state(x_now, nq=self.nq, nv=self.nv)
         N = self.horizon
         dt = self.dt_mpc
+        use_xplan = (
+            self._use_state_track()
+            and t_plan is not None
+            and x_plan is not None
+        )
 
         if self.dist_aware and self.n_dist_param > 0:
             p_stage = np.zeros(self.n_dist_param, dtype=float)
@@ -714,25 +747,39 @@ class AcadosEECentricRealtimeMPC:
                 n_take = min(self.n_dist_param, pd.size)
                 p_stage[:n_take] = pd[:n_take]
 
+        p_ee_now, yaw_ee_now, roll_ee_now, pitch_ee_now = self._current_ee_pose(x_now)
+
         for i in range(N):
             t_i = float(t_query) + i * dt
             p_i = _interp_vec3(t_i, t_ee_ref, p_ee_ref)
             yaw_i = _interp_scalar(t_i, t_ee_ref, yaw_ee_ref)
-            p_b = None
-            yaw_b = None
-            q_j = None
-            qd_j = None
-            if p_base_ref is not None:
-                p_b = _interp_vec3(t_i, t_ee_ref, p_base_ref)
-            if yaw_base_ref is not None:
-                yaw_b = _interp_scalar(t_i, t_ee_ref, yaw_base_ref)
-            if joint_ref is not None:
-                q_j = _interp_rows(t_i, t_ee_ref, joint_ref)
-            if joint_vel_ref is not None:
-                qd_j = _interp_rows(t_i, t_ee_ref, joint_vel_ref)
-            yref, _ = self._ee_to_y(
-                p_i, yaw_i, p_base=p_b, yaw_base=yaw_b, q_joint_ref=q_j, qd_joint_ref=qd_j
+            roll_i = _interp_scalar(t_i, t_ee_ref, roll_ee_ref)
+            pitch_i = _interp_scalar(t_i, t_ee_ref, pitch_ee_ref)
+            p_i, yaw_i, roll_i, pitch_i = clamp_mpc_ee_pose_reference(
+                p_i,
+                yaw_i,
+                roll_i,
+                pitch_i,
+                p_ee_now,
+                yaw_ee_now,
+                roll_ee_now,
+                pitch_ee_now,
+                self.ref_error_limits,
             )
+            x_ref_i = None
+            if use_xplan:
+                x_ref_i = interp_full_state_piecewise(
+                    t_i, t_plan, x_plan, self.robot_model
+                )
+                x_ref_i = _apply_plan_joint_override(
+                    x_ref_i,
+                    enabled=joint_override,
+                    joint_q=joint_override_q,
+                )
+                x_ref_i = clamp_mpc_state_reference(
+                    x_ref_i, x_now, self.ref_error_limits, nq=self.nq, nv=self.nv
+                )
+            yref, _ = self._ee_to_y(p_i, yaw_i, roll_i, pitch_i, x_ref=x_ref_i)
             self.solver.set(i, "yref", yref)
             if self.dist_aware and self.n_dist_param > 0:
                 self.solver.set(i, "p", p_stage)
@@ -740,21 +787,33 @@ class AcadosEECentricRealtimeMPC:
         t_N = float(t_query) + N * dt
         p_N = _interp_vec3(t_N, t_ee_ref, p_ee_ref)
         yaw_N = _interp_scalar(t_N, t_ee_ref, yaw_ee_ref)
-        p_bN = None
-        yaw_bN = None
-        q_jN = None
-        qd_jN = None
-        if p_base_ref is not None:
-            p_bN = _interp_vec3(t_N, t_ee_ref, p_base_ref)
-        if yaw_base_ref is not None:
-            yaw_bN = _interp_scalar(t_N, t_ee_ref, yaw_base_ref)
-        if joint_ref is not None:
-            q_jN = _interp_rows(t_N, t_ee_ref, joint_ref)
-        if joint_vel_ref is not None:
-            qd_jN = _interp_rows(t_N, t_ee_ref, joint_vel_ref)
-        _, yref_e = self._ee_to_y(
-            p_N, yaw_N, p_base=p_bN, yaw_base=yaw_bN, q_joint_ref=q_jN, qd_joint_ref=qd_jN
+        roll_N = _interp_scalar(t_N, t_ee_ref, roll_ee_ref)
+        pitch_N = _interp_scalar(t_N, t_ee_ref, pitch_ee_ref)
+        p_N, yaw_N, roll_N, pitch_N = clamp_mpc_ee_pose_reference(
+            p_N,
+            yaw_N,
+            roll_N,
+            pitch_N,
+            p_ee_now,
+            yaw_ee_now,
+            roll_ee_now,
+            pitch_ee_now,
+            self.ref_error_limits,
         )
+        x_ref_N = None
+        if use_xplan:
+            x_ref_N = interp_full_state_piecewise(
+                t_N, t_plan, x_plan, self.robot_model
+            )
+            x_ref_N = _apply_plan_joint_override(
+                x_ref_N,
+                enabled=joint_override,
+                joint_q=joint_override_q,
+            )
+            x_ref_N = clamp_mpc_state_reference(
+                x_ref_N, x_now, self.ref_error_limits, nq=self.nq, nv=self.nv
+            )
+        _, yref_e = self._ee_to_y(p_N, yaw_N, roll_N, pitch_N, x_ref=x_ref_N)
         self.solver.set(N, "yref", yref_e)
 
         self.solver.set(0, "lbx", x_now)
@@ -772,17 +831,19 @@ class AcadosEECentricRealtimeMPC:
             for i in range(N):
                 self.solver.set(i, "u", self._us_guess[i])
 
-        status = int(self.solver.solve())
-        u_opt = np.asarray(self.solver.get(0, "u"), dtype=float).copy()
-        x_next = np.asarray(self.solver.get(1, "x"), dtype=float).copy()
-        xs = [np.asarray(self.solver.get(i, "x"), dtype=float).copy() for i in range(N + 1)]
-        us = [np.asarray(self.solver.get(i, "u"), dtype=float).copy() for i in range(N)]
+        status = acados_mpc_run_solve(self.solver)
+        u_opt, x_next, xs, us = acados_mpc_extract_solution(self.solver, N)
 
-        finite = (
-            np.all(np.isfinite(u_opt))
-            and np.all(np.isfinite(x_next))
-            and all(np.all(np.isfinite(x)) for x in xs)
-        )
+        if status not in ACADOS_OK_STATUSES or not acados_solution_finite(
+            u_opt, x_next, xs
+        ):
+            for i in range(N + 1):
+                self.solver.set(i, "x", x_now.copy())
+            for i in range(N):
+                self.solver.set(i, "u", self.u_hover.copy())
+            status = acados_mpc_run_solve(self.solver, retry_lm=0.1)
+            u_opt, x_next, xs, us = acados_mpc_extract_solution(self.solver, N)
+
         self.last_status = status
         self.last_sqp_iter = int(self._get_stat("sqp_iter"))
         self.last_qp_iter = int(self._get_stat("qp_iter"))
@@ -792,12 +853,14 @@ class AcadosEECentricRealtimeMPC:
         except Exception:
             self.last_cost = float("nan")
 
-        if status not in (0, 2) or not finite:
+        if status not in ACADOS_OK_STATUSES or not acados_solution_finite(
+            u_opt, x_next, xs
+        ):
             self._xs_guess = None
             self._us_guess = None
             self.last_xs = None
             self.last_cost_terms = {}
-            return self.u_hover.copy(), x_now.copy(), status
+            return None, None, status
 
         self.last_xs = xs
         self._xs_guess = xs[1:] + [xs[-1].copy()]
@@ -819,13 +882,28 @@ class AcadosEECentricRealtimeMPC:
         t_ee_ref: np.ndarray,
         p_ee_ref: np.ndarray,
         yaw_ee_ref: np.ndarray,
+        roll_ee_ref: Optional[np.ndarray] = None,
+        pitch_ee_ref: Optional[np.ndarray] = None,
         iters: int = 5,
     ):
         x0 = np.asarray(x0, dtype=float).flatten()[: self.nx]
         t0 = float(np.asarray(t_ee_ref, dtype=float).flatten()[0]) if np.asarray(t_ee_ref).size else 0.0
+        yaw_ee_ref = np.asarray(yaw_ee_ref, dtype=float).flatten()
+        if roll_ee_ref is None:
+            roll_ee_ref = np.zeros_like(yaw_ee_ref)
+        if pitch_ee_ref is None:
+            pitch_ee_ref = np.zeros_like(yaw_ee_ref)
         for _ in range(max(1, int(iters))):
             try:
-                self.solve_step(x0, t0, t_ee_ref, p_ee_ref, yaw_ee_ref)
+                self.solve_step(
+                    x0,
+                    t0,
+                    t_ee_ref,
+                    p_ee_ref,
+                    yaw_ee_ref,
+                    roll_ee_ref,
+                    pitch_ee_ref,
+                )
             except Exception:
                 break
 
