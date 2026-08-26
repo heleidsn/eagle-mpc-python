@@ -12,6 +12,7 @@ catkin_package()
 ## Mark executable Python helper nodes for installation so that
 ## `rosrun eagle_mpc_python <node>.py` and <node pkg=... type=...> resolve.
 catkin_install_python(PROGRAMS
+  run_tracking_controller.py
   scripts/ros_nodes/groundtruth_pub.py
   scripts/ros_nodes/reference_path_pub.py
   scripts/ros_nodes/pose_to_tf_pub.py

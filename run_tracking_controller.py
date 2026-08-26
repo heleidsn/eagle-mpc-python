@@ -57,8 +57,8 @@ rosrun eagle_mpc_python run_tracking_controller.py \\
 
 启动跟踪（OFFBOARD 且已解锁后）
 ───────────────────────────────
-rosservice call /start_tracking  # 开始跟踪
-rosservice call /stop_tracking   # 停止跟踪（悬停）
+rosservice call /start_tracking  # 开始跟踪（完成后自动结束并在终点悬停）
+rosservice call /stop_tracking   # 停止跟踪（在当前位置悬停，不飞向终点）
 rosservice call /take_off        # 自动：发 setpoint -> OFFBOARD -> 解锁 -> 爬升 1m -> x_plan[0] 悬停
 rosservice call /save_data       # 保存录制数据
 
@@ -519,7 +519,8 @@ class SuiteTrackingController:
 
         # ── Regulation 模式（MPC 镇定到用户设定目标） ─────────────────────────
         # 节点启动时默认处于 regulation 模式，目标 = x_plan[0]
-        # 调用 /start_tracking 才切换到轨迹跟踪；/stop_tracking 切回 regulation
+        # /start_tracking 切到轨迹跟踪；完成后自动回 regulation 并在终点悬停。
+        # /stop_tracking 立即回 regulation，目标 = 当前位姿（不飞向终点）。
         self._regulating: bool = True
         self._reg_target: np.ndarray = self._match_state_dim(
             np.asarray(self.x_plan[0], dtype=float).copy(), zero_vel=True
@@ -1838,12 +1839,10 @@ class SuiteTrackingController:
             t_elapsed = (now - self.controller_start_time).to_sec()
             t_total = float(self.t_plan[-1] - self.t_plan[0])
             if t_elapsed >= t_total:
-                self.traj_finished = True
-                self.recording_enabled = False
-                # 轨迹自然完成 → 锁定在终点继续跟踪，等待用户点击 /stop_tracking
-                rospy.loginfo(
-                    "Trajectory tracking finished. Holding at end-point. "
-                    "Call /stop_tracking to enter regulation mode."
+                self._enter_hover_regulation(
+                    self._plan_end_hover_target(),
+                    reason="Trajectory tracking finished; auto-stop and hover at end-point.",
+                    save=True,
                 )
         elif self.traj_finished:
             t_elapsed = float(self.t_plan[-1] - self.t_plan[0])
@@ -2397,8 +2396,7 @@ class SuiteTrackingController:
             self._reg_target_locked = True
             self._reg_xs_guess  = None   # 目标改变，丢弃旧 warm-start
             self._reg_us_guess  = None
-            # 只有在未进行跟踪（trajectory_started=False）时才立即激活 regulation
-            # 轨迹结束后（traj_finished=True）仍在终点保持跟踪，等待 /stop_tracking
+            # 未跟踪或已结束跟踪时立即生效；正在跟踪时等 stop / 轨迹完成后再切 regulation。
             if not self.trajectory_started:
                 self._regulating = True
             rospy.loginfo(
@@ -4382,16 +4380,56 @@ class SuiteTrackingController:
 
     def _default_reg_target(self) -> np.ndarray:
         """
-        Regulation 默认参考策略：
-        - 未开始 tracking（traj_finished=False）: 轨迹起点 x_plan[0]
-        - tracking 结束后（traj_finished=True）: 轨迹终点 x_plan[-1]
+        未锁定时的 regulation 默认参考：
+        - 未开始 / 未结束 tracking: 轨迹起点 x_plan[0]
+        - tracking 已结束: 轨迹终点 x_plan[-1]
+        Stop tracking 会锁定当前位姿，不会走这条默认策略。
         """
         if self.x_plan is None or len(self.x_plan) == 0:
             return self._match_state_dim(np.asarray(self.state, dtype=float).copy(), zero_vel=True)
         idx = -1 if bool(self.traj_finished) else 0
         x_tgt = np.asarray(self.x_plan[idx], dtype=float).copy()
-        # Regulation is a point stabilization task; clear velocity targets.
         return self._match_state_dim(x_tgt, zero_vel=True)
+
+    def _plan_end_hover_target(self) -> np.ndarray:
+        """轨迹终点悬停（速度清零）。"""
+        if self.x_plan is None or len(self.x_plan) == 0:
+            return self._hold_current_pose_target()
+        return self._match_state_dim(
+            np.asarray(self.x_plan[-1], dtype=float).copy(), zero_vel=True
+        )
+
+    def _enter_hover_regulation(self, target, *, reason: str, save: bool = True) -> str:
+        """结束轨迹跟踪，切到 regulation 并在给定目标悬停。"""
+        was_recording = bool(self.recording_enabled) or bool(self.trajectory_started)
+        self.trajectory_started = False
+        self.traj_finished = True
+        self.recording_enabled = False
+        self.controller_start_time = None
+        self._xs_guess = None
+        self._us_guess = None
+        self._reg_xs_guess = None
+        self._reg_us_guess = None
+        self._reg_target = self._match_state_dim(
+            np.asarray(target, dtype=float).copy(), zero_vel=True
+        )
+        self._reg_target_locked = True
+        self._regulating = True
+        tgt = self._reg_target
+        rospy.loginfo(
+            f"{reason} Hover at x={tgt[0]:.2f} y={tgt[1]:.2f} z={tgt[2]:.2f}"
+        )
+        extra = ""
+        if save and was_recording:
+            try:
+                tag = self._active_tracking_tag or self._compose_tracking_file_tag()
+                csv_path, txt_path = self._save_tracking_csv_and_stats(tag)
+                self._active_tracking_tag = None
+                extra = f" Saved: {csv_path.name}, {txt_path.name}"
+            except Exception as e:
+                extra = f" Save failed: {e}"
+                rospy.logwarn(f"[hover] {extra}")
+        return extra
 
     def _cancel_takeoff_sequence(self) -> None:
         self._takeoff_seq_active = False
@@ -4751,33 +4789,16 @@ class SuiteTrackingController:
         return TriggerResponse(True, "Tracking started")
 
     def _svc_stop_tracking(self, req) -> TriggerResponse:
-        self.trajectory_started = False
-        self.traj_finished = True
-        self.recording_enabled = False
-        # 停止跟踪后切回 regulation 模式，目标固定为轨迹终点。
-        self._reg_target   = self._default_reg_target()
-        self._reg_target_locked = False
-        self._reg_xs_guess = None
-        self._reg_us_guess = None
-        self._regulating   = True
-        tgt = self._reg_target
-        rospy.loginfo(
-            f"Tracking stopped. Switched to regulation at trajectory end-point "
-            f"x={tgt[0]:.2f} y={tgt[1]:.2f} z={tgt[2]:.2f}"
+        extra = self._enter_hover_regulation(
+            self._hold_current_pose_target(),
+            reason="Tracking stopped by user; holding current pose.",
+            save=True,
         )
-        try:
-            tag = self._active_tracking_tag or self._compose_tracking_file_tag()
-            csv_path, txt_path = self._save_tracking_csv_and_stats(tag)
-            self._active_tracking_tag = None
-            return TriggerResponse(
-                True,
-                f"Tracking stopped, holding position. Saved: {csv_path.name}, {txt_path.name}",
-            )
-        except Exception as e:
-            return TriggerResponse(
-                False,
-                f"Tracking stopped, but save failed: {e}",
-            )
+        ok = "Save failed" not in extra
+        return TriggerResponse(
+            ok,
+            f"Tracking stopped, hovering at current pose.{extra}",
+        )
 
     def _svc_save_data(self, req) -> TriggerResponse:
         try:
