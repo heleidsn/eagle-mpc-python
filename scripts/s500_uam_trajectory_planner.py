@@ -1296,7 +1296,7 @@ class S500UAMTrajectoryPlanner:
         ee_targets[i]: world [x,y,z] when modes[i] is ee_pose or ee_pos, else None.
         ee_pose_rpy_world[i]: EE orientation (rad, Pinocchio ZYX roll-pitch-yaw) when modes[i]=="ee_pose";
             used with ee_knot_rotation_weight > 0 for ``ResidualModelFramePlacement``; otherwise translation-only.
-        ee_pos: A,B,C in the table are j1/j2/yaw seeds (deg), not EE orientation.
+        ee_pos: nominal attitude is j1=j2=yaw=0; only EE position is constrained.
         ee_knot_velocity_weight: For ``ee_pose`` knots only, weight on ``ResidualModelFrameVelocity``
             with reference spatial velocity zero (LOCAL_WORLD_ALIGNED). Set 0 to disable.
         ee_knot_velocity_pitch_weight: Weight on angular velocity about world Y (pitch rate) in that

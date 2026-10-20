@@ -88,7 +88,7 @@ def mixed_wp_row_kind(cell0) -> str:
     Returns:
         ``base`` — x,y,z = base origin (m); A,B,C = j1°, j2°, base yaw°.
         ``ee_pose`` — x,y,z = EE position (world); A,B,C = roll°, pitch°, yaw° (ZYX, Pinocchio).
-        ``ee_pos`` — x,y,z = EE position (world); A,B,C = j1°, j2°, yaw° seeds for alignment.
+        ``ee_pos`` — x,y,z = EE position (world); attitude seed is fixed at j1=j2=yaw=0.
     """
     s = str(cell0).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
     if s.startswith("eep") or s in ("eepos", "eeposition"):
@@ -193,10 +193,9 @@ class OptimizationWorker(QThread):
                         ee_pose_rpy_world.append(None)
                     elif rk == "ee_pos":
                         modes.append("ee_pos")
+                        # 仅位置：名义姿态固定为 j1=j2=yaw=0，不用表里灰显的旧角度。
                         st0 = _fit_state_dim(
-                            make_uam_state(
-                            0.0, 0.0, 1.0, j1=a * deg2rad, j2=b * deg2rad, yaw=c * deg2rad
-                            ),
+                            make_uam_state(0.0, 0.0, 1.0, j1=0.0, j2=0.0, yaw=0.0),
                             nx,
                         )
                         st = planner.align_state_ee_to_world_point(

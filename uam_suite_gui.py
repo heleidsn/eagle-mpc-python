@@ -510,6 +510,8 @@ def _plan_bundle_meta_fields(pb: dict) -> dict:
         "plan_mixed_wp_rows",
         "waypoints",
         "t_wp",
+        "hover_pre_s",
+        "hover_post_s",
     ):
         if key in pb and pb[key] is not None:
             meta[key] = pb[key]
@@ -552,7 +554,7 @@ def _read_plan_bundle_files(traj_id: str) -> dict | None:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         data = np.load(npz_path, allow_pickle=False)
         pb: dict = {}
-        for key in ("kind", "velocity_frame", "ee_track_kind"):
+        for key in ("kind", "velocity_frame", "ee_track_kind", "hover_pre_s", "hover_post_s"):
             if key in meta:
                 pb[key] = meta[key]
         for key in ("plan_mixed_wp_rows", "waypoints", "t_wp"):
@@ -2141,9 +2143,9 @@ class UamSuiteGUI(QMainWindow):
         g_full = QVBoxLayout(w_full_path)
 
         self._wp_type_help_label = QLabel(
-            "Columns j1/roll, j2/pitch, yaw: for Base and EEp they mean j1 deg, j2 deg, base yaw deg; "
+            "Columns j1/roll, j2/pitch, yaw: for Base they mean j1 deg, j2 deg, base yaw deg; "
             "for EE they mean roll deg, pitch deg, yaw deg (ZYX). "
-            "EEp constrains only end-effector position; the three angles are alignment seeds. "
+            "EEp constrains only end-effector position; j1, j2 and yaw are fixed at 0. "
             "Zero v: 勾选则在该航点上约束速度为 0 (Base：完整状态速度；EE 模式：EE 笛卡尔速度)，"
             "取消勾选则不约束该航点速度 (仅 full_state_crocoddyl 生效)."
         )
@@ -5242,8 +5244,11 @@ class UamSuiteGUI(QMainWindow):
         if rows:
             tw, bx, ex = self._mixed_rows_to_plot_xyz(rows)
             if tw is not None:
-                t0 = float(t.flatten()[0])
-                tw_rel = tw - t0
+                # 规划时间从首航点起算；Hover before 是事后拼到轨迹前面的，
+                # 表里的 t 不会自动后移，画橙色 WP time 时要补上这段。
+                t_origin = float(rows[0][7])
+                hover_pre = float(pb.get("hover_pre_s") or 0.0)
+                tw_rel = tw - t_origin + hover_pre
                 base_wp, ee_wp = bx, ex
 
         fs = self.fig_states if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_into_figure else None
@@ -7532,8 +7537,9 @@ class UamSuiteGUI(QMainWindow):
     def _build_sim_quick_controls(self) -> None:
         """在 Simulation 页顶部放置常用快捷开关，与详细控件双向同步。
 
-        包含：算法选择（镜像 track_mode_combo）、控制模式、L1 开关、以及五类扰动
-        的开/关复选框（与 L1/Disturbance 子标签内的 QGroupBox 状态联动）。
+        包含：算法选择（镜像 track_mode_combo）、控制模式、L1 开关、五类扰动
+        的开/关复选框，以及 s500_uam 的模拟负载（时刻、质量）。均与
+        L1/Disturbance 子标签内的控件双向同步。
         """
         if not hasattr(self, "_sim_quick_holder"):
             return
@@ -7590,10 +7596,41 @@ class UamSuiteGUI(QMainWindow):
             self.sim_quick_l1_mode.addItem(self.sim_l1_comp_mode.itemText(_i))
         self.sim_quick_l1_mode.setToolTip(self.sim_l1_comp_mode.toolTip())
         gv.addWidget(self.sim_quick_l1_mode, 3, 2, 1, 2)
-        _hint = QLabel("详细参数见 \"Disturbance\" / \"L1\" 子标签；这里只放最常调的开关。")
+        # 模拟负载：与 Disturbance 页 dist_load_group 同一开关。t_start / mass 放在本页，
+        # 惯量与质心仍在 Disturbance 页。仅 s500_uam、Acados direct 闭环会切换 plant 模型。
+        self.sim_quick_load_row = QWidget()
+        load_row = QHBoxLayout(self.sim_quick_load_row)
+        load_row.setContentsMargins(0, 0, 0, 0)
+        self.sim_quick_load = QCheckBox("模拟负载")
+        self.sim_quick_load.setToolTip(
+            "刚性抓取：t_start 之前 plant 用名义模型，之后把质量挂到末端（增广惯量）。"
+            "MPC 仍用名义模型。仅 s500_uam、Acados、direct 闭环生效。"
+            "惯量与质心在 \"Disturbance\" 页的「模拟负载」。"
+        )
+        self.sim_quick_load_t0 = QDoubleSpinBox()
+        self.sim_quick_load_t0.setRange(0.0, 600.0)
+        self.sim_quick_load_t0.setDecimals(2)
+        self.sim_quick_load_t0.setSingleStep(0.1)
+        self.sim_quick_load_t0.setToolTip("抓取时刻 [s]，与 Disturbance 页模拟负载的 t_start 同步")
+        self.sim_quick_load_mass = QDoubleSpinBox()
+        self.sim_quick_load_mass.setRange(0.0, 5.0)
+        self.sim_quick_load_mass.setDecimals(4)
+        self.sim_quick_load_mass.setSingleStep(0.05)
+        self.sim_quick_load_mass.setToolTip("负载质量 [kg]，与 Disturbance 页模拟负载的 mass 同步")
+        load_row.addWidget(self.sim_quick_load)
+        load_row.addWidget(QLabel("t_start [s]"))
+        load_row.addWidget(self.sim_quick_load_t0)
+        load_row.addWidget(QLabel("mass [kg]"))
+        load_row.addWidget(self.sim_quick_load_mass)
+        load_row.addStretch(1)
+        gv.addWidget(self.sim_quick_load_row, 4, 0, 1, 4)
+        _hint = QLabel(
+            "详细参数见 \"Disturbance\" / \"L1\" 子标签；这里放最常调的开关，以及模拟负载的时刻和质量。"
+            "下方灰色的 Plant: simulation-only payload 只对 Crocoddyl 生效。"
+        )
         _hint.setStyleSheet("color: palette(mid); font-size: 11px;")
         _hint.setWordWrap(True)
-        gv.addWidget(_hint, 4, 0, 1, 4)
+        gv.addWidget(_hint, 5, 0, 1, 4)
 
         self._sim_quick_holder.addWidget(grp)
 
@@ -7607,6 +7644,10 @@ class UamSuiteGUI(QMainWindow):
         self._link_quick_check(self.sim_quick_thrust, self.dist_thrust_group)
         self._link_quick_check(self.sim_quick_drag, self.dist_drag_group)
         self._link_quick_check(self.sim_quick_est, self.dist_est_group)
+        self._link_quick_check(self.sim_quick_load, self.dist_load_group)
+        self._link_quick_spin(self.sim_quick_load_t0, self.dist_load_t0)
+        self._link_quick_spin(self.sim_quick_load_mass, self.dist_load_mass)
+        self.dist_load_group.toggled.connect(lambda _v: self._sync_sim_quick_load_fields())
         # 初始化为当前状态。
         self.sim_quick_l1.setChecked(self.sim_l1_group.isChecked())
         self.sim_quick_l1_mode.setCurrentIndex(self.sim_l1_comp_mode.currentIndex())
@@ -7615,7 +7656,11 @@ class UamSuiteGUI(QMainWindow):
         self.sim_quick_thrust.setChecked(self.dist_thrust_group.isChecked())
         self.sim_quick_drag.setChecked(self.dist_drag_group.isChecked())
         self.sim_quick_est.setChecked(self.dist_est_group.isChecked())
+        self.sim_quick_load.setChecked(self.dist_load_group.isChecked())
+        self.sim_quick_load_t0.setValue(self.dist_load_t0.value())
+        self.sim_quick_load_mass.setValue(self.dist_load_mass.value())
         self._sync_sim_quick_mode_items()
+        self._sync_sim_quick_load_fields()
 
     def _link_quick_check(self, quick, group) -> None:
         """复选框 quick 与 checkable QGroupBox group 双向同步（带递归保护）。"""
@@ -7669,6 +7714,43 @@ class UamSuiteGUI(QMainWindow):
         quick.currentIndexChanged.connect(on_quick)
         master.currentIndexChanged.connect(on_master)
 
+    def _link_quick_spin(self, quick, master) -> None:
+        """两个 QDoubleSpinBox 的数值双向同步（带递归保护）。"""
+
+        def on_quick(val):
+            if getattr(self, "_sync_guard", False):
+                return
+            self._sync_guard = True
+            try:
+                if abs(float(master.value()) - float(val)) > 1e-9:
+                    master.setValue(float(val))
+            finally:
+                self._sync_guard = False
+
+        def on_master(val):
+            if getattr(self, "_sync_guard", False):
+                return
+            self._sync_guard = True
+            try:
+                if abs(float(quick.value()) - float(val)) > 1e-9:
+                    quick.setValue(float(val))
+            finally:
+                self._sync_guard = False
+
+        quick.valueChanged.connect(on_quick)
+        master.valueChanged.connect(on_master)
+
+    def _sync_sim_quick_load_fields(self) -> None:
+        """模拟负载行仅 s500_uam 显示；未勾选时时刻和质量不可编辑。"""
+        if not hasattr(self, "sim_quick_load_t0"):
+            return
+        show = not self._is_s500_mode()
+        if hasattr(self, "sim_quick_load_row"):
+            self.sim_quick_load_row.setVisible(show)
+        on = show and bool(self.dist_load_group.isChecked())
+        self.sim_quick_load_t0.setEnabled(on)
+        self.sim_quick_load_mass.setEnabled(on)
+
     def _sync_sim_quick_mode_items(self) -> None:
         """把 track_mode_combo 的项可用性与当前项同步到快捷算法 combo。"""
         if not hasattr(self, "sim_quick_mode"):
@@ -7706,6 +7788,7 @@ class UamSuiteGUI(QMainWindow):
             self.dist_load_group,
         ):
             grp.setVisible(show)
+        self._sync_sim_quick_load_fields()
 
     def _collect_track_disturbance(self) -> dict:
         """从 L1/Disturbance 子标签收集 plant 扰动配置（传给闭环仿真）。"""
@@ -9041,7 +9124,7 @@ class UamSuiteGUI(QMainWindow):
         cb.addItem("EEp (仅位置, 不约束姿态)", "EEp")
         cb.setItemData(0, "基座位姿 + 关节角", Qt.ToolTipRole)
         cb.setItemData(1, "末端执行器位置 + 姿态(roll/pitch/yaw)", Qt.ToolTipRole)
-        cb.setItemData(2, "仅约束末端执行器位置；姿态不约束，角度列禁用", Qt.ToolTipRole)
+        cb.setItemData(2, "仅约束末端执行器位置；姿态固定为 j1=j2=yaw=0", Qt.ToolTipRole)
         canon = _normalize_wp_type_for_combo(type_value)
         idx = cb.findData(canon)
         cb.setCurrentIndex(idx if idx >= 0 else 0)
@@ -9072,9 +9155,10 @@ class UamSuiteGUI(QMainWindow):
                     it = QTableWidgetItem("0")
                     self.wp_table.setItem(r, c, it)
                 if disable:
+                    it.setText("0")
                     it.setFlags(Qt.ItemIsSelectable)
                     it.setBackground(QColor(225, 225, 225))
-                    it.setToolTip("EEp 仅约束位置，姿态不可输入")
+                    it.setToolTip("EEp 仅约束位置，姿态固定为 0")
                 else:
                     it.setFlags(
                         Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
@@ -9216,11 +9300,11 @@ class UamSuiteGUI(QMainWindow):
             if rk == "base":
                 out.append([x, y, z, a, b, c, t])
             elif rk == "ee_pos" and pin_planner is not None and self._make_uam_state is not None:
-                st0 = self._make_uam_state(0.0, 0.0, 1.0, j1=a * d2r, j2=b * d2r, yaw=c * d2r)
+                st0 = self._make_uam_state(0.0, 0.0, 1.0, j1=0.0, j2=0.0, yaw=0.0)
                 st = pin_planner.align_state_ee_to_world_point(
                     st0, np.array([x, y, z], dtype=float)
                 )
-                out.append([float(st[0]), float(st[1]), float(st[2]), a, b, c, t])
+                out.append([float(st[0]), float(st[1]), float(st[2]), 0.0, 0.0, 0.0, t])
             elif rk == "ee_pose" and pin_planner is not None:
                 st0 = np.zeros(17)
                 st0[2] = 1.0
@@ -14112,7 +14196,7 @@ class UamSuiteGUI(QMainWindow):
             "x0": x0,
             "t_plan": pb["t_plan"],
             "x_plan": pb["x_plan"],
-            "T_sim": self.T_sim.value(),
+            "T_sim": self._sim_horizon_covering_plan(),
             "sim_dt": self.sim_dt.value(),
             "control_dt": self.control_dt.value(),
             "dt_mpc": self.dt_mpc.value(),
@@ -14181,10 +14265,37 @@ class UamSuiteGUI(QMainWindow):
             f"kR={best.get('kR', 0):.3f}, kOmega={best.get('kOmega', 0):.3f}（已写回界面）"
         )
 
+    def _sim_horizon_covering_plan(self) -> float:
+        """闭环仿真至少覆盖当前规划全长（含 Hover before/after）。
+
+        T_sim 短于轨迹时，末段参考已经到终点而机体还在追上，位置差会停在半空，
+        看起来像抓取后突然多了一块质量。更长的 T_sim 保持不变。
+        """
+        requested = float(self.T_sim.value())
+        dur = 0.0
+        pb = self._plan_bundle if isinstance(getattr(self, "_plan_bundle", None), dict) else None
+        if pb is not None:
+            for key in ("t_plan", "t_ref"):
+                raw = pb.get(key)
+                if raw is None:
+                    continue
+                t = np.asarray(raw, dtype=float).flatten()
+                if t.size >= 2 and np.isfinite(t[0]) and np.isfinite(t[-1]):
+                    dur = max(dur, float(t[-1] - t[0]))
+        if dur > requested + 1e-3:
+            self.T_sim.setValue(dur)
+            self.log(
+                f"[tracking] 规划轨迹 {dur:.2f}s，T_sim={requested:.2f}s 没有盖住末段，"
+                f"已改为 {dur:.2f}s。"
+            )
+            return dur
+        return requested
+
     def _run_track(self):
         if self._plan_bundle is None:
             return
         self._manual_ref_overlay = None
+        T_sim = self._sim_horizon_covering_plan()
         # s500：确保 base-link ee_snap 已升级为 full-state（幂等；已升级则跳过）。
         self._maybe_upgrade_ee_snap_for_s500()
         mode = self.track_mode_combo.currentIndex()
@@ -14204,7 +14315,7 @@ class UamSuiteGUI(QMainWindow):
                 "x_plan": pb["x_plan"],
                 "x_nom": self._robot_hover_nominal_state(),
                 "urdf_path": self._selected_robot_urdf_path(),
-                "T_sim": self.T_sim.value(),
+                "T_sim": T_sim,
                 "sim_dt": self.sim_dt.value(),
                 "control_dt": self.control_dt.value(),
                 "dt_mpc": self.dt_mpc.value(),
@@ -14269,7 +14380,7 @@ class UamSuiteGUI(QMainWindow):
                 "x0": x0,
                 "t_plan": pb["t_plan"],
                 "x_plan": pb["x_plan"],
-                "T_sim": self.T_sim.value(),
+                "T_sim": T_sim,
                 "sim_dt": self.sim_dt.value(),
                 "control_dt": self.control_dt.value(),
                 "dt_mpc": self.dt_mpc.value(),
@@ -14346,7 +14457,7 @@ class UamSuiteGUI(QMainWindow):
                 pb["x_plan"],
                 rm,
                 eid,
-                self.T_sim.value(),
+                T_sim,
                 sim_dt,
             )
             waypoints = None
@@ -14417,7 +14528,7 @@ class UamSuiteGUI(QMainWindow):
             "p_ref": p_ref,
             "yaw_ref": yaw_ref,
             "x0_init": x0_for_ee,
-            "T_sim": self.T_sim.value(),
+            "T_sim": T_sim,
             "sim_dt": sim_dt,
             "control_dt": self.control_dt.value(),
             "dt_mpc": self.dt_mpc.value(),
