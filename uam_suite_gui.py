@@ -17,6 +17,7 @@ import csv
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1575,6 +1576,75 @@ def _meshcat_playback_frame_indices(
     return np.asarray(indices, dtype=int), t_arr
 
 
+def _meshcat_package_dirs(urdf: Path) -> list[str]:
+    """Pinocchio 解析 package:// 时要的是「包目录的父目录」。
+
+    GUI 用的 URDF 指向 example-robot-data / eagle_mpc_yaml，网格不在本仓库里。
+    只把 URDF 所在目录传进去时，buildModelsFromUrdf 找不到网格，播放会退成空几何，
+    Meshcat 里就没有无人机。
+    """
+    try:
+        text = urdf.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    names = set(re.findall(r"package://([^/\"'\s]+)/", text))
+    parents: list[Path] = []
+    seen: set[str] = set()
+
+    def add(path: Path) -> None:
+        if not path.is_dir():
+            return
+        try:
+            key = str(path.resolve())
+        except OSError:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        parents.append(path)
+
+    def consider(path: Path) -> None:
+        if not path.is_dir():
+            return
+        for name in names:
+            if path.name == name:
+                add(path.parent)
+            elif (path / name).is_dir():
+                add(path)
+
+    ros_path = os.environ.get("ROS_PACKAGE_PATH", "")
+    for item in ros_path.split(":"):
+        if item:
+            consider(Path(item))
+
+    here = Path(__file__).resolve().parent
+    for parent in (here, *here.parents):
+        consider(parent / "devel" / "share")
+        consider(parent / "install" / "share")
+        src = parent / "src"
+        if src.is_dir():
+            consider(src)
+            try:
+                children = [c for c in src.iterdir() if c.is_dir()]
+            except OSError:
+                children = []
+            for child in children:
+                consider(child)
+        if (parent / "devel" / "share").is_dir() or (parent / "install" / "share").is_dir():
+            break
+
+    for extra in (
+        Path("/usr/local/share"),
+        Path("/opt/openrobots/share"),
+        Path(sys.prefix) / "share",
+    ):
+        consider(extra)
+
+    for rel in (urdf.parent, urdf.parent.parent, urdf.parent.parent.parent):
+        add(rel)
+    return [str(p) for p in parents]
+
+
 class MeshcatPlaybackWorker(QThread):
     finished = pyqtSignal(bool, str)
     progress = pyqtSignal(float, float, float, int)  # sim_t, progress_pct, display_fps, loop_idx
@@ -1601,24 +1671,32 @@ class MeshcatPlaybackWorker(QThread):
     def run(self):
         try:
             import pinocchio as pin
+            import pinocchio.visualize  # noqa: F401  # 挂到 pin.visualize
 
             urdf = Path(self.urdf_path).resolve()
             urdf_to_load = urdf
-            # If the URDF uses example-robot-data package URIs, remap to local models/s500_uam meshes.
-            # This keeps meshcat visualization working without requiring system-wide ROS package setup.
+            # 本仓库 models/s500_uam/meshes 若存在，改写成 file://，不依赖 ROS 包路径。
+            # 机体可视/碰撞改用 base_link_vis.STL（约 1.9 万面）。URDF 里的
+            # base_link.dae / base_link.STL 是同一套 38 万面高模，只给仿真用。
             local_mesh_root = Path(__file__).resolve().parent / "models" / "s500_uam" / "meshes"
             uri_prefix = "package://example-robot-data/robots/s500_description/s500_uam/meshes/"
+            vis_stl = local_mesh_root / "base_link_vis.STL"
             if local_mesh_root.exists():
                 txt = urdf.read_text(encoding="utf-8")
-                if uri_prefix in txt:
+                patched = txt
+                if uri_prefix in patched:
                     file_prefix = local_mesh_root.resolve().as_uri() + "/"
-                    patched = txt.replace(uri_prefix, file_prefix)
+                    patched = patched.replace(uri_prefix, file_prefix)
+                if vis_stl.is_file():
+                    patched = patched.replace("base_link.dae", "base_link_vis.STL")
+                    patched = patched.replace("base_link.STL", "base_link_vis.STL")
+                if patched != txt:
                     with tempfile.NamedTemporaryFile(
                         mode="w", suffix=".urdf", delete=False, encoding="utf-8"
                     ) as tf:
                         tf.write(patched)
                         urdf_to_load = Path(tf.name)
-            package_dirs = [str(urdf.parent), str(urdf.parent.parent), str(urdf.parent.parent.parent)]
+            package_dirs = _meshcat_package_dirs(urdf_to_load)
             warn_msg = ""
             try:
                 model, collision_model, visual_model = pin.buildModelsFromUrdf(
@@ -1631,11 +1709,7 @@ class MeshcatPlaybackWorker(QThread):
                 model, collision_model, visual_model = pin.buildModelsFromUrdf(
                     str(urdf_to_load), package_dirs, pin.JointModelFreeFlyer()
                 )
-            except Exception:
-                # Fallback: build kinematic model only when mesh resources are unavailable.
-                model = pin.buildModelFromUrdf(str(urdf_to_load), pin.JointModelFreeFlyer())
-                collision_model = pin.GeometryModel()
-                visual_model = pin.GeometryModel()
+            if int(getattr(visual_model, "ngeoms", 0)) == 0:
                 warn_msg = (
                     "Mesh resources not found; using model-only playback "
                     "(geometry may not be visible)."
