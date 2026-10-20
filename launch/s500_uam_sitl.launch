@@ -36,6 +36,8 @@
     <!-- MAVROS configs -->
     <arg name="fcu_url" default="udp://:14540@localhost:14557"/>
     <arg name="respawn_mavros" default="false"/>
+    <!-- COM_RC_IN_MODE=4：仿真解锁 / OFFBOARD 不依赖 QGC 虚拟摇杆 -->
+    <arg name="disable_rc_input" default="true"/>
 
     <!-- PX4 SITL -->
     <arg unless="$(arg interactive)" name="px4_command_arg1" value="-d"/>
@@ -74,6 +76,12 @@
         <arg name="fcu_protocol" value="v2.0"/>
         <arg name="respawn_mavros" value="$(arg respawn_mavros)"/>
     </include>
+
+    <node pkg="eagle_mpc_python" type="px4_sitl_rc.py" name="px4_sitl_disable_rc"
+          output="screen" if="$(arg disable_rc_input)">
+        <param name="enable" value="true"/>
+        <param name="timeout_s" value="90.0"/>
+    </node>
 
     <!-- robot description -->
     <param name="robot_description" command="$(find xacro)/xacro $(find eagle_mpc_python)/models/urdf/s500_uam_arm_$(arg arm_control_mode).urdf.xacro"/>

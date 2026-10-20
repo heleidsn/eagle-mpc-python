@@ -554,6 +554,7 @@ class SuiteTrackingController:
         self._last_prep_request_t = 0.0
         self._set_mode_client: Optional[rospy.ServiceProxy] = None
         self._arming_client: Optional[rospy.ServiceProxy] = None
+        self._px4_stick_disabled = False
 
         # ── 录制数据 ─────────────────────────────────────────────────────────
         self.recording_enabled = False
@@ -4454,9 +4455,24 @@ class SuiteTrackingController:
             rospy.logwarn(f"[take_off] MAVROS flight services unavailable: {e}")
             return False
 
+    def _ensure_px4_stick_disabled(self) -> None:
+        """仿真：关掉摇杆检查，OFFBOARD / 解锁不再依赖 QGC 虚拟摇杆。"""
+        if self._px4_stick_disabled:
+            return
+        try:
+            from px4_sitl_rc import ensure_px4_offboard_without_stick
+
+            ok, msg = ensure_px4_offboard_without_stick(timeout_s=3.0)
+            rospy.loginfo(f"[take_off] {msg}")
+            if ok:
+                self._px4_stick_disabled = True
+        except Exception as e:
+            rospy.logwarn(f"[take_off] disable stick input: {e}")
+
     def _request_offboard_mode(self) -> bool:
         if not self._ensure_mavros_flight_clients():
             return False
+        self._ensure_px4_stick_disabled()
         try:
             req = SetModeRequest()
             req.custom_mode = "OFFBOARD"
@@ -4472,6 +4488,8 @@ class SuiteTrackingController:
     def _request_arm(self, arm: bool = True) -> bool:
         if not self._ensure_mavros_flight_clients():
             return False
+        if arm:
+            self._ensure_px4_stick_disabled()
         try:
             req = CommandBoolRequest()
             req.value = bool(arm)

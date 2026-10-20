@@ -99,6 +99,23 @@ def _gui_state_path(filename: str) -> Path:
 DEFAULT_PARAMS_PATH = _gui_state_path("uam_suite_gui_params.json")
 LAST_SESSION_PATH = _gui_state_path("uam_suite_gui_last_session.json")
 
+# s500.yaml platform: n_rotors=4, max_thrust=10.3437818 N（1100 rad/s）
+_S500_MAX_THRUST_TOTAL_FALLBACK_N = 4.0 * 10.3437818
+
+
+def s500_max_thrust_total_n() -> float:
+    """四桨满推力 n_rotors × max_thrust，读不到 yaml 时用 s500.yaml 的已知值。"""
+    try:
+        from s500_uam_acados_model import load_s500_config
+
+        plat = load_s500_config()["platform"]
+        value = float(plat["n_rotors"]) * float(plat["max_thrust"])
+    except Exception:
+        value = _S500_MAX_THRUST_TOTAL_FALLBACK_N
+    if not math.isfinite(value) or value <= 0.0:
+        value = _S500_MAX_THRUST_TOTAL_FALLBACK_N
+    return value
+
 
 def _app_icon():
     """Return the application QIcon if the asset exists, else None."""
@@ -3586,7 +3603,10 @@ class UamSuiteGUI(QMainWindow):
 
         mode_btn_row = QHBoxLayout()
         self.rn_offboard_btn = QPushButton("Set OFFBOARD")
-        self.rn_offboard_btn.setToolTip("调用 /mavros/set_mode 切换到 OFFBOARD 模式。")
+        self.rn_offboard_btn.setToolTip(
+            "调用 /mavros/set_mode 切换到 OFFBOARD。\n"
+            "会先把 PX4 设成忽略摇杆（COM_RC_IN_MODE=4），不需要 QGC 虚拟摇杆。"
+        )
         self.rn_offboard_btn.clicked.connect(lambda: self._call_set_flight_mode("OFFBOARD"))
         mode_btn_row.addWidget(self.rn_offboard_btn)
 
@@ -3596,7 +3616,10 @@ class UamSuiteGUI(QMainWindow):
         mode_btn_row.addWidget(self.rn_posctl_btn)
 
         self.rn_arm_btn = QPushButton("Arm")
-        self.rn_arm_btn.setToolTip("调用 /mavros/cmd/arming 解锁。")
+        self.rn_arm_btn.setToolTip(
+            "调用 /mavros/cmd/arming 解锁。\n"
+            "会先关掉摇杆检查。若当前仍是 POSCTL，请先切 OFFBOARD 或用 Takeoff。"
+        )
         self.rn_arm_btn.clicked.connect(lambda: self._call_arm(True))
         mode_btn_row.addWidget(self.rn_arm_btn)
 
@@ -3613,10 +3636,9 @@ class UamSuiteGUI(QMainWindow):
             "QPushButton { font-weight: bold; background-color: #1565c0; color: white; }"
         )
         self.rn_gz_takeoff_btn.setToolTip(
-            "仅需 Gazebo + PX4 SITL + MAVROS：\n"
-            "使用 PX4 AUTO.TAKEOFF 模式一次性解锁并起飞到约 1 米后自动 LOITER 悬停。\n"
-            "不占用 OFFBOARD、不持续发流，因此不会与后续 MPC 的 OFFBOARD 接管冲突。\n"
-            "（可在仅启动 Gazebo / PX4 SITL 后直接使用。）"
+            "仅需 Gazebo + PX4 SITL + MAVROS，不需要 QGroundControl 摇杆：\n"
+            "先忽略摇杆输入，再切 AUTO.TAKEOFF 并解锁，爬到约 1 米后自动 LOITER。\n"
+            "不占用 OFFBOARD、不持续发流，因此不会与后续 MPC 的 OFFBOARD 接管冲突。"
         )
         self.rn_gz_takeoff_btn.clicked.connect(lambda: self._call_gazebo_takeoff(1.0))
         gz_takeoff_row.addWidget(self.rn_gz_takeoff_btn)
@@ -3745,13 +3767,24 @@ class UamSuiteGUI(QMainWindow):
         self.rn_max_thrust_total.setRange(1.0, 500.0)
         self.rn_max_thrust_total.setDecimals(2)
         self.rn_max_thrust_total.setSingleStep(1.0)
-        self.rn_max_thrust_total.setValue(28.0)
+        self.rn_max_thrust_total.setValue(s500_max_thrust_total_n())
         self.rn_max_thrust_total.setToolTip(
             "CTBR 总推力归一化的分母（全部旋翼最大推力之和，单位 N）。\n"
+            "默认是 s500.yaml 的四桨满推力 n_rotors × max_thrust（约 41.38 N）。\n"
             "thrust_cmd = sum(rotor_thrust_N) / max_thrust_total，再 clip 到 [0,1]。\n"
             "需与 PX4 实际最大推力一致；启动 tracking node 前设置（在线更新不改此项）。"
         )
-        rn_grid.addWidget(self.rn_max_thrust_total, 5, 1)
+        self.rn_max_thrust_reset_btn = QPushButton("恢复默认")
+        self.rn_max_thrust_reset_btn.setToolTip(
+            "恢复为 s500.yaml 的四桨满推力：n_rotors × max_thrust（约 41.38 N）。"
+        )
+        self.rn_max_thrust_reset_btn.clicked.connect(self._reset_rn_max_thrust_total)
+        _thrust_row = QWidget()
+        _thrust_lay = QHBoxLayout(_thrust_row)
+        _thrust_lay.setContentsMargins(0, 0, 0, 0)
+        _thrust_lay.addWidget(self.rn_max_thrust_total, 1)
+        _thrust_lay.addWidget(self.rn_max_thrust_reset_btn)
+        rn_grid.addWidget(_thrust_row, 5, 1)
 
         ros_node_layout.addLayout(rn_grid)
 
@@ -10676,6 +10709,12 @@ class UamSuiteGUI(QMainWindow):
             running = self._rn_process is not None and self._rn_process.poll() is None
             self._set_node_service_buttons_enabled(bool(running))
 
+    def _reset_rn_max_thrust_total(self) -> None:
+        """把 ROS tracking 的 max_thrust_total 设回 s500.yaml 的四桨满推力。"""
+        value = s500_max_thrust_total_n()
+        self.rn_max_thrust_total.setValue(value)
+        self.log(f"[ros tracking] max_thrust_total 恢复为 {value:.2f} N")
+
     def _on_rn_mpc_panel_toggled(self, expanded: bool) -> None:
         """折叠/展开 MPC Parameters 面板。"""
         if hasattr(self, "_rn_mpc_panel"):
@@ -12226,6 +12265,16 @@ class UamSuiteGUI(QMainWindow):
             "font-weight: bold; color: %s;" % ("#2e7d32" if running else "gray")
         )
 
+    def _disable_px4_stick_input(self, log) -> None:
+        """仿真里关掉摇杆检查。失败只记日志，不中断后续模式/解锁请求。"""
+        try:
+            from px4_sitl_rc import ensure_px4_offboard_without_stick
+
+            _ok, msg = ensure_px4_offboard_without_stick(timeout_s=3.0)
+            log(f"[px4] {msg}")
+        except Exception as e:
+            log(f"[px4] disable stick input ERROR（忽略，继续）: {e}")
+
     def _call_set_flight_mode(self, mode: str) -> None:
         """调用 /mavros/set_mode 切换 PX4 飞行模式（OFFBOARD / POSCTL ...）。"""
         import threading
@@ -12234,17 +12283,27 @@ class UamSuiteGUI(QMainWindow):
             try:
                 import rospy
                 from mavros_msgs.srv import SetMode
+                from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
 
+                def _log(msg):
+                    QMetaObject.invokeMethod(
+                        self, "log", Qt.QueuedConnection, Q_ARG(str, msg)
+                    )
+
+                if str(mode).upper() == "OFFBOARD":
+                    self._disable_px4_stick_input(_log)
                 rospy.wait_for_service("/mavros/set_mode", timeout=3.0)
                 svc = rospy.ServiceProxy("/mavros/set_mode", SetMode)
                 resp = svc(base_mode=0, custom_mode=mode)
                 ok = bool(getattr(resp, "mode_sent", False))
-                msg = f"[set_mode {mode}] {'OK' if ok else 'FAIL'}"
+                _log(f"[set_mode {mode}] {'OK' if ok else 'FAIL'}")
             except Exception as e:
-                msg = f"[set_mode {mode}] ERROR: {e}"
-            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+                from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
 
-            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+                QMetaObject.invokeMethod(
+                    self, "log", Qt.QueuedConnection,
+                    Q_ARG(str, f"[set_mode {mode}] ERROR: {e}"),
+                )
 
         threading.Thread(target=_call, daemon=True).start()
 
@@ -12256,27 +12315,38 @@ class UamSuiteGUI(QMainWindow):
             try:
                 import rospy
                 from mavros_msgs.srv import CommandBool
+                from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
 
+                def _log(msg):
+                    QMetaObject.invokeMethod(
+                        self, "log", Qt.QueuedConnection, Q_ARG(str, msg)
+                    )
+
+                if arm:
+                    self._disable_px4_stick_input(_log)
                 rospy.wait_for_service("/mavros/cmd/arming", timeout=3.0)
                 svc = rospy.ServiceProxy("/mavros/cmd/arming", CommandBool)
                 resp = svc(value=bool(arm))
                 ok = bool(getattr(resp, "success", False))
-                msg = f"[{'arm' if arm else 'disarm'}] {'OK' if ok else 'FAIL'}"
+                extra = ""
+                if arm and not ok:
+                    extra = "（若当前是 POSCTL，请先 Set OFFBOARD 或用 Takeoff）"
+                _log(f"[{'arm' if arm else 'disarm'}] {'OK' if ok else 'FAIL'}{extra}")
             except Exception as e:
-                msg = f"[{'arm' if arm else 'disarm'}] ERROR: {e}"
-            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+                from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
 
-            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+                QMetaObject.invokeMethod(
+                    self, "log", Qt.QueuedConnection,
+                    Q_ARG(str, f"[{'arm' if arm else 'disarm'}] ERROR: {e}"),
+                )
 
         threading.Thread(target=_call, daemon=True).start()
 
     def _call_gazebo_takeoff(self, target_z: float = 1.0) -> None:
         """仅依赖 Gazebo + PX4 SITL + MAVROS 的一键起飞（PX4 AUTO.TAKEOFF）。
 
-        使用 PX4 内置的 AUTO.TAKEOFF 模式：设定起飞高度参数 → 解锁 → 切
-        AUTO.TAKEOFF。这是一次性指令，PX4 自主爬升到目标高度后会自动转入
-        AUTO.LOITER 悬停。**不占用 OFFBOARD、不持续发布设定点流**，因此不会
-        与后续 MPC 的 OFFBOARD 接管产生冲突。可在仅启动 Gazebo / PX4 SITL 后使用。
+        先关掉摇杆检查，再设定起飞高度、切 AUTO.TAKEOFF、解锁。PX4 自主爬升到
+        目标高度后转入 AUTO.LOITER。不占用 OFFBOARD，也不持续发布设定点。
         """
         import threading
         from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
@@ -12299,6 +12369,9 @@ class UamSuiteGUI(QMainWindow):
                 _log(f"[takeoff] import 失败: {e}")
                 return
 
+            # 0) 忽略摇杆，否则没有 QGC 虚拟摇杆时解锁和 OFFBOARD 会被拒
+            self._disable_px4_stick_input(_log)
+
             # 1) 设置 PX4 起飞高度参数 MIS_TAKEOFF_ALT（米，相对起飞点）
             try:
                 rospy.wait_for_service("/mavros/param/set", timeout=3.0)
@@ -12312,33 +12385,32 @@ class UamSuiteGUI(QMainWindow):
             except Exception as e:
                 _log(f"[takeoff] set MIS_TAKEOFF_ALT ERROR（忽略，继续）: {e}")
 
-            # 2) 解锁
+            # 2) 先切到不要求摇杆的模式，再解锁。POSCTL 在没有摇杆时不能解锁。
+            try:
+                rospy.wait_for_service("/mavros/set_mode", timeout=3.0)
+                set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
+                r = set_mode(base_mode=0, custom_mode="AUTO.TAKEOFF")
+                mode_ok = bool(getattr(r, "mode_sent", False))
+                _log(f"[takeoff] set AUTO.TAKEOFF {'OK' if mode_ok else 'FAIL'}")
+            except Exception as e:
+                _log(f"[takeoff] set AUTO.TAKEOFF ERROR: {e}")
+                return
+
+            # 3) 解锁（已在 AUTO.TAKEOFF，不再要求 QGC 摇杆）
             try:
                 rospy.wait_for_service("/mavros/cmd/arming", timeout=3.0)
                 arming = rospy.ServiceProxy("/mavros/cmd/arming", CommandBool)
                 r = arming(value=True)
                 if not getattr(r, "success", False):
-                    _log("[takeoff] arm FAIL（请检查是否满足解锁条件）")
+                    _log("[takeoff] arm FAIL（请检查定位/预解锁检查）")
                     return
                 _log("[takeoff] arm OK")
+                _log(
+                    f"[takeoff] 已触发自主起飞到约 {target_z:.2f} m，"
+                    "到达后 PX4 自动 LOITER 悬停（未占用 OFFBOARD）。"
+                )
             except Exception as e:
                 _log(f"[takeoff] arm ERROR: {e}")
-                return
-
-            # 3) 切 AUTO.TAKEOFF（一次性，PX4 自主爬升后自动转 LOITER）
-            try:
-                rospy.wait_for_service("/mavros/set_mode", timeout=3.0)
-                set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
-                r = set_mode(base_mode=0, custom_mode="AUTO.TAKEOFF")
-                ok = bool(getattr(r, "mode_sent", False))
-                _log(f"[takeoff] set AUTO.TAKEOFF {'OK' if ok else 'FAIL'}")
-                if ok:
-                    _log(
-                        f"[takeoff] 已触发自主起飞到约 {target_z:.2f} m，"
-                        "到达后 PX4 自动 LOITER 悬停（未占用 OFFBOARD）。"
-                    )
-            except Exception as e:
-                _log(f"[takeoff] set AUTO.TAKEOFF ERROR: {e}")
 
         threading.Thread(target=_run, daemon=True).start()
 
