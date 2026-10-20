@@ -12332,3 +12332,3181 @@ class UamSuiteGUI(QMainWindow):
                 if arm and not ok:
                     extra = "（若当前是 POSCTL，请先 Set OFFBOARD 或用 Takeoff）"
                 _log(f"[{'arm' if arm else 'disarm'}] {'OK' if ok else 'FAIL'}{extra}")
+            except Exception as e:
+                from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+                QMetaObject.invokeMethod(
+                    self, "log", Qt.QueuedConnection,
+                    Q_ARG(str, f"[{'arm' if arm else 'disarm'}] ERROR: {e}"),
+                )
+
+        threading.Thread(target=_call, daemon=True).start()
+
+    def _call_gazebo_takeoff(self, target_z: float = 1.0) -> None:
+        """仅依赖 Gazebo + PX4 SITL + MAVROS 的一键起飞（PX4 AUTO.TAKEOFF）。
+
+        先关掉摇杆检查，再设定起飞高度、切 AUTO.TAKEOFF、解锁。PX4 自主爬升到
+        目标高度后转入 AUTO.LOITER。不占用 OFFBOARD，也不持续发布设定点。
+        """
+        import threading
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _log(msg):
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        if not self._ensure_ros_node():
+            QMessageBox.warning(
+                self, "Notice", "ROS master 不可用，请先启动 Gazebo / PX4 SITL。"
+            )
+            return
+
+        def _run():
+            try:
+                import rospy
+                from mavros_msgs.srv import SetMode, CommandBool, ParamSet
+                from mavros_msgs.msg import ParamValue
+            except Exception as e:
+                _log(f"[takeoff] import 失败: {e}")
+                return
+
+            # 0) 忽略摇杆，否则没有 QGC 虚拟摇杆时解锁和 OFFBOARD 会被拒
+            self._disable_px4_stick_input(_log)
+
+            # 1) 设置 PX4 起飞高度参数 MIS_TAKEOFF_ALT（米，相对起飞点）
+            try:
+                rospy.wait_for_service("/mavros/param/set", timeout=3.0)
+                param_set = rospy.ServiceProxy("/mavros/param/set", ParamSet)
+                val = ParamValue(integer=0, real=float(target_z))
+                r = param_set(param_id="MIS_TAKEOFF_ALT", value=val)
+                _log(
+                    f"[takeoff] set MIS_TAKEOFF_ALT={target_z:.2f}m "
+                    f"{'OK' if getattr(r, 'success', False) else 'FAIL'}"
+                )
+            except Exception as e:
+                _log(f"[takeoff] set MIS_TAKEOFF_ALT ERROR（忽略，继续）: {e}")
+
+            # 2) 先切到不要求摇杆的模式，再解锁。POSCTL 在没有摇杆时不能解锁。
+            try:
+                rospy.wait_for_service("/mavros/set_mode", timeout=3.0)
+                set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
+                r = set_mode(base_mode=0, custom_mode="AUTO.TAKEOFF")
+                mode_ok = bool(getattr(r, "mode_sent", False))
+                _log(f"[takeoff] set AUTO.TAKEOFF {'OK' if mode_ok else 'FAIL'}")
+            except Exception as e:
+                _log(f"[takeoff] set AUTO.TAKEOFF ERROR: {e}")
+                return
+
+            # 3) 解锁（已在 AUTO.TAKEOFF，不再要求 QGC 摇杆）
+            try:
+                rospy.wait_for_service("/mavros/cmd/arming", timeout=3.0)
+                arming = rospy.ServiceProxy("/mavros/cmd/arming", CommandBool)
+                r = arming(value=True)
+                if not getattr(r, "success", False):
+                    _log("[takeoff] arm FAIL（请检查定位/预解锁检查）")
+                    return
+                _log("[takeoff] arm OK")
+                _log(
+                    f"[takeoff] 已触发自主起飞到约 {target_z:.2f} m，"
+                    "到达后 PX4 自动 LOITER 悬停（未占用 OFFBOARD）。"
+                )
+            except Exception as e:
+                _log(f"[takeoff] arm ERROR: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _tracking_service_candidates(self, short_name: str) -> list:
+        """全局名 + 节点私有名（兼容旧 tracking 进程）。"""
+        s = str(short_name).lstrip("/")
+        return [f"/{s}", f"/{TRACKING_NODE_NAME}/{s}"]
+
+    def _wait_tracking_service(self, short_name: str, timeout: float = 5.0) -> str:
+        """等待 tracking 服务上线，返回实际可用的全名。"""
+        import time as _time
+
+        import rospy
+
+        candidates = self._tracking_service_candidates(short_name)
+        deadline = _time.monotonic() + float(timeout)
+        last_err = None
+        while _time.monotonic() < deadline and not rospy.is_shutdown():
+            for srv in candidates:
+                remain = max(0.05, deadline - _time.monotonic())
+                try:
+                    rospy.wait_for_service(srv, timeout=remain)
+                    return srv
+                except rospy.ROSException as e:
+                    last_err = e
+            _time.sleep(0.05)
+        raise rospy.ROSException(
+            f"tracking service {short_name!r} unavailable (tried {candidates}): {last_err}"
+        )
+
+    def _tracking_service_reachable(self, short_name: str) -> bool:
+        """非阻塞探测 tracking 服务是否已注册。"""
+        try:
+            import rosgraph
+
+            if not rosgraph.is_master_online():
+                return False
+            master = rosgraph.Master(f"/{GUI_ROS_NODE_NAME}")
+            for srv in self._tracking_service_candidates(short_name):
+                try:
+                    master.lookupService(srv)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _set_node_service_buttons_enabled(self, enabled: bool) -> None:
+        """Enable/disable all ROS-node-dependent service buttons in one place."""
+        ctrl_mode = (
+            self.rn_controller_combo.currentText()
+            if hasattr(self, "rn_controller_combo")
+            else ""
+        )
+        support_reg = ctrl_mode in (
+            "croc_full_state",
+            "acados_full_state",
+            "acados_ee_pose",
+            "croc_ee_pose",
+            "px4",
+            "geometric",
+        )
+        for name in (
+            "rn_start_svc_btn", "rn_stop_svc_btn", "rn_save_svc_btn",
+            "rn_update_ctrl_btn", "rn_update_traj_btn",
+            "rn_drag_ff_svc_on_btn", "rn_drag_ff_svc_off_btn",
+        ):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(enabled)
+        for name in ("rn_takeoff_btn", "rn_reset_svc_btn", "rn_set_reg_btn"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(enabled and support_reg)
+
+    def _call_tracking_service(self, srv_name: str):
+        """在后台线程中调用一个无参数的 ROS Trigger 服务，结果通过日志反馈。"""
+        import threading
+
+        short = str(srv_name).lstrip("/")
+
+        def _call():
+            try:
+                import rospy
+                from std_srvs.srv import Trigger
+
+                resolved = self._wait_tracking_service(short, timeout=3.0)
+                svc = rospy.ServiceProxy(resolved, Trigger)
+                resp = svc()
+                msg = f"[{resolved}] {'OK' if resp.success else 'FAIL'}: {resp.message}"
+            except Exception as e:
+                msg = f"[/{short}] ERROR: {e}"
+            rospy.loginfo(msg) if "OK" in msg else rospy.logwarn(msg)
+            # Log 到 GUI（需在主线程；用 QMetaObject 保证线程安全）
+            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        threading.Thread(target=_call, daemon=True).start()
+
+    def _run_l1_offline_compare(self):
+        """子进程运行 L1 几何跟踪对比仿真并打开/保存对比图。"""
+        import subprocess
+
+        root = Path(__file__).resolve().parent
+        script = root / "scripts" / "example" / "l1_geometric_tracking_sim.py"
+        if not script.exists():
+            QMessageBox.warning(self, "Notice", f"未找到仿真脚本:\n{script}")
+            return
+        out_png = root / "results" / "l1_geometric_tracking_compare.png"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--no-show",
+            "--save",
+            str(out_png),
+            f"--l1-as={self.rn_l1_as_gain.value()}",
+            f"--l1-wc={self.rn_l1_wc_xy.value()}",
+            f"--l1-kpi={self.rn_l1_k_pos_i_xy.value()}",
+            f"--k-drag=0.35",
+        ]
+        self.log("[L1 sim] 运行离线对比仿真…")
+        try:
+            proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=120)
+            if proc.stdout:
+                self.log(proc.stdout.strip()[:2000])
+            if proc.returncode != 0:
+                self.log(f"[L1 sim] FAIL (code {proc.returncode}): {proc.stderr[:1500]}")
+                QMessageBox.critical(self, "L1 sim failed", (proc.stderr or proc.stdout)[:2000])
+                return
+            self.log(f"[L1 sim] 完成，图已保存: {out_png}")
+            if out_png.exists():
+                try:
+                    from PyQt5.QtGui import QPixmap
+                    from PyQt5.QtWidgets import QDialog, QLabel, QVBoxLayout
+
+                    dlg = QDialog(self)
+                    dlg.setWindowTitle("L1 tracking comparison")
+                    lay = QVBoxLayout(dlg)
+                    lbl = QLabel()
+                    lbl.setPixmap(QPixmap(str(out_png)).scaled(900, 700, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    lay.addWidget(lbl)
+                    dlg.resize(920, 720)
+                    dlg.exec_()
+                except Exception as e:
+                    self.log(f"[L1 sim] 无法弹窗显示图片: {e}")
+        except Exception as e:
+            QMessageBox.critical(self, "L1 sim failed", str(e)[:2000])
+
+    def _run_l1_acados_hover_test(self):
+        """子进程运行 acados 悬停 + 质量突变 + L1 验证仿真并显示对比图。"""
+        import subprocess
+
+        root = Path(__file__).resolve().parent
+        script = root / "scripts" / "example" / "l1_acados_hover_mass_jump_sim.py"
+        if not script.exists():
+            QMessageBox.warning(self, "Notice", f"未找到仿真脚本:\n{script}")
+            return
+        out_png = root / "results" / "l1_acados_hover_mass_jump.png"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--no-show",
+            "--save",
+            str(out_png),
+            f"--l1-as={self.rn_l1_as_gain.value()}",
+            f"--l1-wc={self.rn_l1_wc_z.value()}",
+            f"--dt-mpc={self.rn_dt_mpc.value()}",
+            f"--horizon={int(self.rn_horizon.value())}",
+            "--delta-m=0.3",
+            "--t-step=8.0",
+        ]
+        self.log("[L1 acados] 编译/运行 acados 悬停质量突变仿真（首次需编译，请稍候）…")
+
+        import threading
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _run():
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=str(root), capture_output=True, text=True, timeout=900
+                )
+                tail = "\n".join((proc.stdout or "").strip().splitlines()[-12:])
+                if proc.returncode != 0:
+                    msg = f"[L1 acados] FAIL: {(proc.stderr or proc.stdout)[-1500:]}"
+                else:
+                    msg = f"[L1 acados] 完成:\n{tail}"
+            except Exception as e:
+                msg = f"[L1 acados] ERROR: {e}"
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+            if out_png.exists():
+                QMetaObject.invokeMethod(
+                    self, "_show_image_dialog", Qt.QueuedConnection,
+                    Q_ARG(str, str(out_png)), Q_ARG(str, "Acados hover + mass-jump L1"),
+                )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    from PyQt5.QtCore import pyqtSlot as _pyqtSlot_img
+
+    @_pyqtSlot_img(str, str)
+    def _show_image_dialog(self, png_path: str, title: str):
+        try:
+            from PyQt5.QtGui import QPixmap
+            from PyQt5.QtWidgets import QDialog, QLabel, QVBoxLayout
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle(title)
+            lay = QVBoxLayout(dlg)
+            lbl = QLabel()
+            lbl.setPixmap(
+                QPixmap(png_path).scaled(960, 720, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            lay.addWidget(lbl)
+            dlg.resize(980, 740)
+            dlg.exec_()
+        except Exception as e:
+            self.log(f"[image] 无法显示 {png_path}: {e}")
+
+    def _show_rate_step_response(self):
+        """用当前 CTBR 角速度环参数仿真 roll/pitch/yaw 三轴角速度阶跃响应并弹窗显示。
+
+        简化每轴闭环模型（与后端 CTBR 一致的离散控制率 + 电机一阶滞后）：
+            每 control_dt：ω̇_des = Kp·e + Ki·∫e + Kd·ė（e=ω_sp−ω，∫ 带 anti-windup）
+            每 sim_dt：电机一阶 a_motor += (1−e^(−sim_dt/τ_m))·(ω̇_des − a_motor)；ω += sim_dt·a_motor
+        分配按 plant 控制有效性求解为理想（除电机滞后外 ω̇≈ω̇_des），故此处用归一化加速度模型即可。
+        """
+        try:
+            import numpy as np
+            from PyQt5.QtWidgets import QDialog, QVBoxLayout
+
+            sim_dt = max(float(self.sim_dt.value()), 1e-4)
+            control_dt = max(float(self.control_dt.value()), sim_dt)
+            motor_tau = float(self.sim_ctbr_motor_tau.value())
+            int_limit = float(self.sim_ctbr_int_limit.value())
+            max_rate = float(self.sim_ctbr_max_rate.value())
+            max_acc = float(self.sim_ctbr_max_torque.value())  # 新语义：角加速度限幅
+            gains = {
+                "roll": (float(self.sim_ctbr_kp_rp.value()),
+                         float(self.sim_ctbr_ki_rp.value()),
+                         float(self.sim_ctbr_kd_rp.value())),
+                "pitch": (float(self.sim_ctbr_kp_rp.value()),
+                          float(self.sim_ctbr_ki_rp.value()),
+                          float(self.sim_ctbr_kd_rp.value())),
+                "yaw": (float(self.sim_ctbr_kp_yaw.value()),
+                        float(self.sim_ctbr_ki_yaw.value()),
+                        float(self.sim_ctbr_kd_yaw.value())),
+            }
+            step = 1.0
+            if max_rate > 0.0:
+                step = min(step, max_rate)
+            T = 1.5
+            n = max(2, int(round(T / sim_dt)))
+            n_inner = max(1, int(round(control_dt / sim_dt)))
+            t = np.arange(n) * sim_dt
+            alpha_m = (1.0 - np.exp(-sim_dt / max(motor_tau, 1e-9))
+                       if motor_tau > 1e-9 else 1.0)
+
+            def _sim(kp, ki, kd):
+                omega = 0.0
+                integ = 0.0
+                prev_e = None
+                a_des = 0.0
+                a_motor = 0.0
+                out = np.zeros(n)
+                for k in range(n):
+                    if k % n_inner == 0:
+                        e = step - omega
+                        integ += control_dt * e
+                        if int_limit > 0.0:
+                            integ = float(np.clip(integ, -int_limit, int_limit))
+                        de = 0.0 if prev_e is None else (e - prev_e) / control_dt
+                        prev_e = e
+                        a_des = kp * e + ki * integ + kd * de
+                        if max_acc > 0.0:
+                            a_des = float(np.clip(a_des, -max_acc, max_acc))
+                    a_motor += alpha_m * (a_des - a_motor)
+                    omega += sim_dt * a_motor
+                    out[k] = omega
+                return out
+
+            def _metrics(y):
+                yf = step
+                # 上升时间 10%→90%
+                try:
+                    i10 = int(np.argmax(y >= 0.1 * yf))
+                    i90 = int(np.argmax(y >= 0.9 * yf))
+                    rise = (t[i90] - t[i10]) * 1e3 if i90 > i10 else float("nan")
+                except Exception:
+                    rise = float("nan")
+                over = (np.max(y) - yf) / yf * 100.0 if yf != 0 else 0.0
+                # 2% 调节时间
+                tol = 0.02 * abs(yf)
+                settle = float("nan")
+                for k in range(n - 1, -1, -1):
+                    if abs(y[k] - yf) > tol:
+                        settle = t[k + 1] * 1e3 if k + 1 < n else t[k] * 1e3
+                        break
+                return rise, over, settle
+
+            fig = Figure(figsize=(8.5, 4.6), tight_layout=True)
+            ax = fig.add_subplot(111)
+            colors = {"roll": "tab:blue", "pitch": "tab:green", "yaw": "tab:red"}
+            for name, (kp, ki, kd) in gains.items():
+                y = _sim(kp, ki, kd)
+                rise, over, settle = _metrics(y)
+                ax.plot(
+                    t, y, color=colors[name], lw=1.8,
+                    label=(f"{name} (Kp={kp:g},Ki={ki:g},Kd={kd:g}) | "
+                           f"tr={rise:.0f}ms, OS={over:.0f}%, ts={settle:.0f}ms"),
+                )
+            ax.axhline(step, color="gray", ls="--", lw=0.8)
+            ax.axhline(0.98 * step, color="gray", ls=":", lw=0.6)
+            ax.axhline(1.02 * step, color="gray", ls=":", lw=0.6)
+            ax.set_xlabel("t [s]")
+            ax.set_ylabel("body rate ω [rad/s]")
+            ax.set_title(
+                f"CTBR rate-loop step response (sp={step:g} rad/s, "
+                f"ctrl={1.0/control_dt:.0f}Hz, τ_motor={motor_tau*1e3:.0f}ms)"
+            )
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=_mpl_pt(10), loc="lower right")
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Rate controller — 阶跃响应")
+            lay = QVBoxLayout(dlg)
+            cv = FigureCanvas(fig)
+            lay.addWidget(NavigationToolbar(cv, dlg))
+            lay.addWidget(cv)
+            dlg.resize(900, 560)
+            dlg.exec_()
+        except Exception as e:
+            import traceback
+            self.log(f"[rate-step] 失败: {e}\n{traceback.format_exc()}")
+
+    def _show_motor_step_response(self):
+        """用当前电机时间常数 motor_tau 仿真单电机推力一阶阶跃响应并弹窗显示。
+
+        模型与后端 CTBR 电机滞后一致（按 sim_dt 离散一阶）：
+            u += (1 − e^(−sim_dt/τ_m))·(u_cmd − u)
+        阶跃从悬停推力跳到 80% 满推力，标注 τ/上升时间/调节时间。
+        """
+        try:
+            import numpy as np
+            from PyQt5.QtWidgets import QDialog, QVBoxLayout
+
+            sim_dt = max(float(self.sim_dt.value()), 1e-4)
+            motor_tau = float(self.sim_ctbr_motor_tau.value())
+
+            # 阶跃幅度参考真实推力范围（悬停 → 80% 满推力）。
+            u_lo, u_hi = 0.0, 1.0
+            try:
+                from s500_uam_acados_state_tracking_mpc import load_s500_config
+                plat = load_s500_config()["platform"]
+                u_lo = float(plat.get("min_thrust", 0.0))
+                u_hi = 0.8 * float(plat["max_thrust"])
+            except Exception:
+                pass
+            T = max(0.3, 8.0 * max(motor_tau, sim_dt))
+            n = max(2, int(round(T / sim_dt)))
+            t = np.arange(n) * sim_dt
+            alpha_m = (1.0 - np.exp(-sim_dt / max(motor_tau, 1e-9))
+                       if motor_tau > 1e-9 else 1.0)
+
+            u = u_lo
+            y = np.zeros(n)
+            for k in range(n):
+                u += alpha_m * (u_hi - u)
+                y[k] = u
+            span = u_hi - u_lo
+
+            def _t_at(frac):
+                thr = u_lo + frac * span
+                idx = int(np.argmax(y >= thr))
+                return t[idx] if y[idx] >= thr else float("nan")
+
+            t10, t90 = _t_at(0.1), _t_at(0.9)
+            rise = (t90 - t10) * 1e3 if np.isfinite(t90) and np.isfinite(t10) else float("nan")
+            # 2% 调节时间
+            tol = 0.02 * abs(span)
+            settle = float("nan")
+            for k in range(n - 1, -1, -1):
+                if abs(y[k] - u_hi) > tol:
+                    settle = (t[k + 1] if k + 1 < n else t[k]) * 1e3
+                    break
+
+            fig = Figure(figsize=(8.0, 4.2), tight_layout=True)
+            ax = fig.add_subplot(111)
+            ax.plot(t, y, color="tab:blue", lw=1.8,
+                    label=f"motor (τ={motor_tau*1e3:.0f}ms) | tr={rise:.0f}ms, ts(2%)={settle:.0f}ms")
+            ax.axhline(u_hi, color="gray", ls="--", lw=0.8, label="cmd")
+            ax.axhline(u_lo + 0.98 * span, color="gray", ls=":", lw=0.6)
+            ax.axhline(u_lo + 0.632 * span, color="tab:red", ls=":", lw=0.8,
+                       label="63.2% (=τ)")
+            if motor_tau > 1e-9:
+                ax.axvline(motor_tau, color="tab:red", ls=":", lw=0.8)
+            ax.set_xlabel("t [s]")
+            ax.set_ylabel("rotor thrust [N]")
+            ax.set_title(
+                f"Motor first-order step response (τ={motor_tau*1e3:.0f}ms, sim_dt={sim_dt*1e3:.1f}ms)"
+            )
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=_mpl_pt(10), loc="lower right")
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Motor — 阶跃响应")
+            lay = QVBoxLayout(dlg)
+            cv = FigureCanvas(fig)
+            lay.addWidget(NavigationToolbar(cv, dlg))
+            lay.addWidget(cv)
+            dlg.resize(860, 520)
+            dlg.exec_()
+        except Exception as e:
+            import traceback
+            self.log(f"[motor-step] 失败: {e}\n{traceback.format_exc()}")
+
+    def _rn_l1_mode_display(self, mode: str) -> str:
+        m = str(mode).strip().lower()
+        if m == "oracle":
+            return "oracle (Gazebo真值)"
+        if m == "drag_ff":
+            return "TRUE drag"
+        return "L1 adaptive"
+
+    def _rn_l1_inject_display(self, inject: str) -> str:
+        return "in-model" if str(inject).lower() == "in_model" else "bolt-on"
+
+    def _rn_l1_normalize_inject(self, inject: str) -> str:
+        """非 acados 时 in-model 在节点侧等效 bolt-on。"""
+        inj = str(inject).lower()
+        if inj != "in_model":
+            return "bolt_on"
+        if (
+            hasattr(self, "rn_controller_combo")
+            and self.rn_controller_combo.currentText()
+            in ("acados_full_state", "acados_ee_pose")
+        ):
+            return "in_model"
+        return "bolt_on"
+
+    def _rn_l1_gui_state_dict(self) -> dict:
+        mode = self._rn_l1_backend_mode()
+        return {
+            "dist_enabled": bool(self.rn_l1_enabled.isChecked()),
+            "comp_enabled": bool(self.rn_l1_comp_enabled_chk.isChecked()),
+            "mode": mode,
+            "inject": self._rn_l1_backend_inject(),
+        }
+
+    def _rn_l1_node_state_dict(self, ms: dict | None = None) -> dict | None:
+        import time as _time
+
+        now = _time.monotonic()
+        snap = getattr(self, "_rn_dist_comp_state", None)
+        if isinstance(snap, dict) and (now - float(getattr(self, "_rn_dist_comp_t", 0.0))) < 5.0:
+            est = snap.get("estimation") or {}
+            return {
+                "dist_enabled": bool(snap.get("dist_enabled")),
+                "comp_enabled": bool(snap.get("comp_enabled")),
+                "mode": str(snap.get("l1_mode", "")),
+                "inject": str(snap.get("l1_inject", "")),
+                "force_norm": float(est.get("force_norm", 0.0)),
+                "source": str(est.get("source", "")),
+            }
+        if ms is None:
+            ms = getattr(self, "_mpc_stats", None)
+        if isinstance(ms, dict) and (now - float(getattr(self, "_mpc_stats_t", 0.0))) < 5.0:
+            return {
+                "dist_enabled": bool(
+                    ms.get("l1_dist_enabled") or ms.get("l1_enabled") or ms.get("drag_ff_enabled")
+                ),
+                "comp_enabled": bool(ms.get("l1_comp_enabled")),
+                "mode": str(ms.get("l1_mode", "adaptive")),
+                "inject": str(ms.get("l1_inject", "bolt_on")),
+                "force_norm": float(ms.get("l1_force_norm", 0.0)),
+                "source": str(ms.get("l1_mode", "")),
+            }
+        return None
+
+    def _rn_l1_format_state_line(self, st: dict, *, prefix_est: str = "估计") -> str:
+        on = "开" if st.get("dist_enabled") else "关"
+        comp = "开" if st.get("comp_enabled") else "关"
+        mode = self._rn_l1_mode_display(st.get("mode", "adaptive"))
+        inj = self._rn_l1_inject_display(st.get("inject", "bolt_on"))
+        fn = float(st.get("force_norm", 0.0))
+        extra = f"  |F|={fn:.2f}N" if st.get("dist_enabled") else ""
+        src = st.get("source")
+        if src and str(src) not in ("none", "", str(st.get("mode", ""))):
+            extra += f"  src={src}"
+        return f"{prefix_est}[{on}]  来源[{mode}]  补偿[{comp}]  方式[{inj}]{extra}"
+
+    def _rn_l1_states_match(self, gui: dict, node: dict) -> tuple:
+        if node is None:
+            svc = self._rn_tracking_services_available(use_cache=True)
+            if not svc:
+                return False, "tracking 节点未运行（配置已保存，Launch 后生效）"
+            return False, "等待节点回报…"
+        diffs = []
+        if bool(gui["dist_enabled"]) != bool(node["dist_enabled"]):
+            diffs.append(
+                f"估计 GUI={'开' if gui['dist_enabled'] else '关'}"
+                f" 节点={'开' if node['dist_enabled'] else '关'}"
+            )
+        if gui["dist_enabled"] or node["dist_enabled"]:
+            if str(gui["mode"]) != str(node["mode"]):
+                diffs.append(
+                    f"来源 GUI={self._rn_l1_mode_display(gui['mode'])}"
+                    f" 节点={self._rn_l1_mode_display(node['mode'])}"
+                )
+            if gui["dist_enabled"] and node["dist_enabled"]:
+                if bool(gui["comp_enabled"]) != bool(node["comp_enabled"]):
+                    diffs.append(
+                        f"补偿 GUI={'开' if gui['comp_enabled'] else '关'}"
+                        f" 节点={'开' if node['comp_enabled'] else '关'}"
+                    )
+                gi = self._rn_l1_normalize_inject(gui["inject"])
+                ni = self._rn_l1_normalize_inject(node["inject"])
+                if gi != ni:
+                    diffs.append(
+                        f"方式 GUI={self._rn_l1_inject_display(gui['inject'])}"
+                        f" 节点={self._rn_l1_inject_display(node['inject'])}"
+                    )
+        if diffs:
+            return False, "不一致: " + "; ".join(diffs)
+        return True, "已与节点一致"
+
+    def _refresh_rn_l1_runtime_status(
+        self,
+        *,
+        action: str | None = None,
+        ms_fresh: bool = False,
+        ms: dict | None = None,
+    ) -> None:
+        if not hasattr(self, "rn_l1_gui_state_label"):
+            return
+        gui = self._rn_l1_gui_state_dict()
+        node = self._rn_l1_node_state_dict(ms if ms_fresh else None)
+        self.rn_l1_gui_state_label.setText(self._rn_l1_format_state_line(gui, prefix_est="设置"))
+        if node is None:
+            self.rn_l1_node_state_label.setText("节点回报: —（未收到 /suite_mpc/dist_comp/state）")
+            self.rn_l1_node_state_label.setStyleSheet("font-size: 11px; color: gray;")
+        else:
+            self.rn_l1_node_state_label.setText(
+                self._rn_l1_format_state_line(node, prefix_est="估计")
+            )
+            self.rn_l1_node_state_label.setStyleSheet("font-size: 11px; color: #2e7d32;")
+        ok_sync, sync_msg = self._rn_l1_states_match(gui, node)
+        if getattr(self, "_rn_l1_pending_apply", False):
+            sync_msg = "下发中…"
+            ok_sync = False
+        self.rn_l1_sync_label.setText(f"同步: {sync_msg}")
+        self.rn_l1_sync_label.setStyleSheet(
+            "font-size: 11px; font-weight: bold; color: %s;"
+            % ("#2e7d32" if ok_sync else ("#e65100" if node else "gray"))
+        )
+        if action is not None:
+            apply_line = f"[{action}] 下发中…"
+        elif getattr(self, "_rn_l1_pending_apply", False):
+            apply_line = "下发中…"
+        elif self._rn_l1_last_apply_ok is True:
+            apply_line = f"最近下发: 成功 — {self._rn_l1_last_apply_msg}"
+        elif self._rn_l1_last_apply_ok is False:
+            apply_line = f"最近下发: 失败 — {self._rn_l1_last_apply_msg}"
+        else:
+            apply_line = "操作: 勾选或切换下拉将自动下发到 tracking 节点"
+        self.rn_l1_apply_label.setText(apply_line)
+        self.rn_l1_apply_label.setStyleSheet(
+            "font-size: 11px; color: %s;"
+            % (
+                "#1565c0"
+                if getattr(self, "_rn_l1_pending_apply", False)
+                else ("#2e7d32" if self._rn_l1_last_apply_ok is True else ("#b71c1c" if self._rn_l1_last_apply_ok is False else "gray"))
+            )
+        )
+        if hasattr(self, "rn_l1_force_label"):
+            if node and node.get("dist_enabled"):
+                fn = float(node.get("force_norm", 0.0))
+                mode = str(node.get("mode", ""))
+                if mode == "oracle":
+                    lbl, color = "F_oracle", "#6a1b9a"
+                elif mode == "drag_ff":
+                    lbl, color = "F_drag", "#6a1b9a"
+                else:
+                    lbl, color = "F_est", "#1565c0"
+                self.rn_l1_force_label.setText(f"{lbl}: |F|={fn:.2f} N")
+                self.rn_l1_force_label.setStyleSheet(
+                    f"color: {color}; font-size: 11px; font-weight: bold;"
+                )
+            else:
+                self.rn_l1_force_label.setText("F_est: —")
+                self.rn_l1_force_label.setStyleSheet("color: gray; font-size: 11px;")
+
+    def _on_rn_l1_est_checkbox_toggled(self, checked: bool) -> None:
+        if getattr(self, "_rn_l1_runtime_guard", False):
+            return
+        if hasattr(self, "rn_l1_comp_enabled_chk"):
+            self.rn_l1_comp_enabled_chk.setEnabled(bool(checked))
+            if not checked:
+                self._rn_l1_runtime_guard = True
+                try:
+                    self.rn_l1_comp_enabled_chk.setChecked(False)
+                finally:
+                    self._rn_l1_runtime_guard = False
+        action = "开启扰动估计" if checked else "关闭扰动估计"
+        self._apply_rn_l1_runtime_to_node(action)
+
+    def _on_rn_l1_comp_checkbox_toggled(self, checked: bool) -> None:
+        if getattr(self, "_rn_l1_runtime_guard", False):
+            return
+        action = "开启扰动补偿" if checked else "关闭扰动补偿"
+        self._apply_rn_l1_runtime_to_node(action)
+
+    def _on_rn_l1_config_changed(self, _index: int = 0) -> None:
+        """估计来源 / 补偿方式下拉变更 → 即时下发节点。"""
+        if getattr(self, "_rn_l1_runtime_guard", False):
+            return
+        sync = getattr(self, "_rn_sync_l1_comp_mode_widgets", None)
+        if callable(sync):
+            sync()
+        sender = self.sender()
+        if sender is getattr(self, "rn_l1_comp_mode", None):
+            mode = self._rn_l1_backend_mode()
+            action = f"切换估计来源 → {self._rn_l1_mode_display(mode)}"
+        elif sender is getattr(self, "rn_l1_comp_strategy", None):
+            inj = self._rn_l1_backend_inject()
+            action = f"切换补偿方式 → {self._rn_l1_inject_display(inj)}"
+        else:
+            action = "更新 L1 配置"
+        self._apply_rn_l1_runtime_to_node(action)
+
+    def _on_rn_l1_controller_changed(self, _index: int = 0) -> None:
+        """控制器切换可能影响 in-model 是否可用 → 同步 UI 并下发。"""
+        sync = getattr(self, "_rn_sync_l1_comp_mode_widgets", None)
+        if callable(sync):
+            sync()
+        if hasattr(self, "rn_l1_enabled") and self.rn_l1_enabled.isChecked():
+            self._apply_rn_l1_runtime_to_node("切换控制器（同步 L1 配置）")
+
+    def _apply_rn_l1_runtime_to_node(self, action: str = "更新 L1 配置") -> None:
+        """勾选框 / 下拉框 → apply_l1_params。"""
+        self._rn_l1_pending_action = str(action)
+        if not hasattr(self, "_rn_l1_apply_timer"):
+            from PyQt5.QtCore import QTimer
+
+            self._rn_l1_apply_timer = QTimer(self)
+            self._rn_l1_apply_timer.setSingleShot(True)
+            self._rn_l1_apply_timer.timeout.connect(self._do_apply_rn_l1_runtime_to_node)
+        self._refresh_rn_l1_runtime_status(action=action)
+        self._rn_l1_apply_timer.start(200)
+
+    def _do_apply_rn_l1_runtime_to_node(self) -> None:
+        self._init_drone_status_monitor()
+        l1_cfg = self._rn_l1_dist_params_dict()
+        action = getattr(self, "_rn_l1_pending_action", "更新 L1 配置")
+        self._rn_l1_pending_apply = True
+        self._refresh_rn_l1_runtime_status(action=action)
+        from PyQt5.QtCore import QTimer
+
+        QTimer.singleShot(0, lambda: self._rn_ros_apply_l1_cfg_on_main_thread(l1_cfg, action))
+
+    def _rn_write_l1_runtime_param(self, l1_cfg: dict) -> bool:
+        """主线程写 l1_runtime_update 并读回校验（避免后台线程 set_param 静默失败）。"""
+        if not self._ensure_ros_node():
+            return False
+        try:
+            import rospy
+
+            rospy.set_param(L1_RUNTIME_UPDATE_PARAM, l1_cfg)
+            try:
+                rospy.set_param(
+                    "/suite_tracking_controller/l1_runtime_update", l1_cfg
+                )
+            except Exception:
+                pass
+            rb = rospy.get_param(L1_RUNTIME_UPDATE_PARAM, None)
+            if not isinstance(rb, dict):
+                return False
+            return (
+                bool(rb.get("l1_dist_enabled")) == bool(l1_cfg.get("l1_dist_enabled"))
+                and str(rb.get("l1_mode", "")) == str(l1_cfg.get("l1_mode", ""))
+                and bool(rb.get("l1_comp_enabled"))
+                == bool(l1_cfg.get("l1_comp_enabled"))
+                and str(rb.get("l1_inject", "")) == str(l1_cfg.get("l1_inject", ""))
+            )
+        except Exception:
+            return False
+
+    def _push_rn_l1_runtime_param_to_ros(self) -> None:
+        """把当前 GUI L1 面板写入 rosparam（不调用 apply），清除残留配置。"""
+        if not hasattr(self, "rn_l1_enabled"):
+            return
+        self._rn_write_l1_runtime_param(self._rn_l1_dist_params_dict())
+
+    def _rn_ros_apply_l1_cfg_on_main_thread(
+        self, l1_cfg: dict, action: str = "更新 L1 配置"
+    ) -> None:
+        """主线程：写 param → apply_l1_params / SetBool 回退，刷新运行状态区。"""
+        mode = l1_cfg.get("l1_mode", "?")
+        inj = l1_cfg.get("l1_inject", "?")
+        est = "on" if l1_cfg.get("l1_dist_enabled") else "off"
+        comp = "on" if l1_cfg.get("l1_comp_enabled") else "off"
+        detail = f"mode={mode} inject={inj} est={est} comp={comp}"
+        ok = False
+        msg = ""
+        try:
+            from std_srvs.srv import SetBool, Trigger
+
+            if not self._ensure_ros_node():
+                msg = f"ROS master 不可用（{detail}）"
+            elif not self._rn_write_l1_runtime_param(l1_cfg):
+                msg = f"写 param 失败或读回不一致（{detail}）"
+            else:
+                svc_up = self._rn_tracking_services_available(
+                    use_cache=False, block=True, timeout=5.0
+                )
+                parts = []
+                if svc_up:
+                    try:
+                        import rospy
+
+                        apply_srv = self._wait_tracking_service(
+                            "apply_l1_params", timeout=15.0
+                        )
+                        resp = rospy.ServiceProxy(apply_srv, Trigger)()
+                        if resp.success:
+                            parts.append(resp.message)
+                            ok = True
+                        else:
+                            parts.append(f"FAIL: {resp.message}")
+                    except Exception as e:
+                        parts.append(f"apply_l1_params 异常: {e}")
+                if svc_up and not ok:
+                    import rospy
+
+                    setbool_ok = False
+                    for svc, key in (
+                        ("set_l1_dist_enabled", "l1_dist_enabled"),
+                        ("set_l1_comp_enabled", "l1_comp_enabled"),
+                    ):
+                        try:
+                            resolved = self._wait_tracking_service(svc, timeout=2.0)
+                            r = rospy.ServiceProxy(resolved, SetBool)(
+                                bool(l1_cfg.get(key, False))
+                            )
+                            if r.success:
+                                parts.append(f"{svc} OK")
+                                setbool_ok = True
+                        except Exception:
+                            pass
+                    if setbool_ok:
+                        try:
+                            apply_srv = self._wait_tracking_service(
+                                "apply_l1_params", timeout=5.0
+                            )
+                            resp = rospy.ServiceProxy(apply_srv, Trigger)()
+                            if resp.success:
+                                parts.append(resp.message)
+                                ok = True
+                            else:
+                                parts.append(f"apply after SetBool FAIL: {resp.message}")
+                        except Exception as e:
+                            parts.append(f"apply after SetBool 异常: {e}")
+                if svc_up and not ok:
+                    try:
+                        import rospy
+
+                        upd_srv = self._wait_tracking_service(
+                            "update_controller_params", timeout=5.0
+                        )
+                        cfg = self._build_ros_controller_update_cfg(include_l1=True)
+                        if not self._rn_write_controller_update_param(cfg):
+                            parts.append("写 controller_update_data 失败或读回不一致")
+                        else:
+                            resp = rospy.ServiceProxy(upd_srv, Trigger)()
+                            if resp.success:
+                                parts.append(resp.message)
+                                ok = True
+                            else:
+                                parts.append(f"update FAIL: {resp.message}")
+                    except Exception as e:
+                        parts.append(f"update_controller_params: {e}")
+                if not svc_up:
+                    if self._rn_tracking_node_alive():
+                        msg = (
+                            f"失败 — tracking 在跑但服务不可达，请重启 ROS Tracking 节点 "
+                            f"({detail})"
+                        )
+                        ok = False
+                    else:
+                        msg = f"已保存（tracking 未运行，Launch 后生效）({detail})"
+                        ok = True
+                elif ok:
+                    msg = f"成功 — {' | '.join(parts)} ({detail})"
+                elif parts:
+                    msg = f"失败 — {' | '.join(parts)} ({detail})"
+                else:
+                    msg = f"未找到 tracking 服务 ({detail})"
+        except Exception as e:
+            msg = f"ERROR: {e} ({detail})"
+        self._rn_on_l1_apply_finished(bool(ok), f"[{action}] {msg}")
+
+    def _invoke_ros_l1_runtime_update(self, l1_cfg: dict, log_prefix: str = "L1 runtime") -> None:
+        """兼容旧名：转主线程执行。"""
+        from PyQt5.QtCore import QTimer
+
+        QTimer.singleShot(
+            0, lambda: self._rn_ros_apply_l1_cfg_on_main_thread(l1_cfg, log_prefix)
+        )
+
+    def _apply_rn_l1_runtime_flags_to_node(self) -> None:
+        """兼容旧名。"""
+        self._apply_rn_l1_runtime_to_node()
+
+    def _call_set_l1_dist_enabled_service(self, enabled: bool):
+        """兼容旧调用：同步勾选框并下发节点。"""
+        if hasattr(self, "rn_l1_enabled"):
+            self._rn_l1_runtime_guard = True
+            try:
+                self.rn_l1_enabled.setChecked(bool(enabled))
+            finally:
+                self._rn_l1_runtime_guard = False
+        self._apply_rn_l1_runtime_flags_to_node()
+
+    def _call_set_l1_comp_enabled_service(self, enabled: bool):
+        """兼容旧调用：同步勾选框并下发节点。"""
+        if hasattr(self, "rn_l1_comp_enabled_chk"):
+            self._rn_l1_runtime_guard = True
+            try:
+                self.rn_l1_comp_enabled_chk.setChecked(bool(enabled))
+            finally:
+                self._rn_l1_runtime_guard = False
+        self._apply_rn_l1_runtime_flags_to_node()
+
+    def _call_set_l1_enabled_service(self, enabled: bool):
+        """兼容旧调用：强制 adaptive 后转调 set_l1_dist_enabled。"""
+        if enabled and hasattr(self, "rn_l1_comp_mode"):
+            self.rn_l1_comp_mode.setCurrentIndex(0)
+        self._call_set_l1_dist_enabled_service(enabled)
+
+    def _call_set_drag_ff_enabled_service(self, enabled: bool):
+        """调用 /set_drag_ff_enabled (std_srvs/SetBool) 在线开关真值阻力前馈补偿。"""
+        import threading
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _run():
+            try:
+                import rospy
+                from std_srvs.srv import SetBool
+
+                if not self._ensure_ros_node():
+                    msg = "[/set_drag_ff_enabled] ERROR: ROS master 不可用"
+                else:
+                    rospy.wait_for_service("/set_drag_ff_enabled", timeout=5.0)
+                    resp = rospy.ServiceProxy("/set_drag_ff_enabled", SetBool)(bool(enabled))
+                    state = "ON" if enabled else "OFF"
+                    msg = (
+                        f"[/set_drag_ff_enabled {state}] "
+                        f"{'OK' if resp.success else 'FAIL'}: {resp.message}"
+                    )
+                    if resp.success:
+                        QMetaObject.invokeMethod(
+                            self.rn_drag_ff_enabled,
+                            "setChecked",
+                            Qt.QueuedConnection,
+                            Q_ARG(bool, bool(enabled)),
+                        )
+                        if enabled:
+                            # L1 与真值前馈互斥，前端同步取消 L1 勾选
+                            QMetaObject.invokeMethod(
+                                self.rn_l1_enabled,
+                                "setChecked",
+                                Qt.QueuedConnection,
+                                Q_ARG(bool, False),
+                            )
+            except Exception as e:
+                msg = f"[/set_drag_ff_enabled] ERROR: {e}"
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _call_start_tracking_service(self):
+        self._call_tracking_service("/start_tracking")
+
+    def _call_stop_tracking_service(self):
+        self._call_tracking_service("/stop_tracking")
+
+    def _call_save_data_service(self):
+        self._call_tracking_service("/save_data")
+
+    def _call_update_trajectory_service(self):
+        """Export current GUI plan, then call /update_trajectory for hot reload."""
+        if self._rn_process is None or self._rn_process.poll() is not None:
+            QMessageBox.warning(self, "Notice", "ROS Tracking Node 未运行，无法在线更新轨迹。")
+            return
+        export_pb = self._prepare_ros_export_plan_bundle()
+        if export_pb is None:
+            return
+        try:
+            from suite_plan_export import export_suite_plan_npz
+            import rospy
+            root = Path(__file__).resolve().parent
+            export_dir = root / ".suite_ros_export"
+            export_dir.mkdir(exist_ok=True)
+            npz_path = export_dir / "last_suite_plan.npz"
+            export_suite_plan_npz(npz_path, export_pb, dt_plan_fallback_s=float(self.dt_plan.value()))
+            traj_name = self._current_trajectory_save_name()
+            rospy.set_param("/suite_tracking_controller/trajectory_name", traj_name)
+            rospy.set_param("/suite_tracking_controller/suite_plan_path", str(npz_path))
+            self.log(f"[update_trajectory] 已导出最新规划到 {npz_path}")
+            self.log(f"[update_trajectory] trajectory_name 已更新为: {traj_name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e)[:2000])
+            self.log(f"[update_trajectory] 轨迹导出失败: {e!r}")
+            return
+        self._call_tracking_service("/update_trajectory")
+
+    def _call_reset_to_initial_service(self):
+        self._call_tracking_service("/reset_to_initial")
+
+    def _call_take_off(self):
+        """导出最新规划、刷新节点轨迹，再调用 /take_off 执行两阶段起飞悬停。"""
+        if self._rn_process is None or self._rn_process.poll() is not None:
+            QMessageBox.warning(self, "Notice", "ROS Tracking Node 未运行，无法 Take off。")
+            return
+        export_pb = self._prepare_ros_export_plan_bundle()
+        if export_pb is None:
+            return
+
+        import threading
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _run():
+            try:
+                import rospy
+                from std_srvs.srv import Trigger
+                from suite_plan_export import export_suite_plan_npz
+
+                root = Path(__file__).resolve().parent
+                export_dir = root / ".suite_ros_export"
+                export_dir.mkdir(exist_ok=True)
+                npz_path = export_dir / "last_suite_plan.npz"
+                export_suite_plan_npz(
+                    npz_path, export_pb, dt_plan_fallback_s=float(self.dt_plan.value())
+                )
+                traj_name = self._current_trajectory_save_name()
+                rospy.set_param("/suite_tracking_controller/trajectory_name", traj_name)
+                rospy.set_param("/suite_tracking_controller/suite_plan_path", str(npz_path))
+
+                if self._rn_process is None or self._rn_process.poll() is not None:
+                    msg = "[/take_off] ERROR: tracking 节点已退出，请重新 Launch"
+                    QMetaObject.invokeMethod(
+                        self, "log", Qt.QueuedConnection, Q_ARG(str, msg)
+                    )
+                    return
+
+                # 快速重载轨迹（节点内默认不重建 acados，避免数秒编译导致崩溃）
+                rospy.wait_for_service("/update_trajectory", timeout=10.0)
+                upd = rospy.ServiceProxy("/update_trajectory", Trigger)
+                upd_resp = upd()
+                if not upd_resp.success:
+                    msg = f"[/update_trajectory] FAIL: {upd_resp.message}"
+                    QMetaObject.invokeMethod(
+                        self, "log", Qt.QueuedConnection, Q_ARG(str, msg)
+                    )
+                    return
+
+                if self._rn_process.poll() is not None:
+                    msg = "[/take_off] ERROR: update_trajectory 后节点已退出（请查看终端日志）"
+                    QMetaObject.invokeMethod(
+                        self, "log", Qt.QueuedConnection, Q_ARG(str, msg)
+                    )
+                    return
+
+                rospy.wait_for_service("/take_off", timeout=10.0)
+                to_resp = rospy.ServiceProxy("/take_off", Trigger)()
+                msg = (
+                    f"[/take_off] {'OK' if to_resp.success else 'FAIL'}: {to_resp.message}"
+                )
+            except Exception as e:
+                msg = f"[/take_off] ERROR: {e}"
+                if self._rn_process is not None and self._rn_process.poll() is not None:
+                    msg += "（tracking 节点已退出，请查看 Launch 终端）"
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, msg))
+
+        self.log("[take_off] 导出规划并刷新轨迹，随后启动起飞序列…")
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _build_ros_controller_update_cfg(self, *, include_l1: bool = False) -> dict:
+        """组装 /update_controller_params 所需配置（含当前 Croc/Acados profile）。
+
+        ``include_l1=False``（默认）：仅 MPC/几何权重与求解器选项，避免误改 L1/in-model
+        触发 acados 结构重建。L1 请走 apply_l1_params 或在 fallback 时显式 include_l1=True。
+        """
+        mode = self.rn_controller_combo.currentText()
+        if hasattr(self, "_rn_mpc_weight_profiles") and mode in self._rn_mpc_weight_profiles:
+            self._rn_mpc_weight_profiles[mode] = self._rn_mpc_weight_snapshot()
+        cfg = {
+            "controller_mode": mode,
+            "control_rate": float(self.rn_control_rate.value()),
+            "max_thrust": float(self.rn_max_thrust_total.value()),
+            "dt_mpc": float(self.rn_dt_mpc.value()),
+            "horizon": int(self.rn_horizon.value()),
+            "mpc_max_iter": int(self.rn_mpc_max_iter.value()),
+            "bodyrate_lookahead_ms": float(self.rn_bodyrate_lookahead_ms.value()),
+            "w_state_track": float(self.rn_w_state_track.value()),
+            "w_state_reg": float(self.rn_w_state_reg.value()),
+            "w_control": float(self.rn_w_control.value()),
+            "w_terminal_track": float(self.rn_w_terminal_track.value()),
+            "w_pos": float(self.rn_w_pos.value()),
+            "w_att": float(self.rn_w_att.value()),
+            "w_joint": float(self.rn_w_joint.value()),
+            "w_vel": float(self.rn_w_vel.value()),
+            "w_omega": float(self.rn_w_omega.value()),
+            "w_joint_vel": float(self.rn_w_joint_vel.value()),
+            "w_u_thrust": float(self.rn_w_u_thrust.value()),
+            "w_u_joint_torque": float(self.rn_w_u_joint_torque.value()),
+            "acados_solver_mode": self.rn_acados_solver_mode.currentText(),
+            "acados_integrator": self.rn_acados_integrator.currentText(),
+            "acados_hpipm_mode": self.rn_acados_hpipm.currentText(),
+            "acados_qp_iter_max": int(self.rn_acados_qp_iter.value()),
+            "mpc_ref_clamp_enabled": bool(self.rn_mpc_ref_clamp_en.isChecked()),
+            "mpc_ref_clamp_pos_m": float(self.rn_mpc_ref_clamp_pos.value()),
+            "mpc_ref_clamp_yaw_deg": float(self.rn_mpc_ref_clamp_yaw.value()),
+            "mpc_ref_clamp_rp_deg": float(self.rn_mpc_ref_clamp_rp.value()),
+            "mpc_ref_clamp_ee_pos_m": float(self.rn_mpc_ref_clamp_ee_pos.value()),
+            "ee_w_pos": float(self.rn_ee_w_pos.value()),
+            "ee_w_rot_rp": float(self.rn_ee_w_rot_rp.value()),
+            "ee_w_rot_yaw": float(self.rn_ee_w_rot_yaw.value()),
+            "ee_w_vel_lin": float(self.rn_ee_w_vel_lin.value()),
+            "ee_w_vel_ang_rp": float(self.rn_ee_w_vel_ang_rp.value()),
+            "ee_w_vel_ang_yaw": float(self.rn_ee_w_vel_ang_yaw.value()),
+            "ee_w_terminal": float(self.rn_ee_w_terminal.value()),
+            "ee_override_joints": bool(self.rn_ee_override_joints.isChecked()),
+            "ee_joint1": float(np.deg2rad(self.rn_ee_joint1_deg.value())),
+            "ee_joint2": float(np.deg2rad(self.rn_ee_joint2_deg.value())),
+            "geo_kp_pos": float(self.rn_geo_kp_pos.value()),
+            "geo_kd_vel": float(self.rn_geo_kd_vel.value()),
+            "geo_kR": float(self.rn_geo_kR.value()),
+            "geo_kOmega": float(self.rn_geo_kOmega.value()),
+            "geo_max_tilt_deg": float(self.rn_geo_max_tilt_deg.value()),
+        }
+        if include_l1:
+            cfg.update(self._rn_l1_dist_params_dict())
+        return cfg
+
+    def _rn_tracking_node_alive(self) -> bool:
+        p = getattr(self, "_rn_process", None)
+        return p is not None and p.poll() is None
+
+    def _invalidate_rn_tracking_svc_cache(self) -> None:
+        self._rn_tracking_svc_cache = None
+
+    def _rn_tracking_services_available(
+        self, *, use_cache: bool = True, block: bool = False, timeout: float = 15.0
+    ) -> bool:
+        """tracking 服务是否在线。默认非阻塞 + 缓存，避免状态栏定时器卡 UI。"""
+        import time as _time
+
+        now = _time.monotonic()
+        if use_cache and not block:
+            cached = getattr(self, "_rn_tracking_svc_cache", None)
+            if cached is not None and (now - float(cached[1])) < 2.0:
+                return bool(cached[0])
+
+        proc = getattr(self, "_rn_process", None)
+        if proc is not None and proc.poll() is None:
+            self._rn_tracking_svc_cache = (True, now)
+            return True
+
+        if not getattr(self, "_ros_node_inited", False):
+            if not self._ensure_ros_node():
+                self._rn_tracking_svc_cache = (False, now)
+                return False
+
+        ok = False
+        try:
+            if block:
+                import rospy
+
+                self._wait_tracking_service("apply_l1_params", timeout=float(timeout))
+                ok = True
+            else:
+                ok = self._tracking_service_reachable("apply_l1_params")
+        except Exception:
+            ok = False
+
+        self._rn_tracking_svc_cache = (ok, now)
+        return ok
+
+    def _schedule_rn_l1_sync_to_node(self, delay_ms: int = 800, retries: int = 8) -> None:
+        """参数/配置恢复或 Launch 后，把 L1 面板同步到 tracking 节点（带重试）。"""
+        self._rn_l1_sync_retries_left = int(retries)
+        QTimer.singleShot(int(delay_ms), self._sync_rn_l1_to_node_if_needed)
+
+    def _sync_rn_l1_to_node_if_needed(self) -> None:
+        if not hasattr(self, "rn_l1_enabled"):
+            return
+        if not self._rn_tracking_services_available(use_cache=True):
+            retries = int(getattr(self, "_rn_l1_sync_retries_left", 0))
+            if retries > 0:
+                self._rn_l1_sync_retries_left = retries - 1
+                QTimer.singleShot(2000, self._sync_rn_l1_to_node_if_needed)
+            self._refresh_rn_l1_runtime_status()
+            return
+        self._apply_rn_l1_runtime_to_node("配置恢复后自动同步")
+
+    def _rn_write_controller_update_param(self, cfg: dict) -> bool:
+        """主线程写 controller_update_data 并读回校验。"""
+        if not self._ensure_ros_node():
+            return False
+        try:
+            import rospy
+
+            path = f"/{TRACKING_NODE_NAME}/controller_update_data"
+            rospy.set_param(path, cfg)
+            rb = rospy.get_param(path, None)
+            if not isinstance(rb, dict):
+                return False
+            for key in ("controller_mode", "w_state_track", "w_pos", "l1_mode", "l1_inject"):
+                if key in cfg and str(rb.get(key)) != str(cfg.get(key)):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _rn_ros_apply_controller_cfg_on_main_thread(
+        self, cfg: dict, log_prefix: str = "update_controller_params"
+    ) -> None:
+        """主线程：写 param → 调 update_controller_params。"""
+        mode = str(cfg.get("controller_mode", "?"))
+        wst = cfg.get("w_state_track", "?")
+        wpos = cfg.get("w_pos", "?")
+        detail = f"mode={mode} w_state_track={wst} w_pos={wpos}"
+        ok = False
+        msg = ""
+        try:
+            from std_srvs.srv import Trigger
+
+            if not self._ensure_ros_node():
+                msg = f"[{log_prefix}] ERROR: ROS master 不可用 ({detail})"
+            elif not self._rn_write_controller_update_param(cfg):
+                msg = f"[{log_prefix}] FAIL: 写 controller_update_data 失败或读回不一致 ({detail})"
+            else:
+                import rospy
+
+                upd_srv = self._wait_tracking_service(
+                    "update_controller_params", timeout=8.0
+                )
+                resp = rospy.ServiceProxy(upd_srv, Trigger)()
+                if resp.success:
+                    ok = True
+                    msg = f"[{log_prefix}] OK via {upd_srv}: {resp.message}"
+                else:
+                    msg = f"[{log_prefix}] FAIL via {upd_srv} ({detail}): {resp.message}"
+        except Exception as e:
+            msg = f"[{log_prefix}] ERROR ({detail}): {e}"
+        self._rn_on_update_ctrl_finished(bool(ok), msg)
+
+    def _invoke_ros_update_controller_params(self, cfg: dict, log_prefix: str = "update_controller_params") -> None:
+        """主线程调度：写 controller_update_data 并调用 update_controller_params。"""
+        from PyQt5.QtCore import QTimer
+
+        QTimer.singleShot(
+            0,
+            lambda: self._rn_ros_apply_controller_cfg_on_main_thread(cfg, log_prefix),
+        )
+
+    def _call_update_controller_params(self):
+        """
+        将当前 ROS Tracking 参数写入节点私有参数后，
+        调用 /update_controller_params 在线更新控制器。
+        """
+        cfg = self._build_ros_controller_update_cfg()
+        self._invoke_ros_update_controller_params(cfg)
+
+    def _call_set_regulation_target(self):
+        """
+        先通过 rospy.set_param 设置目标，再调用 /set_regulation_target 服务。
+        """
+        import threading
+
+        x       = self.rn_reg_x.value()
+        y       = self.rn_reg_y.value()
+        z       = self.rn_reg_z.value()
+        yaw_deg = self.rn_reg_yaw.value()
+        j1_deg  = self.rn_reg_j1.value()
+        j2_deg  = self.rn_reg_j2.value()
+
+        def _run():
+            try:
+                import rospy
+                from std_srvs.srv import Trigger
+
+                # 1. 将目标写入节点私有参数（与 _svc_set_regulation_target 读取的路径一致）
+                param_path = "/suite_tracking_controller/regulation_target_data"
+                rospy.set_param(param_path, [x, y, z, yaw_deg, j1_deg, j2_deg])
+
+                # 2. 调用服务
+                svc_name = "/set_regulation_target"
+                rospy.wait_for_service(svc_name, timeout=3.0)
+                svc = rospy.ServiceProxy(svc_name, Trigger)
+                resp = svc()
+                if resp.success:
+                    log_msg = (
+                        f"[regulation_target] 已设置: "
+                        f"x={x:.2f} y={y:.2f} z={z:.2f} "
+                        f"yaw={yaw_deg:.1f}° j1={j1_deg:.1f}° j2={j2_deg:.1f}°\n"
+                        f"  节点回复: {resp.message}"
+                    )
+                else:
+                    log_msg = f"[regulation_target] 服务返回失败: {resp.message}"
+            except Exception as e:
+                log_msg = f"[regulation_target] 错误: {e}"
+            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+            QMetaObject.invokeMethod(self, "log", Qt.QueuedConnection, Q_ARG(str, log_msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    # =========================================================================
+    # ROS Tracking 结果绘图
+    # =========================================================================
+
+    def _plot_ros_tracking_data(self):
+        """弹出文件对话框，加载 run_tracking_controller.py 保存的 npz 并绘图。"""
+        default_dir = str(
+            Path(__file__).resolve().parent / "results" / "suite_tracking"
+        )
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load ROS Tracking Data",
+            default_dir,
+            "NumPy archives (*.npz);;All files (*)",
+        )
+        if not filepath:
+            return
+        try:
+            self._render_ros_tracking_figures(filepath)
+            self.log(f"[plot] Loaded and rendered: {filepath}")
+            if hasattr(self, "_right_plot_tabs"):
+                self._right_plot_tabs.setCurrentIndex(0)
+        except Exception as e:
+            import traceback
+
+            tb = traceback.format_exc()
+            self.log(f"[plot] ERROR rendering {filepath}:\n{tb}")
+            QMessageBox.critical(
+                self,
+                "Plot failed",
+                f"无法绘制该 npz（键名或维度需与 run_tracking_controller 录制一致）。\n\n{e}\n\n{tb[:1200]}",
+            )
+
+    def _render_ros_tracking_figures(self, npz_path: str) -> None:
+        """
+        从 run_tracking_controller.py 保存的 npz 构建 res dict，
+        直接调用 _render_tracking_figures(res, "direct")，
+        与 Run Closed Loop Tracking 完全相同的绘图 API 和 Tab 布局。
+        """
+        import traceback as _tb
+
+        d = np.load(npz_path, allow_pickle=True)
+
+        def _arr(key):
+            if key in d and d[key].size > 0:
+                return np.asarray(d[key], dtype=float)
+            return np.zeros((0,), dtype=float)
+
+        t       = _arr("time").flatten()
+        pos     = _arr("position")                   # (N,3)
+        vel     = _arr("velocity")                   # (N,3) body linear v
+        omg     = _arr("angular_velocity")           # (N,3) body angular v
+        ori     = _arr("orientation")                # (N,4) qx qy qz qw
+        j_pos   = _arr("arm_joint_positions")        # (N,nj)
+        j_vel   = _arr("arm_joint_velocities")       # (N,nj)
+        u_mpc   = _arr("mpc_control")                # (N,nu)
+        t_solve = _arr("mpc_solve_time").flatten()   # ms
+        r_pos   = _arr("reference_position")         # (N,3)
+        r_ori   = _arr("reference_orientation")      # (N,4)
+        r_jpos  = _arr("reference_arm_positions")    # (N,nj)
+        r_vel   = _arr("reference_velocity")
+        r_omg   = _arr("reference_angular_velocity")
+        brate   = _arr("body_rate_commands")          # (N,3) CTBR body-rate cmd [rad/s]
+        thr_cmd = _arr("thrust_command").flatten()    # (N,) normalized thrust cmd
+        l1_force   = _arr("l1_force_world")           # (N,3) L1 估计扰动力 [N]
+        l1_sigma   = _arr("l1_sigma_world")           # (N,3) L1 估计扰动加速度 [m/s²]
+        drag_force = _arr("aero_drag_force_world")    # (N,3) Gazebo 阻力真值 [N]
+
+        N = len(t)
+        if N < 2:
+            self.log("[plot] Not enough data points to plot.")
+            return
+
+        nj = j_pos.shape[1] if (j_pos.ndim == 2 and j_pos.shape[0] == N and j_pos.shape[1] > 0) else 0
+        nq = 7 + nj
+        nv = 6 + nj
+
+        if vel.ndim != 2 or vel.shape[0] != N:
+            vel = np.zeros((N, 3), dtype=float)
+        if omg.ndim != 2 or omg.shape[0] != N:
+            omg = np.zeros((N, 3), dtype=float)
+
+        # ── 重建完整状态 x = [q; v]，与 run_tracking_controller._record / plot_acados 约定一致 ──
+        q_part = np.hstack([pos, ori, j_pos[:N]]) if nj > 0 else np.hstack([pos, ori])
+        if j_vel.ndim == 2 and j_vel.shape[0] >= N and nj > 0:
+            jv = np.asarray(j_vel[:N, :nj], dtype=float)
+        else:
+            jv = np.zeros((N, max(0, nj)), dtype=float)
+        v_body = np.hstack([vel[:N, :3], omg[:N, :3], jv])
+        x_act = np.hstack([q_part, v_body])
+        if x_act.shape[1] != nq + nv:
+            raise ValueError(
+                f"Rebuilt state width mismatch: got {x_act.shape[1]}, expect nq+nv={nq}+{nv}={nq + nv}"
+            )
+
+        def _pad_freeflyer13_to_uam17(x_mat: np.ndarray) -> np.ndarray:
+            """plot_acados 需要 ≥15 列 twist；s500 录制为 13 维 [q7; v6]，补零关节位/速到 UAM 17 维。"""
+            x_mat = np.asarray(x_mat, dtype=float)
+            if x_mat.ndim != 2 or x_mat.shape[1] != 13:
+                return x_mat
+            nw = int(x_mat.shape[0])
+            out = np.zeros((nw, 17), dtype=float)
+            out[:, :7] = x_mat[:, :7]
+            out[:, 9:15] = x_mat[:, 7:13]
+            return out
+
+        x_act = _pad_freeflyer13_to_uam17(x_act)
+
+        # ── 参考状态（含参考速度，供 plot_acados 虚线）──────────────────────
+        has_ref = r_pos.ndim == 2 and r_pos.shape[0] == N
+        if has_ref:
+            if r_ori.ndim != 2 or r_ori.shape[0] != N or r_ori.shape[1] < 4:
+                r_ori = np.tile(np.array([[0.0, 0.0, 0.0, 1.0]], dtype=float), (N, 1))
+            if nj > 0 and r_jpos.ndim == 2 and r_jpos.shape[0] >= N:
+                jr = np.asarray(r_jpos[:N, :nj], dtype=float)
+            else:
+                jr = np.zeros((N, max(0, nj)), dtype=float)
+            qr = np.hstack([r_pos, r_ori, jr]) if nj > 0 else np.hstack([r_pos, r_ori])
+            if r_vel.ndim == 2 and r_vel.shape[0] == N:
+                rv_lin = r_vel[:N, :3]
+            else:
+                rv_lin = np.zeros((N, 3), dtype=float)
+            if r_omg.ndim == 2 and r_omg.shape[0] == N:
+                rv_omg = r_omg[:N, :3]
+            else:
+                rv_omg = np.zeros((N, 3), dtype=float)
+            v_ref = np.hstack([rv_lin, rv_omg, np.zeros((N, max(0, nj)), dtype=float)])
+            x_ref_states = np.hstack([qr, v_ref])
+            x_ref_states = _pad_freeflyer13_to_uam17(x_ref_states)
+        else:
+            x_ref_states = None
+
+        # ── EE FK ──────────────────────────────────────────────────────────
+        if self._is_s500_mode():
+            ee_act = np.full((N, 3), np.nan, dtype=float)
+            ee_ref = np.full((N, 3), np.nan, dtype=float)
+            ee_yaw_act = np.full(N, np.nan, dtype=float)
+            yaw_ref = np.full(N, np.nan, dtype=float)
+            err = np.full(N, np.nan, dtype=float)
+            err_yaw = np.full(N, np.nan, dtype=float)
+        else:
+            try:
+                from s500_uam_acados_trajectory_plot import compute_ee_kinematics_along_trajectory
+
+                rm, eid = self._robot_model_and_ee()
+                pin_data = rm.createData()
+                ee_act_raw, _, ee_rpy_a, _ = compute_ee_kinematics_along_trajectory(x_act, rm, pin_data, eid)
+                ee_act      = np.asarray(ee_act_raw, dtype=float)
+                ee_yaw_act  = np.unwrap(np.asarray(ee_rpy_a[:, 2], dtype=float).flatten())
+                if x_ref_states is not None:
+                    ee_ref_raw, _, ee_rpy_r, _ = compute_ee_kinematics_along_trajectory(x_ref_states, rm, pin_data, eid)
+                    ee_ref  = np.asarray(ee_ref_raw, dtype=float)
+                    yaw_ref = np.unwrap(np.asarray(ee_rpy_r[:, 2], dtype=float).flatten())
+                else:
+                    ee_ref  = ee_act.copy()
+                    yaw_ref = ee_yaw_act.copy()
+            except Exception:
+                self.log(f"[plot] EE FK failed (using base pos as fallback):\n{_tb.format_exc()}")
+                ee_act     = pos.copy()
+                ee_yaw_act = np.zeros(N)
+                ee_ref     = r_pos.copy() if has_ref else pos.copy()
+                yaw_ref    = np.zeros(N)
+
+            err     = np.linalg.norm(ee_act - ee_ref, axis=1) if ee_act.ndim == 2 and ee_ref.ndim == 2 else np.zeros(N)
+            err_yaw = (ee_yaw_act - yaw_ref + np.pi) % (2.0 * np.pi) - np.pi
+
+        # ── 控制量对齐 ────────────────────────────────────────────────────
+        if u_mpc.ndim == 2 and u_mpc.shape[0] in (N, N - 1):
+            u_out = u_mpc
+        else:
+            u_out = np.zeros((max(0, N - 1), 4), dtype=float)
+        N_u = u_out.shape[0]
+
+        # ── MPC 求解统计（与 closed-loop tracking 相同结构）─────────────
+        mpc_wall       = np.zeros(N_u, dtype=float)
+        mpc_iter       = np.zeros(N_u, dtype=int)
+        mpc_stat       = np.zeros(N_u, dtype=int)
+        mpc_total_cost = np.full(N_u, np.nan, dtype=float)
+        if t_solve.size >= N_u > 0:
+            mpc_wall[:] = t_solve[:N_u] / 1000.0   # ms → s
+
+        dt = float(t[1] - t[0]) if N >= 2 else 0.1
+
+        # ── 组装 res dict（与 TrackEeCrocWorker 完全相同的 key/格式）─────
+        res = {
+            "t":            t,
+            "x":            x_act,
+            "u":            u_out,
+            "ee":           ee_act,
+            "p_ref":        ee_ref,
+            "err":          err,
+            "ee_yaw":       ee_yaw_act,
+            "yaw_ref":      yaw_ref,
+            "err_yaw":      err_yaw,
+            "control_mode": "direct",
+            "sim_dt":       dt,
+            "control_dt":   dt,
+            "mpc_stride":   1,
+            "mpc_solve": {
+                "nlp_iter":   mpc_iter,
+                "cpu_s":      mpc_wall.copy(),
+                "wall_s":     mpc_wall,
+                "status":     mpc_stat,
+                "total_cost": mpc_total_cost,
+            },
+            "mpc_cost_t":      t[:N_u] if N_u > 0 else np.array([]),
+            "mpc_cost_total":  np.full(N_u, np.nan, dtype=float),
+            "mpc_cost_terms":  {"solve_ms": t_solve[:N_u]} if t_solve.size >= N_u > 0 else {},
+            "mpc_cost_groups": {},
+            "mpc_cost_weights": {},
+        }
+
+        # ── 临时设置参考状态叠加层 ────────────────────────────────────────
+        old_manual = self._manual_ref_overlay
+        if x_ref_states is not None:
+            self._manual_ref_overlay = {
+                "ref_time_states": t,
+                "ref_states":      x_ref_states,
+            }
+        try:
+            self._render_tracking_figures(res, "direct")
+        finally:
+            self._manual_ref_overlay = old_manual
+
+        # ── CTBR / Feedback 专用图：实际 vs 规划电机力、CTBR 指令、角速度反馈 ──
+        try:
+            self._render_ctbr_feedback_figure(
+                t=t,
+                u_mpc=u_out,
+                omg=omg[:N] if omg.ndim == 2 and omg.shape[0] >= N else None,
+                r_omg=r_omg[:N] if r_omg.ndim == 2 and r_omg.shape[0] >= N else None,
+                brate=brate[:N] if brate.ndim == 2 and brate.shape[0] >= N else None,
+                thr_cmd=thr_cmd[:N] if thr_cmd.size >= N else None,
+            )
+        except Exception:
+            self.log(f"[plot] CTBR/feedback figure failed:\n{_tb.format_exc()}")
+
+        # ── L1 扰动估计 vs Gazebo 气动阻力真值 ────────────────────────────────
+        try:
+            self._render_l1_disturbance_figure(
+                t=t,
+                force_truth=drag_force[:N] if drag_force.ndim == 2 and drag_force.shape[0] >= N else None,
+                force_est=l1_force[:N] if l1_force.ndim == 2 and l1_force.shape[0] >= N else None,
+                truth_label="Gazebo true drag",
+                est_label="L1 estimate m·σ̂",
+                title="L1 disturbance estimate vs Gazebo aerodynamic drag",
+            )
+        except Exception:
+            self.log(f"[plot] L1 disturbance figure failed:\n{_tb.format_exc()}")
+
+        if self._is_s500_mode():
+            self.log(
+                f"[plot] Rendered {N} steps (s500 base-only) | "
+                + (f"solve mean={t_solve.mean():.1f} ms" if t_solve.size else "no solve time")
+            )
+        else:
+            self.log(
+                f"[plot] Rendered {N} steps | "
+                f"EE err mean={float(np.nanmean(err)):.3f} m | "
+                + (f"solve mean={t_solve.mean():.1f} ms" if t_solve.size else "no solve time")
+            )
+
+    def _render_ctbr_feedback_figure(
+        self,
+        *,
+        t: np.ndarray,
+        u_mpc: np.ndarray,
+        omg: Optional[np.ndarray],
+        r_omg: Optional[np.ndarray],
+        brate: Optional[np.ndarray],
+        thr_cmd: Optional[np.ndarray],
+    ) -> None:
+        """Control 图（合并控制输入 + CTBR/反馈，2 列 3 行）。
+
+        布局（行优先）：
+          1) 电机力：MPC 实际输出 vs 规划      2) CTBR 推力指令（归一化）
+          3) roll rate p：指令/反馈/参考       4) pitch rate q：指令/反馈/参考
+          5) yaw rate r：指令/反馈/参考        6) 角速度跟踪误差（指令 - 反馈）
+        """
+        fig = self.fig_control
+        fig.clear()
+        t = np.asarray(t, dtype=float).flatten()
+        N = t.size
+        if N < 2:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+            ax.axis("off")
+            self.cv_control.draw()
+            return
+
+        # 规划电机力（从当前 plan bundle 重采样到记录时间轴）
+        u_plan_interp = None
+        pb = self._plan_bundle
+        try:
+            if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+                up = np.asarray(pb.get("u_plan"), dtype=float)
+                tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                if up.ndim == 2 and up.shape[0] >= 1 and tp.size >= 2:
+                    tpc = tp[: up.shape[0]] - tp[0]
+                    nrot = min(4, up.shape[1])
+                    u_plan_interp = np.column_stack([
+                        np.interp(t, tpc, up[: tpc.size, j]) for j in range(nrot)
+                    ])
+        except Exception:
+            u_plan_interp = None
+
+        u_mpc = np.asarray(u_mpc, dtype=float)
+        n_rot = min(4, u_mpc.shape[1]) if u_mpc.ndim == 2 and u_mpc.shape[0] > 0 else 0
+        t_u = t[: u_mpc.shape[0]] if (u_mpc.ndim == 2 and u_mpc.shape[0] <= N) else t
+
+        # 2 列 3 行（行优先索引：1..6）
+        axes = [fig.add_subplot(3, 2, i + 1) for i in range(6)]
+        colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+
+        # ── 面板 1：电机力（实际 vs 规划）────────────────────────────────────
+        ax = axes[0]
+        if n_rot > 0:
+            for j in range(n_rot):
+                ax.plot(t_u, u_mpc[: t_u.size, j], color=colors[j], lw=1.1,
+                        label=f"MPC rotor {j+1}")
+            if u_plan_interp is not None:
+                for j in range(min(n_rot, u_plan_interp.shape[1])):
+                    ax.plot(t, u_plan_interp[:, j], color=colors[j], lw=1.0,
+                            ls="--", alpha=0.7,
+                            label=f"plan rotor {j+1}" if j == 0 else None)
+        ax.set_title("Rotor forces — MPC (solid) vs plan (dashed)", fontsize=_mpl_pt(12))
+        ax.set_ylabel("force [N]")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=2)
+
+        # ── 面板 2：CTBR 推力指令 ────────────────────────────────────────────
+        ax = axes[1]
+        if thr_cmd is not None and np.asarray(thr_cmd).size >= 2:
+            tc = np.asarray(thr_cmd, dtype=float).flatten()
+            ax.plot(t[: tc.size], tc[: t.size], color="k", lw=1.1, label="CTBR thrust cmd")
+        ax.set_title("CTBR normalized thrust command (→ PX4)", fontsize=_mpl_pt(12))
+        ax.set_ylabel("thrust [0..1]")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=_mpl_pt(10))
+
+        # ── 面板 3-5：三轴角速度（指令 vs 反馈 vs 参考）─────────────────────
+        labels = ["roll rate p", "pitch rate q", "yaw rate r"]
+        for k in range(3):
+            ax = axes[2 + k]
+            if brate is not None and np.asarray(brate).ndim == 2:
+                br = np.asarray(brate, dtype=float)
+                ax.plot(t[: br.shape[0]], br[: t.size, k], color="tab:red", lw=1.2,
+                        label="CTBR cmd")
+            if omg is not None and np.asarray(omg).ndim == 2:
+                ow = np.asarray(omg, dtype=float)
+                ax.plot(t[: ow.shape[0]], ow[: t.size, k], color="tab:blue", lw=1.1,
+                        label="feedback")
+            if r_omg is not None and np.asarray(r_omg).ndim == 2:
+                rw = np.asarray(r_omg, dtype=float)
+                ax.plot(t[: rw.shape[0]], rw[: t.size, k], color="tab:green", lw=1.0,
+                        ls="--", alpha=0.8, label="reference")
+            ax.set_title(f"Angular velocity — {labels[k]} [rad/s]", fontsize=_mpl_pt(12))
+            ax.set_ylabel("[rad/s]")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=3)
+
+        # ── 面板 6：角速度跟踪误差（CTBR 指令 - 反馈），直观体现 PX4 延迟 ──────
+        ax = axes[5]
+        if (
+            brate is not None and np.asarray(brate).ndim == 2
+            and omg is not None and np.asarray(omg).ndim == 2
+        ):
+            br = np.asarray(brate, dtype=float)
+            ow = np.asarray(omg, dtype=float)
+            n = min(br.shape[0], ow.shape[0], t.size)
+            err_labels = ["p", "q", "r"]
+            err_colors = ["tab:blue", "tab:orange", "tab:green"]
+            for k in range(3):
+                ax.plot(t[:n], br[:n, k] - ow[:n, k], color=err_colors[k], lw=1.0,
+                        label=f"{err_labels[k]} err")
+            ax.axhline(0.0, color="gray", lw=0.6, alpha=0.6)
+        ax.set_title("Body-rate tracking error (CTBR cmd − feedback)", fontsize=_mpl_pt(12))
+        ax.set_ylabel("[rad/s]")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=3)
+
+        for ax in (axes[4], axes[5]):
+            ax.set_xlabel("t [s]")
+
+        fig.suptitle("Control — rotor forces, CTBR commands & body-rate feedback",
+                     fontsize=_mpl_pt(14), y=0.995)
+        try:
+            fig.tight_layout(rect=(0, 0, 1, 0.98))
+        except Exception:
+            pass
+        self.cv_control.draw()
+
+    def _on_l1_dist_frame_toggled(self, checked: bool) -> None:
+        """切换 L1/Disturbance 显示坐标系（world↔body），用缓存数据重绘。"""
+        self._l1_dist_frame = "body" if checked else "world"
+        self.l1_dist_frame_btn.setText(
+            "坐标系: 机体系 (body)" if checked else "坐标系: 世界系 (world)"
+        )
+        cache = getattr(self, "_l1_dist_cache", None)
+        if cache:
+            self._render_l1_disturbance_figure(**cache)
+
+    @staticmethod
+    def _world_to_body_series(arr: Optional[np.ndarray], quat: np.ndarray) -> Optional[np.ndarray]:
+        """把世界系时间序列 (N,3) 逐拍旋到机体系：v_body = R(q)ᵀ·v_world。
+
+        quat: (N,4) [qx,qy,qz,qw]（与 sim_disturbance._quat_to_R_np 同约定）。
+        """
+        if arr is None:
+            return None
+        a = np.asarray(arr, dtype=float)
+        if a.ndim != 2 or a.shape[1] < 3:
+            return arr
+        n = min(a.shape[0], quat.shape[0])
+        out = a.copy()
+        for k in range(n):
+            q = quat[k]
+            nn = float(np.linalg.norm(q))
+            if nn < 1e-12:
+                continue
+            x, y, z, w = q / nn
+            # R (world<-body)
+            R = np.array([
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ], dtype=float)
+            out[k, :3] = R.T @ a[k, :3]
+        return out
+
+    @staticmethod
+    def _body_to_world_series(arr: Optional[np.ndarray], quat: np.ndarray) -> Optional[np.ndarray]:
+        """把机体系时间序列 (N,3) 逐拍旋到世界系：v_world = R(q)·v_body。
+
+        quat: (N,4) [qx,qy,qz,qw]（与 _world_to_body_series 同约定）。
+        """
+        if arr is None:
+            return None
+        a = np.asarray(arr, dtype=float)
+        if a.ndim != 2 or a.shape[1] < 3:
+            return arr
+        n = min(a.shape[0], quat.shape[0])
+        out = a.copy()
+        for k in range(n):
+            q = quat[k]
+            nn = float(np.linalg.norm(q))
+            if nn < 1e-12:
+                continue
+            x, y, z, w = q / nn
+            R = np.array([
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ], dtype=float)
+            out[k, :3] = R @ a[k, :3]
+        return out
+
+    @staticmethod
+    def _movavg(arr: np.ndarray, win: int) -> np.ndarray:
+        """零相位移动平均（reflect 边界）。win<3 或样本不足时原样返回。"""
+        a = np.asarray(arr, dtype=float)
+        if win is None or win < 3 or a.shape[0] < 3:
+            return a
+        if win % 2 == 0:
+            win += 1
+        if a.shape[0] < win:
+            win = a.shape[0] if a.shape[0] % 2 == 1 else a.shape[0] - 1
+            if win < 3:
+                return a
+        half = win // 2
+        kernel = np.ones(win, dtype=float) / float(win)
+        A = a if a.ndim == 2 else a[:, None]
+        out = np.empty_like(A)
+        for c in range(A.shape[1]):
+            padded = np.pad(A[:, c], half, mode="reflect")
+            out[:, c] = np.convolve(padded, kernel, mode="valid")
+        return out if a.ndim == 2 else out[:, 0]
+
+    def _render_l1_disturbance_figure(
+        self,
+        *,
+        t: np.ndarray,
+        force_truth: Optional[np.ndarray] = None,
+        force_est: Optional[np.ndarray] = None,
+        torque_truth: Optional[np.ndarray] = None,
+        torque_est: Optional[np.ndarray] = None,
+        comp_force: Optional[np.ndarray] = None,
+        force_truth_body: Optional[np.ndarray] = None,
+        force_est_body: Optional[np.ndarray] = None,
+        torque_truth_body: Optional[np.ndarray] = None,
+        torque_est_body: Optional[np.ndarray] = None,
+        comp_force_body: Optional[np.ndarray] = None,
+        quat: Optional[np.ndarray] = None,
+        joint_torque_truth: Optional[np.ndarray] = None,
+        joint_torque_est: Optional[np.ndarray] = None,
+        joint_names: Optional[list] = None,
+        truth_label: str = "truth",
+        est_label: str = "L1 estimate",
+        comp_label: str = "LPF compensation",
+        title: str = "L1 disturbance estimate vs truth",
+    ) -> None:
+        """扰动估计 vs 真值，固定 3×3（9 图）布局：
+
+          行1：力 Fx / Fy / Fz（真值 vs 估计 + 补偿）
+          行2：力矩 Mx / My / Mz（真值 vs 估计）
+          行3：[臂关节力矩合并(所有关节一张)] [力误差合并(XYZ一张)] [力矩误差合并(XYZ一张)]
+
+        无臂(s500)时行3第一格为占位。L1 平动通道仅估计力；力矩/关节力矩由动量观测器估计。
+        显示坐标系由「坐标系」按钮切换：world（默认）或 body（需传 quat 逐拍旋转）。
+        """
+        # 缓存原始（世界系 + 机体系两套）数据，供「坐标系」按钮切换时重绘。
+        self._l1_dist_cache = dict(
+            t=t, force_truth=force_truth, force_est=force_est,
+            torque_truth=torque_truth, torque_est=torque_est,
+            comp_force=comp_force,
+            force_truth_body=force_truth_body, force_est_body=force_est_body,
+            torque_truth_body=torque_truth_body, torque_est_body=torque_est_body,
+            comp_force_body=comp_force_body,
+            joint_torque_truth=joint_torque_truth, joint_torque_est=joint_torque_est,
+            joint_names=joint_names,
+            quat=quat, truth_label=truth_label,
+            est_label=est_label, comp_label=comp_label, title=title,
+        )
+        # 机体系显示：优先用仿真同拍记录的 *_body 序列（无需事后旋转）；
+        # 若调用方未提供 body 序列（如 ROS/Gazebo 路径），回退到用 quat 逐拍旋转。
+        want_body = getattr(self, "_l1_dist_frame", "world") == "body"
+        use_body = False
+        if want_body:
+            if force_truth_body is not None or torque_truth_body is not None:
+                force_truth = force_truth_body
+                force_est = force_est_body
+                torque_truth = torque_truth_body
+                torque_est = torque_est_body
+                comp_force = comp_force_body
+                use_body = True
+            elif quat is not None:
+                q = np.asarray(quat, dtype=float)
+                if q.ndim == 2 and q.shape[1] >= 4:
+                    force_truth = self._world_to_body_series(force_truth, q)
+                    force_est = self._world_to_body_series(force_est, q)
+                    torque_truth = self._world_to_body_series(torque_truth, q)
+                    torque_est = self._world_to_body_series(torque_est, q)
+                    comp_force = self._world_to_body_series(comp_force, q)
+                    use_body = True
+        frame_lbl = "body" if use_body else "world"
+
+        fig = self.fig_l1_dist
+        fig.clear()
+        t = np.asarray(t, dtype=float).flatten()
+        N = t.size
+
+        def _arr(a):
+            if a is None:
+                return None
+            a = np.asarray(a, dtype=float)
+            return a if a.ndim == 2 and a.shape[1] >= 3 else None
+
+        ft, fe = _arr(force_truth), _arr(force_est)
+        mt, me = _arr(torque_truth), _arr(torque_est)
+        fc = _arr(comp_force)
+
+        def _arr_joint(a):
+            if a is None:
+                return None
+            a = np.asarray(a, dtype=float)
+            return a if a.ndim == 2 and a.shape[1] >= 1 else None
+
+        jt, je = _arr_joint(joint_torque_truth), _arr_joint(joint_torque_est)
+        jlabels = list(joint_names or [])
+        if jt is not None and len(jlabels) < jt.shape[1]:
+            jlabels += [f"j{i+1}" for i in range(len(jlabels), jt.shape[1])]
+        if je is not None and len(jlabels) < je.shape[1]:
+            jlabels += [f"j{i+1}" for i in range(len(jlabels), je.shape[1])]
+        n_joint = 0
+        if jt is not None or je is not None:
+            n_joint = max(
+                jt.shape[1] if jt is not None else 0,
+                je.shape[1] if je is not None else 0,
+            )
+
+        present = [a for a in (ft, fe, mt, me, fc, jt, je) if a is not None]
+        if N < 2 or not present:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "No disturbance / L1 data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=_mpl_pt(12))
+            ax.axis("off")
+            self.cv_l1_dist.draw()
+            return
+
+        n = min([a.shape[0] for a in present] + [N])
+        tt = t[:n]
+        axis_names = ["X", "Y", "Z"]
+        axis_colors = ["tab:red", "tab:green", "tab:blue"]
+        # 固定 3×3 布局：行1 力 Fx/Fy/Fz、行2 力矩 Mx/My/Mz、行3 关节力矩合并 + 力误差合并 + 力矩误差合并。
+        n_plot_rows = 3
+
+        def _plot_value_row(row_base: int, truth, est, unit: str, kind: str, extra=None):
+            """一行三列：分量 X/Y/Z 的真值 vs 估计（+ 可选补偿）。"""
+            for j in range(3):
+                ax = fig.add_subplot(n_plot_rows, 3, row_base * 3 + j + 1)
+                # 估计放最底层、弱色细线（次要参考）；真值与补偿在上层、强色突出。
+                if est is not None:
+                    ax.plot(tt, est[:n, j], color="0.7", lw=1.0, alpha=0.7,
+                            zorder=1, label=est_label)
+                if truth is not None:
+                    ax.plot(tt, truth[:n, j], color="tab:blue", lw=1.8, ls="-",
+                            zorder=3, label=truth_label)
+                if extra is not None:
+                    ax.plot(tt, extra[:n, j], color="tab:orange", lw=1.6, ls="--",
+                            zorder=2, label=comp_label)
+                ax.set_title(f"{kind}{axis_names[j]} [{unit}]", fontsize=_mpl_pt(12))
+                if j == 0:
+                    ax.set_ylabel(f"{kind} [{unit}]")
+                ax.grid(True, alpha=0.3)
+                ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
+                if truth is not None or est is not None:
+                    ax.legend(loc="upper right", fontsize=_mpl_pt(9))
+
+        def _plot_err_combined(pos: int, truth, est, unit: str, kind: str):
+            """单图汇总 X/Y/Z 三分量的估计误差 (est-truth)。"""
+            ax = fig.add_subplot(n_plot_rows, 3, pos)
+            if truth is not None and est is not None:
+                i0 = max(0, int(0.66 * n))
+                for j in range(3):
+                    err = est[:n, j] - truth[:n, j]
+                    lbl = f"{kind}{axis_names[j]}"
+                    if n - i0 > 1:
+                        lbl += f" (|err|~{float(np.mean(np.abs(err[i0:]))):.3g})"
+                    ax.plot(tt, err, color=axis_colors[j], lw=1.2, label=lbl)
+                ax.legend(loc="upper right", fontsize=_mpl_pt(9))
+            else:
+                ax.text(0.5, 0.5, "no estimate", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=_mpl_pt(10))
+            ax.set_title(f"{kind} error (est-truth) [{unit}]", fontsize=_mpl_pt(12))
+            ax.set_ylabel(f"{kind} err [{unit}]")
+            ax.set_xlabel("t [s]")
+            ax.grid(True, alpha=0.3)
+            ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
+
+        def _plot_joint_combined(pos: int, truth, est, unit: str = "N·m"):
+            """单图汇总所有臂关节的扰动力矩真值 vs 估计（关节空间）。"""
+            ax = fig.add_subplot(n_plot_rows, 3, pos)
+            j_colors = ["tab:blue", "tab:orange", "tab:purple", "tab:brown"]
+            for j in range(n_joint):
+                c = j_colors[j % len(j_colors)]
+                lbl = jlabels[j] if j < len(jlabels) else f"j{j+1}"
+                if truth is not None and j < truth.shape[1]:
+                    ax.plot(tt, truth[:n, j], color=c, lw=1.8, ls="-",
+                            zorder=3, label=f"τ_{lbl} truth")
+                if est is not None and j < est.shape[1]:
+                    ax.plot(tt, est[:n, j], color=c, lw=1.2, ls="--", alpha=0.85,
+                            zorder=2, label=f"τ_{lbl} est")
+            ax.set_title(f"arm joint τ [{unit}]", fontsize=_mpl_pt(12))
+            ax.set_ylabel(f"joint τ [{unit}]")
+            ax.set_xlabel("t [s]")
+            ax.grid(True, alpha=0.3)
+            ax.axhline(0.0, color="gray", lw=0.6, alpha=0.5)
+            if n_joint > 0 and (truth is not None or est is not None):
+                ax.legend(loc="upper right", fontsize=_mpl_pt(9))
+
+        # 行1：力分量；行2：力矩分量。
+        _plot_value_row(0, ft, fe, f"N, {frame_lbl}", "F", extra=fc)
+        _plot_value_row(1, mt, me, f"N·m, {frame_lbl}", "M")
+        # 行3：[关节力矩合并] [力误差合并] [力矩误差合并]。无臂时第一格留作占位说明。
+        if n_joint > 0:
+            _plot_joint_combined(7, jt, je)
+        else:
+            ax = fig.add_subplot(n_plot_rows, 3, 7)
+            ax.text(0.5, 0.5, "no arm joints", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=_mpl_pt(10))
+            ax.axis("off")
+        _plot_err_combined(8, ft, fe, f"N, {frame_lbl}", "F")
+        _plot_err_combined(9, mt, me, f"N·m, {frame_lbl}", "M")
+
+        frame_note = frame_lbl if n_joint == 0 else f"{frame_lbl}; joint τ in joint space"
+        fig.suptitle(f"{title}  [frame: {frame_note}]", fontsize=_mpl_pt(14), y=0.995)
+        try:
+            fig.tight_layout(rect=(0, 0, 1, 0.96), pad=0.6, h_pad=1.0, w_pad=0.6)
+            fig.subplots_adjust(hspace=0.40, wspace=0.24)
+        except Exception:
+            pass
+        self.cv_l1_dist.draw()
+
+    def _on_geo_autotune_clicked(self):
+        """启动/停止 geometric 自动调参。"""
+        # 运行中再次点击 = 请求停止。
+        w = getattr(self, "_geo_autotune_worker", None)
+        if w is not None and w.isRunning():
+            w.request_stop()
+            self.geo_autotune_btn.setText("Stopping…")
+            self.geo_autotune_btn.setEnabled(False)
+            return
+        if self._plan_bundle is None:
+            QMessageBox.warning(self, "Notice", "请先规划一条轨迹。")
+            return
+        if not self._EE_MPC_OK:
+            QMessageBox.warning(self, "Error", "Acados 不可用，无法运行 geometric 仿真。")
+            return
+        self._maybe_upgrade_ee_snap_for_s500()
+        if self._plan_bundle.get("kind") not in ("full_croc", "full_acados"):
+            QMessageBox.warning(
+                self, "Notice",
+                "Geometric 自动调参需要 full-state 轨迹（先做 \"Full state\" 规划）。",
+            )
+            return
+        pb = self._plan_bundle
+        x0 = np.asarray(pb["x_plan"][0], dtype=float).flatten()
+        ctbr_cfg = dict(self._collect_track_ctbr())
+        ctbr_cfg["enabled"] = True
+        params = {
+            "x0": x0,
+            "t_plan": pb["t_plan"],
+            "x_plan": pb["x_plan"],
+            "T_sim": self._sim_horizon_covering_plan(),
+            "sim_dt": self.sim_dt.value(),
+            "control_dt": self.control_dt.value(),
+            "dt_mpc": self.dt_mpc.value(),
+            "N": self.N_mpc.value(),
+            "mpc_max_iter": self.mpc_max_iter.value(),
+            "urdf_path": self._selected_robot_urdf_path(),
+            "state_limits": {
+                "v_max": float(self.track_v_max.value()),
+                "omega_max": float(self.track_omega_max.value()),
+                "j_angle_max": float(self.track_j_angle_max.value()),
+                "j_vel_max": float(self.track_j_vel_max.value()),
+            },
+            "ctbr": ctbr_cfg,
+            "max_tilt_deg": float(self.geo_max_tilt.value()),
+            "alpha": 1.0,
+            "budget": int(self.geo_autotune_budget.value()),
+            "init": {
+                "kp_pos": float(self.geo_kp_pos.value()),
+                "kd_vel": float(self.geo_kd_vel.value()),
+                "kR": float(self.geo_kR.value()),
+                "kOmega": float(self.geo_kOmega.value()),
+            },
+        }
+        self._geo_autotune_worker = GeometricAutoTuneWorker(params)
+        self._geo_autotune_worker.progress.connect(self._on_geo_autotune_progress)
+        self._geo_autotune_worker.finished.connect(self._on_geo_autotune_finished)
+        self.geo_autotune_btn.setText("Stop")
+        self.geo_autotune_status.setText("启动中…（调参时关闭扰动/L1）")
+        self.run_track_btn.setEnabled(False)
+        self.log("[geo auto-tune] 开始针对当前轨迹自动调参（pattern search，关闭扰动/L1）。")
+        self._geo_autotune_worker.start()
+
+    def _on_geo_autotune_progress(
+        self, idx: int, budget: int, cur_J: float, best_J: float,
+        mean_e: float, max_e: float, best_gains: object,
+    ) -> None:
+        g = best_gains if isinstance(best_gains, dict) else {}
+        self.geo_autotune_status.setText(
+            f"#{idx}/{budget}  当前J={cur_J:.4g}  最佳J={best_J:.4g}  "
+            f"(mean={mean_e*1000:.1f}mm, max={max_e*1000:.1f}mm)  "
+            f"kp={g.get('kp_pos', 0):.2f} kd={g.get('kd_vel', 0):.2f} "
+            f"kR={g.get('kR', 0):.2f} kΩ={g.get('kOmega', 0):.3f}"
+        )
+
+    def _on_geo_autotune_finished(self, ok: bool, err: str, best: object) -> None:
+        self.geo_autotune_btn.setText("Auto tune (当前轨迹)")
+        self.geo_autotune_btn.setEnabled(True)
+        self.run_track_btn.setEnabled(True)
+        if not ok or not isinstance(best, dict):
+            self.geo_autotune_status.setText("失败")
+            self.log(f"[geo auto-tune] 失败:\n{err}")
+            return
+        # 写回最佳增益。
+        self.geo_kp_pos.setValue(float(best.get("kp_pos", self.geo_kp_pos.value())))
+        self.geo_kd_vel.setValue(float(best.get("kd_vel", self.geo_kd_vel.value())))
+        self.geo_kR.setValue(float(best.get("kR", self.geo_kR.value())))
+        self.geo_kOmega.setValue(float(best.get("kOmega", self.geo_kOmega.value())))
+        self.geo_autotune_status.setText(
+            f"完成 ✓ 最佳J={best.get('J', float('nan')):.4g}  "
+            f"kp={best.get('kp_pos', 0):.2f} kd={best.get('kd_vel', 0):.2f} "
+            f"kR={best.get('kR', 0):.2f} kΩ={best.get('kOmega', 0):.3f}（已写回）"
+        )
+        self.log(
+            f"[geo auto-tune] 完成：J={best.get('J', float('nan')):.4g}, "
+            f"kp_pos={best.get('kp_pos', 0):.3f}, kd_vel={best.get('kd_vel', 0):.3f}, "
+            f"kR={best.get('kR', 0):.3f}, kOmega={best.get('kOmega', 0):.3f}（已写回界面）"
+        )
+
+    def _sim_horizon_covering_plan(self) -> float:
+        """闭环仿真至少覆盖当前规划全长（含 Hover before/after）。
+
+        T_sim 短于轨迹时，末段参考已经到终点而机体还在追上，位置差会停在半空，
+        看起来像抓取后突然多了一块质量。更长的 T_sim 保持不变。
+        """
+        requested = float(self.T_sim.value())
+        dur = 0.0
+        pb = self._plan_bundle if isinstance(getattr(self, "_plan_bundle", None), dict) else None
+        if pb is not None:
+            for key in ("t_plan", "t_ref"):
+                raw = pb.get(key)
+                if raw is None:
+                    continue
+                t = np.asarray(raw, dtype=float).flatten()
+                if t.size >= 2 and np.isfinite(t[0]) and np.isfinite(t[-1]):
+                    dur = max(dur, float(t[-1] - t[0]))
+        if dur > requested + 1e-3:
+            self.T_sim.setValue(dur)
+            self.log(
+                f"[tracking] 规划轨迹 {dur:.2f}s，T_sim={requested:.2f}s 没有盖住末段，"
+                f"已改为 {dur:.2f}s。"
+            )
+            return dur
+        return requested
+
+    def _run_track(self):
+        if self._plan_bundle is None:
+            return
+        self._manual_ref_overlay = None
+        T_sim = self._sim_horizon_covering_plan()
+        # s500：确保 base-link ee_snap 已升级为 full-state（幂等；已升级则跳过）。
+        self._maybe_upgrade_ee_snap_for_s500()
+        mode = self.track_mode_combo.currentIndex()
+        if mode == 0:
+            if self._plan_bundle["kind"] not in ("full_croc", "full_acados"):
+                QMessageBox.warning(
+                    self,
+                    "Notice",
+                    "Tracking along the full-state plan requires doing the \"Full state\" planning first.",
+                )
+                return
+            pb = self._plan_bundle
+            x0 = np.asarray(pb["x_plan"][0], dtype=float).flatten()
+            params = {
+                "x0": x0,
+                "t_plan": pb["t_plan"],
+                "x_plan": pb["x_plan"],
+                "x_nom": self._robot_hover_nominal_state(),
+                "urdf_path": self._selected_robot_urdf_path(),
+                "T_sim": T_sim,
+                "sim_dt": self.sim_dt.value(),
+                "control_dt": self.control_dt.value(),
+                "dt_mpc": self.dt_mpc.value(),
+                "horizon": self.croc_horizon.value(),
+                "mpc_max_iter": self.croc_mpc_iter.value(),
+                "w_state_track": self.w_state_track.value(),
+                "w_state_reg": self.w_state_reg.value(),
+                "w_control": self.w_control.value(),
+                "w_terminal_track": self.w_terminal_track.value(),
+                "w_pos": self.w_pos.value(),
+                "w_att": self.w_att.value(),
+                "w_joint": self.w_joint.value(),
+                "w_vel": self.w_vel.value(),
+                "w_omega": self.w_omega.value(),
+                "w_joint_vel": self.w_joint_vel.value(),
+                "w_u_thrust": self.w_u_thrust.value(),
+                "w_u_joint_torque": self.w_u_joint_torque.value(),
+                "use_actuator_first_order": self.croc_use_actuator_first_order.isChecked(),
+                "tau_thrust": float(self.tau_thrust_track.value()),
+                "tau_theta": float(self.tau_theta_track.value()),
+                "sim_control_stack": (
+                    "ctbr" if self._current_track_scheme() == "ctbr" else "direct"
+                ),
+                "px4_rate_Kp": float(self.px4_rate_Kp_track.value()),
+                "px4_rate_Kd": float(self.px4_rate_Kd_track.value()),
+                "ctbr": self._collect_track_ctbr(),
+                "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
+                "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
+                "sim_payload_mass": float(self.sim_payload_mass.value()),
+                "sim_payload_sphere_r": 0.02,
+            }
+            self.run_track_btn.setEnabled(False)
+            self.log("Crocoddyl closed-loop tracking along the plan…")
+            self._track_worker = TrackCrocAlongPlanWorker(params)
+            self._track_worker.finished.connect(self._on_track_croc_finished)
+            self._track_worker.start()
+            return
+
+        if mode in (1, 4):
+            if not self._EE_MPC_OK:
+                QMessageBox.warning(self, "Error", "Acados MPC is unavailable.")
+                return
+            if self._plan_bundle["kind"] not in ("full_croc", "full_acados"):
+                QMessageBox.warning(
+                    self,
+                    "Notice",
+                    "Tracking along the full-state plan requires doing the \"Full state\" planning first.",
+                )
+                return
+            is_geo = mode == 4
+            pb = self._plan_bundle
+            x0 = np.asarray(pb["x_plan"][0], dtype=float).flatten()
+            cm = (
+                "direct"
+                if (is_geo or self.control_mode_track.currentIndex() == 0)
+                else "actuator_first_order"
+            )
+            ctbr_cfg = dict(self._collect_track_ctbr())
+            # 以 Control scheme 选择器为准（geometric 恒为 CTBR）。
+            ctbr_cfg["enabled"] = bool(is_geo or self._current_track_scheme() == "ctbr")
+            params = {
+                "x0": x0,
+                "t_plan": pb["t_plan"],
+                "x_plan": pb["x_plan"],
+                "T_sim": T_sim,
+                "sim_dt": self.sim_dt.value(),
+                "control_dt": self.control_dt.value(),
+                "dt_mpc": self.dt_mpc.value(),
+                "N": self.N_mpc.value(),
+                "mpc_max_iter": self.mpc_max_iter.value(),
+                "mpc_log_interval": self.mpc_log_iv.value(),
+                "acados_solver_type": self._acados_solver_type_value(),
+                "acados_integrator": self._acados_integrator_value(),
+                "acados_cost_analysis": bool(self.acados_cost_analysis.isChecked()),
+                "acados_inertia_scaling": bool(self.acados_inertia_scaling.isChecked()),
+                "control_mode": cm,
+                "urdf_path": self._selected_robot_urdf_path(),
+                "w_state_track": self.w_state_track.value(),
+                "w_state_reg": self.w_state_reg.value(),
+                "w_control": self.w_control.value(),
+                "w_terminal_track": self.w_terminal_track.value(),
+                "w_pos": self.w_pos.value(),
+                "w_att": self.w_att.value(),
+                "w_joint": self.w_joint.value(),
+                "w_vel": self.w_vel.value(),
+                "w_omega": self.w_omega.value(),
+                "w_joint_vel": self.w_joint_vel.value(),
+                "w_u_thrust": self.w_u_thrust.value(),
+                "w_u_joint_torque": self.w_u_joint_torque.value(),
+                "state_limits": {
+                    "v_max": float(self.track_v_max.value()),
+                    "omega_max": float(self.track_omega_max.value()),
+                    "j_angle_max": float(self.track_j_angle_max.value()),
+                    "j_vel_max": float(self.track_j_vel_max.value()),
+                },
+                "disturbance": self._collect_track_disturbance(),
+                "l1": self._collect_track_l1(),
+                "ctbr": ctbr_cfg,
+                "baseline": "geometric" if is_geo else "acados",
+                "geometric": {
+                    "kp_pos": float(self.geo_kp_pos.value()),
+                    "kd_vel": float(self.geo_kd_vel.value()),
+                    "kR": float(self.geo_kR.value()),
+                    "kOmega": float(self.geo_kOmega.value()),
+                    "max_tilt_deg": float(self.geo_max_tilt.value()),
+                },
+            }
+            self.run_track_btn.setEnabled(False)
+            if is_geo:
+                self.log("Geometric controller closed-loop tracking (CTBR inner loop)…")
+            else:
+                self.log("Acados closed-loop tracking along the plan (shared Croc cost weights)…")
+            self._track_worker = TrackAcadosAlongPlanWorker(params)
+            self._track_worker.finished.connect(self._on_track_acados_full_finished)
+            self._track_worker.progress.connect(self._on_track_acados_progress)
+            self._track_worker.start()
+            return
+
+        pb = self._plan_bundle
+        sim_dt = self.sim_dt.value()
+        if pb["kind"] == "ee_snap":
+            t_ref = np.asarray(pb["t_ref"], dtype=float).flatten()
+            p_ref = np.asarray(pb["p_ref"], dtype=float)
+            yaw_ref = np.asarray(pb["yaw_ref"], dtype=float).flatten()
+            waypoints = pb.get("waypoints")
+            t_wp = pb.get("t_wp")
+            ek = pb.get("ee_track_kind")
+            if ek == "eight":
+                plan_title = "EE figure-eight (plan ref)"
+            elif ek == "acc_track":
+                plan_title = "Acc tracking test (plan ref)"
+            else:
+                plan_title = "EE minimum snap (plan ref)"
+            x0_for_ee = self._aligned_x0_from_ee_ref(p_ref, yaw_ref, x_seed=None)
+        else:
+            rm, eid = self._robot_model_and_ee()
+            t_ref, p_ref, yaw_ref = build_ee_ref_from_full_state(
+                pb["t_plan"],
+                pb["x_plan"],
+                rm,
+                eid,
+                T_sim,
+                sim_dt,
+            )
+            waypoints = None
+            t_wp = None
+            plan_title = "EE ref (from full-state plan FK)"
+            x0_for_ee = self._aligned_x0_from_ee_ref(
+                p_ref, yaw_ref, x_seed=np.asarray(pb["x_plan"][0], dtype=float).flatten()[:17]
+            )
+
+        if mode == 3:
+            if not self._CROC_EE_OK or self._croc_ee_mpc is None:
+                QMessageBox.warning(self, "Error", "Crocoddyl EE pose tracking is unavailable.")
+                return
+            t_plan_ee = None
+            x_plan_ee = None
+            if pb.get("kind") != "ee_snap" and pb.get("t_plan") is not None and pb.get("x_plan") is not None:
+                t_plan_ee = np.asarray(pb["t_plan"], dtype=float)
+                x_plan_ee = np.asarray(pb["x_plan"], dtype=float)
+            params_croc_ee = {
+                "x0": x0_for_ee,
+                "t_ref": t_ref,
+                "p_ref": p_ref,
+                "yaw_ref": yaw_ref,
+                "sim_dt": sim_dt,
+                "control_dt": self.control_dt.value(),
+                "dt_mpc": self.dt_mpc.value(),
+                "N_mpc": self.N_mpc.value(),
+                "croc_ee_w_pos": float(self.croc_ee_w_pos.value()),
+                "croc_ee_w_rot_rp": float(self.croc_ee_w_rot_rp.value()),
+                "croc_ee_w_rot_yaw": float(self.croc_ee_w_rot_yaw.value()),
+                "croc_ee_w_vel_lin": float(self.croc_ee_w_vel_lin.value()),
+                "croc_ee_w_vel_ang_rp": float(self.croc_ee_w_vel_ang_rp.value()),
+                "croc_ee_w_vel_ang_yaw": float(self.croc_ee_w_vel_ang_yaw.value()),
+                "croc_ee_w_u": float(self.croc_ee_w_u.value()),
+                "croc_ee_w_terminal": float(self.croc_ee_w_terminal.value()),
+                "w_state_reg": float(self.w_state_reg.value()),
+                "w_state_track": float(self.w_state_track.value()),
+                "mpc_max_iter": self.mpc_max_iter.value(),
+                "use_thrust_constraints": self.croc_ee_use_thrust_constraints.isChecked(),
+                "use_actuator_first_order": self.croc_use_actuator_first_order.isChecked(),
+                "tau_thrust": float(self.tau_thrust_track.value()),
+                "tau_theta": float(self.tau_theta_track.value()),
+                "t_plan": t_plan_ee,
+                "x_plan": x_plan_ee,
+                "sim_payload_enable": bool(self.sim_payload_enable.isChecked()),
+                "sim_payload_t_grasp": float(self.sim_payload_t_grasp.value()),
+                "sim_payload_mass": float(self.sim_payload_mass.value()),
+                "sim_payload_sphere_r": 0.02,
+            }
+            self.run_track_btn.setEnabled(False)
+            self.log("Crocoddyl EE pose closed loop…")
+            self._track_worker = TrackEeCrocWorker(params_croc_ee)
+            self._track_worker.finished.connect(self._on_track_croc_ee_finished)
+            self._track_worker.start()
+            return
+
+        if not self._EE_MPC_OK or self._ee_mpc is None:
+            QMessageBox.warning(self, "Error", "Acados EE MPC is unavailable.")
+            return
+
+        cm = (
+            "direct"
+            if self.control_mode_track.currentIndex() == 0
+            else "actuator_first_order"
+        )
+        params = {
+            "t_ref": t_ref,
+            "p_ref": p_ref,
+            "yaw_ref": yaw_ref,
+            "x0_init": x0_for_ee,
+            "T_sim": T_sim,
+            "sim_dt": sim_dt,
+            "control_dt": self.control_dt.value(),
+            "dt_mpc": self.dt_mpc.value(),
+            "N_mpc": self.N_mpc.value(),
+            "w_ee": self.w_ee.value(),
+            "w_ee_yaw": self.w_ee_yaw.value(),
+            "mpc_max_iter": self.mpc_max_iter.value(),
+            "mpc_log_interval": self.mpc_log_iv.value(),
+            "control_mode": cm,
+            "plan_title": plan_title,
+            "waypoints": waypoints,
+            "t_wp": t_wp,
+            "track_label": "suite_ee",
+        }
+        self.run_track_btn.setEnabled(False)
+        self.log("Acados EE-centric closed loop…")
+        self._track_worker = TrackEeAcadosWorker(params)
+        self._track_worker.finished.connect(self._on_track_ee_finished)
+        self._track_worker.start()
+
+    def _on_track_acados_progress(self, done: int, total: int, fps: float):
+        pct = (100.0 * done / total) if total > 0 else 0.0
+        sim_t = done * float(self.sim_dt.value())
+        self.run_track_btn.setText(
+            f"Tracking… {pct:4.0f}%  (t={sim_t:5.2f}s, {fps:6.0f} FPS)"
+        )
+
+    def _on_track_acados_full_finished(self, ok: bool, err: str, payload: object):
+        self.run_track_btn.setText("Run closed-loop tracking")
+        self.run_track_btn.setEnabled(True)
+        if hasattr(self, "reg_run_btn"):
+            self.reg_run_btn.setEnabled(True)
+        if not ok:
+            self.log(err)
+            QMessageBox.critical(self, "Error", err[:2000])
+            return
+        assert isinstance(payload, dict)
+        res = payload["res"]
+        cm = payload.get("control_mode", "direct")
+        out = payload.get("out")
+        self._render_tracking_figures(res, cm, out)
+        self._render_track_control_decomp(out)
+        self._render_sim_l1_disturbance(out)
+        self.log(
+            f"Acados full-state tracking finished | EE error (final) {res['err'][-1]:.4f} m | "
+            f"yaw err {res['err_yaw'][-1]:.4f} rad"
+        )
+        self._log_timing_breakdown(res.get("timing") or (out or {}).get("timing"))
+        self.meshcat_track_btn.setEnabled(True)
+
+    def _log_timing_breakdown(self, timing: object) -> None:
+        """把闭环仿真的运行时间分解写入日志面板，便于定位仿真瓶颈。"""
+        if not isinstance(timing, dict) or not timing.get("sections"):
+            return
+        try:
+            total = float(timing.get("loop_wall_s", 0.0))
+            rtf = float(timing.get("rtf", float("nan")))
+            ns = int(timing.get("n_steps", 0))
+            nc = int(timing.get("n_control_steps", 0))
+            self.log(
+                f"⏱ 仿真耗时 {total:.2f}s | RTF {rtf:.2f}x | "
+                f"sim {ns} 步×{float(timing.get('sim_dt',0))*1e3:.1f}ms | "
+                f"control {nc} 步×{float(timing.get('control_dt',0))*1e3:.1f}ms"
+            )
+            secs = sorted(
+                timing["sections"].items(), key=lambda kv: -kv[1].get("total_s", 0.0)
+            )
+            for name, s in secs:
+                self.log(
+                    f"    {name:18s} {s.get('total_s',0):6.2f}s "
+                    f"{s.get('pct',0):5.1f}%  avg {s.get('avg_ms',0):.3f}ms "
+                    f"× {s.get('calls',0)}"
+                )
+        except Exception:
+            pass
+
+    def _render_sim_l1_disturbance(self, out: object) -> None:
+        """闭环仿真后：在 "L1 / Disturbance" 页对比注入扰动真值与 L1 估计。"""
+        if not isinstance(out, dict):
+            return
+        if not (out.get("disturbance_active") or out.get("l1_active")):
+            return
+        try:
+            t = np.asarray(out.get("time"), dtype=float).flatten()
+            n = max(0, t.size - 1)
+            tt = t[:n]
+
+            def _g(key):
+                a = out.get(key)
+                return np.asarray(a, dtype=float) if a is not None else None
+
+            mass = float(out.get("nominal_mass", 1.0) or 1.0)
+            l1_on = bool(out.get("l1_active"))
+            oracle_on = bool(out.get("oracle_active"))
+
+            # 世界系一套（默认显示）。
+            l1f = _g("l1_force_world")
+            l1t = _g("l1_torque_world")
+            dgf = _g("dist_force_world")
+            mt = _g("dist_torque_world")
+            al1 = _g("l1_a_l1")
+            djt = _g("dist_joint_torque")
+            ljt = _g("l1_joint_torque")
+            n_arm = int(out.get("n_arm", 0) or 0)
+            # 机体系一套（仿真时同拍按真实姿态记录，绘图按钮切换用，不再事后旋转）。
+            l1f_b = _g("l1_force_body")
+            dgf_b = _g("dist_force_body")
+            mt_b = _g("dist_torque_body")
+            al1_b = _g("l1_a_l1_body")
+
+            # 力：广义 L1 / oracle 估计 base 世界系力 vs 真值；未开 L1 时无估计。
+            force_est = l1f if l1_on else None
+            force_est_b = l1f_b if l1_on else None
+            # bolt-on 补偿力 = m·a_l1（≈ -扰动平动分量）；in-model 下 a_l1≈0（补偿在模型层）。
+            comp_force = (-mass * al1) if (l1_on and al1 is not None) else None
+            comp_force_b = (-mass * al1_b) if (l1_on and al1_b is not None) else None
+            # base 力矩：广义 L1 / oracle 直接估计（世界系）。
+            if l1_on and l1t is not None:
+                torque_est = l1t
+                torque_est_b = None
+            else:
+                torque_est = np.zeros_like(mt) if mt is not None else None
+                torque_est_b = np.zeros_like(mt_b) if mt_b is not None else None
+            # 臂关节扰动力矩（关节空间）：真值 τ_ext[6:] vs 广义 L1 / oracle 估计。
+            joint_truth = djt if (n_arm > 0 and djt is not None) else None
+            joint_est = ljt if (l1_on and n_arm > 0 and ljt is not None) else None
+            est_lbl = "oracle (truth)" if oracle_on else "generalized L1 τ̂_ext"
+            self._render_l1_disturbance_figure(
+                t=tt,
+                force_truth=dgf,
+                force_est=force_est,
+                torque_truth=mt,
+                torque_est=torque_est,
+                comp_force=comp_force,
+                force_truth_body=dgf_b,
+                force_est_body=force_est_b,
+                torque_truth_body=mt_b,
+                torque_est_body=torque_est_b,
+                comp_force_body=comp_force_b,
+                joint_torque_truth=joint_truth,
+                joint_torque_est=joint_est,
+                joint_names=[f"j{i+1}" for i in range(n_arm)] if n_arm > 0 else None,
+                truth_label="injected (truth)",
+                est_label=est_lbl,
+                comp_label="LPF compensation -m·a_l1",
+                title="Sim: disturbance estimate vs truth (base + arm joints)",
+            )
+        except Exception as exc:  # pragma: no cover - 绘图失败不应中断流程
+            self.log(f"[L1/Disturbance] 渲染失败: {exc}")
+
+    def _render_track_control_decomp(self, out: object) -> bool:
+        """Control 图（闭环 sim track），按"控制层"分行的 3×2 布局（带臂）/2×2（无臂）：
+
+        行1：rotor forces | body torque(xyz)   —— direct 模式（规划旋翼力/力矩）tracking 效果
+        行2：collective thrust | body rate(pqr) —— CTBR 模式（总推力+角速度内环）效果
+        行3：joint torques | joint angles       —— direct 力矩 / joint position control 效果（仅带臂）
+
+        - rotor forces：real(实线)/cmd(虚线)/ref(点线)。
+        - body torque / collective thrust：real 与规划 ref；总推力另含 u_b/u_ac/u_p 分解。
+        - body rate：real 与 setpoint(CTBR 时)。
+        - joint torques：real/cmd(--)/ref(:)；joint angles：real 与规划 ref(--)。
+        """
+        import traceback as _tb
+        if not isinstance(out, dict):
+            return False
+        needed = ("u_baseline", "u_l1_delta", "u_pos_delta", "controls_real", "rotor_alloc")
+        if any(out.get(k) is None for k in needed):
+            return False
+        try:
+            u_b_all = np.asarray(out["u_baseline"], dtype=float)
+            u_ac_all = np.asarray(out["u_l1_delta"], dtype=float)
+            u_p_all = np.asarray(out["u_pos_delta"], dtype=float)
+            u_real_all = np.asarray(out["controls_real"], dtype=float)
+            A = np.asarray(out["rotor_alloc"], dtype=float)
+            n_rot = int(out.get("n_rotors", 4))
+            t_all = np.asarray(out.get("time"), dtype=float).flatten()
+            N = min(
+                u_b_all.shape[0], u_ac_all.shape[0], u_p_all.shape[0],
+                u_real_all.shape[0], max(0, t_all.size),
+            )
+            if N < 2 or A.shape != (4, 4):
+                return False
+            t = t_all[:N]
+            u_b = u_b_all[:N, :n_rot]
+            u_ac = u_ac_all[:N, :n_rot]
+            u_p = u_p_all[:N, :n_rot]
+            u_real = u_real_all[:N, :n_rot]
+            u_after_l1 = u_b + u_ac
+            u_cmd = u_after_l1 + u_p
+
+            # 机械臂关节力矩（仅 S500_uam，n_arm>0）：u_real/u_baseline 的 n_rot: 列。
+            nq_full = int(out.get("nq", 7))
+            n_arm = max(0, nq_full - 7)
+            n_arm = min(n_arm, max(0, u_real_all.shape[1] - n_rot))
+            tau_arm_real = u_real_all[:N, n_rot : n_rot + n_arm] if n_arm > 0 else None
+            tau_arm_cmd = u_b_all[:N, n_rot : n_rot + n_arm] if n_arm > 0 else None
+
+            # 体角速度真值（来自状态 x[nq+3:nq+6]）。
+            omega = None
+            states = out.get("states")
+            if states is not None:
+                states = np.asarray(states, dtype=float)
+                nq = int(out.get("nq", 7))
+                if states.ndim == 2 and states.shape[1] >= nq + 6:
+                    omega = states[:N, nq + 3 : nq + 6]
+
+            # CTBR 模式：角速度设定点（机体系，含 L1 tilt 增广）。
+            ctbr_on = bool(out.get("ctbr_active"))
+            rate_sp = None
+            if ctbr_on:
+                rsp = out.get("ctbr_rate_sp")
+                if rsp is not None:
+                    rsp = np.asarray(rsp, dtype=float)
+                    if rsp.ndim == 2 and rsp.shape[0] >= N and rsp.shape[1] >= 3:
+                        rate_sp = rsp[:N]
+
+            # 规划电机力（重采样到记录时间轴）作为 ref。
+            u_ref = None
+            pb = self._plan_bundle
+            try:
+                if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+                    up = np.asarray(pb.get("u_plan"), dtype=float)
+                    tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                    if up.ndim == 2 and up.shape[0] >= 1 and tp.size >= 2:
+                        tpc = tp[: up.shape[0]] - tp[0]
+                        nj = min(n_rot, up.shape[1])
+                        u_ref = np.column_stack(
+                            [np.interp(t, tpc, up[: tpc.size, j]) for j in range(nj)]
+                        )
+            except Exception:
+                u_ref = None
+
+            # 机械臂关节力矩的规划参考（plan u 的 n_rot: 列，重采样到记录时间轴）。
+            tau_arm_ref = None
+            if n_arm > 0:
+                try:
+                    if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+                        up = np.asarray(pb.get("u_plan"), dtype=float)
+                        tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                        if up.ndim == 2 and up.shape[1] > n_rot and tp.size >= 2:
+                            tpc = tp[: up.shape[0]] - tp[0]
+                            na = min(n_arm, up.shape[1] - n_rot)
+                            tau_arm_ref = np.column_stack(
+                                [np.interp(t, tpc, up[: tpc.size, n_rot + j]) for j in range(na)]
+                            )
+                except Exception:
+                    tau_arm_ref = None
+
+            # 关节角度真值（状态 q 的 arm 段：pos3·quat4·arm）与规划参考。
+            q_arm_real = None
+            q_arm_ref = None
+            if n_arm > 0:
+                if (
+                    states is not None and getattr(states, "ndim", 0) == 2
+                    and states.shape[1] >= 7 + n_arm
+                ):
+                    q_arm_real = states[:N, 7 : 7 + n_arm]
+                try:
+                    if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+                        xp = np.asarray(pb.get("x_plan"), dtype=float)
+                        tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                        if xp.ndim == 2 and xp.shape[1] >= 7 + n_arm and tp.size >= 2:
+                            tpc = tp[: xp.shape[0]] - tp[0]
+                            q_arm_ref = np.column_stack(
+                                [np.interp(t, tpc, xp[: tpc.size, 7 + j]) for j in range(n_arm)]
+                            )
+                except Exception:
+                    q_arm_ref = None
+
+            # 力旋量 [T, Mx, My, Mz] = A · [T1..T4]
+            W_b = (A @ u_b.T).T
+            W_ac = (A @ u_ac.T).T
+            W_p = (A @ u_p.T).T
+            W_real = (A @ u_real.T).T
+            W_after_l1 = W_b + W_ac
+            W_cmd = W_after_l1 + W_p
+
+            rotor_colors = ["tab:blue", "tab:orange", "tab:green", "tab:purple"]
+            # 指令分解三路 + real/ref 的统一配色（u_b / +u_ac / +u_p / real / ref）。
+            c_b, c_l1, c_cmd, c_real, c_ref = (
+                "tab:gray", "tab:blue", "tab:green", "tab:red", "k",
+            )
+            axis_names = ["x", "y", "z"]
+            rate_lbl = ["p", "q", "r"]
+
+            # 力旋量参考（规划）：W_ref = A·u_ref，供 T/Mx/My/Mz 各分量参考线。
+            W_ref = (A @ u_ref.T).T if u_ref is not None else None
+
+            def _plot_wrench_decomp(ax, idx, ref_series, unit):
+                """画某力旋量分量 idx∈{0:T,1:Mx,2:My,3:Mz} 的指令分解 + real(+ref)。
+
+                三路累加：u_b → u_b+u_ac → cmd(=+u_p)，相邻线间隙即各通道贡献。
+                """
+                ax.plot(t, W_b[:, idx], color=c_b, lw=0.9, alpha=0.75, label="u_b")
+                ax.plot(t, W_after_l1[:, idx], color=c_l1, lw=0.9, ls="--",
+                        alpha=0.85, label="u_b+u_ac")
+                ax.plot(t, W_cmd[:, idx], color=c_cmd, lw=1.3, label="cmd(+u_p)")
+                ax.plot(t, W_real[:, idx], color=c_real, lw=1.0, alpha=0.9, label="real")
+                if ref_series is not None:
+                    ax.plot(t, ref_series, color=c_ref, lw=0.8, ls=":",
+                            alpha=0.55, label="ref")
+                ax.set_ylabel(unit)
+                ax.grid(True, alpha=0.3)
+                ax.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+                ax.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=2)
+
+            fig = self.fig_control
+            fig.clear()
+            arm_colors = [
+                "tab:blue", "tab:orange", "tab:green", "tab:purple",
+                "tab:red", "tab:brown", "tab:pink",
+            ]
+            axis_cols = ["tab:red", "tab:green", "tab:blue"]  # x/y/z
+            # 按控制层分行：3×2（带臂）/2×2（无臂）。
+            #   行1 rotor force | body torque(xyz)  → direct（规划旋翼力/力矩）效果
+            #   行2 collective thrust | body rate   → CTBR（总推力+角速度内环）效果
+            #   行3 joint torque | joint angle      → direct / joint position control 效果
+            n_rows = 3 if n_arm > 0 else 2
+            gs = fig.add_gridspec(n_rows, 2, hspace=0.45, wspace=0.22)
+            bottom_row = n_rows - 1
+
+            def _plot_multi_real_ref(ax, real, ref, labels, colors, unit, ref_ls=":"):
+                """同图叠多轴 real(实线) 与规划 ref（同色，ref_ls 虚/点线）。"""
+                for j in range(real.shape[1]):
+                    col = colors[j % len(colors)]
+                    ax.plot(t, real[:, j], color=col, lw=1.2, label=labels[j])
+                    if ref is not None and j < ref.shape[1]:
+                        ax.plot(t, ref[:, j], color=col, lw=0.8, ls=ref_ls, alpha=0.6)
+                ax.set_ylabel(unit)
+                ax.grid(True, alpha=0.3)
+                ax.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+                ax.legend(loc="upper right", fontsize=_mpl_pt(10),
+                          ncol=min(real.shape[1], 3))
+
+            # ── 行1左：4 电机力合一（real/cmd/ref）——direct tracking 效果 ──
+            ax_rot = fig.add_subplot(gs[0, 0])
+            for j in range(min(4, n_rot)):
+                col = rotor_colors[j % len(rotor_colors)]
+                ax_rot.plot(t, u_real[:, j], color=col, lw=1.1, label=f"r{j + 1} real")
+                ax_rot.plot(t, u_cmd[:, j], color=col, lw=0.8, ls="--", alpha=0.6)
+                if u_ref is not None and j < u_ref.shape[1]:
+                    ax_rot.plot(t, u_ref[:, j], color=col, lw=0.7, ls=":", alpha=0.5)
+            ax_rot.set_title("Rotor forces [N] — real / cmd(--) / ref(:)", fontsize=_mpl_pt(12))
+            ax_rot.set_ylabel("N")
+            ax_rot.grid(True, alpha=0.3)
+            ax_rot.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=4)
+            if bottom_row == 0:
+                ax_rot.set_xlabel("t [s]")
+
+            # ── 行1右：三轴体力矩合一（real vs 规划 ref）——direct tracking 效果 ──
+            ax_M = fig.add_subplot(gs[0, 1])
+            M_ref = W_ref[:, 1:4] if W_ref is not None else None
+            _plot_multi_real_ref(ax_M, W_real[:, 1:4], M_ref,
+                                 ["Mx", "My", "Mz"], axis_cols, "N·m")
+            ax_M.set_title("Body torque [N·m] — real / ref(:)", fontsize=_mpl_pt(12))
+            if bottom_row == 0:
+                ax_M.set_xlabel("t [s]")
+
+            # ── 行2左：总推力 T（含 u_b/u_ac/u_p 分解 + real + ref）——CTBR 效果 ──
+            ax_T = fig.add_subplot(gs[1, 0])
+            ref_T = W_ref[:, 0] if W_ref is not None else None
+            _plot_wrench_decomp(ax_T, 0, ref_T, "N")
+            ax_T.set_title("Collective thrust T [N]", fontsize=_mpl_pt(12))
+            if bottom_row == 1:
+                ax_T.set_xlabel("t [s]")
+
+            # ── 行2右：三轴体角速度合一（real vs setpoint）——CTBR 效果 ──
+            ax_w = fig.add_subplot(gs[1, 1])
+            if omega is not None:
+                for i in range(3):
+                    ax_w.plot(t, omega[:, i], color=axis_cols[i], lw=1.2,
+                              label=f"{rate_lbl[i]} real")
+            if rate_sp is not None:
+                for i in range(3):
+                    ax_w.plot(t, rate_sp[:, i], color=axis_cols[i], lw=0.8, ls="--",
+                              alpha=0.6)
+            ax_w.set_title("Body rate [rad/s] — real / setpoint(--)", fontsize=_mpl_pt(12))
+            ax_w.set_ylabel("rad/s")
+            ax_w.grid(True, alpha=0.3)
+            ax_w.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+            ax_w.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=3)
+            if bottom_row == 1:
+                ax_w.set_xlabel("t [s]")
+
+            # ── 行3（仅带臂）：关节力矩(direct) | 关节角度(direct / joint pos ctrl) ──
+            if n_arm > 0:
+                ax_jt = fig.add_subplot(gs[2, 0])
+                for j in range(n_arm):
+                    col = arm_colors[j % len(arm_colors)]
+                    if tau_arm_real is not None:
+                        ax_jt.plot(t, tau_arm_real[:, j], color=col, lw=1.1, label=f"j{j+1} real")
+                    if tau_arm_cmd is not None:
+                        ax_jt.plot(t, tau_arm_cmd[:, j], color=col, lw=0.8, ls="--", alpha=0.6)
+                    if tau_arm_ref is not None and j < tau_arm_ref.shape[1]:
+                        ax_jt.plot(t, tau_arm_ref[:, j], color=col, lw=0.7, ls=":", alpha=0.5)
+                ax_jt.set_title("Joint torques [N·m] — real / cmd(--) / ref(:)", fontsize=_mpl_pt(12))
+                ax_jt.set_ylabel("N·m")
+                ax_jt.set_xlabel("t [s]")
+                ax_jt.grid(True, alpha=0.3)
+                ax_jt.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+                ax_jt.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=min(n_arm, 4))
+
+                ax_jq = fig.add_subplot(gs[2, 1])
+                for j in range(n_arm):
+                    col = arm_colors[j % len(arm_colors)]
+                    if q_arm_real is not None and j < q_arm_real.shape[1]:
+                        ax_jq.plot(t, q_arm_real[:, j], color=col, lw=1.2, label=f"j{j+1} real")
+                    if q_arm_ref is not None and j < q_arm_ref.shape[1]:
+                        ax_jq.plot(t, q_arm_ref[:, j], color=col, lw=0.8, ls="--", alpha=0.6)
+                ax_jq.set_title("Joint angles [rad] — real / ref(--)", fontsize=_mpl_pt(12))
+                ax_jq.set_ylabel("rad")
+                ax_jq.set_xlabel("t [s]")
+                ax_jq.grid(True, alpha=0.3)
+                ax_jq.axhline(0.0, color="gray", lw=0.6, alpha=0.4)
+                ax_jq.legend(loc="upper right", fontsize=_mpl_pt(10), ncol=min(n_arm, 4))
+
+            _mode = "CTBR inner-loop" if ctbr_on else "direct"
+            _arm_suffix = " | joint torque & angle" if n_arm > 0 else ""
+            fig.suptitle(
+                f"Control [{_mode}] — rotor force & body torque | "
+                f"collective thrust & body rate{_arm_suffix}",
+                fontsize=_mpl_pt(14), y=0.995,
+            )
+            try:
+                fig.tight_layout(rect=(0, 0, 1, 0.98))
+            except Exception:
+                pass
+            self.cv_control.draw()
+            return True
+        except Exception:
+            self.log(f"[plot] control decomposition figure failed:\n{_tb.format_exc()}")
+            return False
+
+    def _on_track_croc_finished(self, ok: bool, err: str, payload: object):
+        self.run_track_btn.setEnabled(True)
+        if hasattr(self, "reg_run_btn"):
+            self.reg_run_btn.setEnabled(True)
+        if not ok:
+            self.log(err)
+            QMessageBox.critical(self, "Error", err[:2000])
+            return
+        assert isinstance(payload, dict)
+        res = payload["res"]
+        self._render_tracking_figures(res, "direct")
+        self.log(
+            f"Croc tracking finished | EE error (final) {res['err'][-1]:.4f} m | "
+            f"yaw err {res['err_yaw'][-1]:.4f} rad"
+        )
+        self.meshcat_track_btn.setEnabled(True)
+
+    def _on_track_croc_ee_finished(self, ok: bool, err: str, payload: object):
+        self.run_track_btn.setEnabled(True)
+        if hasattr(self, "reg_run_btn"):
+            self.reg_run_btn.setEnabled(True)
+        if not ok:
+            self.log(err)
+            QMessageBox.critical(self, "Error", err[:2000])
+            return
+        assert isinstance(payload, dict)
+        res = payload["res"]
+        self._render_tracking_figures(res, "direct")
+        self.log(
+            f"Croc EE tracking finished | EE error (final) {res['err'][-1]:.4f} m | "
+            f"yaw err {res['err_yaw'][-1]:.4f} rad"
+        )
+        self.meshcat_track_btn.setEnabled(True)
+
+    def _on_track_ee_finished(self, ok: bool, err: str, out: object):
+        self.run_track_btn.setEnabled(True)
+        if hasattr(self, "reg_run_btn"):
+            self.reg_run_btn.setEnabled(True)
+        if not ok:
+            self.log(err)
+            QMessageBox.critical(self, "Error", err[:2000])
+            return
+        assert isinstance(out, dict)
+        res = out["res"]
+        cm = out["control_mode"]
+        self._render_tracking_figures(res, cm, out)
+        self.log(
+            f"EE tracking finished | pos error (final) {res['err'][-1]:.4f} m | "
+            f"yaw err {res['err_yaw'][-1]:.4f} rad"
+        )
+        self.meshcat_track_btn.setEnabled(True)
+
+    def _render_tracking_figures(self, res: dict, control_mode: str, out: dict | None = None):
+        self._last_track_res = res
+        self._last_track_out = out if isinstance(out, dict) else None
+        em = self._ee_mpc
+        if em is None:
+            self.fig_states.clear()
+            ax = self.fig_states.add_subplot(111)
+            ax.text(
+                0.5,
+                0.5,
+                "States plot unavailable (missing s500_uam_ee_snap_tracking_mpc)",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.axis("off")
+            self.fig_control.clear()
+            axc = self.fig_control.add_subplot(111)
+            axc.axis("off")
+            self.cv_states.draw()
+            self.cv_control.draw()
+
+            self.fig_3d_track.clear()
+            ax3 = self.fig_3d_track.add_subplot(111, projection="3d")
+            ax3.text2D(0.2, 0.5, "3D plot unavailable", transform=ax3.transAxes)
+            self.cv_3d_track.draw()
+
+            self.fig_traj_dash.clear()
+            ax = self.fig_traj_dash.add_subplot(111)
+            ax.text(
+                0.5,
+                0.5,
+                "MPC overview unavailable (missing s500_uam_ee_snap_tracking_mpc)",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.axis("off")
+            self.cv_traj_dash.draw()
+            self._render_cost_analysis_figure(res)
+            return
+
+        wp = None
+        if out is not None and out.get("waypoints") is not None:
+            wp = out["waypoints"]
+        elif self._plan_bundle and self._plan_bundle.get("kind") == "ee_snap":
+            wp = self._plan_bundle.get("waypoints")
+        if self._is_s500_mode():
+            wp = None
+        ref_time_states = None
+        ref_states = None
+        ref_time_controls = None
+        ref_controls = None
+        pb = self._plan_bundle
+        if pb is not None and pb.get("kind") in ("full_croc", "full_acados"):
+            try:
+                tp = np.asarray(pb.get("t_plan"), dtype=float).flatten()
+                xp = np.asarray(pb.get("x_plan"), dtype=float)
+                if tp.size >= 2 and xp.ndim == 2 and xp.shape[0] == tp.size:
+                    ref_time_states = tp - tp[0]
+                    ref_states = xp[:, :17] if xp.shape[1] > 17 else xp
+                up = np.asarray(pb.get("u_plan"), dtype=float)
+                if up.ndim == 2 and up.shape[0] > 0 and ref_time_states is not None:
+                    n_u = int(up.shape[0])
+                    if n_u == max(0, len(ref_time_states) - 1):
+                        ref_time_controls = ref_time_states[:-1]
+                    else:
+                        ref_time_controls = np.linspace(
+                            float(ref_time_states[0]),
+                            float(ref_time_states[-1]),
+                            n_u,
+                        )
+                    ref_controls = up
+            except Exception:
+                ref_time_states = None
+                ref_states = None
+                ref_time_controls = None
+                ref_controls = None
+        manual = self._manual_ref_overlay
+        if isinstance(manual, dict):
+            ref_time_states = manual.get("ref_time_states")
+            ref_states = manual.get("ref_states")
+            ref_time_controls = manual.get("ref_time_controls")
+            ref_controls = manual.get("ref_controls")
+            if wp is None:
+                wp = manual.get("waypoints")
+        fs = self.fig_states if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_into_figure else None
+        f3 = self.fig_3d_track if em.PLOT_ACADOS_GUI_STYLE and em.plot_acados_3d_into_figure else None
+        if fs is None:
+            self.fig_states.clear()
+            ax = self.fig_states.add_subplot(111)
+            ax.text(
+                0.5,
+                0.5,
+                "States plot unavailable\n(needs pinocchio and s500_uam_acados_trajectory)",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.axis("off")
+        if f3 is None:
+            self.fig_3d_track.clear()
+            ax = self.fig_3d_track.add_subplot(111, projection="3d")
+            ax.text2D(0.2, 0.5, "3D plot unavailable", transform=ax.transAxes)
+        plot_res = self._s500_plot_sanitize_res(res) if self._is_s500_mode() else res
+        # s500：与规划页一致，仅机体 state/control + 基座 3D/摘要，不画 EE 总览图。
+        if self._is_s500_mode():
+            Xs = _ensure_uam17_for_s500_base_plot(np.asarray(plot_res["x"], dtype=float))
+            tplt = np.asarray(plot_res["t"], dtype=float).flatten()
+            if Xs.ndim == 2 and Xs.shape[0] == tplt.size:
+                uplt = np.asarray(plot_res.get("u"), dtype=float)
+                t_ref_plt = (
+                    np.asarray(ref_time_states, dtype=float).flatten()
+                    if ref_time_states is not None
+                    else None
+                )
+                x_ref_plt = np.asarray(ref_states, dtype=float) if ref_states is not None else None
+                t_u_ref_plt = (
+                    np.asarray(ref_time_controls, dtype=float).flatten()
+                    if ref_time_controls is not None
+                    else None
+                )
+                u_ref_plt = np.asarray(ref_controls, dtype=float) if ref_controls is not None else None
+                self._render_s500_base_only_planning_figures(
+                    tplt,
+                    Xs,
+                    title_prefix="MPC closed-loop",
+                    u_plan=uplt,
+                    t_ref=t_ref_plt,
+                    x_ref=x_ref_plt,
+                    t_u_ref=t_u_ref_plt,
+                    u_ref=u_ref_plt,
+                    mpc_solve=plot_res.get("mpc_solve"),
+                )
+            else:
+                self.fig_states.clear()
+                ax = self.fig_states.add_subplot(111)
+                ax.text(
+                    0.5,
+                    0.5,
+                    "s500 plot: t and x have mismatched row counts",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
+                ax.axis("off")
+                self.fig_3d_track.clear()
+                ax3 = self.fig_3d_track.add_subplot(111, projection="3d")
+                ax3.text2D(0.2, 0.5, "—", transform=ax3.transAxes)
+                self.fig_traj_dash.clear()
+                axd = self.fig_traj_dash.add_subplot(111)
+                axd.axis("off")
+                self.fig_control.clear()
+                axc = self.fig_control.add_subplot(111)
+                axc.axis("off")
+        else:
+            self._set_control_tab_uam_placeholder()
+            em.render_ee_tracking_results_to_figures(
+                plot_res,
+                fs,
+                f3,
+                self.fig_traj_dash,
+                control_mode=control_mode,
+                plan_waypoints_xyz=wp,
+                states_title="MPC closed-loop",
+                ref_time_states=ref_time_states,
+                ref_states=ref_states,
+                ref_time_controls=ref_time_controls,
+                ref_controls=ref_controls,
+            )
+        self.cv_states.draw()
+        self.cv_control.draw()
+        self.cv_3d_track.draw()
+        self.cv_traj_dash.draw()
+        self._render_cost_analysis_figure(res)
+
+    def _render_cost_analysis_figure(self, res: dict) -> None:
+        fig = self.fig_cost_analysis
+        fig.clear()
+        t = np.asarray(res.get("mpc_cost_t", []), dtype=float).flatten()
+        total = np.asarray(res.get("mpc_cost_total", []), dtype=float).flatten()
+        groups = res.get("mpc_cost_groups", {})
+        terms = res.get("mpc_cost_terms", {})
+        weights = res.get("mpc_cost_weights", {})
+
+        has_total = bool(t.size and total.size == t.size and np.isfinite(total).any())
+        term_keys = []
+        if isinstance(terms, dict):
+            for k in sorted(terms.keys()):
+                v = np.asarray(terms.get(k, []), dtype=float).flatten()
+                if v.size == t.size and v.size > 0 and np.isfinite(v).any():
+                    term_keys.append(k)
+
+        n_panels = (1 if has_total else 0) + len(term_keys)
+        if n_panels <= 0:
+            ax = fig.add_subplot(111)
+            ax.text(
+                0.5,
+                0.5,
+                "No MPC cost breakdown available for this result",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.axis("off")
+            self.cv_cost_analysis.draw()
+            return
+
+        ncols = 2 if n_panels > 1 else 1
+        nrows = int(math.ceil(float(n_panels) / float(ncols)))
+        axes = [fig.add_subplot(nrows, ncols, i + 1) for i in range(n_panels)]
+        idx = 0
+        if has_total:
+            ax = axes[idx]
+            idx += 1
+            ax.plot(t, total, "k-", lw=1.3)
+            ax.set_title("total", fontsize=_mpl_pt(12))
+            ax.set_xlabel("t [s]")
+            ax.set_ylabel("cost")
+            ax.grid(True, alpha=0.3)
+        for key in term_keys:
+            ax = axes[idx]
+            idx += 1
+            v = np.asarray(terms.get(key, []), dtype=float).flatten()
+            ax.plot(t, v, lw=1.0, color="tab:orange")
+            w = float(weights.get(key, float("nan"))) if isinstance(weights, dict) else float("nan")
+            if np.isfinite(w):
+                ax.set_title(f"{key} (w={w:g})", fontsize=_mpl_pt(12))
+            else:
+                ax.set_title(str(key), fontsize=_mpl_pt(12))
+            ax.set_xlabel("t [s]")
+            ax.set_ylabel("cost")
+            ax.grid(True, alpha=0.3)
+
+        fig.suptitle("MPC cost analysis (total + weighted term costs)", fontsize=_mpl_pt(14), y=0.99)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        self.cv_cost_analysis.draw()
+
+
+def _apply_display_scaling(app) -> float:
+    """界面字体与 matplotlib 绘图字号缩放。
+
+    Qt 控件默认 scale=1（可用 UAM_GUI_SCALE 覆盖）。
+    绘图在 4K 屏上自动放大（可用 UAM_PLOT_SCALE 覆盖）。
+    """
+    global _MPL_FONT_SCALE
+
+    env_scale = os.environ.get("UAM_GUI_SCALE", "").strip()
+    if env_scale:
+        try:
+            gui_scale = max(0.8, min(3.0, float(env_scale)))
+        except ValueError:
+            gui_scale = 1.0
+    else:
+        gui_scale = 1.0
+
+    plot_scale = _detect_plot_font_scale(app)
+    _MPL_FONT_SCALE = plot_scale
+
+    base_pt = 10.0
+    f = app.font()
+    f.setPointSizeF(base_pt * gui_scale)
+    app.setFont(f)
+
+    try:
+        import matplotlib
+
+        # 选一个系统里实际存在的中文字体放到 sans-serif 首位，避免图表里的中文/全角标点
+        # （冒号、「」、句号等）渲染为缺字形方块并刷一堆 "Glyph ... missing" 警告。
+        _cjk_pref = [
+            "Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC",
+            "Source Han Sans SC", "Source Han Sans CN",
+            "WenQuanYi Zen Hei", "WenQuanYi Micro Hei",
+            "Microsoft YaHei", "SimHei",
+            "Droid Sans Fallback", "AR PL UMing CN",
+        ]
+        try:
+            import matplotlib.font_manager as _fm
+            _avail = {f.name for f in _fm.fontManager.ttflist}
+        except Exception:
+            _avail = set()
+        _cjk_fonts = [c for c in _cjk_pref if c in _avail]
+        _sans = _cjk_fonts + ["DejaVu Sans", "sans-serif"]
+
+        # 统一字号层级（与各绘图里 _mpl_pt() 显式设置保持一致）：
+        # 图标题 14 / 子图标题 12 / 正文·坐标轴标签 11 / 图例·刻度 10。
+        matplotlib.rcParams.update(
+            {
+                "font.size": 11.0 * plot_scale,
+                "figure.titlesize": 14.0 * plot_scale,
+                "axes.titlesize": 12.0 * plot_scale,
+                "axes.labelsize": 11.0 * plot_scale,
+                "xtick.labelsize": 10.0 * plot_scale,
+                "ytick.labelsize": 10.0 * plot_scale,
+                "legend.fontsize": 10.0 * plot_scale,
+                "font.family": "sans-serif",
+                "font.sans-serif": _sans,
+                # 中文字体的连字号会被当作减号缺字形，用 ASCII 减号避免负号告警。
+                "axes.unicode_minus": False,
+            }
+        )
+    except Exception:
+        pass
+
+    return gui_scale
+
+
+def _fit_window_to_screen(app, w) -> None:
+    """让初始窗口不超过标准 1080p，并适配当前屏幕可用区域后居中显示。"""
+    screen = app.primaryScreen()
+    if screen is None:
+        w.resize(1600, 900)
+        return
+    avail = screen.availableGeometry()
+    # 逻辑像素上限：标准 1080p 显示器。
+    cap_w, cap_h = 1920, 1080
+    target_w = min(1600, cap_w, int(avail.width() * 0.96))
+    target_h = min(900, cap_h, int(avail.height() * 0.94))
+    w.setMaximumSize(min(avail.width(), cap_w), min(avail.height(), cap_h))
+    w.resize(target_w, target_h)
+    fg = w.frameGeometry()
+    fg.moveCenter(avail.center())
+    w.move(fg.topLeft())
+
+
+def main():
+    # High-DPI 适配必须在创建 QApplication 之前设置。
+    try:
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    except Exception:
+        pass
+    os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    _icon = _app_icon()
+    if _icon is not None:
+        app.setWindowIcon(_icon)
+    app.setStyle("Fusion")
+    _apply_display_scaling(app)
+    w = UamSuiteGUI()
+    _fit_window_to_screen(app, w)
+    w.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
