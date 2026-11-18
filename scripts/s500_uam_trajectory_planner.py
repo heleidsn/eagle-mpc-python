@@ -429,12 +429,16 @@ class S500UAMTrajectoryPlanner:
             self.state = crocoddyl.StateMultibody(self.robot_model)
 
             self.ee_frame_id = self.robot_model.getFrameId(self.EE_FRAME_NAME)
-            if self.ee_frame_id == -1:
-                raise ValueError(f"Frame '{self.EE_FRAME_NAME}' not found in model")
+            nframes = len(self.robot_model.frames)
+            if self.ee_frame_id is None or int(self.ee_frame_id) < 0 or int(self.ee_frame_id) >= nframes:
+                self.ee_frame_id = None
 
             print(f"✓ Loaded Pinocchio model")
             print(f"  - nq: {self.robot_model.nq}, nv: {self.robot_model.nv}, ndx: {self.state.ndx}")
-            print(f"  - EE frame '{self.EE_FRAME_NAME}' id: {self.ee_frame_id}")
+            if self.ee_frame_id is None:
+                print(f"  - EE frame '{self.EE_FRAME_NAME}' not found (EE features disabled)")
+            else:
+                print(f"  - EE frame '{self.EE_FRAME_NAME}' id: {self.ee_frame_id}")
         except Exception as e:
             print(f"✗ Failed to load model: {e}")
             raise
@@ -457,6 +461,19 @@ class S500UAMTrajectoryPlanner:
             thruster = crocoddyl.Thruster(M, ctorque, thruster_type, min_thrust, max_thrust)
             thruster_list.append(thruster)
         return thruster_list
+
+    def _control_bounds(self, nu: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Build control bounds with correct dimension for current actuation."""
+        nu = int(nu)
+        if nu <= 0:
+            return np.zeros(0, dtype=float), np.zeros(0, dtype=float)
+        platform = self.s500_config["platform"]
+        u_lb = np.full(nu, -2.0, dtype=float)
+        u_ub = np.full(nu, 2.0, dtype=float)
+        n_thr = min(4, nu)
+        u_lb[:n_thr] = float(platform["min_thrust"])
+        u_ub[:n_thr] = float(platform["max_thrust"])
+        return u_lb, u_ub
 
     def thruster_actuation_for_model(self, robot_model: pin.Model):
         """Crocoddyl floating-base thruster actuation bound to a (possibly copied) ``robot_model``."""
@@ -513,7 +530,8 @@ class S500UAMTrajectoryPlanner:
                          is_terminal: bool = False,
                          is_waypoint: bool = False,
                          waypoint_multiplier: float = 10.0,
-                         include_state_reg: bool = True) -> crocoddyl.CostModelSum:
+                         include_state_reg: bool = True,
+                         state_velocity_weight_scale: float = 1.0) -> crocoddyl.CostModelSum:
         """
         Create cost model
 
@@ -567,7 +585,16 @@ class S500UAMTrajectoryPlanner:
 
         # State cost (optional: off for segments with only task-space targets, e.g. EE at grasp)
         if include_state_reg and effective_state_weight > 0:
-            state_activation = crocoddyl.ActivationModelQuad(self.state.ndx)
+            ndx = int(self.state.ndx)
+            nv_dim = ndx // 2
+            v_scale = float(state_velocity_weight_scale)
+            if abs(v_scale - 1.0) > 1e-12:
+                w_state = np.ones(ndx, dtype=np.float64)
+                # state error layout: [position-tangent (size nv), velocity (size nv)]; scale velocity entries.
+                w_state[nv_dim:] = max(v_scale, 0.0)
+                state_activation = crocoddyl.ActivationModelWeightedQuad(w_state)
+            else:
+                state_activation = crocoddyl.ActivationModelQuad(ndx)
             state_residual = crocoddyl.ResidualModelState(self.state, target_state, control_dim)
             cost_model.addCost("state_reg",
                               crocoddyl.CostModelResidual(self.state, state_activation, state_residual),
@@ -688,6 +715,7 @@ class S500UAMTrajectoryPlanner:
         is_waypoint: bool = False,
         waypoint_multiplier: float = 10.0,
         include_state_reg: bool = True,
+        state_velocity_weight_scale: float = 1.0,
     ) -> crocoddyl.CostModelSum:
         """
         Same tasks as ``create_cost_model``, but for an augmented state
@@ -725,6 +753,12 @@ class S500UAMTrajectoryPlanner:
         if include_state_reg and effective_state_weight > 0:
             w_st = np.ones(state_nd.ndx, dtype=np.float64)
             w_st[-control_dim:] = 0.0
+            v_scale = float(state_velocity_weight_scale)
+            if abs(v_scale - 1.0) > 1e-12:
+                # Augmented layout: [pos-tangent (nv), velocity (nv), actuator state (control_dim)].
+                nv_dim = (int(state_nd.ndx) - int(control_dim)) // 2
+                if nv_dim > 0:
+                    w_st[nv_dim:nv_dim + nv_dim] = max(v_scale, 0.0)
             state_activation = crocoddyl.ActivationModelWeightedQuad(w_st)
             state_residual = crocoddyl.ResidualModelState(state_nd, xref_aug, control_dim)
             cost_model.addCost(
@@ -954,9 +988,7 @@ class S500UAMTrajectoryPlanner:
 
         # Thrust constraints
         if use_thrust_constraints:
-            platform = self.s500_config['platform']
-            u_lb = np.array([platform['min_thrust']] * 4 + [-2.0] * 2)
-            u_ub = np.array([platform['max_thrust']] * 4 + [2.0] * 2)
+            u_lb, u_ub = self._control_bounds(self.actuation.nu)
             for m in running_models:
                 m.u_lb = u_lb
                 m.u_ub = u_ub
@@ -1063,9 +1095,7 @@ class S500UAMTrajectoryPlanner:
                 running_models.append(normal_int)
 
         if use_thrust_constraints:
-            platform = self.s500_config['platform']
-            u_lb = np.array([platform['min_thrust']] * 4 + [-2.0] * 2)
-            u_ub = np.array([platform['max_thrust']] * 4 + [2.0] * 2)
+            u_lb, u_ub = self._control_bounds(self.actuation.nu)
             for m in running_models:
                 m.u_lb = u_lb
                 m.u_ub = u_ub
@@ -1109,6 +1139,7 @@ class S500UAMTrajectoryPlanner:
         segment_n_steps: List[int],
         n_total: int,
         x0: np.ndarray,
+        zero_velocity_flags: Optional[List[bool]] = None,
     ) -> None:
         """Shooting problem with augmented state [q;v;u_act] and first-order actuator dynamics in the OCP."""
         nu = int(self.actuation.nu)
@@ -1119,6 +1150,14 @@ class S500UAMTrajectoryPlanner:
         iamb = crocoddyl.IntegratedActionModelEuler(diff_z, dt)
         tau_vec = self._effective_tau_cmd()
         n = len(modes)
+        if zero_velocity_flags is None:
+            knot_zero_v: List[bool] = [True] * n
+        else:
+            knot_zero_v = [bool(v) for v in zero_velocity_flags]
+            if len(knot_zero_v) < n:
+                knot_zero_v = knot_zero_v + [True] * (n - len(knot_zero_v))
+            elif len(knot_zero_v) > n:
+                knot_zero_v = knot_zero_v[:n]
 
         running_models = []
         for i, duration in enumerate(durations):
@@ -1126,6 +1165,8 @@ class S500UAMTrajectoryPlanner:
             target_state = np.asarray(resolved_states[i + 1], dtype=float).flatten()
             mode_i = str(modes[i]).lower()
             n_steps = segment_n_steps[i]
+            zero_v_i = bool(knot_zero_v[i])
+            v_scale_i = 1.0 if zero_v_i else 0.0
 
             if mode_i in ("ee_pose", "ee_pos") and ee_targets[i] is not None:
                 ee_w = float(ee_knot_weight)
@@ -1139,6 +1180,9 @@ class S500UAMTrajectoryPlanner:
                     if slot is not None and float(ee_knot_rotation_weight) > 0.0:
                         rpy_des = np.asarray(slot, dtype=float).reshape(3)
                         rot_w = float(ee_knot_rotation_weight)
+                # Zero-v 在 EE 模式下约束 EE 笛卡尔速度为 0：ee_pose 与 ee_pos 均适用。
+                # （ee_pos 无状态正则速度项，必须靠 EE FrameVelocity 残差才能让 zero_v 生效。）
+                if zero_v_i:
                     vel_w = float(ee_knot_velocity_weight)
                     vel_pitch_w = float(ee_knot_velocity_pitch_weight)
                 waypoint_cost = self.create_cost_model_augmented(
@@ -1155,6 +1199,7 @@ class S500UAMTrajectoryPlanner:
                     is_waypoint=True,
                     waypoint_multiplier=waypoint_multiplier,
                     include_state_reg=(sr_w > 0),
+                    state_velocity_weight_scale=v_scale_i,
                 )
             else:
                 waypoint_cost = self.create_cost_model_augmented(
@@ -1164,6 +1209,7 @@ class S500UAMTrajectoryPlanner:
                     control_weight=control_weight,
                     is_waypoint=True,
                     waypoint_multiplier=waypoint_multiplier,
+                    state_velocity_weight_scale=v_scale_i,
                 )
             am_w = ActionModelUAMActuatorFirstOrder(
                 state_nd, self.state, self.actuation, waypoint_cost, dt, tau_vec, iamb
@@ -1183,14 +1229,13 @@ class S500UAMTrajectoryPlanner:
                 running_models.append(am_n)
 
         if use_thrust_constraints:
-            platform = self.s500_config["platform"]
-            u_lb = np.array([platform["min_thrust"]] * 4 + [-2.0] * 2)
-            u_ub = np.array([platform["max_thrust"]] * 4 + [2.0] * 2)
+            u_lb, u_ub = self._control_bounds(nu)
             for m in running_models:
                 m.u_lb = u_lb
                 m.u_ub = u_ub
 
         terminal_target = np.asarray(resolved_states[-1], dtype=float).flatten()
+        terminal_zero_v = bool(knot_zero_v[-1])
         terminal_cost = self.create_cost_model_augmented(
             state_nd,
             target_state=terminal_target,
@@ -1199,13 +1244,12 @@ class S500UAMTrajectoryPlanner:
             is_terminal=True,
             is_waypoint=True,
             waypoint_multiplier=waypoint_multiplier,
+            state_velocity_weight_scale=1.0 if terminal_zero_v else 0.0,
         )
         term_base = ActionModelTerminalAugmented(state_nd, nu, terminal_cost, self.robot_data)
         terminal_model = term_base
         if use_thrust_constraints:
-            platform = self.s500_config["platform"]
-            u_lb = np.array([platform["min_thrust"]] * 4 + [-2.0] * 2)
-            u_ub = np.array([platform["max_thrust"]] * 4 + [2.0] * 2)
+            u_lb, u_ub = self._control_bounds(nu)
             terminal_model.u_lb = u_lb
             terminal_model.u_ub = u_ub
 
@@ -1240,6 +1284,7 @@ class S500UAMTrajectoryPlanner:
         use_thrust_constraints: bool = True,
         use_actuator_first_order: bool = False,
         tau_cmd: Optional[np.ndarray] = None,
+        zero_velocity_flags: Optional[List[bool]] = None,
     ) -> None:
         """
         Multi-waypoint problem where each knot may be a full-state (base) constraint or an
@@ -1251,7 +1296,7 @@ class S500UAMTrajectoryPlanner:
         ee_targets[i]: world [x,y,z] when modes[i] is ee_pose or ee_pos, else None.
         ee_pose_rpy_world[i]: EE orientation (rad, Pinocchio ZYX roll-pitch-yaw) when modes[i]=="ee_pose";
             used with ee_knot_rotation_weight > 0 for ``ResidualModelFramePlacement``; otherwise translation-only.
-        ee_pos: A,B,C in the table are j1/j2/yaw seeds (deg), not EE orientation.
+        ee_pos: nominal attitude is j1=j2=yaw=0; only EE position is constrained.
         ee_knot_velocity_weight: For ``ee_pose`` knots only, weight on ``ResidualModelFrameVelocity``
             with reference spatial velocity zero (LOCAL_WORLD_ALIGNED). Set 0 to disable.
         ee_knot_velocity_pitch_weight: Weight on angular velocity about world Y (pitch rate) in that
@@ -1266,6 +1311,14 @@ class S500UAMTrajectoryPlanner:
             ee_pose_rpy_world = [None] * n
         elif len(ee_pose_rpy_world) != n:
             raise ValueError("ee_pose_rpy_world must have same length as modes")
+        if zero_velocity_flags is None:
+            knot_zero_v: List[bool] = [True] * n
+        else:
+            knot_zero_v = [bool(v) for v in zero_velocity_flags]
+            if len(knot_zero_v) < n:
+                knot_zero_v = knot_zero_v + [True] * (n - len(knot_zero_v))
+            elif len(knot_zero_v) > n:
+                knot_zero_v = knot_zero_v[:n]
         self.dt = dt
         self._use_actuator_first_order = bool(use_actuator_first_order)
         self._tau_cmd = None if tau_cmd is None else np.asarray(tau_cmd, dtype=float).reshape(-1)
@@ -1322,6 +1375,7 @@ class S500UAMTrajectoryPlanner:
                 segment_n_steps,
                 n_total,
                 x0,
+                knot_zero_v,
             )
             return
 
@@ -1331,6 +1385,8 @@ class S500UAMTrajectoryPlanner:
             start_state = np.asarray(resolved_states[i], dtype=float).flatten()
             target_state = np.asarray(resolved_states[i + 1], dtype=float).flatten()
             mode_i = str(modes[i]).lower()
+            zero_v_i = bool(knot_zero_v[i])
+            v_scale_i = 1.0 if zero_v_i else 0.0
 
             if mode_i in ("ee_pose", "ee_pos") and ee_targets[i] is not None:
                 ee_w = float(ee_knot_weight)
@@ -1344,6 +1400,9 @@ class S500UAMTrajectoryPlanner:
                     if slot is not None and float(ee_knot_rotation_weight) > 0.0:
                         rpy_des = np.asarray(slot, dtype=float).reshape(3)
                         rot_w = float(ee_knot_rotation_weight)
+                # Zero-v 在 EE 模式下约束 EE 笛卡尔速度为 0：ee_pose 与 ee_pos 均适用。
+                # （ee_pos 无状态正则速度项，必须靠 EE FrameVelocity 残差才能让 zero_v 生效。）
+                if zero_v_i:
                     vel_w = float(ee_knot_velocity_weight)
                     vel_pitch_w = float(ee_knot_velocity_pitch_weight)
                 waypoint_cost = self.create_cost_model(
@@ -1359,6 +1418,7 @@ class S500UAMTrajectoryPlanner:
                     is_waypoint=True,
                     waypoint_multiplier=waypoint_multiplier,
                     include_state_reg=(sr_w > 0),
+                    state_velocity_weight_scale=v_scale_i,
                 )
             else:
                 waypoint_cost = self.create_cost_model(
@@ -1367,6 +1427,7 @@ class S500UAMTrajectoryPlanner:
                     control_weight=control_weight,
                     is_waypoint=True,
                     waypoint_multiplier=waypoint_multiplier,
+                    state_velocity_weight_scale=v_scale_i,
                 )
             waypoint_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
                 self.state, self.actuation, waypoint_cost
@@ -1388,14 +1449,13 @@ class S500UAMTrajectoryPlanner:
                 running_models.append(normal_int)
 
         if use_thrust_constraints:
-            platform = self.s500_config['platform']
-            u_lb = np.array([platform['min_thrust']] * 4 + [-2.0] * 2)
-            u_ub = np.array([platform['max_thrust']] * 4 + [2.0] * 2)
+            u_lb, u_ub = self._control_bounds(self.actuation.nu)
             for m in running_models:
                 m.u_lb = u_lb
                 m.u_ub = u_ub
 
         terminal_target = np.asarray(resolved_states[-1], dtype=float).flatten()
+        terminal_zero_v = bool(knot_zero_v[-1])
         terminal_cost = self.create_cost_model(
             target_state=terminal_target,
             state_weight=waypoint_multiplier * state_weight,
@@ -1403,6 +1463,7 @@ class S500UAMTrajectoryPlanner:
             is_terminal=True,
             is_waypoint=True,
             waypoint_multiplier=waypoint_multiplier,
+            state_velocity_weight_scale=1.0 if terminal_zero_v else 0.0,
         )
         terminal_diff = crocoddyl.DifferentialActionModelFreeFwdDynamics(
             self.state, self.actuation, terminal_cost
@@ -1569,6 +1630,10 @@ class S500UAMTrajectoryPlanner:
         nq, nv = self.robot_model.nq, self.robot_model.nv
         if x.size != nq + nv:
             raise ValueError(f"state must have {nq + nv} elements (q+v), got {x.size}")
+        if self.ee_frame_id is None or int(self.ee_frame_id) >= len(self.robot_data.oMf):
+            # Models without gripper_link (e.g. s500) have no EE frame;
+            # use base position as a safe plotting fallback.
+            return x[:3].copy()
         q = x[:nq]
         v = x[nq:]
         pin.forwardKinematics(self.robot_model, self.robot_data, q, v)

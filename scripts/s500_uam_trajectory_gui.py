@@ -52,6 +52,7 @@ try:
     from s500_uam_acados_trajectory import (
         run_simple_trajectory,
         run_multiwaypoint_trajectory,
+        run_unified_multiwaypoint_trajectory,
         run_simple_trajectory_cascade,
         run_multiwaypoint_trajectory_cascade,
         plot_acados_into_figure,
@@ -62,12 +63,20 @@ try:
 except (ImportError, Exception):
     run_simple_trajectory = None
     run_multiwaypoint_trajectory = None
+    run_unified_multiwaypoint_trajectory = None
     run_simple_trajectory_cascade = None
     run_multiwaypoint_trajectory_cascade = None
     plot_acados_into_figure = None
     plot_acados_3d_into_figure = None
     ACADOS_AVAILABLE = False
     CASCADE_TRAJ_AVAILABLE = False
+
+try:
+    from s500_uam_wp3_joint_opt_minimal import run_wp3_joint_opt
+    WP3_JOINT_OPT_AVAILABLE = True
+except Exception:
+    run_wp3_joint_opt = None
+    WP3_JOINT_OPT_AVAILABLE = False
 
 # Fixed path for saving/loading parameters
 DEFAULT_PARAMS_PATH = Path(__file__).parent.parent / "config" / "yaml" / "trajectories" / "s500_uam_trajectory_params.json"
@@ -79,7 +88,7 @@ def mixed_wp_row_kind(cell0) -> str:
     Returns:
         ``base`` — x,y,z = base origin (m); A,B,C = j1°, j2°, base yaw°.
         ``ee_pose`` — x,y,z = EE position (world); A,B,C = roll°, pitch°, yaw° (ZYX, Pinocchio).
-        ``ee_pos`` — x,y,z = EE position (world); A,B,C = j1°, j2°, yaw° seeds for alignment.
+        ``ee_pos`` — x,y,z = EE position (world); attitude seed is fixed at j1=j2=yaw=0.
     """
     s = str(cell0).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
     if s.startswith("eep") or s in ("eepos", "eeposition"):
@@ -89,16 +98,31 @@ def mixed_wp_row_kind(cell0) -> str:
     return "base"
 
 
-def wp_to_state(wp):
-    """Convert waypoint [x,y,z,j1_deg,j2_deg,yaw_deg,time] to 17-dim state."""
+def _fit_state_dim(x, nx: int):
+    """Pad/crop state vector to target dimension nx."""
+    arr = np.asarray(x, dtype=float).flatten()
+    if int(nx) <= 0:
+        return arr
+    if arr.size == int(nx):
+        return arr
+    if arr.size > int(nx):
+        return arr[: int(nx)].copy()
+    out = np.zeros(int(nx), dtype=float)
+    out[: arr.size] = arr
+    return out
+
+
+def wp_to_state(wp, nx: int = 17):
+    """Convert waypoint [x,y,z,j1_deg,j2_deg,yaw_deg,time] to state with nx dims."""
     if make_uam_state is None:
         return None
     deg2rad = np.pi / 180.0
-    return make_uam_state(
+    x = make_uam_state(
         wp[0], wp[1], wp[2],
         j1=wp[3] * deg2rad, j2=wp[4] * deg2rad,
         yaw=wp[5] * deg2rad,
     )
+    return _fit_state_dim(x, nx)
 
 
 class OptimizationWorker(QThread):
@@ -107,14 +131,14 @@ class OptimizationWorker(QThread):
 
     def __init__(self, method, params):
         super().__init__()
-        self.method = method  # "crocoddyl" | "acados" | "acados_cascade"
+        self.method = method  # "crocoddyl" | "acados" | "acados_cascade" | "acados_wp3_joint_opt"
         self.params = params
 
     def run(self):
         try:
             if self.method == "crocoddyl":
                 self._run_crocoddyl()
-            elif self.method in ("acados", "acados_cascade"):
+            elif self.method in ("acados", "acados_cascade", "acados_wp3_joint_opt"):
                 self._run_acados()
         except Exception as e:
             import traceback
@@ -128,11 +152,12 @@ class OptimizationWorker(QThread):
         if planner is None:
             self.finished.emit(False, "Planner not initialized.", None)
             return
+        nx = int(planner.robot_model.nq + planner.robot_model.nv)
         if self.params.get("grasp"):
             planner.create_trajectory_problem(
-                start_state=self.params["start_state"],
+                start_state=_fit_state_dim(self.params["start_state"], nx),
                 grasp_position=self.params["grasp_position"],
-                target_state=self.params["target_state"],
+                target_state=_fit_state_dim(self.params["target_state"], nx),
                 durations=self.params["durations"],
                 dt=self.params["dt"],
                 grasp_ee_weight=self.params.get("grasp_ee_weight", 5000),
@@ -159,7 +184,7 @@ class OptimizationWorker(QThread):
                     x, y, z, a, b, c, t = (float(row[i]) for i in range(1, 8))
                     if rk == "base":
                         modes.append("base")
-                        st = wp_to_state([x, y, z, a, b, c, t])
+                        st = wp_to_state([x, y, z, a, b, c, t], nx=nx)
                         if st is None:
                             self.finished.emit(False, "make_uam_state not available.", None)
                             return
@@ -168,8 +193,10 @@ class OptimizationWorker(QThread):
                         ee_pose_rpy_world.append(None)
                     elif rk == "ee_pos":
                         modes.append("ee_pos")
-                        st0 = make_uam_state(
-                            0.0, 0.0, 1.0, j1=a * deg2rad, j2=b * deg2rad, yaw=c * deg2rad
+                        # 仅位置：名义姿态固定为 j1=j2=yaw=0，不用表里灰显的旧角度。
+                        st0 = _fit_state_dim(
+                            make_uam_state(0.0, 0.0, 1.0, j1=0.0, j2=0.0, yaw=0.0),
+                            nx,
                         )
                         st = planner.align_state_ee_to_world_point(
                             st0, np.array([x, y, z], dtype=float)
@@ -179,7 +206,7 @@ class OptimizationWorker(QThread):
                         ee_pose_rpy_world.append(None)
                     else:
                         modes.append("ee_pose")
-                        st0 = np.zeros(17)
+                        st0 = np.zeros(nx, dtype=float)
                         st0[2] = 1.0
                         rpy = np.array([a, b, c], dtype=float) * deg2rad
                         R = pin.rpy.rpyToMatrix(
@@ -196,6 +223,9 @@ class OptimizationWorker(QThread):
                 for i in range(len(sorted_rows) - 1):
                     d = float(sorted_rows[i + 1][7]) - float(sorted_rows[i][7])
                     durs.append(d if d > 1e-6 else 1.0)
+                zero_velocity_flags = self.params.get("zero_velocity_flags")
+                if zero_velocity_flags is not None:
+                    zero_velocity_flags = [bool(v) for v in zero_velocity_flags]
                 planner.create_trajectory_problem_mixed_waypoints(
                     modes=modes,
                     resolved_states=resolved,
@@ -219,6 +249,7 @@ class OptimizationWorker(QThread):
                     ),
                     use_actuator_first_order=self.params.get("use_actuator_first_order", False),
                     tau_cmd=self.params.get("tau_cmd"),
+                    zero_velocity_flags=zero_velocity_flags,
                 )
             else:
                 waypoints = self.params.get("waypoints", [])
@@ -226,7 +257,7 @@ class OptimizationWorker(QThread):
                 if len(waypoints) < 2:
                     self.finished.emit(False, "Need at least 2 waypoints.", None)
                     return
-                states = [wp_to_state(wp) for wp in waypoints]
+                states = [wp_to_state(wp, nx=nx) for wp in waypoints]
                 if any(s is None for s in states):
                     self.finished.emit(False, "make_uam_state not available.", None)
                     return
@@ -262,6 +293,23 @@ class OptimizationWorker(QThread):
         )
 
     def _run_acados(self):
+        if self.method == "acados_wp3_joint_opt":
+            if not WP3_JOINT_OPT_AVAILABLE or run_wp3_joint_opt is None:
+                self.finished.emit(False, "wp3_joint_opt method is unavailable.", None)
+                return
+            cfg = dict(self.params.get("wp3_config", {}))
+            cfg.setdefault("dt", float(self.params.get("dt", 0.05)))
+            cfg.setdefault("max_iter", int(self.params.get("max_iter", 200)))
+            cfg.setdefault("state_weight", float(self.params.get("state_weight", 1.0)))
+            cfg.setdefault("control_weight", float(self.params.get("control_weight", 1e-5)))
+            cfg.setdefault("terminal_scale", float(self.params.get("waypoint_multiplier", 1000.0)))
+            out = run_wp3_joint_opt(cfg, show_plots=False)
+            if out is None or out.get("simX") is None:
+                self.finished.emit(False, "wp3_joint_opt optimization failed.", None)
+                return
+            self.finished.emit(True, "", out)
+            return
+
         waypoints = self.params.get("waypoints", [])
         durations = self.params.get("durations", [])
         if len(waypoints) < 2:
@@ -276,7 +324,13 @@ class OptimizationWorker(QThread):
             "control_weight": self.params.get("control_weight", 1e-5),
             "waypoint_multiplier": self.params.get("waypoint_multiplier", 1000),
             "max_iter": self.params.get("max_iter", 200),
+            "verbose_opt": False,
         }
+        mixed_rows = self.params.get("mixed_wp_rows") or []
+        has_ee_knot = any(
+            mixed_wp_row_kind(r[0]) in ("ee_pos", "ee_pose") for r in mixed_rows
+        )
+        use_unified = bool(self.params.get("use_unified_ocp", has_ee_knot))
         if self.method == "acados_cascade":
             if not ACADOS_AVAILABLE or not CASCADE_TRAJ_AVAILABLE or run_simple_trajectory_cascade is None:
                 self.finished.emit(
@@ -308,18 +362,24 @@ class OptimizationWorker(QThread):
             if not ACADOS_AVAILABLE or run_simple_trajectory is None:
                 self.finished.emit(False, "Acados not available. Install acados_template and build acados.", None)
                 return
-            if len(waypoints) == 2:
+            if use_unified and run_unified_multiwaypoint_trajectory is not None and len(waypoints) >= 2:
+                simX, simU, time_arr, _, timing = run_unified_multiwaypoint_trajectory(
+                    states, durations, dt=self.params["dt"], **kw
+                )
+                method_tag = "acados_unified"
+            elif len(waypoints) == 2:
                 simX, simU, time_arr, _, timing = run_simple_trajectory(
                     states[0], states[1],
                     duration=durations[0],
                     dt=self.params["dt"],
                     **kw,
                 )
+                method_tag = "acados"
             else:
                 simX, simU, time_arr, _, timing = run_multiwaypoint_trajectory(
                     states, durations, dt=self.params["dt"], **kw
                 )
-            method_tag = "acados"
+                method_tag = "acados"
             control_layout = "direct"
         if simX is None:
             self.finished.emit(False, "Acados optimization failed.", None)

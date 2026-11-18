@@ -1,0 +1,15 @@
+trajectory_name: sun_ellipse
+controller_mode: px4
+robot_name: s500
+odom_source: gazebo
+samples: 728
+duration_s: 14.540000
+pos_rmse_m: 0.141309
+pos_mean_m: 0.112546
+pos_max_m: 0.312782
+att_rmse_deg: 47.140152
+att_mean_deg: 38.932707
+att_max_deg: 90.623068
+solve_ms_mean: 0.000000
+solve_ms_p95: 0.000000
+solve_ms_max: 0.000000

@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>eagle_mpc_python</name>
+  <version>1.0.0</version>
+  <description>
+    Eagle MPC Python suite: trajectory planning, MPC tracking, Gazebo/PX4 SITL
+    launch files, models and helper nodes for the s500 / s500_uam platforms.
+    Self-contained replacement for the resources previously borrowed from
+    eagle_mpc_debugger.
+  </description>
+
+  <maintainer email="heleidsn@gmail.com">helei</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>gazebo_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>mavros</exec_depend>
+  <exec_depend>mavros_msgs</exec_depend>
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>rviz</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_state_controller</exec_depend>
+  <exec_depend>position_controllers</exec_depend>
+  <exec_depend>velocity_controllers</exec_depend>
+  <exec_depend>effort_controllers</exec_depend>
+
+  <export>
+    <architecture_independent />
+  </export>
+</package>

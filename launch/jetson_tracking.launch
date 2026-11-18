@@ -1,0 +1,77 @@
+<?xml version="1.0"?>
+<launch>
+  <!--
+    Jetson 真机：MAVROS + suite_tracking_controller（不起 Gazebo / RViz）。
+
+    推荐：
+      export ROS_IP=<Jetson局域网IP>
+      export ROS_MASTER_URI=http://$ROS_IP:11311
+      export EAGLE_PYTHON=$HOME/anaconda3/envs/eagle_mpc/bin/python
+      roslaunch eagle_mpc_python jetson_tracking.launch
+
+    仅 Tracking（MAVROS 已在跑）：
+      roslaunch eagle_mpc_python jetson_tracking.launch launch_mavros:=false
+
+    USB 飞控：
+      roslaunch eagle_mpc_python jetson_tracking.launch fcu_url:=serial:///dev/ttyUSB0:921600
+
+    MPC 后端：
+      roslaunch eagle_mpc_python jetson_tracking.launch controller_mode:=acados_full_state
+
+    若提示找不到 run_tracking_controller.py：
+      catkin_make -DCATKIN_WHITELIST_PACKAGES=eagle_mpc_python
+  -->
+
+  <arg name="launch_mavros" default="true"/>
+  <arg name="fcu_url" default="serial:///dev/ttyTHS1:921600"/>
+  <arg name="gcs_url" default=""/>
+  <arg name="tgt_system" default="1"/>
+  <arg name="tgt_component" default="1"/>
+  <arg name="respawn_mavros" default="false"/>
+
+  <arg name="eagle_python" default="$(optenv EAGLE_PYTHON)"/>
+  <arg name="robot_name" default="s500_uam"/>
+  <arg name="arm_enabled" default="true"/>
+  <arg name="controller_mode" default="px4"/>
+  <arg name="odom_source" default="mavros"/>
+  <arg name="use_simulation" default="false"/>
+  <arg name="control_rate" default="50.0"/>
+  <arg name="dt_mpc" default="0.05"/>
+  <arg name="horizon" default="25"/>
+  <arg name="mpc_max_iter" default="20"/>
+  <arg name="suite_plan_path" default="$(find eagle_mpc_python)/config/plans/bootstrap_hover.npz"/>
+  <arg name="takeoff_alt_m" default="1.0"/>
+  <arg name="viz_robot_markers" default="true"/>
+
+  <include file="$(find mavros)/launch/px4.launch" if="$(arg launch_mavros)">
+    <arg name="fcu_url" value="$(arg fcu_url)"/>
+    <arg name="gcs_url" value="$(arg gcs_url)"/>
+    <arg name="tgt_system" value="$(arg tgt_system)"/>
+    <arg name="tgt_component" value="$(arg tgt_component)"/>
+    <arg name="log_output" value="screen"/>
+    <arg name="respawn_mavros" value="$(arg respawn_mavros)"/>
+  </include>
+
+  <node name="suite_tracking_controller"
+        pkg="eagle_mpc_python"
+        type="run_tracking_controller.py"
+        output="screen"
+        required="true"
+        launch-prefix="$(arg eagle_python)">
+    <param name="trajectory_source" value="suite_npz"/>
+    <param name="suite_plan_path" value="$(arg suite_plan_path)"/>
+    <param name="robot_name" value="$(arg robot_name)"/>
+    <param name="arm_enabled" value="$(arg arm_enabled)"/>
+    <param name="controller_mode" value="$(arg controller_mode)"/>
+    <param name="odom_source" value="$(arg odom_source)"/>
+    <param name="use_simulation" value="$(arg use_simulation)"/>
+    <param name="control_rate" value="$(arg control_rate)"/>
+    <param name="dt_mpc" value="$(arg dt_mpc)"/>
+    <param name="horizon" value="$(arg horizon)"/>
+    <param name="mpc_max_iter" value="$(arg mpc_max_iter)"/>
+    <param name="takeoff_alt_m" value="$(arg takeoff_alt_m)"/>
+    <param name="takeoff_auto_arm_offboard" value="true"/>
+    <param name="viz_robot_markers" value="$(arg viz_robot_markers)"/>
+    <param name="rebuild_mpc_on_trajectory_update" value="false"/>
+  </node>
+</launch>

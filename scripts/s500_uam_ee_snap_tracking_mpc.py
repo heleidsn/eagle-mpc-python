@@ -62,6 +62,9 @@ TRACK_TRAJECTORY_ALIASES = {
 # Optional imports (fail with clear message)
 # -----------------------------------------------------------------------------
 try:
+    from acados_runtime import preload_acados_shared_libs
+
+    preload_acados_shared_libs()
     from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
     ACADOS_AVAILABLE = True
 except ImportError:
@@ -86,7 +89,13 @@ except ImportError as e:
     _deps_err = e
 
 try:
-    from s500_uam_acados_trajectory import plot_acados_into_figure, plot_acados_3d_into_figure
+    # Import plotting from trajectory_plot only (no acados OCP / heavy deps).
+    # Importing via s500_uam_acados_trajectory can fail when acados is unavailable,
+    # which incorrectly disables all GUI state/control figures.
+    from s500_uam_acados_trajectory_plot import (
+        plot_acados_3d_into_figure,
+        plot_acados_into_figure,
+    )
 
     PLOT_ACADOS_GUI_STYLE = True
 except ImportError:
@@ -99,6 +108,21 @@ from s500_uam_closed_loop_plant import CasadiRK4Plant, rk4_step
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 EE_FRAME_NAME = "gripper_link"
+
+
+def _ft(pt: float) -> float:
+    """4K 屏绘图字号缩放：跟随 GUI 设的全局 matplotlib font.size（基准 11pt）。
+
+    GUI 在 `_apply_scaling` 里把 rcParams["font.size"] 设为 11·plot_scale，s500 绘图
+    用 `_mpl_pt` 同源缩放；这里读取同一比例，让 s500_uam 外部绘图的硬编码字号也随
+    4K 放大，未缩放（CLI）时返回原值。
+    """
+    try:
+        import matplotlib as _mpl
+
+        return float(pt) * (float(_mpl.rcParams.get("font.size", 11.0)) / 11.0)
+    except Exception:
+        return float(pt)
 
 # Align with s500_uam_acados_trajectory defaults
 STATE_LIMITS = {
@@ -323,6 +347,8 @@ def sample_ee_figure_eight_trajectory(
     Gerono figure-eight (vertical ∞): in the local xy plane
       x = cx + a*sin(θ), y = cy + a*sin(θ)*cos(θ), z = cz
     where θ = 2π * t / period; one closed figure-eight every ``period`` seconds.
+    A quintic time-scaling is applied so that speed ramps up/down smoothly:
+      s=t/T, sigma=10s^3-15s^4+6s^5, theta=2π*(T*sigma)/period
 
     Reference yaw is fixed to 0 (no longer aligned to the velocity tangent).
 
@@ -344,7 +370,18 @@ def sample_ee_figure_eight_trajectory(
     if len(t_grid) == 0 or abs(t_grid[-1] - tf) > 1e-6:
         t_grid = np.append(t_grid, tf)
 
-    theta = omega * t_grid
+    # Quintic ease-in/out time scaling for smooth start/stop speed.
+    if tf <= 1e-9:
+        tau = t_grid.copy()
+        dtau_dt = np.zeros_like(t_grid)
+    else:
+        s = np.clip(t_grid / tf, 0.0, 1.0)
+        sigma = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
+        dsigma_ds = 30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4
+        tau = tf * sigma
+        dtau_dt = dsigma_ds
+
+    theta = omega * tau
     st = np.sin(theta)
     ct = np.cos(theta)
     # Use sin(θ)cos(θ) = (1/2)sin(2θ) to simplify writing the velocity
@@ -357,8 +394,9 @@ def sample_ee_figure_eight_trajectory(
     p[:, 2] = c[2]
 
     dp = np.zeros((N, 3))
-    dp[:, 0] = a * ct * omega
-    dp[:, 1] = a * np.cos(2.0 * theta) * omega
+    # Chain rule: d/dt = d/dtau * dtau/dt
+    dp[:, 0] = a * ct * omega * dtau_dt
+    dp[:, 1] = a * np.cos(2.0 * theta) * omega * dtau_dt
     dp[:, 2] = 0.0
 
     yaw_ref = np.zeros(N)
@@ -388,6 +426,24 @@ def _casadi_ee_heading_cs_expr(acados_model, pin_model, frame_id: int) -> tuple[
     R = cdata.oMf[frame_id].rotation
     yaw = _casadi_matrix_to_yaw_world_z(R)
     return ca.cos(yaw), ca.sin(yaw)
+
+
+def _casadi_ee_rpy_zyx_expr(acados_model, pin_model, frame_id: int) -> "ca.SX":
+    """EE frame orientation as ``[yaw, roll, pitch]`` (rad), matching full-state cost layout."""
+    nq = pin_model.nq
+    q = acados_model.x[:nq]
+    quat = q[3:7]
+    quat_u = quat / ca.fmax(ca.norm_2(quat), 1e-9)
+    q_fk = ca.vertcat(q[0:3], quat_u, q[7:nq])
+    cmodel = cpin.Model(pin_model)
+    cdata = cmodel.createData()
+    cpin.forwardKinematics(cmodel, cdata, q_fk)
+    cpin.updateFramePlacements(cmodel, cdata)
+    R = cdata.oMf[frame_id].rotation
+    roll = ca.atan2(R[2, 1], R[2, 2])
+    pitch = ca.asin(ca.fmax(ca.fmin(-R[2, 0], 1.0), -1.0))
+    yaw = _casadi_matrix_to_yaw_world_z(R)
+    return ca.vertcat(yaw, roll, pitch)
 
 
 def _casadi_ee_translation_expr(acados_model, pin_model, frame_id: int):
@@ -424,7 +480,7 @@ def create_ee_tracking_mpc_solver(
     control_mode:
       - ``direct``: u = [T1..T4, τ1, τ2] (consistent with the existing model)
       - ``actuator_first_order``: u = [ω_cmd(3), T_total_cmd, θ_cmd(2)]; the state is augmented with u_act,
-        which first-order lags to the actual thrust/torque (see s500_uam_acados_actuator_layer.py)
+        which first-order lags to the actual thrust/torque (see build_acados_model_actuator_first_order in s500_uam_acados_model.py)
     """
     if not ACADOS_AVAILABLE:
         raise ImportError("acados_template not installed")
@@ -437,7 +493,7 @@ def create_ee_tracking_mpc_solver(
     if control_mode == "direct":
         acados_model, pin_model, nq, nv, nu = build_acados_model()
     elif control_mode == "actuator_first_order":
-        from s500_uam_acados_actuator_layer import build_acados_model_actuator_first_order
+        from s500_uam_acados_model import build_acados_model_actuator_first_order
 
         acados_model, pin_model, nq, nv, nu, _meta = build_acados_model_actuator_first_order()
     else:
@@ -754,7 +810,7 @@ def run_closed_loop(
     When ``control_dt`` is ``None``, it matches ``sim_dt``, i.e., solve MPC at every simulation step.
     ``mpc_log_interval``: print statistics every k **MPC solves** (not sim sub-steps); 0 = only print the final summary.
     """
-    from s500_uam_acados_actuator_layer import nominal_command_hover
+    from s500_uam_acados_model import nominal_command_hover
 
     f_fun = _make_f_expl_fun(acados_model)
     plant = CasadiRK4Plant(f_fun, sim_dt, nu)
@@ -1013,42 +1069,49 @@ def plot_minimum_snap_reference(
     a_norm = np.linalg.norm(ddp, axis=1)
 
     fig = plt.figure(figsize=(16, 12))
-    fig.suptitle(title, fontsize=12, y=0.98)
+    fig.suptitle(title, fontsize=_ft(12), y=0.98)
     gs = fig.add_gridspec(4, 3, hspace=0.38, wspace=0.3, left=0.06, right=0.98, top=0.93, bottom=0.05)
-    tinfo = {"fontsize": 9, "labelpad": 2}
+    tinfo = {"fontsize": _ft(9), "labelpad": 2}
 
     ax3 = fig.add_subplot(gs[0:2, 0:2], projection="3d")
     ax3.plot(p_ref[:, 0], p_ref[:, 1], p_ref[:, 2], "b-", lw=1.5, label="p_ref(t)")
     if has_wp:
         ax3.scatter(W[:, 0], W[:, 1], W[:, 2], c="crimson", s=80, marker="o", label="waypoints", zorder=5)
         for k in range(len(tw)):
-            ax3.text(W[k, 0], W[k, 1], W[k, 2], f"  t={tw[k]:.1f}s", fontsize=8, color="dimgray")
+            ax3.text(W[k, 0], W[k, 1], W[k, 2], f"  t={tw[k]:.1f}s", fontsize=_ft(8), color="dimgray")
     ax3.set_xlabel("x [m]", **tinfo)
     ax3.set_ylabel("y [m]", **tinfo)
     ax3.set_zlabel("z [m]", **tinfo)
-    ax3.legend(loc="upper left", fontsize=8)
-    ax3.set_title("3D reference path", fontsize=10)
+    ax3.legend(loc="upper left", fontsize=_ft(8))
+    ax3.set_title("3D reference path", fontsize=_ft(10))
 
     ax_xy = fig.add_subplot(gs[0, 2])
     ax_xy.plot(p_ref[:, 0], p_ref[:, 1], "b-", lw=1.5, label="p_ref (xy)")
     if has_wp:
         ax_xy.scatter(W[:, 0], W[:, 1], c="crimson", s=70, zorder=5, label="waypoints")
-    ax_xy.set_aspect("equal", adjustable="box")
+    _st_xy = [np.column_stack((p_ref[:, 0], p_ref[:, 1]))]
+    if has_wp:
+        _st_xy.append(np.column_stack((W[:, 0], W[:, 1])))
+    _square_2d_axis_limits(ax_xy, *_st_xy)
     ax_xy.set_xlabel("x [m]", **tinfo)
     ax_xy.set_ylabel("y [m]", **tinfo)
-    ax_xy.set_title("Horizontal (XY)", fontsize=10)
-    ax_xy.legend(fontsize=7, loc="best")
+    ax_xy.set_title("Horizontal (XY)", fontsize=_ft(10))
+    ax_xy.legend(fontsize=_ft(7), loc="best")
     ax_xy.grid(True, alpha=0.3)
 
     ax_xz = fig.add_subplot(gs[1, 2])
     ax_xz.plot(p_ref[:, 0], p_ref[:, 2], "b-", lw=1.5, label="p_ref (xz)")
     if has_wp:
         ax_xz.scatter(W[:, 0], W[:, 2], c="crimson", s=70, zorder=5)
+    _st_xz = [np.column_stack((p_ref[:, 0], p_ref[:, 2]))]
+    if has_wp:
+        _st_xz.append(np.column_stack((W[:, 0], W[:, 2])))
+    _square_2d_axis_limits(ax_xz, *_st_xz)
     ax_xz.set_xlabel("x [m]", **tinfo)
     ax_xz.set_ylabel("z [m]", **tinfo)
-    ax_xz.set_title("Vertical profile (XZ)", fontsize=10)
+    ax_xz.set_title("Vertical profile (XZ)", fontsize=_ft(10))
     ax_xz.grid(True, alpha=0.3)
-    ax_xz.legend(fontsize=7, loc="best")
+    ax_xz.legend(fontsize=_ft(7), loc="best")
 
     ax_t = fig.add_subplot(gs[2, 0])
     for j, name in enumerate("xyz"):
@@ -1058,24 +1121,24 @@ def plot_minimum_snap_reference(
             ax_t.axvline(tw[k], color="gray", ls=":", lw=0.8, alpha=0.7)
     ax_t.set_xlabel("t [s]", **tinfo)
     ax_t.set_ylabel("position [m]", **tinfo)
-    ax_t.legend(loc="best", fontsize=7)
-    ax_t.set_title("Position vs time", fontsize=10)
+    ax_t.legend(loc="best", fontsize=_ft(7))
+    ax_t.set_title("Position vs time", fontsize=_ft(10))
     ax_t.grid(True, alpha=0.3)
 
     ax_v = fig.add_subplot(gs[2, 1])
     ax_v.plot(t_ref, v_norm, "g-", lw=1.2, label=r"$\|\dot p\|$ (finite diff.)")
     ax_v.set_xlabel("t [s]", **tinfo)
     ax_v.set_ylabel("[m/s]", **tinfo)
-    ax_v.set_title("Reference speed", fontsize=10)
-    ax_v.legend(fontsize=8)
+    ax_v.set_title("Reference speed", fontsize=_ft(10))
+    ax_v.legend(fontsize=_ft(8))
     ax_v.grid(True, alpha=0.3)
 
     ax_a = fig.add_subplot(gs[2, 2])
     ax_a.plot(t_ref, a_norm, "m-", lw=1.2, label=r"$\|\ddot p\|$ (finite diff.)")
     ax_a.set_xlabel("t [s]", **tinfo)
     ax_a.set_ylabel(r"[m/s²]", **tinfo)
-    ax_a.set_title("Reference accel. magnitude", fontsize=10)
-    ax_a.legend(fontsize=8)
+    ax_a.set_title("Reference accel. magnitude", fontsize=_ft(10))
+    ax_a.legend(fontsize=_ft(8))
     ax_a.grid(True, alpha=0.3)
 
     ax_yaw = fig.add_subplot(gs[3, :])
@@ -1089,8 +1152,8 @@ def plot_minimum_snap_reference(
             ax_yaw.axvline(tw[k], color="gray", ls=":", lw=0.8, alpha=0.7)
     ax_yaw.set_xlabel("t [s]", **tinfo)
     ax_yaw.set_ylabel("deg", **tinfo)
-    ax_yaw.set_title("EE yaw reference (planning)", fontsize=10)
-    ax_yaw.legend(loc="best", fontsize=8)
+    ax_yaw.set_title("EE yaw reference (planning)", fontsize=_ft(10))
+    ax_yaw.legend(loc="best", fontsize=_ft(8))
     ax_yaw.grid(True, alpha=0.3)
 
     if out_path:
@@ -1117,6 +1180,40 @@ def _plot_wp_vlines(ax, plan_waypoint_times):
         ax.axvline(float(tv), color="gray", ls=":", lw=0.75, alpha=0.65, zorder=1)
 
 
+def _square_2d_axis_limits(ax, *xy2: np.ndarray, margin: float = 0.06) -> None:
+    """横纵轴相同米制比例（取 x/y 向包络的最大边长为正方形视域）。"""
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    for A in xy2:
+        if A is None:
+            continue
+        M = np.asarray(A, dtype=float)
+        if M.size == 0 or M.ndim != 2 or M.shape[1] < 2:
+            continue
+        xs.append(M[:, 0].ravel())
+        ys.append(M[:, 1].ravel())
+    if not xs:
+        ax.set_aspect("equal", adjustable="box")
+        return
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x = x[ok]
+    y = y[ok]
+    if x.size == 0:
+        ax.set_aspect("equal", adjustable="box")
+        return
+    xmin, xmax = float(x.min()), float(x.max())
+    ymin, ymax = float(y.min()), float(y.max())
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+    span = max(xmax - xmin, ymax - ymin, 1e-9)
+    half = 0.5 * span * (1.0 + margin)
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_aspect("equal", adjustable="box")
+
+
 def _plot_tracking_dashboard(
     fig: plt.Figure,
     res: dict,
@@ -1132,129 +1229,69 @@ def _plot_tracking_dashboard(
     ee = res["ee"]
     pref = res["p_ref"]
     err_vec = ee - pref
+    t_flat = np.asarray(t, dtype=float).flatten()
+    v_ee = np.zeros_like(ee, dtype=float)
+    v_pref = np.zeros_like(pref, dtype=float)
+    if t_flat.size >= 2:
+        for j in range(3):
+            v_ee[:, j] = np.gradient(np.asarray(ee[:, j], dtype=float), t_flat)
+            v_pref[:, j] = np.gradient(np.asarray(pref[:, j], dtype=float), t_flat)
+    ev_vec = v_ee - v_pref
     ms = res.get("mpc_solve") or {}
-    wall = np.asarray(ms.get("wall_s", []), dtype=float)
-    nit = np.asarray(ms.get("nlp_iter", []), dtype=int)
-    stat = np.asarray(ms.get("status", []), dtype=int)
-    t_u = t[:-1]
+    wall = np.asarray(ms.get("wall_s", []), dtype=float).flatten()
+    nit = np.asarray(ms.get("nlp_iter", []), dtype=float).flatten().astype(int, copy=False)
+    stat = np.asarray(ms.get("status", []), dtype=float).flatten().astype(int, copy=False)
+    n_t = int(np.asarray(t, dtype=float).size)
+    nw = int(wall.size)
+    # 仿真里 u 常为 N-1（段上常值）；ROS / 录制常为每状态一步 => N 与 t 对齐
+    if nw == 0:
+        t_u = np.asarray(t, dtype=float).flatten()[:-1] if n_t > 1 else np.asarray(t, dtype=float).flatten()
+    elif nw == n_t:
+        t_u = np.asarray(t, dtype=float).flatten()
+    elif nw == n_t - 1:
+        t_u = np.asarray(t, dtype=float).flatten()[:-1]
+    else:
+        m = min(nw, n_t)
+        t_u = np.asarray(t, dtype=float).flatten()[:m]
+        wall = wall[:m]
+        if nit.size:
+            nit = nit[:m]
+        if stat.size:
+            stat = stat[:m]
+    L = int(wall.size)
+    if L and nit.size > L:
+        nit = nit[:L]
+    if L and stat.size > L:
+        stat = stat[:L]
 
     fig.clear()
-    fig.suptitle("MPC EE tracking — overview (ref vs actual, errors, solver)", fontsize=12, y=0.98)
-    gs = fig.add_gridspec(4, 3, hspace=0.4, wspace=0.32, left=0.06, right=0.98, top=0.92, bottom=0.05)
-    tinfo = {"fontsize": 9, "labelpad": 2}
+    fig.suptitle("MPC EE tracking — overview (ref vs actual, errors, solver)", fontsize=_ft(12), y=0.98)
+    # 第一行轨迹/3D 路径已移除（在 Trajectory 3D 标签页可见），仅保留误差/求解器/代价。
+    gs = fig.add_gridspec(4, 3, hspace=0.38, wspace=0.32, left=0.06, right=0.98, top=0.90, bottom=0.05)
+    tinfo = {"fontsize": _ft(9), "labelpad": 2}
 
-    ax3 = fig.add_subplot(gs[0, 0], projection="3d")
-    ax3.plot(base[:, 0], base[:, 1], base[:, 2], "b-", lw=1.5, label="Base")
-    ax3.plot(ee[:, 0], ee[:, 1], ee[:, 2], "m-", lw=1.2, label="EE")
-    ax3.plot(pref[:, 0], pref[:, 1], pref[:, 2], "k--", lw=1.0, alpha=0.7, label="p_ref")
-    ax3.scatter(base[0, 0], base[0, 1], base[0, 2], c="g", s=60, label="Start")
-    ax3.scatter(base[-1, 0], base[-1, 1], base[-1, 2], c="r", s=60, label="End")
-    Bwp = _valid_plan_wp_xyz(plan_waypoints_base_xyz)
-    Ewp = _valid_plan_wp_xyz(plan_waypoints_ee_xyz)
-    if Bwp.shape[0] or Ewp.shape[0]:
-        if Bwp.shape[0]:
-            ax3.scatter(Bwp[:, 0], Bwp[:, 1], Bwp[:, 2], c="tab:blue", s=100, marker="s", label="plan Base WP", zorder=5)
-        if Ewp.shape[0]:
-            ax3.scatter(Ewp[:, 0], Ewp[:, 1], Ewp[:, 2], c="darkorange", s=120, marker="*", label="plan EE WP", zorder=6)
-    elif plan_waypoints_xyz is not None:
-        W = np.asarray(plan_waypoints_xyz, dtype=float)
-        W = W[:, :3] if W.shape[1] > 3 else W.reshape(-1, 3)
-        ax3.scatter(W[:, 0], W[:, 1], W[:, 2], c="orange", s=120, marker="*", label="plan WPs")
-    ax3.set_xlabel("X [m]", **tinfo)
-    ax3.set_ylabel("Y [m]", **tinfo)
-    ax3.set_zlabel("Z [m]", **tinfo)
-    ax3.set_title("3D: base / EE / p_ref", fontsize=10)
-    ax3.legend(loc="upper left", fontsize=6, framealpha=0.9)
-    _pts = np.vstack(
-        [
-            np.asarray(base[:, :3], dtype=float),
-            np.asarray(ee[:, :3], dtype=float),
-            np.asarray(pref[:, :3], dtype=float),
-        ]
-    )
-    _ok = np.isfinite(_pts).all(axis=1)
-    _pts = _pts[_ok]
-    if _pts.shape[0] == 0:
-        mid = np.array([0.0, 0.0, 1.0], dtype=float)
-        r = 0.5
-        ax3.text2D(
-            0.05,
-            0.02,
-            "NaN/Inf in trajectories — axis limits defaulted",
-            transform=ax3.transAxes,
-            fontsize=7,
-            color="crimson",
-        )
-    else:
-        br = float(np.ptp(_pts, axis=0).max())
-        mid = _pts.mean(axis=0)
-        if not np.isfinite(br) or br < 0:
-            br = 0.0
-        r = max(br * 0.55, 0.25)
-        if not np.all(np.isfinite(mid)) or not np.isfinite(r) or r <= 0:
-            mid = np.array([0.0, 0.0, 1.0], dtype=float)
-            r = 0.5
-    ax3.set_xlim(float(mid[0] - r), float(mid[0] + r))
-    ax3.set_ylim(float(mid[1] - r), float(mid[1] + r))
-    ax3.set_zlim(float(mid[2] - r), float(mid[2] + r))
-    try:
-        ax3.set_box_aspect([1, 1, 1])
-    except Exception:
-        pass
-
-    ax_xy = fig.add_subplot(gs[0, 1])
-    ax_xy.plot(pref[:, 0], pref[:, 1], "k--", lw=1.2, alpha=0.8, label="p_ref (xy)")
-    ax_xy.plot(ee[:, 0], ee[:, 1], "m-", lw=1.2, label="EE (xy)")
-    ax_xy.plot(base[:, 0], base[:, 1], "b-", lw=1.0, alpha=0.6, label="Base (xy)")
-    ax_xy.plot(base[0, 0], base[0, 1], "go", ms=5, label="Start")
-    ax_xy.plot(base[-1, 0], base[-1, 1], "rs", ms=5, label="End")
-    if Bwp.shape[0]:
-        ax_xy.scatter(Bwp[:, 0], Bwp[:, 1], c="tab:blue", s=55, marker="s", zorder=5, label="plan Base WP")
-    if Ewp.shape[0]:
-        ax_xy.scatter(Ewp[:, 0], Ewp[:, 1], c="darkorange", s=65, marker="*", zorder=6, label="plan EE WP")
-    ax_xy.set_aspect("equal", adjustable="box")
-    ax_xy.set_xlabel("X [m]", **tinfo)
-    ax_xy.set_ylabel("Y [m]", **tinfo)
-    ax_xy.set_title("Horizontal (XY)", fontsize=10)
-    ax_xy.legend(loc="best", fontsize=6, framealpha=0.9)
-    ax_xy.grid(True, alpha=0.3)
-
-    ax_xz = fig.add_subplot(gs[0, 2])
-    ax_xz.plot(pref[:, 0], pref[:, 2], "k--", lw=1.2, alpha=0.8, label="p_ref (xz)")
-    ax_xz.plot(ee[:, 0], ee[:, 2], "m-", lw=1.2, label="EE (xz)")
-    ax_xz.plot(base[:, 0], base[:, 2], "b-", lw=1.0, alpha=0.6, label="Base (xz)")
-    if Bwp.shape[0]:
-        ax_xz.scatter(Bwp[:, 0], Bwp[:, 2], c="tab:blue", s=55, marker="s", zorder=5, label="plan Base WP")
-    if Ewp.shape[0]:
-        ax_xz.scatter(Ewp[:, 0], Ewp[:, 2], c="darkorange", s=65, marker="*", zorder=6, label="plan EE WP")
-    ax_xz.set_xlabel("X [m]", **tinfo)
-    ax_xz.set_ylabel("Z [m]", **tinfo)
-    ax_xz.set_title("Vertical profile (XZ)", fontsize=10)
-    ax_xz.legend(loc="best", fontsize=6, framealpha=0.9)
-    ax_xz.grid(True, alpha=0.3)
-
-    ax_e = fig.add_subplot(gs[1, 0])
+    ax_e = fig.add_subplot(gs[0, 0])
     ax_e.fill_between(t, 0.0, res["err"], color="red", alpha=0.2)
     ax_e.plot(t, res["err"], "r-", lw=1.2, label=r"$\|e\|$")
     _plot_wp_vlines(ax_e, plan_waypoint_times)
     ax_e.set_xlabel("t [s]", **tinfo)
     ax_e.set_ylabel("m", **tinfo)
-    ax_e.set_title("EE position error norm", fontsize=10)
-    ax_e.legend(fontsize=8)
+    ax_e.set_title("EE position error norm", fontsize=_ft(10))
+    ax_e.legend(fontsize=_ft(8))
     ax_e.grid(True, alpha=0.3)
 
-    ax_ec = fig.add_subplot(gs[1, 1])
+    ax_ec = fig.add_subplot(gs[0, 1])
     for j, c in enumerate("rgb"):
         ax_ec.plot(t, err_vec[:, j], color=c, lw=1.0, label=f"e_{'xyz'[j]}")
     ax_ec.axhline(0.0, color="gray", ls=":", lw=0.8)
     _plot_wp_vlines(ax_ec, plan_waypoint_times)
     ax_ec.set_xlabel("t [s]", **tinfo)
     ax_ec.set_ylabel("m", **tinfo)
-    ax_ec.set_title("EE error components (EE − p_ref)", fontsize=10)
-    ax_ec.legend(loc="best", fontsize=7)
+    ax_ec.set_title("EE error components (EE − p_ref)", fontsize=_ft(10))
+    ax_ec.legend(loc="best", fontsize=_ft(7))
     ax_ec.grid(True, alpha=0.3)
 
-    ax_pos = fig.add_subplot(gs[1, 2])
+    ax_pos = fig.add_subplot(gs[0, 2])
     cols = ("b", "g", "r")
     for j, name in enumerate("xyz"):
         ax_pos.plot(t, ee[:, j], color=cols[j], ls="-", lw=1.0, label=f"ee {name}")
@@ -1262,18 +1299,50 @@ def _plot_tracking_dashboard(
         ax_pos.plot(t, pref[:, j], color=cols[j], ls="--", lw=1.0, alpha=0.75, label=f"ref {name}")
     ax_pos.set_xlabel("t [s]", **tinfo)
     ax_pos.set_ylabel("position [m]", **tinfo)
-    ax_pos.set_title("EE vs p_ref (xyz)", fontsize=10)
-    ax_pos.legend(loc="best", fontsize=6, ncol=2)
+    ax_pos.set_title("EE vs p_ref (xyz)", fontsize=_ft(10))
+    ax_pos.legend(loc="best", fontsize=_ft(6), ncol=2)
     ax_pos.grid(True, alpha=0.3)
     _plot_wp_vlines(ax_pos, plan_waypoint_times)
+
+    ev_norm = np.linalg.norm(ev_vec, axis=1)
+    ax_evn = fig.add_subplot(gs[1, 0])
+    ax_evn.fill_between(t_flat, 0.0, ev_norm, color="teal", alpha=0.18)
+    ax_evn.plot(t_flat, ev_norm, color="teal", lw=1.15, label=r"$\|e_v\|$")
+    _plot_wp_vlines(ax_evn, plan_waypoint_times)
+    ax_evn.set_xlabel("t [s]", **tinfo)
+    ax_evn.set_ylabel("m/s", **tinfo)
+    ax_evn.set_title("EE velocity error norm", fontsize=_ft(10))
+    ax_evn.legend(fontsize=_ft(8))
+    ax_evn.grid(True, alpha=0.3)
+
+    ax_evc = fig.add_subplot(gs[1, 1])
+    for j, c in enumerate("rgb"):
+        ax_evc.plot(t_flat, ev_vec[:, j], color=c, lw=1.0, label=f"e_v{'xyz'[j]}")
+    ax_evc.axhline(0.0, color="gray", ls=":", lw=0.8)
+    _plot_wp_vlines(ax_evc, plan_waypoint_times)
+    ax_evc.set_xlabel("t [s]", **tinfo)
+    ax_evc.set_ylabel("m/s", **tinfo)
+    ax_evc.set_title("EE velocity error components", fontsize=_ft(10))
+    ax_evc.legend(loc="best", fontsize=_ft(7))
+    ax_evc.grid(True, alpha=0.3)
+
+    ax_spd = fig.add_subplot(gs[1, 2])
+    ax_spd.plot(t_flat, np.linalg.norm(v_ee, axis=1), "m-", lw=1.1, label=r"$\|v_{\mathrm{EE}}\|$")
+    ax_spd.plot(t_flat, np.linalg.norm(v_pref, axis=1), "k--", lw=1.05, alpha=0.8, label=r"$\|v_{\mathrm{ref}}\|$")
+    _plot_wp_vlines(ax_spd, plan_waypoint_times)
+    ax_spd.set_xlabel("t [s]", **tinfo)
+    ax_spd.set_ylabel("m/s", **tinfo)
+    ax_spd.set_title("EE speed: actual vs reference", fontsize=_ft(10))
+    ax_spd.legend(loc="best", fontsize=_ft(7))
+    ax_spd.grid(True, alpha=0.3)
 
     ax_w = fig.add_subplot(gs[2, 0])
     if wall.size:
         ax_w.plot(t_u, wall * 1000.0, "C0-", lw=0.8, label="wall time / step")
         ax_w.set_xlabel("t [s]", **tinfo)
         ax_w.set_ylabel("ms", **tinfo)
-        ax_w.set_title("MPC wall time per solve", fontsize=10)
-        ax_w.legend(fontsize=8)
+        ax_w.set_title("MPC wall time per solve", fontsize=_ft(10))
+        ax_w.legend(fontsize=_ft(8))
         ax_w.grid(True, alpha=0.3)
     else:
         ax_w.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_w.transAxes)
@@ -1283,8 +1352,8 @@ def _plot_tracking_dashboard(
         ax_n.step(t_u, nit, where="post", color="C2", lw=0.9, label="nlp_iter")
         ax_n.set_xlabel("t [s]", **tinfo)
         ax_n.set_ylabel("count", **tinfo)
-        ax_n.set_title("SQP iterations per MPC step", fontsize=10)
-        ax_n.legend(fontsize=8)
+        ax_n.set_title("SQP iterations per MPC step", fontsize=_ft(10))
+        ax_n.legend(fontsize=_ft(8))
         ax_n.grid(True, alpha=0.3)
     else:
         ax_n.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_n.transAxes)
@@ -1296,7 +1365,7 @@ def _plot_tracking_dashboard(
         ax_st.set_xticks([0, 1])
         ax_st.set_xticklabels(["status 0", "≠0"])
         ax_st.set_ylabel("steps", **tinfo)
-        ax_st.set_title(f"MPC exit status (fail {n_fail}/{len(stat)})", fontsize=10)
+        ax_st.set_title(f"MPC exit status (fail {n_fail}/{len(stat)})", fontsize=_ft(10))
         ax_st.grid(True, axis="y", alpha=0.3)
     else:
         ax_st.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_st.transAxes)
@@ -1353,14 +1422,14 @@ def _plot_tracking_dashboard(
         ax_y.text(0.5, 0.5, "MPC cost breakdown unavailable", ha="center", va="center", transform=ax_y.transAxes)
     ax_y.set_xlabel("t [s]", **tinfo)
     ax_y.set_ylabel("cost", **tinfo)
-    ax_y.set_title("MPC cost breakdown (running/terminal + total)", fontsize=10)
+    ax_y.set_title("MPC cost breakdown (running/terminal + total)", fontsize=_ft(10))
     if has_cost_curve:
-        ax_y.legend(loc="best", fontsize=7, ncol=2)
+        ax_y.legend(loc="best", fontsize=_ft(7), ncol=2)
     ax_y.grid(True, alpha=0.3)
     _plot_wp_vlines(ax_y, plan_waypoint_times)
 
     for ax in fig.get_axes():
-        ax.tick_params(axis="both", labelsize=8)
+        ax.tick_params(axis="both", labelsize=_ft(8))
 
 
 def render_ee_tracking_results_to_figures(
@@ -1434,11 +1503,11 @@ def render_ee_tracking_results_to_figures(
             ref_states=ref_states,
         )
         if traj_solver_meta and traj_solver_meta.get("backend") == "crocoddyl":
-            fig_3d.suptitle("Base 3D path (planned, Crocoddyl) + waypoints", fontsize=11, y=0.98)
+            fig_3d.suptitle("Trajectory 3D path (planned, Crocoddyl) + waypoints", fontsize=_ft(11), y=0.98)
         elif traj_solver_meta and traj_solver_meta.get("backend") == "acados_traj":
-            fig_3d.suptitle("Base 3D path (planned, Acados) + waypoints", fontsize=11, y=0.98)
+            fig_3d.suptitle("Trajectory 3D path (planned, Acados) + waypoints", fontsize=_ft(11), y=0.98)
         else:
-            fig_3d.suptitle("Base 3D path (acados style) + plan waypoints", fontsize=11, y=0.98)
+            fig_3d.suptitle("Trajectory 3D path (acados style) + plan waypoints", fontsize=_ft(11), y=0.98)
 
     assert isinstance(fig_dashboard, matplotlib.figure.Figure)
     _plot_tracking_dashboard(
@@ -1604,7 +1673,7 @@ def run_ee_tracking_pipeline(
     x0 = align_uam_state_ee_to_world_position(x0, pin_model, p0_ref, nq, nv)
 
     if control_mode_canonical == "actuator_first_order":
-        from s500_uam_acados_actuator_layer import pack_initial_state_with_actuators
+        from s500_uam_acados_model import pack_initial_state_with_actuators
 
         x0 = pack_initial_state_with_actuators(x0, pin_model=pin_model)
 
@@ -1740,7 +1809,7 @@ def run_ee_tracking_from_reference_arrays(
     x0 = align_uam_state_ee_to_world_position(x0, pin_model, p0_ref, nq, nv)
 
     if control_mode_canonical == "actuator_first_order":
-        from s500_uam_acados_actuator_layer import pack_initial_state_with_actuators
+        from s500_uam_acados_model import pack_initial_state_with_actuators
 
         x0 = pack_initial_state_with_actuators(x0, pin_model=pin_model)
 

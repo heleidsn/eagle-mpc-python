@@ -1,0 +1,5174 @@
+#!/usr/bin/env python3
+"""
+ROS 空中操作臂闭环跟踪控制节点 — run_tracking_controller.py
+
+与 run_controller.py 的区别
+───────────────────────────
+| run_controller.py           | run_tracking_controller.py            |
+|-----------------------------|---------------------------------------|
+| eagle_mpc.RailMpc (C++ lib) | UAMCrocoddylStateTrackingMPC /        |
+|                             | UAMEEPoseTrackingCrocoddylMPC (纯 Py) |
+| 固定 RailMpc 代价结构        | 可调权重 w_state_track / w_ee_pos 等   |
+| 轨迹参考来自 YAML 求解       | 轨迹来自 GUI 规划导出 npz 或 YAML     |
+| 与数值仿真共用同一类          | 专为 ROS 实时控制设计，无仿真 plant   |
+
+控制器模式（~controller_mode）
+──────────────────────────────
+croc_full_state  : Crocoddyl 全状态跟踪 (build_shooting_problem_along_plan)
+acados_full_state: Acados NMPC 全状态跟踪（实时，s500 与 s500_uam 均支持）
+acados_ee_pose   : Acados NMPC EE 位置+航向跟踪（实时 RTI，需机械臂；支持 in-model 扰动）
+croc_ee_pose     : Crocoddyl EE 位姿跟踪 (build_shooting_problem_along_ee_ref)
+px4              : 发送 PositionTarget（位置/速度/加速度/yaw）给 PX4 内部控制器
+geometric        : 节点内置 geometric controller（直接输出 body_rate + thrust）
+
+参考轨迹来源（~trajectory_source）
+──────────────────────────────────
+suite_npz        : 从 GUI 导出的 last_suite_plan.npz 加载 t_plan / x_plan
+yaml             : 使用本包 config/yaml/trajectories/temp_trajectory.yaml 求解结果
+
+发布/订阅接口（与 run_controller.py 保持一致）
+──────────────────────────────────────────────
+订阅: /gazebo/model_states 或 /mavros/local_position/odom (base 状态)
+      /arm_controller/joint_states 或 /joint_states           (机械臂)
+      /mavros/state                                           (PX4 模式)
+发布: /mavros/setpoint_raw/attitude  (croc_*: body_rate + thrust → PX4)
+      /mavros/setpoint_raw/local     (px4: PositionTarget)
+      /desired_joint_states          (机械臂关节指令)
+      /mpc/state                     (调试状态)
+      /suite_mpc/robot_markers       (RViz: 机器人各 link mesh marker, 由 FK 计算)
+      /suite_mpc/ee_axes             (RViz: EE 坐标轴 X/Y/Z 箭头) + TF frame "suite_mpc_ee"
+      /suite_mpc/tracking_error_markers (RViz: base/EE 位置跟踪误差箭头与标注)
+
+使用示例
+────────
+# Gazebo 仿真（从 GUI npz 加载轨迹，全状态 Crocoddyl 跟踪）
+rosrun eagle_mpc_python run_tracking_controller.py \\
+    _trajectory_source:=suite_npz \\
+    _suite_plan_path:=/path/to/last_suite_plan.npz \\
+    _controller_mode:=croc_full_state \\
+    _odom_source:=gazebo
+
+# 实机（从 YAML 加载，EE 位姿跟踪）
+rosrun eagle_mpc_python run_tracking_controller.py \\
+    _controller_mode:=croc_ee_pose \\
+    _odom_source:=mavros \\
+    _dt_mpc:=0.05 \\
+    _horizon:=25
+
+启动跟踪（OFFBOARD 且已解锁后）
+───────────────────────────────
+rosservice call /start_tracking  # 开始跟踪（完成后自动结束并在终点悬停）
+rosservice call /stop_tracking   # 停止跟踪（在当前位置悬停，不飞向终点）
+rosservice call /take_off        # 自动：发 setpoint -> OFFBOARD -> 解锁 -> 爬升 1m -> x_plan[0] 悬停
+rosservice call /save_data       # 保存录制数据
+
+L1 自适应增广（与任意 baseline 叠加，u = u_b + u_ac）
+────────────────────────────────────────────────────
+rosservice call /apply_l1_params  # GUI 估计来源/补偿方式/开关即时更新（读 ~l1_runtime_update）
+rosservice call /set_l1_dist_enabled "data: true"   # 运行时开启扰动估计
+rosservice call /set_l1_dist_enabled "data: false"  # 运行时关闭扰动估计
+rosservice call /set_l1_comp_enabled "data: true"   # 运行时开启扰动补偿
+# 兼容旧接口：/set_l1_enabled 仅切换 L1 adaptive（建议改用 set_l1_dist_enabled）
+# 参数：~l1_enabled, ~l1_as_gain, ~l1_wc_xy, ~l1_wc_z, ~l1_tilt_gain, ...
+# 调试：/suite_mpc/l1_debug (JSON, 兼容), /suite_mpc/dist_comp/* (估计/补偿状态)
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+import json
+import math
+import csv
+import threading
+from collections import deque
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+# ── ROS ──────────────────────────────────────────────────────────────────────
+import rospy
+from nav_msgs.msg import Odometry, Path as RosPath
+from geometry_msgs.msg import PoseStamped, Vector3, Pose, Point, Quaternion, Twist, Vector3 as GeoVec3
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Float32, Float64MultiArray, Header
+from mavros_msgs.msg import State, AttitudeTarget, PositionTarget
+from mavros_msgs.srv import SetMode, SetModeRequest, CommandBool, CommandBoolRequest
+from gazebo_msgs.msg import ModelStates, ModelState
+from gazebo_msgs.srv import SetModelState, GetModelState, GetModelStateRequest
+from std_srvs.srv import SetBool, SetBoolResponse, Trigger, TriggerResponse
+from eagle_mpc_msgs.msg import MpcState
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import TransformStamped
+import tf2_ros
+import xml.etree.ElementTree as ET
+
+# ── visualization ─────────────────────────────────────────────────────────────
+try:
+    from eagle_mpc_viz import WholeBodyStatePublisher, WholeBodyTrajectoryPublisher
+    _WHOLEBODY_VIZ_OK = True
+except ImportError:
+    _WHOLEBODY_VIZ_OK = False
+    WholeBodyStatePublisher = None
+    WholeBodyTrajectoryPublisher = None
+
+# tf utilities
+from tf.transformations import quaternion_matrix, euler_from_quaternion
+
+# ── scripts/ (Crocoddyl MPC classes) ─────────────────────────────────────────
+_SCRIPTS = Path(__file__).resolve().parent / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+import pinocchio as pin
+import crocoddyl
+
+from s500_uam_crocoddyl_state_tracking_mpc import (
+    UAMCrocoddylStateTrackingMPC,
+    UAMEEPoseTrackingCrocoddylMPC,
+    EETrackingWeights,
+    interp_full_state_piecewise,
+    interp_ref_pose,
+    default_hover_nominal,
+)
+from s500_uam_trajectory_planner import (
+    S500UAMTrajectoryPlanner,
+    compute_ee_kinematics_along_trajectory,
+)
+from l1_adaptive import L1AdaptiveAugmentation, L1Params
+from s500_uam_arm_ik import (
+    ee_position_world,
+    solve_arm_ik_plane2r,
+)
+
+# CTBR 总推力归一化分母：四电机合计最大推力标定 (N)
+DEFAULT_MAX_THRUST_TOTAL = 28.0
+# GUI / tracking 节点共用的 L1 运行时配置（全局 param，避免私有 param 命名空间不一致）
+L1_RUNTIME_UPDATE_PARAM = "/suite_mpc/l1_runtime_update"
+TRACKING_NODE_NAME = "suite_tracking_controller"
+CONTROLLER_UPDATE_PARAM = f"/{TRACKING_NODE_NAME}/controller_update_data"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_suite_npz(path: str) -> Dict[str, Any]:
+    """Load plan exported by run_ros_tracking.export_suite_plan_npz."""
+    data = np.load(path, allow_pickle=True)
+    t_plan = np.asarray(data["t_plan"], dtype=float).ravel()
+    x_plan = np.asarray(data["x_plan"], dtype=float)
+    dt_ms = int(np.asarray(data.get("dt_traj_opt_ms", 50)).item())
+    kind = "unknown"
+    if "kind" in data.files:
+        try:
+            kind = str(np.asarray(data["kind"]).item())
+        except Exception:
+            kind = "unknown"
+    velocity_frame = "unknown"
+    if "velocity_frame" in data.files:
+        try:
+            velocity_frame = str(np.asarray(data["velocity_frame"]).item()).strip().lower() or "unknown"
+        except Exception:
+            velocity_frame = "unknown"
+    u_plan = None
+    if "u_plan" in data.files:
+        u = np.asarray(data["u_plan"], dtype=float)
+        if u.ndim == 2 and u.shape[0] > 0:
+            u_plan = u
+    ddp_plan = None
+    if "ddp_plan" in data.files:
+        ddp = np.asarray(data["ddp_plan"], dtype=float)
+        if ddp.ndim == 2 and ddp.shape[0] == t_plan.shape[0] and ddp.shape[1] == 3:
+            ddp_plan = ddp
+    return {
+        "kind": kind,
+        "velocity_frame": velocity_frame,
+        "t_plan": t_plan,
+        "x_plan": x_plan,
+        "dt_traj_opt_ms": dt_ms,
+        "u_plan": u_plan,
+        "ddp_plan": ddp_plan,
+    }
+
+
+def _load_yaml_trajectory(dt_traj_opt_ms: int, use_squash: bool = True):
+    """Load + solve trajectory from this package's temp_trajectory.yaml."""
+    try:
+        import yaml
+        import eagle_mpc
+
+        root = Path(__file__).resolve().parent
+        yaml_path = str(root / "config" / "yaml" / "trajectories" / "temp_trajectory.yaml")
+
+        traj = eagle_mpc.Trajectory()
+        traj.autoSetup(yaml_path)
+        problem = traj.createProblem(dt_traj_opt_ms, use_squash, "IntegratedActionModelEuler")
+
+        if use_squash:
+            solver = eagle_mpc.SolverSbFDDP(problem, traj.squash)
+        else:
+            solver = crocoddyl.SolverBoxFDDP(problem)
+
+        solver.convergence_init = 1e-6
+        solver.solve([], [], 100)
+
+        xs = [np.array(x, dtype=float).ravel() for x in solver.xs]
+        n = len(xs)
+        t_plan = np.arange(n, dtype=float) * (dt_traj_opt_ms / 1000.0)
+        x_plan = np.vstack(xs)
+        us = [np.array(u, dtype=float).ravel() for u in solver.us]
+        u_plan = np.vstack(us) if us else None
+        rospy.loginfo(f"Loaded YAML trajectory: {n} states, T={t_plan[-1]:.2f}s")
+        return {"t_plan": t_plan, "x_plan": x_plan, "dt_traj_opt_ms": dt_traj_opt_ms, "u_plan": u_plan}
+    except Exception as e:
+        rospy.logerr(f"Failed to load YAML trajectory: {e}")
+        raise
+
+
+def _compute_ee_vel_refs(
+    t_ref: np.ndarray, p_ref: np.ndarray, yaw_ref: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Finite-difference EE reference velocity arrays (dp/dt, dyaw/dt)."""
+    n = len(t_ref)
+    dp = np.zeros((n, 3), dtype=float)
+    dyaw = np.zeros(n, dtype=float)
+    for i in range(1, n - 1):
+        dt = t_ref[i + 1] - t_ref[i - 1]
+        if dt > 1e-10:
+            dp[i] = (p_ref[i + 1] - p_ref[i - 1]) / dt
+            dyaw[i] = (yaw_ref[i + 1] - yaw_ref[i - 1]) / dt
+    if n >= 2:
+        dt0 = t_ref[1] - t_ref[0]
+        if dt0 > 1e-10:
+            dp[0] = (p_ref[1] - p_ref[0]) / dt0
+            dyaw[0] = (yaw_ref[1] - yaw_ref[0]) / dt0
+        dtn = t_ref[-1] - t_ref[-2]
+        if dtn > 1e-10:
+            dp[-1] = (p_ref[-1] - p_ref[-2]) / dtn
+            dyaw[-1] = (yaw_ref[-1] - yaw_ref[-2]) / dtn
+    return dp, dyaw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main controller class
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SuiteTrackingController:
+    """
+    ROS 节点：使用 scripts/ 下的 Crocoddyl Python MPC 对 aerial manipulator
+    进行在线闭环跟踪控制。
+
+    状态来自 ROS 话题（Gazebo 或 MAVROS），控制指令发布到 MAVROS。
+    MPC 每个控制周期重新构建 shooting problem 并求解（ZOH 持续到下一个求解完成）。
+    """
+
+    def __init__(self):
+        rospy.init_node("suite_tracking_controller", anonymous=False, log_level=rospy.INFO)
+        np.set_printoptions(precision=4, suppress=True)
+
+        # ── 基础参数 ───────────────────────────────────────────────────────────
+        self.robot_name = rospy.get_param("~robot_name", "s500_uam")
+        self.controller_mode = rospy.get_param("~controller_mode", "croc_full_state")
+        self.trajectory_source = rospy.get_param("~trajectory_source", "suite_npz")
+        self.trajectory_name = str(rospy.get_param("~trajectory_name", "trajectory"))
+        self.odom_source = rospy.get_param("~odom_source", "gazebo")
+        self.use_simulation = rospy.get_param("~use_simulation", True)
+        self.arm_enabled = rospy.get_param("~arm_enabled", True)
+        self.arm_control_mode = rospy.get_param("~arm_control_mode", "position")
+        if str(self.robot_name).strip().lower() == "s500":
+            self.arm_enabled = False
+
+        # 控制速率
+        self.control_rate = rospy.get_param("~control_rate", 50.0)  # Hz
+        self.dt_control = 1.0 / self.control_rate
+
+        # MPC 参数
+        self.dt_mpc = rospy.get_param("~dt_mpc", 0.05)       # s
+        self.horizon = rospy.get_param("~horizon", 25)
+        self.mpc_max_iter = rospy.get_param("~mpc_max_iter", 60)
+        # CTBR 体角速度前瞻：发布的 body rate 取自 MPC 解 horizon 中
+        # t = bodyrate_lookahead_ms 处（按 dt_mpc 离散点线性插值），与 dt_mpc 解耦。
+        # 默认 = dt_mpc（即原行为：取 xs[1]，约 50ms 后）。0 → 取当前步 xs[0]。
+        self.bodyrate_lookahead_ms = float(
+            rospy.get_param("~bodyrate_lookahead_ms", self.dt_mpc * 1000.0)
+        )
+        self.bodyrate_lookahead_s = max(0.0, self.bodyrate_lookahead_ms / 1000.0)
+        # acados 实时求解器配置（默认面向高频控制：RTI + ERK + HPIPM SPEED）
+        self.acados_solver_mode = str(rospy.get_param("~acados_solver_mode", "rti"))
+        self.acados_integrator = str(rospy.get_param("~acados_integrator", "ERK"))
+        self.acados_hpipm_mode = str(rospy.get_param("~acados_hpipm_mode", "SPEED"))
+        self.acados_qp_iter_max = int(rospy.get_param("~acados_qp_iter_max", 20))
+        # 实时/精度细调（见 s500_uam_acados_realtime_mpc._build_solver）
+        self.acados_qp_warm_start = int(rospy.get_param("~acados_qp_warm_start", 1))
+        self.acados_sim_num_stages = int(rospy.get_param("~acados_sim_num_stages", 4))
+        self.acados_sim_num_steps = int(rospy.get_param("~acados_sim_num_steps", 1))
+        self.acados_as_rti_iter = int(rospy.get_param("~acados_as_rti_iter", 0))
+        # MPC 参考误差限幅（相对当前状态），减轻 RTI 大误差时 QP 病态 / NAN
+        self.mpc_ref_clamp_enabled = bool(rospy.get_param("~mpc_ref_clamp_enabled", True))
+        self.mpc_ref_clamp_pos_m = float(rospy.get_param("~mpc_ref_clamp_pos_m", 1.5))
+        self.mpc_ref_clamp_yaw_deg = float(rospy.get_param("~mpc_ref_clamp_yaw_deg", 90.0))
+        self.mpc_ref_clamp_rp_deg = float(rospy.get_param("~mpc_ref_clamp_rp_deg", 45.0))
+        self.mpc_ref_clamp_lin_vel = float(rospy.get_param("~mpc_ref_clamp_lin_vel", 2.0))
+        self.mpc_ref_clamp_omega = float(rospy.get_param("~mpc_ref_clamp_omega", 2.0))
+        self.mpc_ref_clamp_joint_deg = float(rospy.get_param("~mpc_ref_clamp_joint_deg", 60.0))
+        self.mpc_ref_clamp_joint_vel = float(rospy.get_param("~mpc_ref_clamp_joint_vel", 3.0))
+        self.mpc_ref_clamp_ee_pos_m = float(rospy.get_param("~mpc_ref_clamp_ee_pos_m", 1.5))
+
+        # 全状态跟踪权重
+        self.w_state_track = rospy.get_param("~w_state_track", 10.0)
+        self.w_state_reg = rospy.get_param("~w_state_reg", 0.1)
+        self.w_control = rospy.get_param("~w_control", 1e-3)
+        self.w_terminal_track = rospy.get_param("~w_terminal_track", 100.0)
+        self.w_pos = rospy.get_param("~w_pos", 1.0)
+        self.w_att = rospy.get_param("~w_att", 1.0)
+        self.w_joint = rospy.get_param("~w_joint", 1.0)
+        self.w_vel = rospy.get_param("~w_vel", 1.0)
+        self.w_omega = rospy.get_param("~w_omega", 1.0)
+        self.w_joint_vel = rospy.get_param("~w_joint_vel", 1.0)
+        self.w_u_thrust = rospy.get_param("~w_u_thrust", 1.0)
+        self.w_u_joint_torque = rospy.get_param("~w_u_joint_torque", 1.0)
+
+        # EE 位姿跟踪权重
+        self.ee_w_pos = rospy.get_param("~ee_w_pos", 10.0)
+        self.ee_w_rot_rp = rospy.get_param("~ee_w_rot_rp", 1.0)
+        self.ee_w_rot_yaw = rospy.get_param("~ee_w_rot_yaw", 1.0)
+        self.ee_w_vel_lin = rospy.get_param("~ee_w_vel_lin", 1.0)
+        self.ee_w_vel_ang_rp = rospy.get_param("~ee_w_vel_ang_rp", 0.5)
+        self.ee_w_vel_ang_yaw = rospy.get_param("~ee_w_vel_ang_yaw", 0.5)
+        self.ee_w_terminal = rospy.get_param("~ee_w_terminal", 3.0)
+        self.ee_override_joints = bool(rospy.get_param("~ee_override_joints", False))
+        self.ee_joint1 = float(rospy.get_param("~ee_joint1", 0.0))
+        self.ee_joint2 = float(rospy.get_param("~ee_joint2", 0.0))
+
+        # PX4 指令限制
+        self.max_thrust_total = rospy.get_param("~max_thrust", DEFAULT_MAX_THRUST_TOTAL)  # N
+        self.max_angular_velocity = rospy.get_param("~max_angular_velocity", math.radians(120))
+        self.min_thrust_cmd = rospy.get_param("~min_thrust_cmd", 0.0)
+        self.max_thrust_cmd = rospy.get_param("~max_thrust_cmd", 1.0)
+        # 内置 geometric controller 增益
+        self.geo_kp_pos = float(rospy.get_param("~geo_kp_pos", 4.0))
+        self.geo_kd_vel = float(rospy.get_param("~geo_kd_vel", 2.5))
+        self.geo_kR = float(rospy.get_param("~geo_kR", 4.0))
+        self.geo_kOmega = float(rospy.get_param("~geo_kOmega", 0.35))
+        self.geo_max_tilt_deg = float(rospy.get_param("~geo_max_tilt_deg", 35.0))
+
+        # L1 自适应增广（与 baseline 控制器叠加：u = u_b + u_ac）
+        _l1_param_raw = bool(rospy.get_param("~l1_enabled", False))
+        self.l1_dist_enabled = bool(rospy.get_param("~l1_dist_enabled", _l1_param_raw))
+        self.l1_as_gain = float(rospy.get_param("~l1_as_gain", 8.0))
+        self.l1_wc_xy = float(rospy.get_param("~l1_wc_xy", 6.0))
+        self.l1_wc_z = float(rospy.get_param("~l1_wc_z", 6.0))
+        self.l1_tilt_gain = float(rospy.get_param("~l1_tilt_gain", 3.0))
+        self.l1_max_accel_xy = float(rospy.get_param("~l1_max_accel_xy", 6.0))
+        self.l1_max_accel_z = float(rospy.get_param("~l1_max_accel_z", 6.0))
+        self.l1_max_sigma = float(rospy.get_param("~l1_max_sigma", 25.0))
+        # 位置误差积分增广（消除 L1 补偿残差导致的稳态位置误差）
+        self.l1_use_pos_feedback = bool(rospy.get_param("~l1_use_pos_feedback", False))
+        self.l1_k_pos_i_xy = float(rospy.get_param("~l1_k_pos_i_xy", 0.6))
+        self.l1_k_pos_i_z = float(rospy.get_param("~l1_k_pos_i_z", 0.8))
+        self.l1_max_pos_integral = float(rospy.get_param("~l1_max_pos_integral", 1.5))
+        # 扰动估计来源：adaptive=L1；oracle=Gazebo 施加 wrench 真值；drag_ff=气动阻力真值
+        self.l1_mode = str(rospy.get_param("~l1_mode", "adaptive")).strip().lower()
+        if self.l1_mode not in ("adaptive", "oracle", "drag_ff"):
+            self.l1_mode = "adaptive"
+        # 扰动补偿总开关（默认关：避免「仅开估计」时误注入补偿导致抖动）
+        self.l1_comp_enabled = bool(rospy.get_param("~l1_comp_enabled", False))
+        # 补偿注入方式：bolt_on=后嵌 CTBR；in_model=增广 MPC（acados_full_state / acados_ee_pose）
+        self.l1_inject = str(rospy.get_param("~l1_inject", "bolt_on")).strip().lower()
+        if self.l1_inject not in ("bolt_on", "in_model"):
+            self.l1_inject = "bolt_on"
+        self._l1_oracle_wrench = np.zeros(6, dtype=float)
+        self.l1_enabled = bool(self.l1_dist_enabled and self.l1_mode == "adaptive")
+        self._l1 = L1AdaptiveAugmentation(
+            L1Params(
+                enabled=self.l1_enabled,
+                as_gain=self.l1_as_gain,
+                wc_xy=self.l1_wc_xy,
+                wc_z=self.l1_wc_z,
+                tilt_gain=self.l1_tilt_gain,
+                max_accel_xy=self.l1_max_accel_xy,
+                max_accel_z=self.l1_max_accel_z,
+                max_sigma=self.l1_max_sigma,
+                use_pos_feedback=self.l1_use_pos_feedback,
+                k_pos_i_xy=self.l1_k_pos_i_xy,
+                k_pos_i_z=self.l1_k_pos_i_z,
+                max_pos_integral_xy=self.l1_max_pos_integral,
+                max_pos_integral_z=self.l1_max_pos_integral,
+            )
+        )
+        self._l1_last_a_applied = np.zeros(3, dtype=float)
+        self._l1_last_debug_pub_t = 0.0
+
+        # ── Gazebo 气动阻力“真值”同步重建（用于与 L1 扰动估计对比）──────────────
+        # Gazebo gazebo_motor_model 逐电机施加转子阻力：
+        #     air_drag_i = -|ω_i| · Cd · V_perp
+        # 求和后世界系总阻力 F_drag = -Cd·(Σ|ω_i|)·V_perp，其中
+        #     V_perp   = (v - wind) 在机体 z 轴(转子轴)垂直平面上的分量
+        #     Σ|ω_i|   由总推力反推：T=Σ kf·ω_i² ⇒ Σ|ω| = sqrt(n·T/kf)（等分近似）
+        # 默认参数取自 s500_uam SDF（rotorDragCoefficient=1.75e-4, motorConstant=8.548e-6）。
+        self.aero_drag_record = bool(rospy.get_param("~aero_drag_record", True))
+        self.aero_rotor_drag_coeff = float(
+            rospy.get_param("~aero_rotor_drag_coeff", 1.75e-4)
+        )
+        self.aero_motor_constant = float(
+            rospy.get_param("~aero_motor_constant", 8.548e-6)
+        )
+        _wind = rospy.get_param("~aero_wind_world", [0.0, 0.0, 0.0])
+        try:
+            self.aero_wind_world = np.asarray(_wind, dtype=float).reshape(3)
+        except Exception:
+            self.aero_wind_world = np.zeros(3, dtype=float)
+        # 真值阻力前馈补偿（与 L1 互斥的对照实验）：不开 L1，直接用解析重建的
+        # 阻力真值 -F_drag/m 作为补偿加速度 a_ac，注入与 L1 相同的 CTBR 增广通道，
+        # 用于检验“若扰动估计完全准确，补偿后的跟踪效果如何”。
+        self.drag_ff_enabled = bool(rospy.get_param("~drag_ff_enabled", False))
+        # 与 l1_mode 对齐：drag_ff 模式或显式参数
+        if self.l1_mode == "drag_ff":
+            self.drag_ff_enabled = True
+        if self.l1_enabled and self.drag_ff_enabled and self.l1_mode != "drag_ff":
+            self.drag_ff_enabled = False  # 互斥：L1 自适应优先于旧 drag_ff 参数
+        if self.l1_mode == "oracle":
+            self.l1_enabled = False
+            self.drag_ff_enabled = False
+
+        # 悬停 regulation：臂零空间 IK，用实际 base 姿态把 EE 位置拉回 reg 目标
+        self.arm_ee_compensate = bool(rospy.get_param("~arm_ee_compensate", False))
+        self.arm_ee_jdot_max = float(rospy.get_param("~arm_ee_jdot_max", 3.0))
+        self._arm_jdes_prev: Optional[np.ndarray] = None
+
+        # 轨迹来源参数
+        self.suite_plan_path = rospy.get_param("~suite_plan_path", "")
+        self.dt_traj_opt_ms = rospy.get_param("~dt_traj_opt_ms", 50)
+
+        # ── 运行状态标志 ───────────────────────────────────────────────────────
+        self.trajectory_started = False
+        self.traj_finished = False
+        self.controller_start_time = None
+
+        self.px4_state = State()
+        self.arm_state = JointState()
+
+        # ── 加载轨迹 & 构建 MPC ───────────────────────────────────────────────
+        self._traj_data: Dict[str, Any] = {}
+        self.t_plan: Optional[np.ndarray] = None
+        self.x_plan: Optional[np.ndarray] = None
+        self.ddp_plan: Optional[np.ndarray] = None
+        self.t_ref_ee: Optional[np.ndarray] = None
+        self.p_ref_ee: Optional[np.ndarray] = None
+        self.yaw_ref_ee: Optional[np.ndarray] = None
+        self.roll_ref_ee: Optional[np.ndarray] = None
+        self.pitch_ref_ee: Optional[np.ndarray] = None
+        self.dp_ref_ee: Optional[np.ndarray] = None
+        self.dyaw_ref_ee: Optional[np.ndarray] = None
+
+        # ── RViz 路径可视化参数 ────────────────────────────────────────────────
+        self.viz_path_publish_hz     = float(rospy.get_param("~viz_path_publish_hz", 15.0))
+        self.viz_path_min_pos_step   = float(rospy.get_param("~viz_path_min_position_step", 0.0))
+        self.uav_actual_path_max_len = int(rospy.get_param("~uav_actual_path_max_length", 3000))
+        self.ee_actual_path_max_len  = int(rospy.get_param("~ee_actual_path_max_length",  3000))
+        _viz_hz = max(self.viz_path_publish_hz, 0.5)
+        self._viz_path_min_period    = 1.0 / _viz_hz
+        self._last_viz_pub_wall_t    = 0.0
+
+        # ── RViz 机器人 / EE 坐标轴可视化参数 ─────────────────────────────────
+        # 所有 marker 与 path 使用同一 fixed frame（默认 "map"，与 path 话题一致）。
+        self.viz_frame_id        = str(rospy.get_param("~viz_frame_id", "map"))
+        self.viz_robot_markers   = bool(rospy.get_param("~viz_robot_markers", True))
+        self.viz_ee_axes         = bool(rospy.get_param("~viz_ee_axes", True))
+        self.viz_ee_axis_len     = float(rospy.get_param("~viz_ee_axis_length", 0.15))
+        self.viz_ee_axis_diam    = float(rospy.get_param("~viz_ee_axis_diameter", 0.012))
+        self.viz_tracking_error  = bool(rospy.get_param("~viz_tracking_error", True))
+        self.viz_track_err_sphere_r = float(rospy.get_param("~viz_track_err_sphere_radius", 0.05))
+        self._robot_visual_specs: List[dict] = []
+
+        # 缓存固定参考路径（轨迹加载后构建一次，必须在 _load_trajectory 之前声明）
+        self._cached_ref_path:     Optional[RosPath] = None
+        self._cached_ee_plan_path: Optional[RosPath] = None
+        # 每次 MPC 求解后暂存 horizon 路径（staging → throttled publish）
+        self._staged_mpc_path:     Optional[RosPath] = None
+        # 累积实际路径缓冲
+        self._uav_actual_path_msg: RosPath = RosPath()
+        self._uav_actual_path_msg.header.frame_id = "map"
+        self._ee_actual_path_msg:  RosPath = RosPath()
+        self._ee_actual_path_msg.header.frame_id  = "map"
+        self._last_uav_path_pos_sample: Optional[np.ndarray] = None
+        self._last_ee_path_pos_sample:  Optional[np.ndarray] = None
+
+        self._load_trajectory()
+        self._build_mpc()
+        # 轨迹和 MPC 均就绪后构建 RViz 可视化缓存（EE FK 需要 self.mpc）
+        self._rebuild_cached_viz_paths()
+        # 解析 URDF 视觉网格 → 用于 RViz 机器人 mesh marker 显示
+        self._build_robot_visual_specs()
+        self._viz_fk_data = self.mpc.robot_model.createData()
+
+        # ── 初始状态（从规划起点） ────────────────────────────────────────────
+        self.state = self._match_state_dim(np.asarray(self.x_plan[0], dtype=float).copy())
+        self.arm_joint_number = self.mpc.robot_model.nq - 7  # nq = 7(base) + n_arm
+
+        # WarmStart 缓存（shift-warm-start）
+        self._xs_guess: Optional[List[np.ndarray]] = None
+        self._us_guess: Optional[List[np.ndarray]] = None
+        self._u_hold = self._hover_thrust_cmd()
+        # 最近一次求解的完整 horizon 状态序列 [x(0), x(1), ..., x(N)]（按 dt_mpc 等间隔），
+        # 供 body rate 前瞻插值用；与 warm-start 缓存分开，避免 croc 平移猜测带来的歧义。
+        self._mpc_xs_horizon: Optional[List[np.ndarray]] = None
+
+        # ── Regulation 模式（MPC 镇定到用户设定目标） ─────────────────────────
+        # 节点启动时默认处于 regulation 模式，目标 = x_plan[0]
+        # /start_tracking 切到轨迹跟踪；完成后自动回 regulation 并在终点悬停。
+        # /stop_tracking 立即回 regulation，目标 = 当前位姿（不飞向终点）。
+        self._regulating: bool = True
+        self._reg_target: np.ndarray = self._match_state_dim(
+            np.asarray(self.x_plan[0], dtype=float).copy(), zero_vel=True
+        )
+        # False: use default start/end target policy; True: keep user-set regulation target.
+        self._reg_target_locked: bool = False
+        self._reg_xs_guess: Optional[List[np.ndarray]] = None
+        self._reg_us_guess: Optional[List[np.ndarray]] = None
+        # Bounded look-ahead for regulation: the reference fed to the MPC is clamped
+        # to at most this distance from the current state, so a far target does not
+        # make the (single-iteration) acados RTI QP ill-conditioned (ACADOS_NAN).
+        # <= 0 disables clamping (use the raw far target).
+        self._reg_lookahead_m: float = float(rospy.get_param("~reg_lookahead_m", 1.5))
+        self.control_output_enabled = bool(rospy.get_param("~control_output_enabled", True))
+
+        # ── Take-off 序列（/take_off）──────────────────────────────────────────
+        self._takeoff_seq_active = False
+        self._takeoff_phase = 0  # 0: climb, 1: move to trajectory start
+        self._takeoff_alt_m = float(rospy.get_param("~takeoff_alt_m", 1.0))
+        self._takeoff_pos_tol = float(rospy.get_param("~takeoff_pos_tol", 0.12))
+        self._takeoff_vel_tol = float(rospy.get_param("~takeoff_vel_tol", 0.25))
+        self._takeoff_auto_arm_offboard = bool(
+            rospy.get_param("~takeoff_auto_arm_offboard", True)
+        )
+        self._takeoff_stream_s = float(rospy.get_param("~takeoff_stream_setpoints_s", 2.0))
+        self._takeoff_prep_retry_s = float(rospy.get_param("~takeoff_prep_retry_s", 5.0))
+        self._takeoff_prep_timeout_s = float(rospy.get_param("~takeoff_prep_timeout_s", 60.0))
+        self._takeoff_prep_active = False
+        self._takeoff_prep_stage = "stream"  # stream | offboard | arm | fly
+        self._takeoff_prep_t0 = 0.0
+        self._last_prep_request_t = 0.0
+        self._set_mode_client: Optional[rospy.ServiceProxy] = None
+        self._arming_client: Optional[rospy.ServiceProxy] = None
+        self._px4_stick_disabled = False
+
+        # ── 录制数据 ─────────────────────────────────────────────────────────
+        self.recording_enabled = False
+        self.recorded_data: Dict[str, list] = {
+            "time": [], "position": [], "velocity": [], "orientation": [],
+            "angular_velocity": [],
+            "arm_joint_positions": [], "arm_joint_velocities": [],
+            "mpc_control": [], "mpc_cost": [], "mpc_solve_time": [],
+            "body_rate_commands": [], "thrust_command": [],
+            "arm_joint_commands": [], "reference_position": [],
+            "reference_orientation": [], "reference_velocity": [],
+            "reference_angular_velocity": [], "reference_arm_positions": [],
+            # L1 扰动估计 vs Gazebo 气动阻力真值（世界系）
+            "l1_sigma_world": [],        # L1 估计扰动加速度 σ̂ (m/s²)
+            "l1_force_world": [],        # L1 估计扰动力 m·σ̂ (N)
+            "l1_a_ac_world": [],         # L1 补偿加速度 a_ac (m/s²)
+            "aero_drag_force_world": [], # Gazebo 转子阻力真值 (N)
+            "aero_drag_accel_world": [], # 阻力真值除以质量 (m/s²)，与 σ̂ 同量纲
+        }
+        self._active_tracking_tag: Optional[str] = None
+        self.solve_times: deque = deque(maxlen=200)
+        # MPC 实时统计
+        self._cb_wall_times: deque = deque(maxlen=50)
+        self._last_mpc_iters: int = 0
+        self._last_mpc_qp_iters: int = 0
+        self._last_mpc_status: int = 0
+        self._last_mpc_cost: float = float("nan")
+        self._last_stats_pub_t: float = 0.0
+        self._mpc_debug_backend: str = ""
+        self._mpc_debug_cpu_ms: float = float("nan")
+        self._mpc_debug_cost_unified: Dict[str, float] = {}
+        self._mpc_debug_cost_detail: Dict[str, float] = {}
+        # 最近一次跟踪误差（在 _publish_debug 中按当前参考计算）
+        self._track_err_xyz: np.ndarray = np.zeros(3, dtype=float)
+        self._track_err_pos: float = 0.0
+        self._track_err_yaw_deg: float = 0.0
+        self._track_err_ee_xyz: np.ndarray = np.zeros(3, dtype=float)
+        self._track_err_ee_pos: float = 0.0
+        self._last_debug_x_ref: Optional[np.ndarray] = None
+
+        # ── ROS 话题 ─────────────────────────────────────────────────────────
+        self._init_subscribers()
+        self._init_publishers()
+        self._init_services()
+
+        # ── Gazebo set_model_state 服务代理（仅 use_simulation 时初始化） ─────
+        self._gazebo_set_state: Optional[rospy.ServiceProxy] = None
+        if self.use_simulation:
+            try:
+                rospy.wait_for_service("/gazebo/set_model_state", timeout=5.0)
+                self._gazebo_set_state = rospy.ServiceProxy(
+                    "/gazebo/set_model_state", SetModelState
+                )
+                rospy.loginfo("Connected to /gazebo/set_model_state")
+            except Exception as e:
+                rospy.logwarn(f"/gazebo/set_model_state unavailable: {e}")
+
+        # ── 控制定时器 ───────────────────────────────────────────────────────
+        self._thread_lock = threading.Lock()
+        self._mpc_rebuilding = False  # True 时控制环只发上一帧 hold，避免与 _build_mpc 竞态
+        self.timer = rospy.Timer(rospy.Duration(self.dt_control), self._control_callback)
+
+        rospy.loginfo(
+            f"SuiteTrackingController ready | mode={self.controller_mode} "
+            f"| traj={self.trajectory_source} | rate={self.control_rate} Hz "
+            f"| dt_mpc={self.dt_mpc}s H={self.horizon} | arm={self.arm_enabled}"
+        )
+
+    # =========================================================================
+    # 初始化：轨迹 / MPC
+    # =========================================================================
+
+    def _load_trajectory(self):
+        """从 suite npz 或 YAML 加载参考轨迹。"""
+        if self.trajectory_source == "suite_npz":
+            if not self.suite_plan_path:
+                raise ValueError("~suite_plan_path 不能为空（~trajectory_source:=suite_npz）")
+            path = os.path.abspath(os.path.expanduser(self.suite_plan_path))
+            rospy.loginfo(f"Loading suite npz: {path}")
+            self._traj_data = _load_suite_npz(path)
+        else:
+            rospy.loginfo("Loading trajectory from YAML (temp_trajectory.yaml)")
+            self._traj_data = _load_yaml_trajectory(self.dt_traj_opt_ms)
+
+        self.t_plan = self._traj_data["t_plan"]
+        self.x_plan = self._traj_data["x_plan"]
+        self.ddp_plan = self._traj_data.get("ddp_plan")
+        traj_kind = str(self._traj_data.get("kind", "unknown"))
+        vel_frame = str(self._traj_data.get("velocity_frame", "unknown"))
+        rospy.loginfo(
+            f"Suite plan metadata: kind={traj_kind}, velocity_frame={vel_frame}. "
+            "full_croc/full_acados body-frame velocities are used directly (no extra conversion)."
+        )
+
+        # EE 参考（用于 EE-centric 模式，从全状态 plan FK 建立）
+        if self.controller_mode in ("croc_ee_pose", "acados_ee_pose"):
+            self._build_ee_ref_from_full_state()
+
+        rospy.loginfo(
+            f"Trajectory loaded: {len(self.t_plan)} states, T={self.t_plan[-1]:.2f}s"
+        )
+        # 注意：_rebuild_cached_viz_paths() 需要 self.mpc，
+        # 因此放到 _build_mpc() 之后在 __init__ 中调用，此处不再调用。
+
+    def _build_ee_ref_from_full_state(self):
+        """从全状态轨迹 FK 计算 EE 参考（位置 + yaw），用于 EE 位姿跟踪模式。"""
+        s500_yaml_path, urdf_path = self._model_paths_for_robot()
+        planner = S500UAMTrajectoryPlanner(
+            s500_yaml_path=s500_yaml_path,
+            urdf_path=urdf_path,
+        )
+        if planner.ee_frame_id is None:
+            raise ValueError("Current robot model has no EE frame 'gripper_link'.")
+        rm = planner.robot_model
+        data = rm.createData()
+        eid = planner.ee_frame_id
+
+        ee_pos, _, ee_rpy, _ = compute_ee_kinematics_along_trajectory(
+            self.x_plan, rm, data, eid
+        )
+        self.t_ref_ee = self.t_plan.copy()
+        self.p_ref_ee = ee_pos.copy()
+        self.roll_ref_ee = ee_rpy[:, 0].copy()
+        self.pitch_ref_ee = ee_rpy[:, 1].copy()
+        self.yaw_ref_ee = ee_rpy[:, 2].copy()
+        self.dp_ref_ee, self.dyaw_ref_ee = _compute_ee_vel_refs(
+            self.t_ref_ee, self.p_ref_ee, self.yaw_ref_ee
+        )
+        rospy.loginfo("EE reference built from full-state FK.")
+
+    def _model_paths_for_robot(self) -> Tuple[str, str]:
+        root = Path(__file__).resolve().parent
+        s500_yaml = str(root / "config" / "yaml" / "multicopter" / "s500.yaml")
+        robot = str(self.robot_name).strip().lower()
+        if robot == "s500":
+            urdf = str(root / "models" / "urdf" / "s500_simple.urdf")
+        else:
+            urdf = str(root / "models" / "urdf" / "s500_uam_simple.urdf")
+        return s500_yaml, urdf
+
+    def _compute_x_nominal(self, mpc_obj) -> np.ndarray:
+        """
+        Build a dimension-safe nominal state for MPC regularization.
+        Priority: x_plan[0] (if compatible) -> default_hover_nominal() (if compatible) -> neutral+zero-vel.
+        """
+        expected_dim = int(mpc_obj.nq + mpc_obj.nv)
+
+        if self.x_plan is not None and len(self.x_plan) > 0:
+            x0 = np.asarray(self.x_plan[0], dtype=float).reshape(-1)
+            if x0.size == expected_dim:
+                return x0.copy()
+
+        x_def = np.asarray(default_hover_nominal(), dtype=float).reshape(-1)
+        if x_def.size == expected_dim:
+            return x_def.copy()
+
+        # Fallback for model mismatch (e.g., s500 13D vs s500_uam 17D)
+        x_nom = np.zeros(expected_dim, dtype=float)
+        try:
+            x_nom[: mpc_obj.nq] = pin.neutral(mpc_obj.robot_model)
+        except Exception:
+            pass
+        if expected_dim >= 3:
+            x_nom[2] = 1.0
+        rospy.logwarn(
+            f"Nominal state dimension mismatch: using neutral fallback ({expected_dim}D)."
+        )
+        return x_nom
+
+    def _match_state_dim(self, x: np.ndarray, zero_vel: bool = False) -> np.ndarray:
+        """Resize/crop a state vector to current MPC model dimension (nq+nv)."""
+        x_in = np.asarray(x, dtype=float).reshape(-1)
+        nq = int(self.mpc.nq)
+        nx = int(self.mpc.nq + self.mpc.nv)
+        if x_in.size == nx:
+            out = x_in.copy()
+        else:
+            out = np.zeros(nx, dtype=float)
+            if x_in.size > 0:
+                out[: min(nx, x_in.size)] = x_in[: min(nx, x_in.size)]
+            # Prefer a valid neutral configuration when input dimension mismatches.
+            try:
+                q0 = np.asarray(pin.neutral(self.mpc.robot_model), dtype=float).reshape(-1)
+                out[: min(nq, q0.size)] = q0[: min(nq, q0.size)]
+            except Exception:
+                pass
+            if nq >= 3 and out[2] == 0.0:
+                out[2] = 1.0
+            rospy.logwarn_throttle(
+                1.0,
+                f"State dimension mismatch fixed: input={x_in.size}, expected={nx}.",
+            )
+        if zero_vel and out.size > nq:
+            out[nq:] = 0.0
+        return out
+
+    @staticmethod
+    def _safe_token(text: str) -> str:
+        s = str(text or "").strip().lower()
+        out = []
+        for ch in s:
+            if ch.isalnum() or ch in ("-", "_"):
+                out.append(ch)
+            elif ch in (" ", "/", "\\", "."):
+                out.append("_")
+        tok = "".join(out).strip("_")
+        return tok or "trajectory"
+
+    def _clear_recorded_data(self) -> None:
+        for k in list(self.recorded_data.keys()):
+            self.recorded_data[k].clear()
+        self.solve_times.clear()
+
+    def _tracking_results_dir(self) -> Path:
+        out_dir = Path(__file__).resolve().parent / "tracking_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    def _compose_tracking_file_tag(self) -> str:
+        traj = self._safe_token(self.trajectory_name)
+        mode = self._safe_token(self.controller_mode)
+        return f"{traj}__{mode}"
+
+    def _compute_tracking_stats(self) -> Dict[str, float]:
+        stats: Dict[str, float] = {}
+        t = np.asarray(self.recorded_data.get("time", []), dtype=float).reshape(-1)
+        pos = np.asarray(self.recorded_data.get("position", []), dtype=float)
+        pos_ref = np.asarray(self.recorded_data.get("reference_position", []), dtype=float)
+        quat = np.asarray(self.recorded_data.get("orientation", []), dtype=float)
+        quat_ref = np.asarray(self.recorded_data.get("reference_orientation", []), dtype=float)
+        solve_ms = np.asarray(self.recorded_data.get("mpc_solve_time", []), dtype=float).reshape(-1)
+        stats["samples"] = float(t.size)
+        stats["duration_s"] = float(t[-1] - t[0]) if t.size >= 2 else 0.0
+        if pos.ndim == 2 and pos_ref.ndim == 2 and pos.shape == pos_ref.shape and pos.shape[0] > 0:
+            pe = np.linalg.norm(pos - pos_ref, axis=1)
+            stats["pos_rmse_m"] = float(np.sqrt(np.mean(pe ** 2)))
+            stats["pos_mean_m"] = float(np.mean(pe))
+            stats["pos_max_m"] = float(np.max(pe))
+        if quat.ndim == 2 and quat_ref.ndim == 2 and quat.shape == quat_ref.shape and quat.shape[0] > 0:
+            dot = np.sum(quat * quat_ref, axis=1)
+            dot = np.clip(np.abs(dot), 0.0, 1.0)
+            ang = 2.0 * np.arccos(dot)
+            stats["att_rmse_deg"] = float(np.degrees(np.sqrt(np.mean(ang ** 2))))
+            stats["att_mean_deg"] = float(np.degrees(np.mean(ang)))
+            stats["att_max_deg"] = float(np.degrees(np.max(ang)))
+        if solve_ms.size > 0:
+            stats["solve_ms_mean"] = float(np.mean(solve_ms))
+            stats["solve_ms_p95"] = float(np.percentile(solve_ms, 95))
+            stats["solve_ms_max"] = float(np.max(solve_ms))
+        return stats
+
+    def _save_tracking_csv_and_stats(self, tag: str) -> Tuple[Path, Path]:
+        out_dir = self._tracking_results_dir()
+        csv_path = out_dir / f"{tag}.csv"
+        txt_path = out_dir / f"{tag}_stats.txt"
+        t = np.asarray(self.recorded_data.get("time", []), dtype=float).reshape(-1)
+        pos = np.asarray(self.recorded_data.get("position", []), dtype=float)
+        vel = np.asarray(self.recorded_data.get("velocity", []), dtype=float)
+        omega = np.asarray(self.recorded_data.get("angular_velocity", []), dtype=float)
+        quat = np.asarray(self.recorded_data.get("orientation", []), dtype=float)
+        u = np.asarray(self.recorded_data.get("mpc_control", []), dtype=float)
+        bcmd = np.asarray(self.recorded_data.get("body_rate_commands", []), dtype=float)
+        thrust_cmd = np.asarray(self.recorded_data.get("thrust_command", []), dtype=float).reshape(-1)
+        pos_ref = np.asarray(self.recorded_data.get("reference_position", []), dtype=float)
+        vel_ref = np.asarray(self.recorded_data.get("reference_velocity", []), dtype=float)
+        omega_ref = np.asarray(self.recorded_data.get("reference_angular_velocity", []), dtype=float)
+        quat_ref = np.asarray(self.recorded_data.get("reference_orientation", []), dtype=float)
+        solve_ms = np.asarray(self.recorded_data.get("mpc_solve_time", []), dtype=float).reshape(-1)
+        l1_force = np.asarray(self.recorded_data.get("l1_force_world", []), dtype=float)
+        drag_force = np.asarray(self.recorded_data.get("aero_drag_force_world", []), dtype=float)
+        n = int(t.size)
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            header = [
+                "time",
+                "px", "py", "pz",
+                "qx", "qy", "qz", "qw",
+                "vx_b", "vy_b", "vz_b",
+                "wx_b", "wy_b", "wz_b",
+                "ref_px", "ref_py", "ref_pz",
+                "ref_qx", "ref_qy", "ref_qz", "ref_qw",
+                "ref_vx_b", "ref_vy_b", "ref_vz_b",
+                "ref_wx_b", "ref_wy_b", "ref_wz_b",
+                "u0", "u1", "u2", "u3", "u4", "u5",
+                "cmd_wx", "cmd_wy", "cmd_wz", "cmd_thrust_norm",
+                "solve_ms",
+                "l1_fx", "l1_fy", "l1_fz",
+                "drag_fx", "drag_fy", "drag_fz",
+            ]
+            w.writerow(header)
+            for i in range(n):
+                row = [float(t[i])]
+                row.extend(pos[i].tolist() if pos.ndim == 2 and i < pos.shape[0] else [float("nan")] * 3)
+                row.extend(quat[i].tolist() if quat.ndim == 2 and i < quat.shape[0] else [float("nan")] * 4)
+                row.extend(vel[i].tolist() if vel.ndim == 2 and i < vel.shape[0] else [float("nan")] * 3)
+                row.extend(omega[i].tolist() if omega.ndim == 2 and i < omega.shape[0] else [float("nan")] * 3)
+                row.extend(pos_ref[i].tolist() if pos_ref.ndim == 2 and i < pos_ref.shape[0] else [float("nan")] * 3)
+                row.extend(quat_ref[i].tolist() if quat_ref.ndim == 2 and i < quat_ref.shape[0] else [float("nan")] * 4)
+                row.extend(vel_ref[i].tolist() if vel_ref.ndim == 2 and i < vel_ref.shape[0] else [float("nan")] * 3)
+                row.extend(omega_ref[i].tolist() if omega_ref.ndim == 2 and i < omega_ref.shape[0] else [float("nan")] * 3)
+                if u.ndim == 2 and i < u.shape[0]:
+                    ui = u[i].tolist()
+                    row.extend(ui[:6] + [float("nan")] * max(0, 6 - len(ui)))
+                else:
+                    row.extend([float("nan")] * 6)
+                row.extend(bcmd[i].tolist() if bcmd.ndim == 2 and i < bcmd.shape[0] else [float("nan")] * 3)
+                row.append(float(thrust_cmd[i]) if i < thrust_cmd.size else float("nan"))
+                row.append(float(solve_ms[i]) if i < solve_ms.size else float("nan"))
+                row.extend(l1_force[i].tolist() if l1_force.ndim == 2 and i < l1_force.shape[0] else [float("nan")] * 3)
+                row.extend(drag_force[i].tolist() if drag_force.ndim == 2 and i < drag_force.shape[0] else [float("nan")] * 3)
+                w.writerow(row)
+
+        stats = self._compute_tracking_stats()
+        with txt_path.open("w", encoding="utf-8") as f:
+            f.write(f"trajectory_name: {self.trajectory_name}\n")
+            f.write(f"controller_mode: {self.controller_mode}\n")
+            f.write(f"robot_name: {self.robot_name}\n")
+            f.write(f"odom_source: {self.odom_source}\n")
+            f.write(f"samples: {int(stats.get('samples', 0.0))}\n")
+            for k in (
+                "duration_s",
+                "pos_rmse_m", "pos_mean_m", "pos_max_m",
+                "att_rmse_deg", "att_mean_deg", "att_max_deg",
+                "solve_ms_mean", "solve_ms_p95", "solve_ms_max",
+            ):
+                if k in stats:
+                    f.write(f"{k}: {stats[k]:.6f}\n")
+        return csv_path, txt_path
+
+    def _restart_control_timer(self) -> None:
+        """控制频率变更后重建定时器。"""
+        try:
+            if getattr(self, "timer", None) is not None:
+                self.timer.shutdown()
+        except Exception:
+            pass
+        self.timer = rospy.Timer(rospy.Duration(self.dt_control), self._control_callback)
+
+    def _mpc_structure_signature(self) -> tuple:
+        dist_aware = (
+            self.controller_mode in ("acados_full_state", "acados_ee_pose")
+            and str(getattr(self, "l1_inject", "bolt_on")).lower() == "in_model"
+        )
+        return (
+            self.controller_mode,
+            int(self.horizon),
+            round(float(self.dt_mpc), 6),
+            str(self.robot_name),
+            bool(self.arm_enabled),
+            str(self.acados_integrator),
+            str(self.acados_solver_mode),
+            int(self.acados_qp_warm_start),
+            int(self.acados_sim_num_stages),
+            int(self.acados_sim_num_steps),
+            int(self.acados_as_rti_iter),
+            bool(dist_aware),
+            bool(float(self.w_state_track) > 0.0),
+        )
+
+    def _apply_cfg_weights_from_dict(self, cfg: dict) -> None:
+        """从 GUI/服务 dict 更新内存中的 MPC 权重与 acados 求解器选项。"""
+        self.w_state_track = float(cfg.get("w_state_track", self.w_state_track))
+        self.w_state_reg = float(cfg.get("w_state_reg", self.w_state_reg))
+        self.w_control = float(cfg.get("w_control", self.w_control))
+        self.w_terminal_track = float(cfg.get("w_terminal_track", self.w_terminal_track))
+        self.w_pos = float(cfg.get("w_pos", self.w_pos))
+        self.w_att = float(cfg.get("w_att", self.w_att))
+        self.w_joint = float(cfg.get("w_joint", self.w_joint))
+        self.w_vel = float(cfg.get("w_vel", self.w_vel))
+        self.w_omega = float(cfg.get("w_omega", self.w_omega))
+        self.w_joint_vel = float(cfg.get("w_joint_vel", self.w_joint_vel))
+        self.w_u_thrust = float(cfg.get("w_u_thrust", self.w_u_thrust))
+        self.w_u_joint_torque = float(cfg.get("w_u_joint_torque", self.w_u_joint_torque))
+        if "acados_solver_mode" in cfg:
+            self.acados_solver_mode = str(cfg["acados_solver_mode"])
+        if "acados_integrator" in cfg:
+            self.acados_integrator = str(cfg["acados_integrator"])
+        if "acados_hpipm_mode" in cfg:
+            self.acados_hpipm_mode = str(cfg["acados_hpipm_mode"])
+        if "acados_qp_iter_max" in cfg:
+            self.acados_qp_iter_max = int(cfg["acados_qp_iter_max"])
+        if "acados_qp_warm_start" in cfg:
+            self.acados_qp_warm_start = int(cfg["acados_qp_warm_start"])
+        if "acados_sim_num_stages" in cfg:
+            self.acados_sim_num_stages = int(cfg["acados_sim_num_stages"])
+        if "acados_sim_num_steps" in cfg:
+            self.acados_sim_num_steps = int(cfg["acados_sim_num_steps"])
+        if "acados_as_rti_iter" in cfg:
+            self.acados_as_rti_iter = int(cfg["acados_as_rti_iter"])
+        if "mpc_ref_clamp_enabled" in cfg:
+            self.mpc_ref_clamp_enabled = bool(cfg["mpc_ref_clamp_enabled"])
+        if "mpc_ref_clamp_pos_m" in cfg:
+            self.mpc_ref_clamp_pos_m = float(cfg["mpc_ref_clamp_pos_m"])
+        if "mpc_ref_clamp_yaw_deg" in cfg:
+            self.mpc_ref_clamp_yaw_deg = float(cfg["mpc_ref_clamp_yaw_deg"])
+        if "mpc_ref_clamp_rp_deg" in cfg:
+            self.mpc_ref_clamp_rp_deg = float(cfg["mpc_ref_clamp_rp_deg"])
+        if "mpc_ref_clamp_lin_vel" in cfg:
+            self.mpc_ref_clamp_lin_vel = float(cfg["mpc_ref_clamp_lin_vel"])
+        if "mpc_ref_clamp_omega" in cfg:
+            self.mpc_ref_clamp_omega = float(cfg["mpc_ref_clamp_omega"])
+        if "mpc_ref_clamp_joint_deg" in cfg:
+            self.mpc_ref_clamp_joint_deg = float(cfg["mpc_ref_clamp_joint_deg"])
+        if "mpc_ref_clamp_joint_vel" in cfg:
+            self.mpc_ref_clamp_joint_vel = float(cfg["mpc_ref_clamp_joint_vel"])
+        if "mpc_ref_clamp_ee_pos_m" in cfg:
+            self.mpc_ref_clamp_ee_pos_m = float(cfg["mpc_ref_clamp_ee_pos_m"])
+        self._sync_mpc_ref_limits_to_solver()
+
+    def _mpc_ref_error_limits(self):
+        from s500_uam_acados_state_tracking_mpc import MpcRefErrorLimits
+
+        if not self.mpc_ref_clamp_enabled:
+            return MpcRefErrorLimits.disabled()
+        return MpcRefErrorLimits(
+            enabled=True,
+            max_pos_m=float(self.mpc_ref_clamp_pos_m),
+            max_yaw_rad=float(np.deg2rad(self.mpc_ref_clamp_yaw_deg)),
+            max_roll_pitch_rad=float(np.deg2rad(self.mpc_ref_clamp_rp_deg)),
+            max_lin_vel_mps=float(self.mpc_ref_clamp_lin_vel),
+            max_omega_radps=float(self.mpc_ref_clamp_omega),
+            max_joint_rad=float(np.deg2rad(self.mpc_ref_clamp_joint_deg)),
+            max_joint_vel_radps=float(self.mpc_ref_clamp_joint_vel),
+            max_ee_pos_m=float(self.mpc_ref_clamp_ee_pos_m),
+        )
+
+    def _sync_mpc_ref_limits_to_solver(self) -> None:
+        limits = self._mpc_ref_error_limits()
+        for mpc_obj in (self.mpc, self.mpc_reg):
+            if mpc_obj is not None and hasattr(mpc_obj, "ref_error_limits"):
+                mpc_obj.ref_error_limits = limits
+
+    def _clear_mpc_warm_start(self) -> None:
+        """权重/结构更新后丢弃旧 horizon 初值，避免热更新后行为看似不变。"""
+        self._xs_guess = None
+        self._us_guess = None
+        self._reg_xs_guess = None
+        self._reg_us_guess = None
+        self._mpc_xs_horizon = None
+        if self.mpc is not None and hasattr(self.mpc, "reset_warm_start"):
+            try:
+                self.mpc.reset_warm_start()
+            except Exception:
+                pass
+
+    def _rebuild_mpc_after_param_update(self, cfg: dict, prev_sig: tuple) -> str:
+        """按模式重建或热更新 MPC。返回简短说明供服务响应。"""
+        new_sig = self._mpc_structure_signature()
+        same_structure = prev_sig == new_sig
+
+        if self.controller_mode == "acados_full_state":
+            if same_structure and hasattr(self.mpc, "update_cost_weights"):
+                self._mpc_rebuilding = True
+                try:
+                    self.mpc.update_cost_weights(
+                        w_pos=self.w_pos,
+                        w_att=self.w_att,
+                        w_joint=self.w_joint,
+                        w_vel=self.w_vel,
+                        w_omega=self.w_omega,
+                        w_joint_vel=self.w_joint_vel,
+                        w_control=self.w_control,
+                        w_u_thrust=self.w_u_thrust,
+                        w_u_joint_torque=self.w_u_joint_torque,
+                        w_state_track=self.w_state_track,
+                        w_terminal_track=self.w_terminal_track,
+                        max_iter=self.mpc_max_iter,
+                    )
+                finally:
+                    self._mpc_rebuilding = False
+                self.mpc_reg = self.mpc
+                self._sync_mpc_ref_limits_to_solver()
+                self._clear_mpc_warm_start()
+                return (
+                    "acados cost weights updated (runtime cost_set); "
+                    f"w_state_track={self.w_state_track:g}, w_pos={self.w_pos:g}, "
+                    f"w_att={self.w_att:g}, w_terminal={self.w_terminal_track:g} "
+                    "(note: w_state_reg ignored by acados)"
+                )
+        if self.controller_mode == "acados_ee_pose":
+            if same_structure and hasattr(self.mpc, "update_cost_weights"):
+                self._mpc_rebuilding = True
+                try:
+                    self.mpc.update_cost_weights(
+                        w_ee_pos=self.ee_w_pos,
+                        w_ee_yaw=self.ee_w_rot_yaw,
+                        w_ee_rot_rp=self.ee_w_rot_rp,
+                        w_state_track=self.w_state_track,
+                        w_pos=self.w_pos,
+                        w_att=self.w_att,
+                        w_joint=self.w_joint,
+                        w_vel=self.w_vel,
+                        w_omega=self.w_omega,
+                        w_joint_vel=self.w_joint_vel,
+                        w_control=self.w_control,
+                        w_u_thrust=self.w_u_thrust,
+                        w_u_joint_torque=self.w_u_joint_torque,
+                        w_terminal_scale=self.ee_w_terminal,
+                        w_terminal_track=self.w_terminal_track,
+                        max_iter=self.mpc_max_iter,
+                    )
+                finally:
+                    self._mpc_rebuilding = False
+                self.mpc_reg = self.mpc
+                self._sync_mpc_ref_limits_to_solver()
+                self._clear_mpc_warm_start()
+                return (
+                    "acados-ee cost weights updated (runtime cost_set); "
+                    f"ee_w_pos={self.ee_w_pos:g}, ee_w_yaw={self.ee_w_rot_yaw:g}, "
+                    f"w_state_track={self.w_state_track:g}, w_joint={self.w_joint:g}"
+                )
+        if self.controller_mode == "croc_full_state":
+            if same_structure and hasattr(self.mpc, "update_cost_weights"):
+                self.mpc.update_cost_weights(
+                    w_state_track=self.w_state_track,
+                    w_state_reg=self.w_state_reg,
+                    w_control=self.w_control,
+                    w_terminal_track=self.w_terminal_track,
+                    w_pos=self.w_pos,
+                    w_att=self.w_att,
+                    w_joint=self.w_joint,
+                    w_vel=self.w_vel,
+                    w_omega=self.w_omega,
+                    w_joint_vel=self.w_joint_vel,
+                    w_u_thrust=self.w_u_thrust,
+                    w_u_joint_torque=self.w_u_joint_torque,
+                    dt_mpc=self.dt_mpc,
+                    horizon=self.horizon,
+                )
+                self.mpc_reg = self.mpc
+                self._clear_mpc_warm_start()
+                return (
+                    "croc cost weights updated (in-place); "
+                    f"w_state_track={self.w_state_track:g}, w_pos={self.w_pos:g}, "
+                    f"w_att={self.w_att:g}, w_joint={self.w_joint:g}, "
+                    f"w_terminal={self.w_terminal_track:g}"
+                )
+        if self.controller_mode == "croc_ee_pose":
+            if same_structure and hasattr(self.mpc, "update_cost_weights"):
+                self.mpc.update_cost_weights(
+                    ee_w_pos=self.ee_w_pos,
+                    ee_w_rot_rp=self.ee_w_rot_rp,
+                    ee_w_rot_yaw=self.ee_w_rot_yaw,
+                    ee_w_vel_lin=self.ee_w_vel_lin,
+                    ee_w_vel_ang_rp=self.ee_w_vel_ang_rp,
+                    ee_w_vel_ang_yaw=self.ee_w_vel_ang_yaw,
+                    ee_w_terminal_scale=self.ee_w_terminal,
+                    w_state_track=self.w_state_track,
+                    w_state_reg=self.w_state_reg,
+                    w_control=self.w_control,
+                    w_terminal_track=self.w_terminal_track,
+                    w_pos=self.w_pos,
+                    w_att=self.w_att,
+                    w_joint=self.w_joint,
+                    w_vel=self.w_vel,
+                    w_omega=self.w_omega,
+                    w_joint_vel=self.w_joint_vel,
+                    w_u_thrust=self.w_u_thrust,
+                    w_u_joint_torque=self.w_u_joint_torque,
+                    dt_mpc=self.dt_mpc,
+                    horizon=self.horizon,
+                )
+                self._clear_mpc_warm_start()
+                return (
+                    "croc-ee cost weights updated (in-place); "
+                    f"ee_w_pos={self.ee_w_pos:g}, ee_w_yaw={self.ee_w_rot_yaw:g}, "
+                    f"w_state_track={self.w_state_track:g}, w_joint={self.w_joint:g}"
+                )
+
+        self._build_mpc()
+        self._clear_mpc_warm_start()
+        return (
+            f"MPC rebuilt ({self.controller_mode}); "
+            f"w_state_track={self.w_state_track:g}, w_pos={self.w_pos:g}"
+        )
+
+    def _reload_trajectory_plan_only(self) -> None:
+        """仅重载轨迹与可视化缓存，不重建 MPC（避免 acados 重复编译导致节点卡死/崩溃）。"""
+        self.trajectory_name = str(rospy.get_param("~trajectory_name", self.trajectory_name))
+        self.suite_plan_path = str(rospy.get_param("~suite_plan_path", self.suite_plan_path))
+        self._load_trajectory()
+        if self.mpc is None:
+            raise RuntimeError("MPC not initialized")
+        if hasattr(self.mpc, "reset_warm_start"):
+            self.mpc.reset_warm_start()
+        if self.controller_mode in ("croc_ee_pose", "acados_ee_pose"):
+            self._build_ee_ref_from_full_state()
+        self.arm_joint_number = self.mpc.robot_model.nq - 7
+        self._rebuild_cached_viz_paths()
+        self._u_hold = self._hover_thrust_cmd()
+        self._xs_guess = None
+        self._us_guess = None
+        self._reg_xs_guess = None
+        self._reg_us_guess = None
+        self.trajectory_started = False
+        self.traj_finished = False
+        self.controller_start_time = None
+        self._reg_target = self._default_reg_target()
+        self._reg_target_locked = False
+        self._regulating = True
+        self._clear_actual_paths()
+
+    def _build_mpc(self):
+        """构建 Crocoddyl MPC 实例（与 scripts/ 仿真脚本相同的类）。"""
+        s500_yaml_path, urdf_path = self._model_paths_for_robot()
+        if self.controller_mode in ("croc_full_state", "px4", "geometric"):
+            self.mpc = UAMCrocoddylStateTrackingMPC(
+                s500_yaml_path=s500_yaml_path,
+                urdf_path=urdf_path,
+                dt_mpc=self.dt_mpc,
+                horizon=self.horizon,
+                w_state_track=self.w_state_track,
+                w_state_reg=self.w_state_reg,
+                w_control=self.w_control,
+                w_terminal_track=self.w_terminal_track,
+                w_pos=self.w_pos,
+                w_att=self.w_att,
+                w_joint=self.w_joint,
+                w_vel=self.w_vel,
+                w_omega=self.w_omega,
+                w_joint_vel=self.w_joint_vel,
+                w_u_thrust=self.w_u_thrust,
+                w_u_joint_torque=self.w_u_joint_torque,
+                use_thrust_constraints=True,
+            )
+            # 全状态模式下 mpc_reg 直接复用 mpc（避免重复构建）
+            self.mpc_reg = self.mpc
+        elif self.controller_mode == "acados_full_state":
+            from s500_uam_acados_realtime_mpc import AcadosFullStateRealtimeMPC
+
+            self.mpc = AcadosFullStateRealtimeMPC(
+                urdf_path=urdf_path,
+                dt_mpc=self.dt_mpc,
+                horizon=self.horizon,
+                w_pos=self.w_pos,
+                w_att=self.w_att,
+                w_joint=self.w_joint,
+                w_vel=self.w_vel,
+                w_omega=self.w_omega,
+                w_joint_vel=self.w_joint_vel,
+                w_control=self.w_control,
+                w_u_thrust=self.w_u_thrust,
+                w_u_joint_torque=self.w_u_joint_torque,
+                w_state_track=self.w_state_track,
+                w_terminal_track=self.w_terminal_track,
+                max_iter=self.mpc_max_iter,
+                solver_mode=self.acados_solver_mode,
+                integrator_type=self.acados_integrator,
+                hpipm_mode=self.acados_hpipm_mode,
+                qp_iter_max=self.acados_qp_iter_max,
+                qp_warm_start=self.acados_qp_warm_start,
+                sim_num_stages=self.acados_sim_num_stages,
+                sim_num_steps=self.acados_sim_num_steps,
+                as_rti_iter=self.acados_as_rti_iter,
+                dist_aware=(str(self.l1_inject).lower() == "in_model"),
+                ref_error_limits=self._mpc_ref_error_limits(),
+            )
+            # acados full-state solver也用于 regulation（常值参考）
+            self.mpc_reg = self.mpc
+            # 预热求解：在控制定时器启动前完成首帧编译/加载/因子分解，
+            # 避免第一帧在线求解阻塞导致 setpoint 中断而炸机。
+            try:
+                if self.x_plan is not None and len(self.x_plan) > 0:
+                    t0 = time.perf_counter()
+                    self.mpc.warmup(self.x_plan[0], self.t_plan, self.x_plan, iters=8)
+                    self.mpc.reset_warm_start()
+                    rospy.loginfo(
+                        f"[acados] warmup done in {(time.perf_counter()-t0)*1000:.0f} ms"
+                    )
+            except Exception as e:
+                rospy.logwarn(f"[acados] warmup failed: {e}")
+        elif self.controller_mode == "acados_ee_pose":
+            if not self.arm_enabled:
+                raise ValueError(
+                    "controller_mode 'acados_ee_pose' requires arm/EE model; "
+                    "use 'croc_full_state', 'acados_full_state', 'px4', or 'geometric' for s500."
+                )
+            from s500_uam_acados_ee_realtime_mpc import AcadosEECentricRealtimeMPC
+
+            self.mpc = AcadosEECentricRealtimeMPC(
+                urdf_path=urdf_path,
+                dt_mpc=self.dt_mpc,
+                horizon=self.horizon,
+                w_ee_pos=self.ee_w_pos,
+                w_ee_yaw=self.ee_w_rot_yaw,
+                w_ee_rot_rp=self.ee_w_rot_rp,
+                w_state_track=self.w_state_track,
+                w_pos=self.w_pos,
+                w_att=self.w_att,
+                w_joint=self.w_joint,
+                w_vel=self.w_vel,
+                w_omega=self.w_omega,
+                w_joint_vel=self.w_joint_vel,
+                w_control=self.w_control,
+                w_u_thrust=self.w_u_thrust,
+                w_u_joint_torque=self.w_u_joint_torque,
+                w_terminal_scale=self.ee_w_terminal,
+                w_terminal_track=self.w_terminal_track,
+                max_iter=self.mpc_max_iter,
+                solver_mode=self.acados_solver_mode,
+                integrator_type=self.acados_integrator,
+                hpipm_mode=self.acados_hpipm_mode,
+                qp_iter_max=self.acados_qp_iter_max,
+                qp_warm_start=self.acados_qp_warm_start,
+                sim_num_stages=self.acados_sim_num_stages,
+                sim_num_steps=self.acados_sim_num_steps,
+                as_rti_iter=self.acados_as_rti_iter,
+                dist_aware=(str(self.l1_inject).lower() == "in_model"),
+                ref_error_limits=self._mpc_ref_error_limits(),
+            )
+            self.mpc_reg = self.mpc
+            try:
+                if (
+                    self.x_plan is not None
+                    and len(self.x_plan) > 0
+                    and hasattr(self, "p_ref_ee")
+                ):
+                    t0 = time.perf_counter()
+                    self.mpc.warmup(
+                        self.x_plan[0],
+                        self.t_ref_ee,
+                        self.p_ref_ee,
+                        self.yaw_ref_ee,
+                        self.roll_ref_ee,
+                        self.pitch_ref_ee,
+                        iters=8,
+                    )
+                    self.mpc.reset_warm_start()
+                    rospy.loginfo(
+                        f"[acados-ee] warmup done in {(time.perf_counter()-t0)*1000:.0f} ms"
+                    )
+            except Exception as e:
+                rospy.logwarn(f"[acados-ee] warmup failed: {e}")
+            if hasattr(self.mpc, "describe_cost_layout"):
+                rospy.loginfo(f"[acados-ee] {self.mpc.describe_cost_layout()}")
+        elif self.controller_mode == "croc_ee_pose":
+            if not self.arm_enabled:
+                raise ValueError(
+                    "controller_mode 'croc_ee_pose' requires arm/EE model; "
+                    "use 'croc_full_state', 'acados_full_state', 'px4', or 'geometric' for s500."
+                )
+            ee_weights = EETrackingWeights(
+                w_pos=self.ee_w_pos,
+                w_rot_rp=self.ee_w_rot_rp,
+                w_rot_yaw=self.ee_w_rot_yaw,
+                w_vel_lin=self.ee_w_vel_lin,
+                w_vel_ang_rp=self.ee_w_vel_ang_rp,
+                w_vel_ang_yaw=self.ee_w_vel_ang_yaw,
+                w_terminal_scale=self.ee_w_terminal,
+            )
+            rospy.loginfo(
+                "[croc_ee_pose] EE task w_pos=%.2f w_yaw=%.2f | state ref "
+                "w_state_track=%.2f w_joint=%.2f w_state_reg=%.2f w_control=%.2g",
+                float(self.ee_w_pos),
+                float(self.ee_w_rot_yaw),
+                float(self.w_state_track),
+                float(self.w_joint),
+                float(self.w_state_reg),
+                float(self.w_control),
+            )
+            self.mpc = UAMEEPoseTrackingCrocoddylMPC(
+                s500_yaml_path=s500_yaml_path,
+                urdf_path=urdf_path,
+                dt_mpc=self.dt_mpc,
+                horizon=self.horizon,
+                u_weights=ee_weights,
+                w_state_track=self.w_state_track,
+                w_state_reg=self.w_state_reg,
+                w_control=self.w_control,
+                w_terminal_track=self.w_terminal_track,
+                w_pos=self.w_pos,
+                w_att=self.w_att,
+                w_joint=self.w_joint,
+                w_vel=self.w_vel,
+                w_omega=self.w_omega,
+                w_joint_vel=self.w_joint_vel,
+                w_u_thrust=self.w_u_thrust,
+                w_u_joint_torque=self.w_u_joint_torque,
+                use_thrust_constraints=True,
+            )
+            # EE-pose 模式下，regulation 需要单独的全状态 MPC
+            # （build_shooting_problem_along_plan 仅支持 full-state 模式）
+            self.mpc_reg = UAMCrocoddylStateTrackingMPC(
+                s500_yaml_path=s500_yaml_path,
+                urdf_path=urdf_path,
+                dt_mpc=self.dt_mpc,
+                horizon=self.horizon,
+                w_state_track=self.w_state_track,
+                w_state_reg=self.w_state_reg,
+                w_control=self.w_control,
+                w_terminal_track=self.w_terminal_track,
+                w_pos=self.w_pos,
+                w_att=self.w_att,
+                w_joint=self.w_joint,
+                w_vel=self.w_vel,
+                w_omega=self.w_omega,
+                w_joint_vel=self.w_joint_vel,
+                w_u_thrust=self.w_u_thrust,
+                w_u_joint_torque=self.w_u_joint_torque,
+                use_thrust_constraints=True,
+            )
+        else:
+            raise ValueError(
+                f"Unknown controller_mode: {self.controller_mode!r}. "
+                "Use 'croc_full_state', 'acados_full_state', 'acados_ee_pose', "
+                "'croc_ee_pose', 'px4', or 'geometric'."
+            )
+        self.x_nom = self._compute_x_nominal(self.mpc_reg)
+
+        # 从 s500_config 提取推力参数（用于归一化）
+        p = self.mpc.s500_config["platform"]
+        self._n_rotors = int(p["n_rotors"])
+        self._single_max_thrust = float(p["max_thrust"])
+        self._total_max_thrust_cfg = self._n_rotors * self._single_max_thrust
+        if self.max_thrust_total <= 0:
+            self.max_thrust_total = self._total_max_thrust_cfg
+        rospy.loginfo(
+            f"MPC built: mode={self.controller_mode}, nq={self.mpc.nq}, "
+            f"nu={self.mpc.nu}, max_thrust={self.max_thrust_total:.1f} N"
+        )
+
+    # =========================================================================
+    # 初始化：ROS 接口
+    # =========================================================================
+
+    def _init_subscribers(self):
+        rospy.Subscriber("/mavros/state", State, self._mav_state_cb)
+
+        if self.odom_source == "gazebo":
+            rospy.Subscriber(
+                "/gazebo/model_states", ModelStates, self._gazebo_state_cb
+            )
+        else:
+            rospy.Subscriber(
+                "/mavros/local_position/odom", Odometry, self._mavros_odom_cb
+            )
+
+        if self.use_simulation:
+            rospy.Subscriber(
+                "/arm_controller/joint_states", JointState, self._arm_state_sim_cb
+            )
+        else:
+            rospy.Subscriber("/joint_states", JointState, self._arm_state_cb)
+
+        # Regulation 目标话题（GUI 或外部工具发布）
+        # 消息格式：Float64MultiArray.data = [x, y, z, yaw_deg, j1_deg, j2_deg]
+        from std_msgs.msg import Float64MultiArray
+        rospy.Subscriber(
+            "~/regulation_target", Float64MultiArray, self._regulation_target_cb
+        )
+
+    def _init_publishers(self):
+        self.body_rate_thrust_pub = rospy.Publisher(
+            "/mavros/setpoint_raw/attitude", AttitudeTarget, queue_size=10
+        )
+        self.mavros_setpoint_raw_pub = rospy.Publisher(
+            "/mavros/setpoint_raw/local", PositionTarget, queue_size=10
+        )
+        self.yaw_pub = rospy.Publisher("/reference/yaw", Float32, queue_size=10)
+        self.arm_control_pub = rospy.Publisher(
+            "/desired_joint_states", JointState, queue_size=10
+        )
+        # 仿真单关节话题
+        from std_msgs.msg import Float64
+        self.joint1_pub = rospy.Publisher(
+            "/arm_controller/joint_1_controller/command", Float64, queue_size=10
+        )
+        self.joint2_pub = rospy.Publisher(
+            "/arm_controller/joint_2_controller/command", Float64, queue_size=10
+        )
+        self.debug_pub = rospy.Publisher("/suite_mpc/state", MpcState, queue_size=10)
+        # MPC 实时运行统计（频率 / 求解耗时 / 迭代步数），JSON 字符串，GUI 订阅显示
+        from std_msgs.msg import String as _StringMsg
+        self.mpc_stats_pub = rospy.Publisher(
+            "/suite_mpc/stats", _StringMsg, queue_size=5
+        )
+        self.l1_debug_pub = rospy.Publisher(
+            "/suite_mpc/l1_debug", _StringMsg, queue_size=5
+        )
+        try:
+            from mpc_ros_debug_pub import MpcRosDebugPublisher
+
+            self._mpc_ros_debug = MpcRosDebugPublisher(min_interval_s=0.0)
+            rospy.loginfo("MPC debug topics: /suite_mpc/mpc_debug/* (PlotJuggler)")
+        except Exception as e:
+            rospy.logwarn(f"mpc_ros_debug publisher disabled: {e}")
+            self._mpc_ros_debug = None
+        try:
+            from dist_comp_ros_pub import DistCompRosPublisher
+
+            self._dist_comp_ros_pub = DistCompRosPublisher(min_interval_s=0.02)
+            rospy.loginfo("Disturbance topics: /suite_mpc/dist_comp/*")
+        except Exception as e:
+            rospy.logwarn(f"dist_comp publisher disabled: {e}")
+            self._dist_comp_ros_pub = None
+
+        # ── RViz 路径话题（与 run_controller.py 相同名称） ────────────────────
+        # 参考轨迹（整条，固定）
+        self.ref_traj_path_pub = rospy.Publisher(
+            "/reference/current_trajectory", RosPath, queue_size=5, latch=True
+        )
+        # MPC horizon 预测路径（每个控制步更新）
+        self.mpc_planned_path_pub = rospy.Publisher(
+            "/mpc/current_planned_path", RosPath, queue_size=5
+        )
+        # 飞机实际轨迹（累积）
+        self.uav_actual_path_pub = rospy.Publisher(
+            "uav_path", RosPath, queue_size=5
+        )
+        # EE 规划轨迹（固定）
+        self.ee_planned_path_pub = rospy.Publisher(
+            "/ee/planned_trajectory", RosPath, queue_size=5, latch=True
+        )
+        # EE 实际轨迹（累积）
+        self.ee_actual_path_pub = rospy.Publisher(
+            "/ee/actual_trajectory", RosPath, queue_size=5
+        )
+
+        # ── RViz 机器人 mesh marker / EE 坐标轴 marker ────────────────────────
+        self.robot_markers_pub = rospy.Publisher(
+            "/suite_mpc/robot_markers", MarkerArray, queue_size=2, latch=True
+        )
+        self.ee_axes_pub = rospy.Publisher(
+            "/suite_mpc/ee_axes", MarkerArray, queue_size=2
+        )
+        self.tracking_error_markers_pub = rospy.Publisher(
+            "/suite_mpc/tracking_error_markers", MarkerArray, queue_size=2
+        )
+        # TF：发布到独立 frame 名，避免与 robot_state_publisher / gazebo 冲突
+        self._tf_broadcaster = tf2_ros.TransformBroadcaster()
+
+        # ── WholeBody 可视化（eagle_mpc_viz，可选） ───────────────────────────
+        self._wb_current_pub  = None
+        self._wb_target_pub   = None
+        self._wb_planned_pub  = None
+        if _WHOLEBODY_VIZ_OK:
+            try:
+                rm  = self.mpc.robot_model
+                pp  = self.mpc.s500_config["platform"]
+                # eagle_mpc_viz 使用 platform_params 对象；这里传入轻量 namespace
+                class _PP:
+                    pass
+                _pp = _PP()
+                _pp.n_rotors = int(pp["n_rotors"])
+                # WholeBodyStatePublisher / TrajectoryPublisher 只需 robot_model & platform_params
+                self._wb_current_pub = WholeBodyStatePublisher(
+                    "whole_body_state_current", rm, _pp, frame_id="world"
+                )
+                self._wb_target_pub = WholeBodyStatePublisher(
+                    "whole_body_state_target", rm, _pp, frame_id="world"
+                )
+                self._wb_planned_pub = WholeBodyTrajectoryPublisher(
+                    "whole_body_partial_trajectory_current", rm, _pp, frame_id="world"
+                )
+                rospy.loginfo("WholeBody visualization publishers initialized.")
+            except Exception as e:
+                rospy.logwarn(f"WholeBody viz init failed (non-fatal): {e}")
+                self._wb_current_pub = None
+                self._wb_target_pub  = None
+                self._wb_planned_pub = None
+
+    def _init_services(self):
+        # 全局服务名（与文档 / GUI 一致）；同时注册节点私有别名以兼容旧客户端
+        trigger_specs = [
+            ("start_tracking", self._svc_start_tracking),
+            ("stop_tracking", self._svc_stop_tracking),
+            ("save_data", self._svc_save_data),
+            ("update_trajectory", self._svc_update_trajectory),
+            ("reset_to_initial", self._svc_reset_to_initial),
+            ("take_off", self._svc_take_off),
+            ("set_regulation_target", self._svc_set_regulation_target),
+            ("update_controller_params", self._svc_update_controller_params),
+            ("apply_l1_params", self._svc_apply_l1_params),
+        ]
+        for short, cb in trigger_specs:
+            rospy.Service(f"/{short}", Trigger, cb)
+            rospy.Service(f"/{TRACKING_NODE_NAME}/{short}", Trigger, cb)
+
+        setbool_specs = [
+            ("set_control_output_enabled", self._svc_set_control_output_enabled),
+            ("set_l1_dist_enabled", self._svc_set_l1_dist_enabled),
+            ("set_l1_comp_enabled", self._svc_set_l1_comp_enabled),
+            ("set_l1_enabled", self._svc_set_l1_enabled),
+            ("set_drag_ff_enabled", self._svc_set_drag_ff_enabled),
+        ]
+        for short, cb in setbool_specs:
+            rospy.Service(f"/{short}", SetBool, cb)
+            rospy.Service(f"/{TRACKING_NODE_NAME}/{short}", SetBool, cb)
+
+        # 用启动参数覆盖 roscore 上可能残留的 l1_runtime_update（否则 apply 会误开估计）
+        self._write_l1_runtime_cfg_param(self._current_l1_cfg_snapshot())
+        rospy.loginfo(
+            "[services] e.g. /update_controller_params and "
+            f"/{TRACKING_NODE_NAME}/update_controller_params"
+        )
+        rospy.loginfo(
+            "[L1] rosparam synced from launch: est=%s mode=%s comp=%s inject=%s",
+            "on" if self.l1_dist_enabled else "off",
+            self.l1_mode,
+            "on" if self.l1_comp_enabled else "off",
+            self.l1_inject,
+        )
+
+    def _current_l1_cfg_snapshot(self) -> dict:
+        """节点当前 L1 运行时状态（供 SetBool 与 param 合并）。"""
+        return {
+            "l1_dist_enabled": bool(self.l1_dist_enabled),
+            "l1_mode": str(self.l1_mode),
+            "l1_comp_enabled": bool(self.l1_comp_enabled),
+            "l1_inject": str(self.l1_inject),
+            "l1_enabled": bool(self.l1_enabled),
+            "l1_as_gain": float(self.l1_as_gain),
+            "l1_wc_xy": float(self.l1_wc_xy),
+            "l1_wc_z": float(self.l1_wc_z),
+            "l1_tilt_gain": float(self.l1_tilt_gain),
+            "l1_max_accel_xy": float(self.l1_max_accel_xy),
+            "l1_max_accel_z": float(self.l1_max_accel_z),
+            "l1_max_sigma": float(self.l1_max_sigma),
+            "l1_use_pos_feedback": bool(self.l1_use_pos_feedback),
+            "l1_k_pos_i_xy": float(self.l1_k_pos_i_xy),
+            "l1_k_pos_i_z": float(self.l1_k_pos_i_z),
+            "l1_max_pos_integral": float(self.l1_max_pos_integral),
+            "drag_ff_enabled": bool(self.drag_ff_enabled),
+            "arm_ee_compensate": bool(self.arm_ee_compensate),
+        }
+
+    def _read_l1_runtime_cfg_from_param(self) -> Optional[dict]:
+        """读取 GUI 写入的 L1 配置（全局 param 优先，兼容节点私有 param）。"""
+        for param_name in (L1_RUNTIME_UPDATE_PARAM, "~l1_runtime_update"):
+            try:
+                cfg = rospy.get_param(param_name, None)
+                if isinstance(cfg, dict):
+                    return dict(cfg)
+            except Exception:
+                pass
+        return None
+
+    def _write_l1_runtime_cfg_param(self, cfg: dict) -> None:
+        try:
+            rospy.set_param(L1_RUNTIME_UPDATE_PARAM, cfg)
+            rospy.set_param("~l1_runtime_update", cfg)
+        except Exception:
+            pass
+
+    def _merged_l1_runtime_cfg(self, overrides: Optional[dict] = None) -> dict:
+        """合并 ~l1_runtime_update、节点当前状态与 overrides。"""
+        base: dict = {}
+        pending = self._read_l1_runtime_cfg_from_param()
+        if isinstance(pending, dict):
+            base.update(pending)
+        else:
+            base.update(self._current_l1_cfg_snapshot())
+        if overrides:
+            base.update(overrides)
+        return base
+
+    def _apply_l1_runtime_cfg(self, cfg: dict) -> str:
+        """应用完整 L1 配置；仅 MPC 结构变化时短暂 rebuild。"""
+        prev_sig = self._mpc_structure_signature()
+        with self._thread_lock:
+            self._apply_l1_params_from_dict(cfg)
+        mpc_detail = self._maybe_rebuild_mpc_after_cfg(cfg, prev_sig)
+        self._write_l1_runtime_cfg_param(cfg)
+        return mpc_detail
+
+    def _read_controller_update_cfg(self) -> Optional[dict]:
+        """读取 GUI 写入的在线更新配置（绝对路径优先）。"""
+        cfg = rospy.get_param(CONTROLLER_UPDATE_PARAM, None)
+        if not isinstance(cfg, dict):
+            cfg = rospy.get_param("~controller_update_data", None)
+        return cfg if isinstance(cfg, dict) else None
+
+    def _maybe_rebuild_mpc_after_cfg(self, cfg: dict, prev_sig: tuple) -> str:
+        """结构签名变化时才置 _mpc_rebuilding；纯权重热更新不阻断控制环。"""
+        if self.controller_mode not in (
+            "croc_full_state",
+            "acados_full_state",
+            "acados_ee_pose",
+            "croc_ee_pose",
+        ):
+            return ""
+        new_sig = self._mpc_structure_signature()
+        if new_sig == prev_sig:
+            with self._thread_lock:
+                return self._rebuild_mpc_after_param_update(cfg, prev_sig)
+        self._mpc_rebuilding = True
+        try:
+            with self._thread_lock:
+                if self.controller_mode in ("croc_ee_pose", "acados_ee_pose"):
+                    self._build_ee_ref_from_full_state()
+                detail = self._rebuild_mpc_after_param_update(cfg, prev_sig)
+                self.arm_joint_number = self.mpc.robot_model.nq - 7
+                self._u_hold = self._hover_thrust_cmd()
+                return detail
+        finally:
+            self._mpc_rebuilding = False
+
+    def _svc_apply_l1_params(self, req) -> TriggerResponse:
+        """从 /suite_mpc/l1_runtime_update 应用估计来源 / 补偿方式 / 开关 / L1 增益。"""
+        try:
+            cfg = self._read_l1_runtime_cfg_from_param()
+            if not isinstance(cfg, dict):
+                return TriggerResponse(
+                    False,
+                    f"Param {L1_RUNTIME_UPDATE_PARAM} (or ~l1_runtime_update) must be a dict.",
+                )
+            rospy.loginfo(
+                "[apply_l1_params] applying: est=%s mode=%s comp=%s inject=%s arm_ee=%s",
+                "on" if cfg.get("l1_dist_enabled") else "off",
+                cfg.get("l1_mode", "?"),
+                "on" if cfg.get("l1_comp_enabled") else "off",
+                cfg.get("l1_inject", "?"),
+                "on" if cfg.get("arm_ee_compensate") else "off",
+            )
+            mpc_detail = self._apply_l1_runtime_cfg(cfg)
+            msg = (
+                f"L1: mode={self.l1_mode} inject={self.l1_inject} "
+                f"est={'on' if self.l1_dist_enabled else 'off'} "
+                f"comp={'on' if self.l1_comp_enabled else 'off'}. {mpc_detail}"
+            )
+            rospy.loginfo(f"[apply_l1_params] {msg}")
+            return TriggerResponse(True, msg)
+        except Exception as e:
+            self._mpc_rebuilding = False
+            rospy.logerr(f"[apply_l1_params] failed: {e}")
+            return TriggerResponse(False, f"Error: {e}")
+
+    def _svc_set_l1_dist_enabled(self, req: SetBool) -> SetBoolResponse:
+        """运行时开启/关闭扰动估计（合并 ~l1_runtime_update 后全量应用）。"""
+        try:
+            on = bool(req.data)
+            cfg = self._merged_l1_runtime_cfg({"l1_dist_enabled": on})
+            self._apply_l1_runtime_cfg(cfg)
+            if on and self.l1_comp_enabled:
+                rospy.logwarn(
+                    "[set_l1_dist_enabled] disturbance compensation is ON; "
+                    "disable via /set_l1_comp_enabled false for estimation-only."
+                )
+            msg = (
+                f"Disturbance estimation {'enabled' if on else 'disabled'} "
+                f"(mode={self.l1_mode}, comp={'on' if self.l1_comp_enabled else 'off'})."
+            )
+            rospy.loginfo(msg)
+            return SetBoolResponse(success=True, message=msg)
+        except Exception as e:
+            rospy.logerr(f"[set_l1_dist_enabled] failed: {e}")
+            return SetBoolResponse(success=False, message=str(e))
+
+    def _svc_set_l1_comp_enabled(self, req: SetBool) -> SetBoolResponse:
+        """运行时开启/关闭扰动补偿（合并 ~l1_runtime_update 后全量应用）。"""
+        try:
+            cfg = self._merged_l1_runtime_cfg({"l1_comp_enabled": bool(req.data)})
+            self._apply_l1_runtime_cfg(cfg)
+            state = "enabled" if self.l1_comp_enabled else "disabled"
+            msg = (
+                f"Disturbance compensation {state} "
+                f"(estimation={'on' if self.l1_dist_enabled else 'off'})."
+            )
+            rospy.loginfo(msg)
+            return SetBoolResponse(success=True, message=msg)
+        except Exception as e:
+            rospy.logerr(f"[set_l1_comp_enabled] failed: {e}")
+            return SetBoolResponse(success=False, message=str(e))
+
+    def _svc_set_l1_enabled(self, req: SetBool) -> SetBoolResponse:
+        """兼容旧接口：等效于 set_l1_dist_enabled 且强制 adaptive 模式。"""
+        on = bool(req.data)
+        if on:
+            self.l1_dist_enabled = True
+            self.l1_mode = "adaptive"
+            self.drag_ff_enabled = False
+        self.l1_enabled = on and self.l1_mode == "adaptive"
+        self._l1.set_enabled(self.l1_enabled)
+        if self.l1_enabled:
+            v_w = self._linear_vel_world_from_state(self.state)
+            self._l1.reset(v_w)
+            self._l1_last_a_applied = np.zeros(3, dtype=float)
+        elif not on:
+            self.l1_dist_enabled = False
+        state = "enabled" if self.l1_enabled else "disabled"
+        msg = f"L1 adaptive estimation {state}."
+        rospy.loginfo(msg)
+        return SetBoolResponse(success=True, message=msg)
+
+    def _svc_set_drag_ff_enabled(self, req: SetBool) -> SetBoolResponse:
+        """运行时开启/关闭“真值阻力前馈补偿”（与 L1 互斥的对照实验）。
+        开启时若 L1 在运行则先关闭 L1。"""
+        self.drag_ff_enabled = bool(req.data)
+        if self.drag_ff_enabled and self.l1_enabled:
+            self.l1_enabled = False
+            self._l1.set_enabled(False)
+            rospy.loginfo("L1 auto-disabled (drag-truth feedforward takes over).")
+        state = "enabled" if self.drag_ff_enabled else "disabled"
+        msg = f"Drag-truth feedforward compensation {state}."
+        rospy.loginfo(msg)
+        return SetBoolResponse(success=True, message=msg)
+
+    def _svc_set_control_output_enabled(self, req: SetBool) -> SetBoolResponse:
+        self.control_output_enabled = bool(req.data)
+        state = "enabled" if self.control_output_enabled else "disabled"
+        msg = f"Control output {state}."
+        rospy.loginfo(msg)
+        return SetBoolResponse(success=True, message=msg)
+
+    # =========================================================================
+    # 状态回调（与 run_controller.py 逻辑相同）
+    # =========================================================================
+
+    def _mav_state_cb(self, msg: State):
+        self.px4_state = msg
+
+    def _arm_state_cb(self, msg: JointState):
+        """实机：/joint_states（真实关节顺序 -2/-1）。"""
+        self.arm_state = msg
+        nj = self.arm_joint_number
+        self.state[7 : 7 + nj] = [msg.position[-1], msg.position[-2]]
+        self.state[-nj:] = [msg.velocity[-1], msg.velocity[-2]]
+
+    def _arm_state_sim_cb(self, msg: JointState):
+        """仿真：/arm_controller/joint_states（顺序 0/1）。"""
+        self.arm_state = msg
+        nj = self.arm_joint_number
+        self.state[7 : 7 + nj] = list(msg.position[:nj])
+        self.state[-nj:] = list(msg.velocity[:nj])
+
+    def _gazebo_state_cb(self, msg: ModelStates):
+        try:
+            idx = msg.name.index(self.robot_name)
+        except ValueError:
+            rospy.logerr_throttle(5.0, f"Robot '{self.robot_name}' not in Gazebo model_states")
+            return
+        pose = msg.pose[idx]
+        twist = msg.twist[idx]
+        self.state[0:3] = [pose.position.x, pose.position.y, pose.position.z]
+        self.state[3:7] = [
+            pose.orientation.x, pose.orientation.y,
+            pose.orientation.z, pose.orientation.w,
+        ]
+        nj = self.arm_joint_number
+        quat = self.state[3:7]
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        v_world = np.array([twist.linear.x, twist.linear.y, twist.linear.z], dtype=float)
+        w_world = np.array([twist.angular.x, twist.angular.y, twist.angular.z], dtype=float)
+        self.state[7 + nj : 10 + nj] = R.T @ v_world   # body-frame linear vel
+        self.state[10 + nj : 13 + nj] = R.T @ w_world  # body-frame angular vel
+
+    def _mavros_odom_cb(self, msg: Odometry):
+        pose = msg.pose.pose
+        twist = msg.twist.twist
+        self.state[0:3] = [pose.position.x, pose.position.y, pose.position.z]
+        self.state[3:7] = [
+            pose.orientation.x, pose.orientation.y,
+            pose.orientation.z, pose.orientation.w,
+        ]
+        nq = self.mpc.nq
+        self.state[nq : nq + 3] = [twist.linear.x, twist.linear.y, twist.linear.z]
+        self.state[nq + 3 : nq + 6] = [twist.angular.x, twist.angular.y, twist.angular.z]
+
+    # =========================================================================
+    # 主控制回调
+    # =========================================================================
+
+    def _publish_hold_during_rebuild(self) -> None:
+        """MPC 重建期间维持上一帧控制，避免 PX4 setpoint 中断。"""
+        if not self.control_output_enabled:
+            return
+        try:
+            xs = self.state.copy() if self.state is not None else None
+            self._publish_body_rate_thrust(self._u_hold, xs)
+            self._publish_dist_comp_state("rebuild_hold")
+        except Exception:
+            pass
+
+    def _control_callback(self, event):
+        now = rospy.Time.now()
+
+        if getattr(self, "_mpc_rebuilding", False):
+            self._publish_hold_during_rebuild()
+            return
+
+        # ── 时间管理 ──────────────────────────────────────────────────────────
+        if self.trajectory_started and not self.traj_finished:
+            t_elapsed = (now - self.controller_start_time).to_sec()
+            t_total = float(self.t_plan[-1] - self.t_plan[0])
+            if t_elapsed >= t_total:
+                self._enter_hover_regulation(
+                    self._plan_end_hover_target(),
+                    reason="Trajectory tracking finished; auto-stop and hover at end-point.",
+                    save=True,
+                )
+        elif self.traj_finished:
+            t_elapsed = float(self.t_plan[-1] - self.t_plan[0])
+        else:
+            t_elapsed = 0.0
+
+        # ── PX4 / Geometric 高层控制模式（不走 Crocoddyl 在线求解）────────────
+        if self.controller_mode in ("px4", "geometric"):
+            self._control_callback_high_level(t_elapsed)
+            return
+
+        # ── MPC 求解 ──────────────────────────────────────────────────────────
+        x_now = self.state.copy()
+
+        # ── Regulation 模式：MPC 镇定到 _reg_target ──────────────────────────
+        if self._regulating:
+            self._update_takeoff_prep()
+            self._update_takeoff_sequence()
+            # Keep reference policy deterministic in regulation mode.
+            if not self._reg_target_locked:
+                self._reg_target = self._default_reg_target()
+            self._step_l1_adaptive(ref_pos_world=self._l1_ref_pos_for_step(0.0))
+            t0 = time.perf_counter()
+            u_cmd, xs_next = self._solve_mpc_regulate(x_now)
+            solve_ms = (time.perf_counter() - t0) * 1000.0
+            self.solve_times.append(solve_ms)
+            rospy.logdebug_throttle(
+                1.0, f"[regulate] MPC solve: {solve_ms:.1f} ms | target={self._reg_target[:3].tolist()}"
+            )
+            if u_cmd is not None:
+                self._u_hold = u_cmd
+            self._publish_dist_comp_state("regulation")
+            if self.control_output_enabled:
+                self._publish_body_rate_thrust(self._u_hold, xs_next)
+                if self.arm_enabled:
+                    self._publish_arm_cmd(xs_next)
+            self._publish_debug(0.0, solve_ms, x_ref_override=self._reg_target)
+            self._publish_mpc_stats(solve_ms, "regulation")
+            self._publish_mpc_ros_debug(
+                solve_ms, "regulation", self._u_hold, xs_next, x_now
+            )
+            # Regulation 模式下也追加实际路径（方便观察归位过程）
+            self._append_uav_actual_path_point()
+            if self.arm_enabled:
+                self._append_ee_actual_path_point()
+            if u_cmd is not None and self._reg_xs_guess is not None:
+                self._stage_mpc_planned_path(self._reg_xs_guess)
+            self._maybe_flush_viz_publishes(xs_next)
+            return
+
+        self._step_l1_adaptive(ref_pos_world=self._l1_ref_pos_for_step(t_elapsed))
+        t0 = time.perf_counter()
+        u_cmd, xs_next = self._solve_mpc(x_now, t_elapsed)
+        solve_ms = (time.perf_counter() - t0) * 1000.0
+        self.solve_times.append(solve_ms)
+        rospy.logdebug_throttle(
+            1.0, f"MPC solve: {solve_ms:.1f} ms | t_elapsed={t_elapsed:.2f}s"
+        )
+
+        if u_cmd is not None:
+            self._u_hold = u_cmd
+
+        self._publish_dist_comp_state("tracking")
+
+        # ── 发布控制指令 ──────────────────────────────────────────────────────
+        if self.control_output_enabled:
+            self._publish_body_rate_thrust(self._u_hold, xs_next)
+            if self.arm_enabled:
+                self._publish_arm_cmd(xs_next)
+        self._publish_debug(t_elapsed, solve_ms)
+        self._publish_mpc_stats(solve_ms, "tracking")
+        self._publish_mpc_ros_debug(
+            solve_ms, "tracking", self._u_hold, xs_next, x_now
+        )
+
+        # ── RViz 可视化 ───────────────────────────────────────────────────────
+        # 实际路径只在 tracking 激活时累积，避免起始点与 x_plan[0] 不符
+        if self.trajectory_started:
+            self._append_uav_actual_path_point()
+            if self.arm_enabled:
+                self._append_ee_actual_path_point()
+        if u_cmd is not None and self._xs_guess is not None:
+            self._stage_mpc_planned_path(self._xs_guess)
+        # 降频批量发布（15 Hz 默认，避免高频序列化）
+        self._maybe_flush_viz_publishes(xs_next)
+
+        # ── 数据录制 ──────────────────────────────────────────────────────────
+        if self.recording_enabled:
+            self._record(t_elapsed, self._u_hold, xs_next, solve_ms)
+
+    # =========================================================================
+    # MPC 求解核心
+    # =========================================================================
+
+    def _ee_croc_use_plan_aux(self) -> bool:
+        """croc/acados EE 是否在代价中使用 x_plan 全状态参考。"""
+        return float(self.w_state_track) > 0.0
+
+    def _ee_pose_ref_from_state(self, x_ref: np.ndarray) -> Tuple[np.ndarray, float]:
+        """从全状态向量 FK 得到 EE 世界位置与 yaw（rad）。"""
+        p_ee, _, _, yaw = self._ee_full_pose_ref_from_state(x_ref)
+        return np.asarray(p_ee, dtype=float).reshape(3), float(yaw)
+
+    def _ee_full_pose_ref_from_state(
+        self, x_ref: np.ndarray
+    ) -> Tuple[np.ndarray, float, float, float]:
+        """FK：EE 位置 + roll/pitch/yaw（rad，Pinocchio RPY 顺序）。"""
+        x_ref = np.asarray(x_ref, dtype=float).flatten()
+        if self.mpc is None:
+            raise ValueError("MPC not initialized")
+        rm = self.mpc.robot_model
+        eid = int(self.mpc.ee_frame_id)
+        data = rm.createData()
+        p, _, rpy, _ = compute_ee_kinematics_along_trajectory(
+            x_ref.reshape(1, -1), rm, data, eid
+        )
+        return (
+            np.asarray(p[0], dtype=float).reshape(3),
+            float(rpy[0, 0]),
+            float(rpy[0, 1]),
+            float(rpy[0, 2]),
+        )
+
+    def _ee_joint_override_q(self) -> Tuple[float, float]:
+        return float(self.ee_joint1), float(self.ee_joint2)
+
+    def _solve_acados_ee(
+        self,
+        x_now: np.ndarray,
+        t_query: float,
+        t_ee_ref: np.ndarray,
+        p_ee_ref: np.ndarray,
+        yaw_ee_ref: np.ndarray,
+        roll_ee_ref: np.ndarray,
+        pitch_ee_ref: np.ndarray,
+        *,
+        t_plan: Optional[np.ndarray] = None,
+        x_plan: Optional[np.ndarray] = None,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        try:
+            thrust_hint = (
+                float(np.sum(self._u_hold[: self._n_rotors]))
+                if self._u_hold is not None
+                else 0.0
+            )
+            p_dist = self._dist_wrench_for_mpc(thrust_hint)
+            if t_plan is None and x_plan is None and self._ee_croc_use_plan_aux():
+                t_plan = self.t_plan
+                x_plan = self.x_plan
+            u_opt, x_next, status = self.mpc.solve_step(
+                x_now,
+                t_query,
+                t_ee_ref,
+                p_ee_ref,
+                yaw_ee_ref,
+                roll_ee_ref,
+                pitch_ee_ref,
+                t_plan=t_plan,
+                x_plan=x_plan,
+                joint_override=bool(self.ee_override_joints),
+                joint_override_q=self._ee_joint_override_q(),
+                p_dist=p_dist,
+            )
+            if status not in (0, 2) or u_opt is None:
+                rospy.logwarn_throttle(1.0, f"[acados-ee] solve status={status}")
+                self._capture_acados_mpc_diagnostics(self.mpc, status)
+                self._mpc_xs_horizon = None
+                return None, None
+            self._capture_acados_mpc_diagnostics(self.mpc, status)
+            self._xs_guess = getattr(self.mpc, "last_xs", None)
+            self._mpc_xs_horizon = getattr(self.mpc, "last_xs", None)
+            return u_opt, x_next
+        except Exception as e:
+            rospy.logwarn_throttle(1.0, f"Acados EE MPC solve failed: {e}")
+            self.mpc.reset_warm_start()
+            self._mpc_xs_horizon = None
+            return None, None
+
+    def _solve_mpc(
+        self, x_now: np.ndarray, t_elapsed: float
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        构建 shooting problem 并求解，返回 (u_opt, xs_next) 或 (None, None)。
+
+        xs_next: MPC 规划的下一时刻状态（用于从 xs[1] 读取 body rate 参考）。
+        """
+        t_start_plan = float(self.t_plan[0])
+        t_query = t_start_plan + t_elapsed
+
+        if self.controller_mode == "acados_full_state":
+            try:
+                thrust_hint = float(np.sum(self._u_hold[: self._n_rotors])) if self._u_hold is not None else 0.0
+                p_dist = self._dist_wrench_for_mpc(thrust_hint)
+                u_opt, x_next, status = self.mpc.solve_step(
+                    x_now, t_query, self.t_plan, self.x_plan, p_dist=p_dist
+                )
+                if status not in (0, 2) or u_opt is None:
+                    rospy.logwarn_throttle(
+                        1.0, f"[acados] solve status={status}"
+                    )
+                    self._capture_acados_mpc_diagnostics(self.mpc, status)
+                    self._mpc_xs_horizon = None
+                    return None, None
+                self._capture_acados_mpc_diagnostics(self.mpc, status)
+                # expose full solved horizon for planned-path visualization (RViz)
+                self._xs_guess = getattr(self.mpc, "last_xs", None)
+                self._mpc_xs_horizon = getattr(self.mpc, "last_xs", None)
+                return u_opt, x_next
+            except Exception as e:
+                rospy.logwarn_throttle(1.0, f"Acados MPC solve failed: {e}")
+                self.mpc.reset_warm_start()
+                self._mpc_xs_horizon = None
+                return None, None
+
+        if self.controller_mode == "acados_ee_pose":
+            return self._solve_acados_ee(
+                x_now,
+                t_query,
+                self.t_ref_ee,
+                self.p_ref_ee,
+                self.yaw_ref_ee,
+                self.roll_ref_ee,
+                self.pitch_ref_ee,
+            )
+
+        try:
+            if self.controller_mode == "croc_full_state":
+                prob = self.mpc.build_shooting_problem_along_plan(
+                    x_now,
+                    self.x_nom,
+                    t_query,
+                    self.t_plan,
+                    self.x_plan,
+                )
+            else:  # croc_ee_pose
+                use_xplan = self._ee_croc_use_plan_aux()
+                prob = self.mpc.build_shooting_problem_along_ee_ref(
+                    x_now,
+                    t_query,
+                    self.t_ref_ee,
+                    self.p_ref_ee,
+                    self.yaw_ref_ee,
+                    self.dp_ref_ee,
+                    self.dyaw_ref_ee,
+                    self.roll_ref_ee,
+                    self.pitch_ref_ee,
+                    t_plan=self.t_plan if use_xplan else None,
+                    x_plan=self.x_plan if use_xplan else None,
+                    joint_override=bool(self.ee_override_joints),
+                    joint_override_q=self._ee_joint_override_q(),
+                )
+
+            solver = crocoddyl.SolverBoxFDDP(prob)
+            solver.convergence_init = 1e-9
+            solver.convergence_stop = 1e-7
+            try:
+                solver.setCallbacks([])
+            except Exception:
+                pass
+
+            # Warm start
+            if self._xs_guess is None:
+                xs_init = [x_now.copy() for _ in range(self.horizon + 1)]
+                us_init = [self._hover_thrust_cmd() for _ in range(self.horizon)]
+            else:
+                xs_init = self._xs_guess
+                us_init = self._us_guess
+                xs_init[0] = x_now.copy()
+
+            solver.solve(xs_init, us_init, self.mpc_max_iter)
+
+            u_opt = np.array(solver.us[0], dtype=float).copy()
+            self._capture_croc_mpc_diagnostics(solver)
+
+            # Shift warm start for next iteration
+            H = self.horizon
+            self._xs_guess = (
+                [np.array(solver.xs[i + 1], dtype=float).copy() for i in range(H)]
+                + [np.array(solver.xs[-1], dtype=float).copy()]
+            )
+            self._xs_guess[0] = x_now.copy()
+            self._us_guess = (
+                [np.array(solver.us[i + 1], dtype=float).copy() for i in range(H - 1)]
+                + [np.array(solver.us[-1], dtype=float).copy()]
+            )
+
+            # 完整 horizon（未平移）供 body rate 前瞻插值
+            self._mpc_xs_horizon = [np.array(x, dtype=float).copy() for x in solver.xs]
+
+            xs_next = np.array(solver.xs[1], dtype=float).copy()
+            return u_opt, xs_next
+
+        except Exception as e:
+            rospy.logwarn_throttle(1.0, f"MPC solve failed: {e}")
+            self._xs_guess = None
+            self._us_guess = None
+            self._mpc_xs_horizon = None
+            return None, None
+
+    def _regulation_reference(self, x_now: np.ndarray) -> np.ndarray:
+        """Bounded look-ahead regulation reference.
+
+        Returns a copy of ``self._reg_target`` whose position is clamped to at most
+        ``self._reg_lookahead_m`` from the current position, along the direction to
+        the true target. This keeps the (single-iteration) acados RTI QP well posed
+        when the commanded target is far away, while still walking toward it as the
+        robot approaches. ``reg_lookahead_m <= 0`` disables clamping.
+        """
+        x_tgt = np.asarray(self._reg_target, dtype=float).copy()
+        look = float(self._reg_lookahead_m)
+        if look <= 0.0 or x_now is None:
+            return x_tgt
+        p_now = np.asarray(x_now, dtype=float).flatten()[0:3]
+        p_tgt = x_tgt[0:3]
+        delta = p_tgt - p_now
+        dist = float(np.linalg.norm(delta))
+        if dist > look:
+            x_tgt[0:3] = p_now + delta * (look / dist)
+        return x_tgt
+
+    def _solve_mpc_regulate(
+        self, x_now: np.ndarray
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        将 _reg_target 作为常值参考，构建点镇定 shooting problem 并求解。
+        用于 regulation 模式（启动时、stop 后、reset 后均进入此模式）。
+        使用独立的 warm-start 缓存（_reg_xs_guess / _reg_us_guess）。
+
+        远目标时使用有界 look-ahead 参考，避免 acados RTI 单步 QP 病态（NaN）。
+        """
+        x_tgt = self._regulation_reference(x_now)
+        H     = self.horizon
+        dt    = self.dt_mpc
+
+        # 常值参考轨迹：H+1 个节点，全部等于 _reg_target
+        t_reg = np.array([float(i) * dt for i in range(H + 1)], dtype=float)
+        x_reg = np.array([x_tgt.copy() for _ in range(H + 1)], dtype=float)
+
+        if self.controller_mode == "acados_full_state":
+            try:
+                thrust_hint = float(np.sum(self._u_hold[: self._n_rotors])) if self._u_hold is not None else 0.0
+                p_dist = self._dist_wrench_for_mpc(thrust_hint)
+                u_opt, x_next, status = self.mpc.solve_step(
+                    x_now, 0.0, t_reg, x_reg, p_dist=p_dist
+                )
+                if status not in (0, 2) or u_opt is None:
+                    rospy.logwarn_throttle(1.0, f"[acados-reg] solve status={status}")
+                    self._capture_acados_mpc_diagnostics(self.mpc, status)
+                    self._mpc_xs_horizon = None
+                    return None, None
+                self._capture_acados_mpc_diagnostics(self.mpc, status)
+                # expose full solved horizon for planned-path visualization (RViz)
+                self._reg_xs_guess = getattr(self.mpc, "last_xs", None)
+                self._mpc_xs_horizon = getattr(self.mpc, "last_xs", None)
+                return u_opt, x_next
+            except Exception as e:
+                rospy.logwarn_throttle(1.0, f"Acados regulate solve failed: {e}")
+                self.mpc.reset_warm_start()
+                self._mpc_xs_horizon = None
+                return None, None
+
+        if self.controller_mode == "acados_ee_pose":
+            try:
+                p_ee, roll_ee, pitch_ee, yaw_ee = self._ee_full_pose_ref_from_state(x_tgt)
+            except Exception as e:
+                rospy.logwarn_throttle(1.0, f"[acados-ee-reg] EE ref failed: {e}")
+                return None, None
+            t_const = np.array([0.0, float(H) * dt], dtype=float)
+            p_const = np.vstack([p_ee, p_ee])
+            yaw_const = np.array([yaw_ee, yaw_ee], dtype=float)
+            roll_const = np.array([roll_ee, roll_ee], dtype=float)
+            pitch_const = np.array([pitch_ee, pitch_ee], dtype=float)
+            t_plan = None
+            x_plan = None
+            if self._ee_croc_use_plan_aux():
+                t_plan = t_const
+                x_plan = np.vstack([x_tgt, x_tgt])
+            return self._solve_acados_ee(
+                x_now,
+                0.0,
+                t_const,
+                p_const,
+                yaw_const,
+                roll_const,
+                pitch_const,
+                t_plan=t_plan,
+                x_plan=x_plan,
+            )
+
+        if self.controller_mode == "croc_ee_pose":
+            try:
+                p_ee, roll_ee, pitch_ee, yaw_ee = self._ee_full_pose_ref_from_state(x_tgt)
+                t_const = np.array([0.0, max(float(H) * dt, 1e-3)], dtype=float)
+                p_const = np.vstack([p_ee, p_ee])
+                yaw_const = np.array([yaw_ee, yaw_ee], dtype=float)
+                roll_const = np.array([roll_ee, roll_ee], dtype=float)
+                pitch_const = np.array([pitch_ee, pitch_ee], dtype=float)
+                dp_const = np.zeros((2, 3), dtype=float)
+                dyaw_const = np.zeros(2, dtype=float)
+                use_xplan = self._ee_croc_use_plan_aux()
+                prob = self.mpc.build_shooting_problem_along_ee_ref(
+                    x_now,
+                    0.0,
+                    t_const,
+                    p_const,
+                    yaw_const,
+                    dp_const,
+                    dyaw_const,
+                    roll_const,
+                    pitch_const,
+                    t_plan=t_reg if use_xplan else None,
+                    x_plan=x_reg if use_xplan else None,
+                    joint_override=bool(self.ee_override_joints),
+                    joint_override_q=self._ee_joint_override_q(),
+                )
+                solver = crocoddyl.SolverBoxFDDP(prob)
+                solver.convergence_init = 1e-9
+                solver.convergence_stop = 1e-7
+                try:
+                    solver.setCallbacks([])
+                except Exception:
+                    pass
+                if self._reg_xs_guess is None:
+                    xs_init = [x_now.copy() for _ in range(H + 1)]
+                    us_init = [self._hover_thrust_cmd() for _ in range(H)]
+                else:
+                    xs_init = self._reg_xs_guess
+                    us_init = self._reg_us_guess
+                    xs_init[0] = x_now.copy()
+                solver.solve(xs_init, us_init, self.mpc_max_iter)
+                u_opt = np.array(solver.us[0], dtype=float).copy()
+                self._capture_croc_mpc_diagnostics(solver)
+                self._reg_xs_guess = (
+                    [np.array(solver.xs[i + 1], dtype=float).copy() for i in range(H)]
+                    + [np.array(solver.xs[-1], dtype=float).copy()]
+                )
+                self._reg_xs_guess[0] = x_now.copy()
+                self._reg_us_guess = (
+                    [np.array(solver.us[i + 1], dtype=float).copy() for i in range(H - 1)]
+                    + [np.array(solver.us[-1], dtype=float).copy()]
+                )
+                self._mpc_xs_horizon = [np.array(x, dtype=float).copy() for x in solver.xs]
+                return u_opt, np.array(solver.xs[1], dtype=float).copy()
+            except Exception as e:
+                rospy.logwarn_throttle(1.0, f"[croc-ee-reg] regulate solve failed: {e}")
+                self._reg_xs_guess = None
+                self._reg_us_guess = None
+                self._mpc_xs_horizon = None
+                return None, None
+
+        try:
+            # croc_full_state regulation（croc_ee_pose 已走 EE shooting 分支）
+            prob = self.mpc_reg.build_shooting_problem_along_plan(
+                x_now,
+                self.x_nom,
+                t_reg[0],   # t_query = 0 → 全 horizon 均参考 x_tgt
+                t_reg,
+                x_reg,
+            )
+
+            solver = crocoddyl.SolverBoxFDDP(prob)
+            solver.convergence_init = 1e-9
+            solver.convergence_stop = 1e-7
+            try:
+                solver.setCallbacks([])
+            except Exception:
+                pass
+
+            # Warm start
+            if self._reg_xs_guess is None:
+                xs_init = [x_now.copy() for _ in range(H + 1)]
+                us_init = [self._hover_thrust_cmd() for _ in range(H)]
+            else:
+                xs_init = self._reg_xs_guess
+                us_init = self._reg_us_guess
+                xs_init[0] = x_now.copy()
+
+            solver.solve(xs_init, us_init, self.mpc_max_iter)
+
+            u_opt = np.array(solver.us[0], dtype=float).copy()
+            self._capture_croc_mpc_diagnostics(solver)
+
+            # Shift warm start
+            self._reg_xs_guess = (
+                [np.array(solver.xs[i + 1], dtype=float).copy() for i in range(H)]
+                + [np.array(solver.xs[-1], dtype=float).copy()]
+            )
+            self._reg_xs_guess[0] = x_now.copy()
+            self._reg_us_guess = (
+                [np.array(solver.us[i + 1], dtype=float).copy() for i in range(H - 1)]
+                + [np.array(solver.us[-1], dtype=float).copy()]
+            )
+
+            self._mpc_xs_horizon = [np.array(x, dtype=float).copy() for x in solver.xs]
+
+            xs_next = np.array(solver.xs[1], dtype=float).copy()
+            return u_opt, xs_next
+
+        except Exception as e:
+            rospy.logwarn_throttle(1.0, f"Regulate MPC solve failed: {e}")
+            self._reg_xs_guess = None
+            self._reg_us_guess = None
+            self._mpc_xs_horizon = None
+            return None, None
+
+    def _make_reg_target(
+        self,
+        x: float, y: float, z: float,
+        yaw_deg: float,
+        j1_deg: float, j2_deg: float,
+    ) -> np.ndarray:
+        """
+        将 (x, y, z, yaw_deg, j1_deg, j2_deg) 转为 MPC 全状态向量。
+        姿态：roll=0, pitch=0, yaw=yaw_deg；速度全为 0。
+        """
+        from tf.transformations import quaternion_from_euler
+        nq = self.mpc.nq
+        nv = self.mpc.nv
+        x_tgt = np.zeros(nq + nv, dtype=float)
+        x_tgt[0] = x
+        x_tgt[1] = y
+        x_tgt[2] = z
+        quat = quaternion_from_euler(0.0, 0.0, math.radians(yaw_deg))  # [qx,qy,qz,qw]
+        x_tgt[3:7] = quat
+        nj = self.arm_joint_number
+        if nj >= 1:
+            x_tgt[7]      = math.radians(j1_deg)
+        if nj >= 2:
+            x_tgt[7 + 1]  = math.radians(j2_deg)
+        return x_tgt
+
+    def _regulation_target_cb(self, msg) -> None:
+        """
+        接收来自 GUI 或外部工具的 regulation 目标。
+        Float64MultiArray.data = [x, y, z, yaw_deg, j1_deg, j2_deg]
+        目标更新后立即重置 warm-start 缓存，以便 MPC 重新规划。
+        """
+        if self.mpc is None:
+            return
+        d = list(msg.data)
+        if len(d) < 6:
+            rospy.logwarn(f"[regulation_target] 期望 6 个数值，收到 {len(d)}")
+            return
+        try:
+            new_target = self._make_reg_target(
+                x=float(d[0]), y=float(d[1]), z=float(d[2]),
+                yaw_deg=float(d[3]),
+                j1_deg=float(d[4]), j2_deg=float(d[5]),
+            )
+            self._reg_target    = new_target
+            self._reg_target_locked = True
+            self._reg_xs_guess  = None   # 目标改变，丢弃旧 warm-start
+            self._reg_us_guess  = None
+            # 未跟踪或已结束跟踪时立即生效；正在跟踪时等 stop / 轨迹完成后再切 regulation。
+            if not self.trajectory_started:
+                self._regulating = True
+            rospy.loginfo(
+                f"[regulation_target] 更新目标: "
+                f"x={d[0]:.2f} y={d[1]:.2f} z={d[2]:.2f} "
+                f"yaw={d[3]:.1f}° j1={d[4]:.1f}° j2={d[5]:.1f}°"
+                + (" (regulation 已激活)" if not self.trajectory_started else " (tracking 中，下次 stop 后生效)")
+            )
+        except Exception as e:
+            rospy.logerr(f"[regulation_target] 解析失败: {e}")
+
+    # =========================================================================
+    # PX4 / Geometric 高层参考发布
+    # =========================================================================
+
+    def _sample_ref_state(self, t_elapsed: float) -> np.ndarray:
+        t_query = float(self.t_plan[0]) + float(t_elapsed)
+        return interp_full_state_piecewise(
+            t_query, self.t_plan, self.x_plan, self.mpc.robot_model
+        )
+
+    def _linear_vel_world_from_state(self, x_ref: np.ndarray) -> np.ndarray:
+        nq = self.mpc.nq
+        vel_body = np.asarray(x_ref[nq : nq + 3], dtype=float)
+        quat = np.asarray(x_ref[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        return R @ vel_body
+
+    def _sample_ref_kinematics(
+        self, t_elapsed: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """
+        从 x_plan 插值采样高层参考：
+        pos_world, vel_world, acc_world, yaw。
+        """
+        x_ref = self._sample_ref_state(t_elapsed)
+        pos = np.asarray(x_ref[0:3], dtype=float).copy()
+        vel = self._linear_vel_world_from_state(x_ref)
+
+        if (
+            self.ddp_plan is not None
+            and isinstance(self.ddp_plan, np.ndarray)
+            and self.ddp_plan.ndim == 2
+            and self.ddp_plan.shape[0] == len(self.t_plan)
+            and self.ddp_plan.shape[1] == 3
+        ):
+            t_query = float(self.t_plan[0]) + float(t_elapsed)
+            tq = float(np.clip(t_query, float(self.t_plan[0]), float(self.t_plan[-1])))
+            acc = np.array(
+                [
+                    np.interp(tq, self.t_plan, self.ddp_plan[:, 0]),
+                    np.interp(tq, self.t_plan, self.ddp_plan[:, 1]),
+                    np.interp(tq, self.t_plan, self.ddp_plan[:, 2]),
+                ],
+                dtype=float,
+            )
+        else:
+            dt = max(float(self.dt_control), 1e-3)
+            t_prev = max(0.0, float(t_elapsed) - dt)
+            t_next = min(float(self.t_plan[-1] - self.t_plan[0]), float(t_elapsed) + dt)
+            if t_next > t_prev + 1e-6:
+                x_prev = self._sample_ref_state(t_prev)
+                x_next = self._sample_ref_state(t_next)
+                v_prev = self._linear_vel_world_from_state(x_prev)
+                v_next = self._linear_vel_world_from_state(x_next)
+                acc = (v_next - v_prev) / (t_next - t_prev)
+            else:
+                acc = np.zeros(3, dtype=float)
+
+        quat = np.asarray(x_ref[3:7], dtype=float)
+        yaw = float(euler_from_quaternion([quat[0], quat[1], quat[2], quat[3]])[2])
+        return pos, vel, acc, yaw
+
+    def _control_callback_high_level(self, t_elapsed: float) -> None:
+        if self._regulating:
+            self._update_takeoff_prep()
+            self._update_takeoff_sequence()
+            if not self._reg_target_locked:
+                self._reg_target = self._default_reg_target()
+            # PX4 / Geometric 下 regulation 使用常值目标（而非 Crocoddyl regulate 求解）
+            x_ref = np.asarray(self._reg_target, dtype=float).copy()
+            pos_ref = np.asarray(x_ref[0:3], dtype=float)
+            vel_ref = np.zeros(3, dtype=float)
+            acc_ref = np.zeros(3, dtype=float)
+            q_ref = np.asarray(x_ref[3:7], dtype=float)
+            yaw_ref = float(euler_from_quaternion([q_ref[0], q_ref[1], q_ref[2], q_ref[3]])[2])
+        else:
+            x_ref = self._sample_ref_state(t_elapsed)
+            pos_ref, vel_ref, acc_ref, yaw_ref = self._sample_ref_kinematics(t_elapsed)
+            if self.traj_finished:
+                vel_ref = np.zeros(3, dtype=float)
+                acc_ref = np.zeros(3, dtype=float)
+
+        self._step_l1_adaptive(ref_pos_world=np.asarray(pos_ref, dtype=float))
+        phase_hl = "regulation" if self._regulating else "tracking"
+        self._publish_dist_comp_state(phase_hl)
+
+        if self.controller_mode == "px4":
+            acc_out = np.asarray(acc_ref, dtype=float).copy()
+            if self._bolt_on_comp_active():
+                thrust_hover_N = max(self._robot_mass(), 1e-6) * 9.81
+                a_inj = self._injected_comp_accel_world(thrust_hover_N)
+                acc_out = acc_out + a_inj
+                self._l1_last_a_applied = np.asarray(acc_out, dtype=float).reshape(3)
+            elif self.l1_enabled:
+                thrust_hover_N = max(self._robot_mass(), 1e-6) * 9.81
+                self._l1_last_a_applied = self._l1_a_applied_for_predictor(thrust_hover_N)
+            if self.control_output_enabled:
+                self._publish_mavros_setpoint_raw(pos_ref, vel_ref, acc_out, yaw_ref, 0.0)
+        elif self.controller_mode == "geometric":
+            if self.control_output_enabled:
+                self._publish_geometric_bodyrate_thrust(pos_ref, vel_ref, acc_ref, yaw_ref)
+
+        # 机械臂维持参考轨迹角度
+        if self.arm_enabled and self.control_output_enabled:
+            self._publish_arm_cmd(x_ref)
+
+        if self._regulating:
+            self._publish_debug(t_elapsed, 0.0, x_ref_override=self._reg_target)
+        else:
+            self._publish_debug(t_elapsed, 0.0)
+        if self.trajectory_started:
+            self._append_uav_actual_path_point()
+            if self.arm_enabled:
+                self._append_ee_actual_path_point()
+        self._maybe_flush_viz_publishes(None)
+
+        if self.recording_enabled:
+            self._record(
+                t_elapsed,
+                np.zeros(self.mpc.nu, dtype=float),
+                x_ref,
+                0.0,
+            )
+            if self.controller_mode == "px4":
+                self.recorded_data["body_rate_commands"].append([0.0, 0.0, 0.0])
+                self.recorded_data["thrust_command"].append(0.0)
+
+    # =========================================================================
+    # L1 自适应增广（u = u_baseline + u_ac）
+    # =========================================================================
+
+    def _robot_mass(self) -> float:
+        return float(pin.computeTotalMass(self.mpc.robot_model))
+
+    def _body_to_world_vel(self) -> np.ndarray:
+        """世界系平动速度 (3,)。"""
+        nq = self.mpc.nq
+        v_body = np.asarray(self.state[nq : nq + 3], dtype=float)
+        quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        return R @ v_body
+
+    def _l1_predictor_accel(
+        self,
+        thrust_baseline_N: float,
+        a_ac: np.ndarray,
+    ) -> np.ndarray:
+        """L1 预测器输入：名义模型下“实际施加的比力加速度”（世界系, m/s²）。
+
+            a_applied = (T_actual / m) · b3_meas - g·e3
+
+        其中 T_actual = thrust_baseline_N + m·(a_ac·b3) 为 L1 竖直注入后的实际总
+        推力，b3_meas 为**当前测量姿态**的机体 z 轴。
+
+        为什么不再显式 “+ a_ac”（修复 xy 漂移/左右不对称的关键）
+        ────────────────────────────────────────────────────────
+        水平补偿 a_ac_xy 是靠**倾转机体**实现的，其效果已体现在测量姿态 b3_meas
+        里。若再显式 + a_ac，则水平通道被重复计入 → σ̂_xy 退化为自由积分器、失去
+        可观性，悬停时漂移且依赖飞行历史（左右不对称）。竖直注入推力不含在
+        baseline 推力中，故通过 T_actual 计入。如此 σ = a_real - a_applied 恰为
+        真实外部扰动，xy / z 通道一致且均可观。
+        """
+        quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        b3 = R[:, 2]
+        mass = max(self._robot_mass(), 1e-3)
+        a_ac = np.asarray(a_ac, dtype=float).reshape(3)
+        thrust_actual_N = float(thrust_baseline_N) + mass * float(np.dot(a_ac, b3))
+        return (thrust_actual_N / mass) * b3 - np.array([0.0, 0.0, 9.81], dtype=float)
+
+    def _compute_true_aero_drag(self, thrust_total_N: float) -> np.ndarray:
+        """重建 Gazebo gazebo_motor_model 的转子阻力真值（世界系, N）。
+
+            F_drag = -Cd · (Σ|ω_i|) · V_perp
+            Σ|ω_i| = sqrt(n · T / kf)         （n 个转子等分总推力的近似）
+            V_perp = (v_world - wind) - ((v_world - wind)·b3) b3
+
+        b3 为当前机体 z 轴（转子轴）在世界系的方向。这是平动气动扰动，
+        与 L1 估计的 σ̂（外部比力加速度）可直接对比。
+        """
+        v_world = self._body_to_world_vel()
+        v_rel = np.asarray(v_world, dtype=float).reshape(3) - self.aero_wind_world
+        quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        b3 = R[:, 2]
+        v_perp = v_rel - float(np.dot(v_rel, b3)) * b3
+        n_rot = max(int(self._n_rotors), 1)
+        kf = max(self.aero_motor_constant, 1e-12)
+        thrust = max(float(thrust_total_N), 0.0)
+        sum_omega = math.sqrt(n_rot * thrust / kf)
+        return -self.aero_rotor_drag_coeff * sum_omega * v_perp
+
+    def _rotation_world_for_dist_link(self, link: str) -> np.ndarray:
+        """扰动配置 link 的机体系 → 世界系旋转矩阵。"""
+        link_key = str(link).strip().lower()
+        if link_key in ("gripper_link", "gripper", "ee", "ee_link"):
+            if self.mpc.ee_frame_id is not None:
+                q = np.asarray(self.state[: self.mpc.nq], dtype=float)
+                data = self._viz_fk_data
+                pin.forwardKinematics(self.mpc.robot_model, data, q)
+                pin.updateFramePlacements(self.mpc.robot_model, data)
+                return np.asarray(data.oMf[self.mpc.ee_frame_id].rotation, dtype=float)
+        quat = np.asarray(self.state[3:7], dtype=float)
+        return quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+
+    def _read_oracle_wrench_world(self) -> np.ndarray:
+        """从 GUI 写入的 /suite_mpc/disturbance_config 读取 Gazebo 施加 wrench 真值（世界系）。"""
+        try:
+            from gazebo_disturbance_helper import DISTURBANCE_CONFIG_PARAM
+
+            cfg = rospy.get_param(DISTURBANCE_CONFIG_PARAM, None)
+            if not isinstance(cfg, dict) or not bool(cfg.get("active", False)):
+                return np.zeros(6, dtype=float)
+            force = np.asarray(cfg.get("force", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
+            torque = np.asarray(cfg.get("torque", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
+            frame = str(cfg.get("frame", "world")).strip().lower()
+            if frame == "link":
+                link = str(cfg.get("link", "base_link"))
+                R = self._rotation_world_for_dist_link(link)
+                force = R @ force
+                torque = R @ torque
+            return np.concatenate([force, torque])
+        except Exception:
+            return np.zeros(6, dtype=float)
+
+    def _pos_feedback_active(self) -> bool:
+        return bool(self.l1_use_pos_feedback)
+
+    def _dist_estimation_active(self) -> bool:
+        return bool(self.l1_dist_enabled)
+
+    def _dist_compensation_active(self) -> bool:
+        """扰动补偿（不含位置积分）：需 comp 开关 + 估计源。"""
+        if not self.l1_comp_enabled or not self.l1_dist_enabled:
+            return False
+        return bool(
+            self.l1_enabled or self.drag_ff_enabled or self.l1_mode == "oracle"
+        )
+
+    def _dist_wrench_for_mpc(self, thrust_baseline_N: float) -> np.ndarray:
+        """增广 MPC 用的世界系 base wrench 参数（6D）；仅 in-model 扰动补偿。"""
+        if str(self.l1_inject).lower() != "in_model" or not self._dist_compensation_active():
+            return np.zeros(6, dtype=float)
+        if self.l1_mode == "oracle":
+            return self._read_oracle_wrench_world()
+        if self.l1_enabled:
+            mass = max(self._robot_mass(), 1e-6)
+            sig = np.asarray(self._l1.sigma_hat, dtype=float).reshape(3)
+            w = np.zeros(6, dtype=float)
+            w[:3] = mass * sig
+            return w
+        if self.drag_ff_enabled:
+            w = np.zeros(6, dtype=float)
+            w[:3] = self._compute_true_aero_drag(float(thrust_baseline_N))
+            return w
+        return np.zeros(6, dtype=float)
+
+    def _bolt_on_comp_active(self) -> bool:
+        """bolt-on CTBR 是否需要注入补偿加速度（扰动补偿和/或位置积分）。"""
+        if str(self.l1_inject).lower() == "in_model":
+            # in-model 扰动走 MPC；位置积分仍经 CTBR bolt-on。
+            return self._pos_feedback_active()
+        if self._pos_feedback_active():
+            return True
+        return self._dist_compensation_active()
+
+    def _disturbance_accel_world(self, thrust_baseline_N: float) -> np.ndarray:
+        """扰动补偿加速度 a_l1（世界系），仅 l1_comp_enabled 时非零。"""
+        if not self._dist_compensation_active():
+            return np.zeros(3, dtype=float)
+        if str(self.l1_inject).lower() == "in_model":
+            return np.zeros(3, dtype=float)
+        if self.l1_mode == "oracle":
+            mass = max(self._robot_mass(), 1e-6)
+            f = self._read_oracle_wrench_world()[:3]
+            return -f / mass
+        if self.l1_enabled:
+            return np.asarray(self._l1.a_l1, dtype=float).reshape(3)
+        if self.drag_ff_enabled:
+            mass = max(self._robot_mass(), 1e-6)
+            f_drag = self._compute_true_aero_drag(float(thrust_baseline_N))
+            return -np.asarray(f_drag, dtype=float).reshape(3) / mass
+        return np.zeros(3, dtype=float)
+
+    def _position_feedback_accel_world(self) -> np.ndarray:
+        """位置误差积分通道 a_pos（世界系），独立于扰动估计/补偿。"""
+        if not self._pos_feedback_active():
+            return np.zeros(3, dtype=float)
+        return np.asarray(self._l1.a_pos, dtype=float).reshape(3)
+
+    def _compensation_accel_world(self, thrust_baseline_N: float) -> np.ndarray:
+        """bolt-on 注入的总补偿加速度 a_ac = a_dist + a_pos（世界系, m/s²）。"""
+        a_dist = self._disturbance_accel_world(thrust_baseline_N)
+        a_pos = self._position_feedback_accel_world()
+        a_total = a_dist + a_pos
+        p = self._l1.params
+        if p.max_accel_xy > 0.0:
+            a_total[0] = float(np.clip(a_total[0], -p.max_accel_xy, p.max_accel_xy))
+            a_total[1] = float(np.clip(a_total[1], -p.max_accel_xy, p.max_accel_xy))
+        if p.max_accel_z > 0.0:
+            a_total[2] = float(np.clip(a_total[2], -p.max_accel_z, p.max_accel_z))
+        return a_total
+
+    def _injected_comp_accel_world(self, thrust_baseline_N: float) -> np.ndarray:
+        """本拍实际注入控制器的补偿加速度（已门控，估计专用通道不含）。"""
+        return self._compensation_accel_world(thrust_baseline_N)
+
+    def _l1_a_applied_for_predictor(self, thrust_baseline_N: float) -> np.ndarray:
+        """L1 预测器输入：名义 MPC 推力 + 本拍**实际注入**的补偿（非内部 a_l1）。"""
+        a_inj = self._injected_comp_accel_world(thrust_baseline_N)
+        return self._l1_predictor_accel(thrust_baseline_N, a_inj)
+
+    def _clear_estimation_state(self, *, keep_pos_integral: bool = False) -> None:
+        """扰动估计关闭时将所有估计量恢复初值 0（位置积分可保留）。"""
+        self._l1_oracle_wrench[:] = 0.0
+        self._l1.sigma_hat[:] = 0.0
+        self._l1.a_l1[:] = 0.0
+        if hasattr(self._l1, "_a_l1_body"):
+            self._l1._a_l1_body[:] = 0.0
+        if not keep_pos_integral:
+            self._l1.pos_integral[:] = 0.0
+        if not self._pos_feedback_active():
+            self._l1.a_pos[:] = 0.0
+            self._l1.a_ac[:] = 0.0
+        elif not keep_pos_integral:
+            self._l1.a_ac[:] = np.asarray(self._l1.a_pos, dtype=float)
+
+    def _apply_l1_to_attitude_target(
+        self,
+        att_msg: AttitudeTarget,
+        thrust_baseline_N: float,
+    ) -> AttitudeTarget:
+        """更新 L1 预测器缓存并按需 bolt-on 注入 CTBR。"""
+        if not (
+            self.l1_enabled
+            or self._pos_feedback_active()
+            or self._dist_compensation_active()
+        ):
+            return att_msg
+        a_inj = self._injected_comp_accel_world(thrust_baseline_N)
+        self._l1_last_a_applied = self._l1_predictor_accel(thrust_baseline_N, a_inj)
+        return self._l1_augment_attitude_target(att_msg, a_inj)
+
+    def _baseline_accel_world(
+        self,
+        thrust_N: float,
+        quat: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Baseline 名义比力加速度（世界系, m/s²），**不含** L1 补偿：
+            a_nom = (T_b/m_nom)·b3 - g·e3
+        用于 L1 预测器；必须把 u_ac 与 u_b 分开，否则会把补偿误当作模型的一部分。
+        """
+        if quat is None:
+            quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        mass = max(self._robot_mass(), 1e-3)
+        return (float(thrust_N) / mass) * R[:, 2] - np.array(
+            [0.0, 0.0, 9.81], dtype=float
+        )
+
+    def _thrust_N_from_u(self, u: np.ndarray) -> float:
+        return float(np.sum(np.asarray(u[: self._n_rotors], dtype=float)))
+
+    def _thrust_N_from_normalized(self, thrust_norm: float) -> float:
+        return float(thrust_norm) * float(self.max_thrust_total)
+
+    def _body_to_attitude_target(
+        self,
+        roll_rate: float,
+        pitch_rate: float,
+        yaw_rate: float,
+        thrust_normalized: float,
+    ) -> AttitudeTarget:
+        att_msg = AttitudeTarget()
+        att_msg.header.stamp = rospy.Time.now()
+        att_msg.type_mask = AttitudeTarget.IGNORE_ATTITUDE
+        att_msg.body_rate = Vector3(
+            float(roll_rate), float(pitch_rate), float(yaw_rate)
+        )
+        att_msg.thrust = float(thrust_normalized)
+        return att_msg
+
+    def _l1_augment_attitude_target(
+        self,
+        att_msg: AttitudeTarget,
+        a_ac_world: np.ndarray,
+    ) -> AttitudeTarget:
+        """
+        将 L1 补偿加速度 a_ac（世界系）映射到 CTBR 指令：
+          • 推力增量 ΔT = m · a_ac_z_world（沿当前机体 z 轴在世界系的投影）
+          • 体角速度增量：由 a_ac 的横向分量驱动期望比力方向修正
+        """
+        if not self._bolt_on_comp_active() or a_ac_world is None:
+            return att_msg
+        a_ac = np.asarray(a_ac_world, dtype=float).reshape(3)
+        if not np.any(np.abs(a_ac) > 1e-9):
+            return att_msg
+
+        quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        mass = self._robot_mass()
+        b3 = R[:, 2]
+
+        thrust_N = self._thrust_N_from_normalized(float(att_msg.thrust))
+        thrust_N += float(mass * np.dot(a_ac, b3))
+        thrust_norm = float(
+            np.clip(
+                thrust_N / self.max_thrust_total,
+                self.min_thrust_cmd,
+                self.max_thrust_cmd,
+            )
+        )
+
+        a_des = a_ac.copy()
+        a_des[2] += 9.81
+        n_des = np.linalg.norm(a_des)
+        if n_des < 1e-6:
+            return self._body_to_attitude_target(
+                att_msg.body_rate.x,
+                att_msg.body_rate.y,
+                att_msg.body_rate.z,
+                thrust_norm,
+            )
+        b3_des = a_des / n_des
+        e_tilt = np.cross(b3, b3_des)
+        tilt_gain = float(self._l1.params.tilt_gain)
+        d_rate = tilt_gain * e_tilt
+        d_rate = np.clip(d_rate, -self.max_angular_velocity, self.max_angular_velocity)
+
+        return self._body_to_attitude_target(
+            float(att_msg.body_rate.x) + float(d_rate[0]),
+            float(att_msg.body_rate.y) + float(d_rate[1]),
+            float(att_msg.body_rate.z) + float(d_rate[2]),
+            thrust_norm,
+        )
+
+    def _l1_ref_pos_for_step(self, t_elapsed: float) -> Optional[np.ndarray]:
+        """位置误差积分用的参考位置（世界系）；独立于扰动估计开关。"""
+        if not self._pos_feedback_active():
+            return None
+        try:
+            if self._regulating:
+                return np.asarray(self._reg_target[0:3], dtype=float)
+            return self._sample_ref_kinematics(t_elapsed)[0]
+        except Exception:
+            return None
+
+    def _step_l1_adaptive(self, ref_pos_world: Optional[np.ndarray] = None) -> None:
+        """
+        每个控制周期：更新扰动估计（可选）与位置积分状态（可选）。
+
+        估计与补偿解耦（对齐数值仿真 comp_on / pos_fb_on）：
+          • l1_dist_enabled + adaptive → L1 预测器更新 σ̂（与 l1_comp_enabled 无关）
+          • l1_dist_enabled + oracle/drag_ff → 读真值或解析阻力（估计）
+          • l1_use_pos_feedback → 位置积分通道（与估计/补偿均独立）
+          • 实际注入由 _disturbance_accel_world / _position_feedback_accel_world 门控
+
+        ref_pos_world : 参考位置（世界系），供位置误差积分；None 则跳过积分更新。
+        """
+        if not self.l1_dist_enabled:
+            self._clear_estimation_state(keep_pos_integral=self._pos_feedback_active())
+            if not self._pos_feedback_active():
+                return
+        elif self.l1_mode == "oracle":
+            self._l1_oracle_wrench = self._read_oracle_wrench_world()
+
+        if not (self.l1_enabled or self._pos_feedback_active()):
+            return
+
+        pos_err = None
+        if self._pos_feedback_active() and ref_pos_world is not None:
+            pos_err = np.asarray(self.state[0:3], dtype=float) - np.asarray(
+                ref_pos_world, dtype=float
+            ).reshape(3)
+
+        v_world = self._body_to_world_vel()
+        thrust_N = self._thrust_baseline_N_for_dist()
+        a_applied = self._l1_a_applied_for_predictor(thrust_N)
+        self._l1.step(
+            self.dt_control,
+            v_world,
+            a_applied,
+            pos_err_world=pos_err,
+        )
+
+    def _thrust_baseline_N_for_dist(self) -> float:
+        if self._u_hold is not None:
+            try:
+                return float(np.sum(self._u_hold[: self._n_rotors]))
+            except Exception:
+                pass
+        return max(self._robot_mass(), 1e-6) * 9.81
+
+    def _collect_dist_comp_snapshot(self, phase: str) -> Dict[str, Any]:
+        """组装扰动估计 + 补偿状态（世界系）供 topic / GUI / 日志。"""
+        mass = max(self._robot_mass(), 1e-6)
+        thrust_N = self._thrust_baseline_N_for_dist()
+        inject = str(self.l1_inject).lower()
+        bolt_on = self._bolt_on_comp_active()
+        in_model = self._dist_compensation_active() and inject == "in_model"
+        wrench_mpc = self._dist_wrench_for_mpc(thrust_N)
+        a_dist = self._disturbance_accel_world(thrust_N)
+        a_pos = self._position_feedback_accel_world()
+        a_bolt = a_dist + a_pos
+
+        if not self._dist_estimation_active():
+            sigma = np.zeros(3, dtype=float)
+            wrench_est = np.zeros(6, dtype=float)
+            est_source = "none"
+        elif self.l1_mode == "oracle":
+            wrench_est = np.asarray(self._read_oracle_wrench_world(), dtype=float).reshape(6)
+            self._l1_oracle_wrench = wrench_est.copy()
+            sigma = wrench_est[:3] / mass
+            est_source = "oracle"
+        elif self.l1_mode == "drag_ff":
+            f_drag = self._compute_true_aero_drag(thrust_N)
+            wrench_est = np.zeros(6, dtype=float)
+            wrench_est[:3] = f_drag
+            sigma = f_drag / mass
+            est_source = "drag_ff"
+        elif self.l1_mode == "adaptive":
+            sigma = np.asarray(self._l1.sigma_hat, dtype=float).reshape(3)
+            wrench_est = np.zeros(6, dtype=float)
+            wrench_est[:3] = mass * sigma
+            est_source = "adaptive"
+        else:
+            sigma = np.zeros(3, dtype=float)
+            wrench_est = np.zeros(6, dtype=float)
+            est_source = "none"
+
+        force_est = wrench_est[:3].copy()
+        oracle_cfg = None
+        try:
+            from gazebo_disturbance_helper import DISTURBANCE_CONFIG_PARAM
+
+            oracle_cfg = rospy.get_param(DISTURBANCE_CONFIG_PARAM, None)
+        except Exception:
+            pass
+
+        return {
+            "phase": str(phase),
+            "controller_mode": str(self.controller_mode),
+            "dist_enabled": bool(self.l1_dist_enabled),
+            "comp_enabled": bool(self.l1_comp_enabled),
+            "l1_mode": str(self.l1_mode),
+            "l1_inject": inject,
+            "l1_enabled": bool(self.l1_enabled),
+            "drag_ff_enabled": bool(self.drag_ff_enabled),
+            "l1_use_pos_feedback": bool(self.l1_use_pos_feedback),
+            "arm_ee_compensate": bool(self.arm_ee_compensate),
+            "flags": {
+                "dist_enabled": bool(self.l1_dist_enabled),
+                "comp_enabled": bool(self.l1_comp_enabled),
+                "pos_fb_active": bool(self._pos_feedback_active()),
+                "dist_comp_active": bool(self._dist_compensation_active()),
+                "bolt_on_active": bool(bolt_on),
+                "in_model_active": bool(in_model),
+                "arm_ee_compensate": bool(
+                    self.arm_ee_compensate and self._regulating and self.arm_enabled
+                ),
+            },
+            "estimation": {
+                "source": est_source,
+                "sigma_world": [round(float(x), 5) for x in sigma],
+                "accel_world": [round(float(x), 5) for x in sigma],
+                "force_world": [round(float(x), 4) for x in force_est],
+                "wrench_world": [round(float(x), 4) for x in wrench_est],
+                "force_norm": round(float(np.linalg.norm(force_est)), 4),
+            },
+            "compensation": {
+                "accel_bolt_on": [round(float(x), 5) for x in a_bolt],
+                "accel_dist": [round(float(x), 5) for x in a_dist],
+                "accel_pos": [round(float(x), 5) for x in a_pos],
+                "accel_norm": round(float(np.linalg.norm(a_bolt)), 5),
+                "wrench_in_model": [round(float(x), 4) for x in wrench_mpc],
+                "a_l1": [round(float(x), 5) for x in a_dist],
+                "a_pos": [round(float(x), 5) for x in a_pos],
+            },
+            "oracle": {
+                "config_active": bool(
+                    isinstance(oracle_cfg, dict) and oracle_cfg.get("active", False)
+                ),
+                "wrench_world": [round(float(x), 4) for x in wrench_est]
+                if est_source == "oracle"
+                else [0.0] * 6,
+            },
+        }
+
+    def _publish_dist_comp_state(self, phase: str) -> None:
+        """发布 /suite_mpc/dist_comp/* 与兼容 /suite_mpc/l1_debug。"""
+        try:
+            snap = self._collect_dist_comp_snapshot(phase)
+            pub = getattr(self, "_dist_comp_ros_pub", None)
+            if pub is not None:
+                pub.publish(snap)
+
+            from std_msgs.msg import String as _StringMsg
+
+            est = snap.get("estimation") or {}
+            comp = snap.get("compensation") or {}
+            sig = est.get("sigma_world", [0.0, 0.0, 0.0])
+            a_ac = comp.get("accel_bolt_on", [0.0, 0.0, 0.0])
+            legacy = {
+                "enabled": bool(snap.get("l1_enabled")),
+                "dist_enabled": bool(snap.get("dist_enabled")),
+                "comp_enabled": bool(snap.get("comp_enabled")),
+                "l1_mode": snap.get("l1_mode"),
+                "l1_inject": snap.get("l1_inject"),
+                "sigma_x": sig[0] if len(sig) > 0 else 0.0,
+                "sigma_y": sig[1] if len(sig) > 1 else 0.0,
+                "sigma_z": sig[2] if len(sig) > 2 else 0.0,
+                "sigma_norm": float(np.linalg.norm(sig)),
+                "a_ac_x": a_ac[0] if len(a_ac) > 0 else 0.0,
+                "a_ac_y": a_ac[1] if len(a_ac) > 1 else 0.0,
+                "a_ac_z": a_ac[2] if len(a_ac) > 2 else 0.0,
+                "a_ac_norm": float(comp.get("accel_norm", 0.0)),
+                "dist_force_N": float(est.get("force_norm", 0.0)),
+                "est_source": est.get("source"),
+                "bolt_on_active": bool((snap.get("flags") or {}).get("bolt_on_active")),
+                "in_model_active": bool((snap.get("flags") or {}).get("in_model_active")),
+            }
+            self.l1_debug_pub.publish(_StringMsg(data=json.dumps(legacy)))
+            if self.l1_dist_enabled:
+                est = snap.get("estimation") or {}
+                rospy.loginfo_throttle(
+                    5.0,
+                    "[dist_comp] phase=%s est=%s |F|=%.2fN comp=%s bolt=%s in_model=%s",
+                    phase,
+                    est.get("source", "?"),
+                    float(est.get("force_norm", 0.0)),
+                    "on" if snap.get("comp_enabled") else "off",
+                    bool((snap.get("flags") or {}).get("bolt_on_active")),
+                    bool((snap.get("flags") or {}).get("in_model_active")),
+                )
+        except Exception as e:
+            rospy.logdebug_throttle(5.0, f"[dist_comp] publish error: {e}")
+
+    def _publish_l1_debug(self, a_ac_world: np.ndarray) -> None:
+        """兼容旧接口；实际发布由 _publish_dist_comp_state 统一完成。"""
+        del a_ac_world
+
+    def _apply_l1_params_from_dict(self, cfg: dict) -> None:
+        """从 controller_update_data 或 ROS param 更新 L1 / 扰动补偿参数。"""
+        prev_mode = str(self.l1_mode)
+        prev_inject = str(self.l1_inject).lower()
+        prev_dist = bool(self.l1_dist_enabled)
+        prev_comp = bool(self.l1_comp_enabled)
+        if "l1_dist_enabled" in cfg:
+            self.l1_dist_enabled = bool(cfg["l1_dist_enabled"])
+        elif "l1_enabled" in cfg and "l1_mode" not in cfg:
+            # 旧 GUI：l1_enabled 即总开关且为 adaptive
+            self.l1_dist_enabled = bool(cfg["l1_enabled"])
+        if "l1_mode" in cfg:
+            mode = str(cfg["l1_mode"]).strip().lower()
+            if mode in ("adaptive", "oracle", "drag_ff"):
+                self.l1_mode = mode
+        if "l1_comp_enabled" in cfg:
+            self.l1_comp_enabled = bool(cfg["l1_comp_enabled"])
+        if "l1_inject" in cfg:
+            inj = str(cfg["l1_inject"]).strip().lower()
+            if inj in ("bolt_on", "in_model"):
+                self.l1_inject = inj
+        if "drag_ff_enabled" in cfg:
+            self.drag_ff_enabled = bool(cfg["drag_ff_enabled"])
+        self.l1_enabled = bool(self.l1_dist_enabled and self.l1_mode == "adaptive")
+        if self.l1_dist_enabled and self.l1_mode == "drag_ff":
+            self.drag_ff_enabled = True
+        elif self.l1_mode != "drag_ff" and "drag_ff_enabled" not in cfg:
+            if self.l1_enabled:
+                self.drag_ff_enabled = False
+        if self.l1_enabled and self.drag_ff_enabled:
+            self.drag_ff_enabled = False
+        if self.l1_mode == "oracle":
+            self.l1_enabled = False
+            self.drag_ff_enabled = False
+        if "l1_use_pos_feedback" in cfg:
+            self.l1_use_pos_feedback = bool(cfg["l1_use_pos_feedback"])
+        if "arm_ee_compensate" in cfg:
+            prev_arm_ee = bool(self.arm_ee_compensate)
+            self.arm_ee_compensate = bool(cfg["arm_ee_compensate"])
+            if prev_arm_ee != self.arm_ee_compensate:
+                self._arm_jdes_prev = None
+                rospy.loginfo(
+                    "[arm_ee] null-space IK compensation %s (regulation / hover only)",
+                    "ON" if self.arm_ee_compensate else "OFF",
+                )
+        self._l1.update_params(
+            enabled=self.l1_enabled,
+            as_gain=cfg.get("l1_as_gain", self.l1_as_gain),
+            wc_xy=cfg.get("l1_wc_xy", self.l1_wc_xy),
+            wc_z=cfg.get("l1_wc_z", self.l1_wc_z),
+            tilt_gain=cfg.get("l1_tilt_gain", self.l1_tilt_gain),
+            max_accel_xy=cfg.get("l1_max_accel_xy", self.l1_max_accel_xy),
+            max_accel_z=cfg.get("l1_max_accel_z", self.l1_max_accel_z),
+            max_sigma=cfg.get("l1_max_sigma", self.l1_max_sigma),
+            use_pos_feedback=self.l1_use_pos_feedback,
+            k_pos_i_xy=cfg.get("l1_k_pos_i_xy", self.l1_k_pos_i_xy),
+            k_pos_i_z=cfg.get("l1_k_pos_i_z", self.l1_k_pos_i_z),
+            max_pos_integral_xy=cfg.get("l1_max_pos_integral", self.l1_max_pos_integral),
+            max_pos_integral_z=cfg.get("l1_max_pos_integral", self.l1_max_pos_integral),
+        )
+        p = self._l1.params
+        self.l1_as_gain = p.as_gain
+        self.l1_wc_xy = p.wc_xy
+        self.l1_wc_z = p.wc_z
+        self.l1_tilt_gain = p.tilt_gain
+        self.l1_max_accel_xy = p.max_accel_xy
+        self.l1_max_accel_z = p.max_accel_z
+        self.l1_max_sigma = p.max_sigma
+        self.l1_k_pos_i_xy = p.k_pos_i_xy
+        self.l1_k_pos_i_z = p.k_pos_i_z
+        self.l1_max_pos_integral = p.max_pos_integral_xy
+        mode_changed = prev_mode != str(self.l1_mode)
+        inject_changed = prev_inject != str(self.l1_inject).lower()
+        dist_turned_off = prev_dist and not self.l1_dist_enabled
+        dist_turned_on = (not prev_dist) and self.l1_dist_enabled
+        if dist_turned_off or dist_turned_on or mode_changed or inject_changed:
+            self._clear_estimation_state(keep_pos_integral=self._pos_feedback_active())
+        if dist_turned_on or dist_turned_off:
+            rospy.loginfo(
+                "[L1] disturbance estimation %s (mode=%s, comp=%s)",
+                "ON" if self.l1_dist_enabled else "OFF",
+                self.l1_mode,
+                "on" if self.l1_comp_enabled else "off",
+            )
+        comp_turned_on = (not prev_comp) and self.l1_comp_enabled
+        comp_turned_off = prev_comp and not self.l1_comp_enabled
+        if comp_turned_on or comp_turned_off:
+            rospy.loginfo(
+                "[L1] disturbance compensation %s (est=%s, mode=%s)",
+                "ON" if self.l1_comp_enabled else "OFF",
+                "on" if self.l1_dist_enabled else "off",
+                self.l1_mode,
+            )
+        self._l1.set_enabled(self.l1_enabled)
+        if dist_turned_on or mode_changed or inject_changed:
+            if self.l1_enabled:
+                self._l1.reset(self._body_to_world_vel())
+                self._l1_last_a_applied = np.zeros(3, dtype=float)
+            elif mode_changed and prev_mode == "adaptive":
+                self._l1.reset(self._body_to_world_vel())
+                self._l1_last_a_applied = np.zeros(3, dtype=float)
+        if self.l1_dist_enabled and self.l1_mode == "oracle":
+            self._l1_oracle_wrench = self._read_oracle_wrench_world()
+        try:
+            rospy.set_param("~l1_mode", str(self.l1_mode))
+            rospy.set_param("~l1_inject", str(self.l1_inject))
+            rospy.set_param("~l1_dist_enabled", bool(self.l1_dist_enabled))
+            rospy.set_param("~l1_comp_enabled", bool(self.l1_comp_enabled))
+        except Exception:
+            pass
+        if mode_changed or inject_changed:
+            rospy.loginfo(
+                "[L1] mode %s→%s inject %s→%s dist=%s comp=%s",
+                prev_mode,
+                self.l1_mode,
+                prev_inject,
+                self.l1_inject,
+                self.l1_dist_enabled,
+                self.l1_comp_enabled,
+            )
+
+    def _bodyrate_from_horizon(
+        self, xs_next: Optional[np.ndarray]
+    ) -> Optional[np.ndarray]:
+        """按 bodyrate_lookahead 从已解 MPC horizon 插值得到体角速度指令 (3,)。
+
+        horizon 状态在时间 0, dt_mpc, 2·dt_mpc, ... 处；取 t = bodyrate_lookahead_s
+        处的体角速度，按相邻离散点线性插值。lookahead = dt_mpc 时退化为 xs[1]
+        （原行为）；lookahead = 0 取 xs[0]（当前步）。MPC 本身（dt_mpc/horizon）不变。
+
+        horizon 不可用时回退到 xs_next（即 xs[1]）；再不行返回 None 交由上层用参考态。
+        """
+        nq = self.mpc.nq
+
+        def _rates(x: np.ndarray) -> np.ndarray:
+            return np.array(
+                [float(x[nq + 3]), float(x[nq + 4]), float(x[nq + 5])], dtype=float
+            )
+
+        xs = self._mpc_xs_horizon
+        dt = float(self.dt_mpc)
+        look = float(self.bodyrate_lookahead_s)
+
+        if xs is None or len(xs) < 2 or dt <= 1e-9:
+            if xs_next is not None and xs_next.size >= nq + 6:
+                return _rates(xs_next)
+            return None
+
+        n_seg = len(xs) - 1                      # 离散段数 N
+        s = look / dt                            # 连续索引（lookahead 对应的格点位置）
+        s = min(max(s, 0.0), float(n_seg))
+        i0 = int(math.floor(s))
+        if i0 >= n_seg:
+            i0 = n_seg - 1
+        frac = s - float(i0)
+        if xs[i0].size < nq + 6 or xs[i0 + 1].size < nq + 6:
+            if xs_next is not None and xs_next.size >= nq + 6:
+                return _rates(xs_next)
+            return None
+        return (1.0 - frac) * _rates(xs[i0]) + frac * _rates(xs[i0 + 1])
+
+    def _publish_body_rate_thrust(
+        self,
+        u: np.ndarray,
+        xs_next: Optional[np.ndarray],
+    ):
+        """
+        将 Crocoddyl MPC 控制量 u=[T1..T4, tau_j1, tau_j2] 转换并发布：
+        - 总推力归一化 → att_msg.thrust
+        - MPC 规划的下一时刻 body angular rate → att_msg.body_rate
+        """
+        if u is None:
+            u = self._hover_thrust_cmd()
+        nq = self.mpc.nq
+
+        # ── 总推力 ─────────────────────────────────────────────────────────
+        total_thrust_N = float(np.sum(u[: self._n_rotors]))
+        thrust_normalized = np.clip(
+            total_thrust_N / self.max_thrust_total,
+            self.min_thrust_cmd,
+            self.max_thrust_cmd,
+        )
+
+        # ── Body angular rate（按 bodyrate_lookahead 从 MPC horizon 插值）─────
+        # s500: nq+nv = 13, body rates 在 [nq+3 : nq+6]。lookahead 默认 = dt_mpc，
+        # 退化为原来的 xs[1]；可经参数调小以减小前瞻相位（MPC 本身不变）。
+        rates = self._bodyrate_from_horizon(xs_next)
+        if rates is not None:
+            roll_rate = float(rates[0])
+            pitch_rate = float(rates[1])
+            yaw_rate = float(rates[2])
+        else:
+            # 若 MPC 求解失败，用上一次的参考状态估算
+            t_query = 0.0
+            if self.trajectory_started and self.controller_start_time is not None:
+                t_query = (rospy.Time.now() - self.controller_start_time).to_sec()
+            x_ref = interp_full_state_piecewise(
+                float(self.t_plan[0]) + t_query, self.t_plan, self.x_plan, self.mpc.robot_model
+            )
+            roll_rate = float(x_ref[nq + 3])
+            pitch_rate = float(x_ref[nq + 4])
+            yaw_rate = float(x_ref[nq + 5])
+
+        # 限幅
+        roll_rate = float(np.clip(roll_rate, -self.max_angular_velocity, self.max_angular_velocity))
+        pitch_rate = float(np.clip(pitch_rate, -self.max_angular_velocity, self.max_angular_velocity))
+        yaw_rate = float(np.clip(yaw_rate, -self.max_angular_velocity, self.max_angular_velocity))
+
+        att_msg = self._body_to_attitude_target(
+            roll_rate, pitch_rate, yaw_rate, thrust_normalized
+        )
+        thrust_baseline_N = self._thrust_N_from_normalized(thrust_normalized)
+        att_msg = self._apply_l1_to_attitude_target(att_msg, thrust_baseline_N)
+
+        if self.recording_enabled:
+            self.recorded_data["body_rate_commands"].append(
+                [float(att_msg.body_rate.x), float(att_msg.body_rate.y), float(att_msg.body_rate.z)]
+            )
+            self.recorded_data["thrust_command"].append(float(att_msg.thrust))
+
+        self.body_rate_thrust_pub.publish(att_msg)
+
+    def _publish_mavros_setpoint_raw(
+        self,
+        pos_world: np.ndarray,
+        vel_world: np.ndarray,
+        acc_world: np.ndarray,
+        yaw: float,
+        yaw_rate: float,
+    ) -> None:
+        msg = PositionTarget()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "map"
+        msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        msg.type_mask = PositionTarget.IGNORE_YAW_RATE
+        msg.position = Point(float(pos_world[0]), float(pos_world[1]), float(pos_world[2]))
+        msg.velocity.x = float(vel_world[0])
+        msg.velocity.y = float(vel_world[1])
+        msg.velocity.z = float(vel_world[2])
+        msg.acceleration_or_force.x = float(acc_world[0])
+        msg.acceleration_or_force.y = float(acc_world[1])
+        msg.acceleration_or_force.z = float(acc_world[2])
+        msg.yaw = float(yaw)
+        msg.yaw_rate = float(yaw_rate)
+        self.mavros_setpoint_raw_pub.publish(msg)
+
+    def _publish_reference_yaw(self, yaw: float) -> None:
+        yaw_msg = Float32()
+        yaw_msg.data = float(yaw)
+        self.yaw_pub.publish(yaw_msg)
+
+    @staticmethod
+    def _vee(M: np.ndarray) -> np.ndarray:
+        return np.array([M[2, 1], M[0, 2], M[1, 0]], dtype=float)
+
+    def _publish_geometric_bodyrate_thrust(
+        self,
+        pos_ref: np.ndarray,
+        vel_ref: np.ndarray,
+        acc_ref: np.ndarray,
+        yaw_ref: float,
+    ) -> None:
+        """
+        内置 geometric controller:
+          (p,v) 误差 -> 期望加速度 -> 期望姿态 -> body rate + thrust。
+        """
+        nq = self.mpc.nq
+        p = np.asarray(self.state[0:3], dtype=float)
+        v_body = np.asarray(self.state[nq : nq + 3], dtype=float)
+        quat = np.asarray(self.state[3:7], dtype=float)
+        R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+        v = R @ v_body
+
+        e_p = p - np.asarray(pos_ref, dtype=float)
+        e_v = v - np.asarray(vel_ref, dtype=float)
+        e3 = np.array([0.0, 0.0, 1.0], dtype=float)
+        a_des = (
+            np.asarray(acc_ref, dtype=float)
+            - self.geo_kp_pos * e_p
+            - self.geo_kd_vel * e_v
+            + 9.81 * e3
+        )
+
+        # 倾角限幅
+        a_xy = np.linalg.norm(a_des[:2])
+        a_z = max(1e-3, float(a_des[2]))
+        tilt = math.atan2(a_xy, a_z)
+        tilt_max = math.radians(max(1.0, self.geo_max_tilt_deg))
+        if tilt > tilt_max and a_xy > 1e-6:
+            scale = math.tan(tilt_max) * a_z / a_xy
+            a_des[0] *= scale
+            a_des[1] *= scale
+
+        if np.linalg.norm(a_des) < 1e-6:
+            a_des = 9.81 * e3
+        b3_des = a_des / np.linalg.norm(a_des)
+        b1_yaw = np.array([math.cos(yaw_ref), math.sin(yaw_ref), 0.0], dtype=float)
+        b2_des = np.cross(b3_des, b1_yaw)
+        n_b2 = np.linalg.norm(b2_des)
+        if n_b2 < 1e-6:
+            b2_des = np.array([-math.sin(yaw_ref), math.cos(yaw_ref), 0.0], dtype=float)
+        else:
+            b2_des /= n_b2
+        b1_des = np.cross(b2_des, b3_des)
+        R_des = np.column_stack([b1_des, b2_des, b3_des])
+
+        e_R_mat = 0.5 * (R_des.T @ R - R.T @ R_des)
+        e_R = self._vee(e_R_mat)
+        omega = np.asarray(self.state[nq + 3 : nq + 6], dtype=float)
+        rate_cmd = -self.geo_kR * e_R - self.geo_kOmega * omega
+        rate_cmd = np.clip(rate_cmd, -self.max_angular_velocity, self.max_angular_velocity)
+
+        mass = float(pin.computeTotalMass(self.mpc.robot_model))
+        thrust_N = float(mass * np.dot(a_des, R[:, 2]))
+        thrust_cmd = float(
+            np.clip(thrust_N / self.max_thrust_total, self.min_thrust_cmd, self.max_thrust_cmd)
+        )
+
+        att_msg = self._body_to_attitude_target(
+            float(rate_cmd[0]), float(rate_cmd[1]), float(rate_cmd[2]), thrust_cmd
+        )
+        thrust_baseline_N = self._thrust_N_from_normalized(thrust_cmd)
+        att_msg = self._apply_l1_to_attitude_target(att_msg, thrust_baseline_N)
+
+        self.body_rate_thrust_pub.publish(att_msg)
+        self._publish_reference_yaw(float(yaw_ref))
+
+        if self.recording_enabled:
+            self.recorded_data["body_rate_commands"].append(
+                [float(att_msg.body_rate.x), float(att_msg.body_rate.y), float(att_msg.body_rate.z)]
+            )
+            self.recorded_data["thrust_command"].append(float(att_msg.thrust))
+
+    def _publish_arm_cmd(self, xs_next: Optional[np.ndarray]):
+        """
+        根据 arm_control_mode 发布关节指令。
+        默认：位置参考 = MPC 规划下一时刻状态 xs[1] 的关节角。
+        悬停 regulation + arm_ee_compensate：零空间 IK 跟踪 reg 目标 EE 世界位置。
+        """
+        from std_msgs.msg import Float64
+
+        nj = self.arm_joint_number
+        ref_j = None
+        ref_jdot = np.zeros(nj, dtype=float)
+
+        use_ee_ik = bool(
+            self.arm_ee_compensate
+            and self.arm_enabled
+            and self._regulating
+            and nj >= 1
+            and self.mpc is not None
+            and self.mpc.ee_frame_id is not None
+        )
+        if use_ee_ik:
+            p_ee_des = self._hover_ee_des_world()
+            if p_ee_des is not None:
+                j_ik = self._arm_joints_nullspace_ik(p_ee_des)
+                if j_ik is not None:
+                    ref_j = np.asarray(j_ik, dtype=float).reshape(nj)
+                    dt = float(self.dt_control) if self.dt_control > 1e-6 else 0.004
+                    if self._arm_jdes_prev is not None and ref_j.size == self._arm_jdes_prev.size:
+                        ref_jdot = np.clip(
+                            (ref_j - self._arm_jdes_prev) / dt,
+                            -self.arm_ee_jdot_max,
+                            self.arm_ee_jdot_max,
+                        )
+                    self._arm_jdes_prev = ref_j.copy()
+        elif self.arm_ee_compensate and self.arm_enabled and not self._regulating:
+            rospy.logdebug_throttle(
+                5.0,
+                "[arm_ee] null-space IK active only in regulation/hover; using MPC joint ref",
+            )
+            self._arm_jdes_prev = None
+
+        if ref_j is None:
+            self._arm_jdes_prev = None
+            if xs_next is not None and xs_next.size >= 7 + nj:
+                ref_j = xs_next[7 : 7 + nj]
+                if xs_next.size >= 7 + nj + 6 + nj:
+                    ref_jdot = xs_next[7 + nj + 6 : 7 + nj + 6 + nj]
+            else:
+                t_elapsed = 0.0
+                if self.trajectory_started and self.controller_start_time is not None:
+                    t_elapsed = (rospy.Time.now() - self.controller_start_time).to_sec()
+                x_ref = interp_full_state_piecewise(
+                    float(self.t_plan[0]) + t_elapsed,
+                    self.t_plan,
+                    self.x_plan,
+                    self.mpc.robot_model,
+                )
+                ref_j = x_ref[7 : 7 + nj]
+                ref_jdot = np.zeros(nj, dtype=float)
+
+        joint_msg = JointState()
+        joint_msg.header.stamp = rospy.Time.now()
+        joint_msg.name = [f"joint_{i+1}" for i in range(nj)]
+
+        if self.arm_control_mode == "position":
+            joint_msg.position = list(ref_j)
+            joint_msg.velocity = [0.0] * nj
+            joint_msg.effort = [0.0] * nj
+        elif self.arm_control_mode == "position_velocity":
+            joint_msg.position = list(ref_j)
+            joint_msg.velocity = list(ref_jdot)
+            joint_msg.effort = [0.0] * nj
+        elif self.arm_control_mode == "velocity":
+            joint_msg.position = [0.0] * nj
+            joint_msg.velocity = list(ref_jdot)
+            joint_msg.effort = [0.0] * nj
+        else:
+            joint_msg.position = list(ref_j)
+            joint_msg.velocity = [0.0] * nj
+            joint_msg.effort = [0.0] * nj
+
+        self.arm_control_pub.publish(joint_msg)
+
+        # 仿真单关节话题
+        if self.use_simulation and nj >= 2:
+            from std_msgs.msg import Float64 as F64
+            self.joint1_pub.publish(F64(float(ref_j[0])))
+            self.joint2_pub.publish(F64(float(ref_j[1])))
+
+        if self.recording_enabled:
+            self.recorded_data["arm_joint_commands"].append(list(ref_j))
+
+    def _full_state_to_pin_q(self, x_full: np.ndarray) -> np.ndarray:
+        nq = self.mpc.nq
+        return np.asarray(x_full[:nq], dtype=float).reshape(nq)
+
+    def _ee_world_from_full_state(self, x_full: np.ndarray) -> Optional[np.ndarray]:
+        if self.mpc is None or self.mpc.ee_frame_id is None or not self.arm_enabled:
+            return None
+        try:
+            q = self._full_state_to_pin_q(x_full)
+            return ee_position_world(
+                self.mpc.robot_model,
+                self._viz_fk_data,
+                int(self.mpc.ee_frame_id),
+                q,
+            )
+        except Exception as e:
+            rospy.logdebug_throttle(2.0, f"[arm_ee] EE FK failed: {e}")
+            return None
+
+    def _hover_ee_des_world(self) -> Optional[np.ndarray]:
+        """Regulation 目标全状态对应的 EE 世界位置。"""
+        if self._reg_target is None:
+            return None
+        return self._ee_world_from_full_state(self._reg_target)
+
+    def _arm_joints_nullspace_ik(self, p_ee_des_world: np.ndarray) -> Optional[np.ndarray]:
+        """实际 base 位姿下，求臂关节使 EE 世界位置逼近 p_ee_des_world。"""
+        from tf.transformations import quaternion_matrix
+
+        if self.mpc is None or self.mpc.ee_frame_id is None:
+            return None
+        try:
+            x = np.asarray(self.state, dtype=float).flatten()
+            nj = self.arm_joint_number
+            p = x[0:3]
+            quat = x[3:7]
+            j0 = x[7 : 7 + nj]
+            R = quaternion_matrix([quat[0], quat[1], quat[2], quat[3]])[:3, :3]
+            target_local = R.T @ (np.asarray(p_ee_des_world, dtype=float).reshape(3) - p)
+            j_des, resid = solve_arm_ik_plane2r(
+                self.mpc.robot_model,
+                int(self.mpc.ee_frame_id),
+                target_local,
+                j0=j0,
+                data=self._viz_fk_data,
+            )
+            if float(np.linalg.norm(resid)) > 0.05:
+                rospy.logdebug_throttle(
+                    2.0,
+                    "[arm_ee] IK residual local=%.3f m (y 向不可达时正常)",
+                    float(np.linalg.norm(resid)),
+                )
+            return j_des
+        except Exception as e:
+            rospy.logwarn_throttle(2.0, f"[arm_ee] IK failed: {e}")
+            return None
+
+    def _update_tracking_error(self, x_ref: np.ndarray) -> None:
+        """根据当前参考 x_ref 计算位置(三轴/总)与 yaw 跟踪误差，供 stats 显示。"""
+        try:
+            x_ref = np.asarray(x_ref, dtype=float).flatten()
+            s = np.asarray(self.state, dtype=float).flatten()
+            err_xyz = s[0:3] - x_ref[0:3]
+            self._track_err_xyz = err_xyz
+            self._track_err_pos = float(np.linalg.norm(err_xyz))
+            _, _, yaw_s = euler_from_quaternion([s[3], s[4], s[5], s[6]])
+            _, _, yaw_r = euler_from_quaternion(
+                [x_ref[3], x_ref[4], x_ref[5], x_ref[6]]
+            )
+            dyaw = math.atan2(math.sin(yaw_s - yaw_r), math.cos(yaw_s - yaw_r))
+            self._track_err_yaw_deg = math.degrees(dyaw)
+        except Exception:
+            pass
+
+    def _update_ee_tracking_error(self, x_ref: np.ndarray) -> None:
+        """EE 世界位置跟踪误差（actual − ref）。"""
+        try:
+            if not self.arm_enabled or self.mpc.ee_frame_id is None:
+                self._track_err_ee_xyz = np.zeros(3, dtype=float)
+                self._track_err_ee_pos = 0.0
+                return
+            p_act = self._ee_world_from_full_state(self.state)
+            p_ref = self._ee_world_from_full_state(x_ref)
+            if p_act is None or p_ref is None:
+                return
+            err = np.asarray(p_act, dtype=float).reshape(3) - np.asarray(p_ref, dtype=float).reshape(3)
+            self._track_err_ee_xyz = err
+            self._track_err_ee_pos = float(np.linalg.norm(err))
+        except Exception:
+            pass
+
+    def _capture_acados_mpc_diagnostics(self, mpc_obj, status: int) -> None:
+        """Store solver stats + acados cost breakdown for PlotJuggler topics."""
+        self._last_mpc_iters = int(getattr(mpc_obj, "last_sqp_iter", 0))
+        self._last_mpc_qp_iters = int(getattr(mpc_obj, "last_qp_iter", 0))
+        self._last_mpc_status = int(status)
+        self._last_mpc_cost = float(getattr(mpc_obj, "last_cost", float("nan")))
+        self._mpc_debug_backend = "acados"
+        self._mpc_debug_cpu_ms = float(getattr(mpc_obj, "last_cpu_time_ms", float("nan")))
+        from mpc_ros_debug_pub import pack_acados_cost
+
+        terms = dict(getattr(mpc_obj, "last_cost_terms", None) or {})
+        self._mpc_debug_cost_unified, self._mpc_debug_cost_detail = pack_acados_cost(
+            terms, self._last_mpc_cost
+        )
+
+    def _capture_croc_mpc_diagnostics(self, solver) -> None:
+        """Store solver stats + crocoddyl cost breakdown for PlotJuggler topics."""
+        self._last_mpc_iters = int(getattr(solver, "iter", 0))
+        self._last_mpc_qp_iters = 0
+        self._last_mpc_status = 0
+        self._last_mpc_cost = float(getattr(solver, "cost", float("nan")))
+        self._mpc_debug_backend = "crocoddyl"
+        self._mpc_debug_cpu_ms = float("nan")
+        from mpc_ros_debug_pub import pack_croc_cost
+        from s500_uam_crocoddyl_state_tracking_mpc import _extract_solver_cost_terms
+
+        try:
+            terms, groups, _ = _extract_solver_cost_terms(solver)
+            self._mpc_debug_cost_unified, self._mpc_debug_cost_detail = pack_croc_cost(
+                terms, groups, self._last_mpc_cost
+            )
+        except Exception:
+            self._mpc_debug_cost_unified, self._mpc_debug_cost_detail = {}, {}
+
+    def _publish_mpc_ros_debug(
+        self,
+        solve_ms: float,
+        phase: str,
+        u_cmd: Optional[np.ndarray],
+        x_next: Optional[np.ndarray],
+        x_now: np.ndarray,
+    ) -> None:
+        """Publish structured MPC debug topics for PlotJuggler."""
+        if self._mpc_ros_debug is None:
+            return
+        try:
+            nu, n_arm = 4, 0
+            if self.controller_mode in ("acados_full_state", "acados_ee_pose") and hasattr(
+                self, "mpc"
+            ):
+                nu = int(getattr(self.mpc, "nu", 4))
+                n_arm = int(getattr(self.mpc, "n_arm", 0))
+            elif hasattr(self, "mpc") and hasattr(self.mpc, "nu"):
+                nu = int(self.mpc.nu)
+                n_arm = int(getattr(self.mpc, "n_arm", max(0, nu - 4)))
+            self._mpc_ros_debug.publish(
+                backend=self._mpc_debug_backend or self.controller_mode,
+                phase=phase,
+                solve_time_ms=solve_ms,
+                cpu_time_ms=self._mpc_debug_cpu_ms,
+                sqp_iter=self._last_mpc_iters,
+                qp_iter=self._last_mpc_qp_iters,
+                status=self._last_mpc_status,
+                cost_unified=self._mpc_debug_cost_unified,
+                cost_detail=self._mpc_debug_cost_detail,
+                u_cmd=u_cmd,
+                x_next=x_next,
+                x_now=x_now,
+                nu=nu,
+                n_arm=n_arm,
+            )
+        except Exception as e:
+            rospy.logdebug_throttle(5.0, f"[mpc_debug] publish error: {e}")
+
+    def _publish_mpc_stats(self, solve_ms: float, phase: str) -> None:
+        """发布 MPC 实时运行统计（JSON 字符串）到 /suite_mpc/stats，供 GUI 显示。"""
+        try:
+            from std_msgs.msg import String as _StringMsg
+
+            now = time.perf_counter()
+            self._cb_wall_times.append(now)
+            # 实际控制环频率（相邻回调墙钟时间差的均值）
+            loop_hz = 0.0
+            if len(self._cb_wall_times) >= 2:
+                dts = np.diff(np.asarray(self._cb_wall_times, dtype=float))
+                dts = dts[dts > 1e-6]
+                if dts.size:
+                    loop_hz = float(1.0 / np.mean(dts))
+            st = list(self.solve_times)
+            solve_avg = float(np.mean(st)) if st else solve_ms
+            solve_max = float(np.max(st)) if st else solve_ms
+            # 限频发布（~20 Hz 足够 GUI 显示，避免高频序列化）
+            if now - self._last_stats_pub_t < 0.05:
+                return
+            self._last_stats_pub_t = now
+            payload = {
+                "mode": self.controller_mode,
+                "phase": phase,                 # tracking | regulation
+                "target_hz": float(self.control_rate),
+                "loop_hz": round(loop_hz, 2),
+                "solve_ms": round(float(solve_ms), 3),
+                "solve_ms_avg": round(solve_avg, 3),
+                "solve_ms_max": round(solve_max, 3),
+                "iters": int(self._last_mpc_iters),
+                "qp_iters": int(self._last_mpc_qp_iters),
+                "status": int(self._last_mpc_status),
+                "horizon": int(self.horizon),
+                "dt_mpc": float(self.dt_mpc),
+                "bodyrate_lookahead_ms": round(float(self.bodyrate_lookahead_ms), 2),
+                "cost": (
+                    round(float(self._last_mpc_cost), 4)
+                    if np.isfinite(self._last_mpc_cost)
+                    else None
+                ),
+                "err_x": round(float(self._track_err_xyz[0]), 4),
+                "err_y": round(float(self._track_err_xyz[1]), 4),
+                "err_z": round(float(self._track_err_xyz[2]), 4),
+                "err_pos": round(float(self._track_err_pos), 4),
+                "err_yaw_deg": round(float(self._track_err_yaw_deg), 2),
+                "ee_err_x": round(float(self._track_err_ee_xyz[0]), 4),
+                "ee_err_y": round(float(self._track_err_ee_xyz[1]), 4),
+                "ee_err_z": round(float(self._track_err_ee_xyz[2]), 4),
+                "ee_err_pos": round(float(self._track_err_ee_pos), 4),
+                "l1_enabled": bool(self.l1_enabled),
+                "l1_dist_enabled": bool(self.l1_dist_enabled),
+                "l1_mode": str(self.l1_mode),
+                "l1_comp_enabled": bool(self.l1_comp_enabled),
+                "l1_inject": str(self.l1_inject),
+                "l1_use_pos_feedback": bool(self.l1_use_pos_feedback),
+                "drag_ff_enabled": bool(self.drag_ff_enabled),
+            }
+            thrust_ref = self._thrust_baseline_N_for_dist()
+            if self.l1_dist_enabled:
+                payload["l1_sigma_norm"] = round(float(np.linalg.norm(self._l1.sigma_hat)), 4)
+                payload["l1_a_ac_norm"] = round(
+                    float(np.linalg.norm(self._compensation_accel_world(thrust_ref))), 4
+                )
+                payload["l1_a_l1_norm"] = round(
+                    float(np.linalg.norm(self._disturbance_accel_world(thrust_ref))), 4
+                )
+            else:
+                payload["l1_sigma_norm"] = 0.0
+                payload["l1_a_ac_norm"] = 0.0
+                payload["l1_a_l1_norm"] = 0.0
+            payload["l1_a_pos_norm"] = round(
+                float(np.linalg.norm(self._position_feedback_accel_world())), 4
+            )
+            # 估计的扰动力（世界系，N）；与 dist_comp estimation/force_world 同源逻辑。
+            _l1_mass = self._robot_mass()
+            if not self.l1_dist_enabled:
+                _f_est = np.zeros(3, dtype=float)
+            elif self.l1_mode == "oracle":
+                _f_est = np.asarray(self._read_oracle_wrench_world()[:3], dtype=float)
+            elif self.l1_mode == "drag_ff":
+                _f_est = np.asarray(
+                    self._compute_true_aero_drag(thrust_ref), dtype=float
+                ).reshape(3)
+            elif self.l1_mode == "adaptive":
+                _f_est = _l1_mass * np.asarray(self._l1.sigma_hat, dtype=float).reshape(3)
+            else:
+                _f_est = np.zeros(3, dtype=float)
+            payload["l1_force_x"] = round(float(_f_est[0]), 3)
+            payload["l1_force_y"] = round(float(_f_est[1]), 3)
+            payload["l1_force_z"] = round(float(_f_est[2]), 3)
+            payload["l1_force_norm"] = round(float(np.linalg.norm(_f_est)), 3)
+            # 真值阻力前馈补偿时，实时显示当前真值阻力力（世界系，N）
+            if self.drag_ff_enabled:
+                _f_drag = self._compute_true_aero_drag(_l1_mass * 9.81)
+                payload["drag_force_x"] = round(float(_f_drag[0]), 3)
+                payload["drag_force_y"] = round(float(_f_drag[1]), 3)
+                payload["drag_force_z"] = round(float(_f_drag[2]), 3)
+            self.mpc_stats_pub.publish(_StringMsg(data=json.dumps(payload)))
+        except Exception as e:
+            rospy.logdebug_throttle(5.0, f"[mpc_stats] publish error: {e}")
+
+    def _publish_debug(
+        self,
+        t_elapsed: float,
+        solve_ms: float,
+        x_ref_override: Optional[np.ndarray] = None,
+    ):
+        """发布 /suite_mpc/state 调试话题。"""
+        try:
+            msg = MpcState()
+            msg.header.stamp = rospy.Time.now()
+            msg.state = self.state.tolist()
+
+            if x_ref_override is not None:
+                x_ref = np.asarray(x_ref_override, dtype=float).flatten()
+            else:
+                x_ref = interp_full_state_piecewise(
+                    float(self.t_plan[0]) + t_elapsed, self.t_plan, self.x_plan, self.mpc.robot_model
+                )
+            msg.state_ref = x_ref.tolist()
+            nq = self.mpc.nq
+            err = pin.difference(self.mpc.robot_model, x_ref[:nq], self.state[:nq])
+            msg.state_error = err.tolist()
+            self._update_tracking_error(x_ref)
+            self._update_ee_tracking_error(x_ref)
+            self._last_debug_x_ref = np.asarray(x_ref, dtype=float).flatten().copy()
+            msg.solving_time = float(solve_ms / 1000.0)  # MpcState field: seconds
+            msg.u_mpc = list(self._u_hold)
+            self.debug_pub.publish(msg)
+        except Exception:
+            pass
+
+    # =========================================================================
+    # RViz 路径可视化（仿照 run_controller.py）
+    # =========================================================================
+
+    def _rebuild_cached_viz_paths(self):
+        """
+        将完整规划轨迹（x_plan）转为 RosPath，一次性构建并缓存。
+        同时计算 EE 规划路径（需要 Pinocchio FK）。
+        由 _load_trajectory() 在轨迹加载后调用一次。
+        """
+        self._cached_ref_path     = None
+        self._cached_ee_plan_path = None
+
+        if self.x_plan is None or len(self.x_plan) == 0:
+            return
+
+        stamp = rospy.Time.now()
+
+        # ── UAV base 参考路径 ─────────────────────────────────────────────
+        ref_msg = RosPath()
+        ref_msg.header.stamp    = stamp
+        ref_msg.header.frame_id = "map"
+        for x in self.x_plan:
+            ps = PoseStamped()
+            ps.header = ref_msg.header
+            ps.pose.position.x    = float(x[0])
+            ps.pose.position.y    = float(x[1])
+            ps.pose.position.z    = float(x[2])
+            ps.pose.orientation.x = float(x[3])
+            ps.pose.orientation.y = float(x[4])
+            ps.pose.orientation.z = float(x[5])
+            ps.pose.orientation.w = float(x[6])
+            ref_msg.poses.append(ps)
+        self._cached_ref_path = ref_msg
+
+        # ── EE 规划路径（Pinocchio FK） ───────────────────────────────────
+        if self.arm_enabled:
+            try:
+                rm   = self.mpc.robot_model
+                data = rm.createData()
+                eid  = self.mpc.ee_frame_id
+                ee_msg = RosPath()
+                ee_msg.header.stamp    = stamp
+                ee_msg.header.frame_id = "map"
+                for x in self.x_plan:
+                    nq = rm.nq
+                    q  = np.asarray(x[:nq], dtype=float)
+                    pin.forwardKinematics(rm, data, q)
+                    pin.updateFramePlacements(rm, data)
+                    t_ee = data.oMf[eid].translation
+                    R_ee = data.oMf[eid].rotation
+                    quat_ee = pin.Quaternion(R_ee)
+                    ps = PoseStamped()
+                    ps.header = ee_msg.header
+                    ps.pose.position.x    = float(t_ee[0])
+                    ps.pose.position.y    = float(t_ee[1])
+                    ps.pose.position.z    = float(t_ee[2])
+                    ps.pose.orientation.x = float(quat_ee.x)
+                    ps.pose.orientation.y = float(quat_ee.y)
+                    ps.pose.orientation.z = float(quat_ee.z)
+                    ps.pose.orientation.w = float(quat_ee.w)
+                    ee_msg.poses.append(ps)
+                if ee_msg.poses:
+                    self._cached_ee_plan_path = ee_msg
+            except Exception as e:
+                rospy.logwarn(f"EE planned path build failed: {e}")
+
+        n_ref = len(self._cached_ref_path.poses) if self._cached_ref_path else 0
+        n_ee  = len(self._cached_ee_plan_path.poses) if self._cached_ee_plan_path else 0
+        rospy.loginfo(
+            f"Viz caches built: UAV ref={n_ref} pts"
+            + (f", EE plan={n_ee} pts" if n_ee else "")
+        )
+
+    def _stage_mpc_planned_path(self, xs_guess: List[np.ndarray]) -> None:
+        """将本次 MPC solver 规划的 horizon 状态序列暂存为 RosPath（不立即发布）。"""
+        if not xs_guess:
+            return
+        msg = RosPath()
+        msg.header.stamp    = rospy.Time.now()
+        msg.header.frame_id = "map"
+        for x in xs_guess:
+            if len(x) < 7:
+                continue
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position.x    = float(x[0])
+            ps.pose.position.y    = float(x[1])
+            ps.pose.position.z    = float(x[2])
+            ps.pose.orientation.x = float(x[3])
+            ps.pose.orientation.y = float(x[4])
+            ps.pose.orientation.z = float(x[5])
+            ps.pose.orientation.w = float(x[6])
+            msg.poses.append(ps)
+        self._staged_mpc_path = msg if msg.poses else None
+
+    def _append_uav_actual_path_point(self) -> None:
+        """将当前 UAV base 位姿追加到实际路径缓冲。"""
+        if self.state is None or len(self.state) < 7:
+            return
+        pos = np.array(self.state[0:3], dtype=float)
+        if (self.viz_path_min_pos_step > 0.0
+                and self._last_uav_path_pos_sample is not None
+                and np.linalg.norm(pos - self._last_uav_path_pos_sample) < self.viz_path_min_pos_step):
+            return
+        self._last_uav_path_pos_sample = pos.copy()
+
+        ps = PoseStamped()
+        ps.header.stamp    = rospy.Time.now()
+        ps.header.frame_id = "map"
+        ps.pose.position.x    = float(self.state[0])
+        ps.pose.position.y    = float(self.state[1])
+        ps.pose.position.z    = float(self.state[2])
+        ps.pose.orientation.x = float(self.state[3])
+        ps.pose.orientation.y = float(self.state[4])
+        ps.pose.orientation.z = float(self.state[5])
+        ps.pose.orientation.w = float(self.state[6])
+        self._uav_actual_path_msg.header.stamp    = ps.header.stamp
+        self._uav_actual_path_msg.header.frame_id = "map"
+        self._uav_actual_path_msg.poses.append(ps)
+        if len(self._uav_actual_path_msg.poses) > self.uav_actual_path_max_len:
+            self._uav_actual_path_msg.poses = (
+                self._uav_actual_path_msg.poses[-self.uav_actual_path_max_len:]
+            )
+
+    def _append_ee_actual_path_point(self) -> None:
+        """将当前 EE 位姿（Pinocchio FK）追加到实际路径缓冲。"""
+        try:
+            rm   = self.mpc.robot_model
+            data = rm.createData()
+            eid  = self.mpc.ee_frame_id
+            nq   = rm.nq
+            q    = np.asarray(self.state[:nq], dtype=float)
+            pin.forwardKinematics(rm, data, q)
+            pin.updateFramePlacements(rm, data)
+            t_ee   = data.oMf[eid].translation
+            R_ee   = data.oMf[eid].rotation
+            quat_e = pin.Quaternion(R_ee)
+        except Exception:
+            return
+
+        pos = np.array(t_ee, dtype=float)
+        if (self.viz_path_min_pos_step > 0.0
+                and self._last_ee_path_pos_sample is not None
+                and np.linalg.norm(pos - self._last_ee_path_pos_sample) < self.viz_path_min_pos_step):
+            return
+        self._last_ee_path_pos_sample = pos.copy()
+
+        ps = PoseStamped()
+        ps.header.stamp    = rospy.Time.now()
+        ps.header.frame_id = "map"
+        ps.pose.position.x    = float(t_ee[0])
+        ps.pose.position.y    = float(t_ee[1])
+        ps.pose.position.z    = float(t_ee[2])
+        ps.pose.orientation.x = float(quat_e.x)
+        ps.pose.orientation.y = float(quat_e.y)
+        ps.pose.orientation.z = float(quat_e.z)
+        ps.pose.orientation.w = float(quat_e.w)
+        self._ee_actual_path_msg.header.stamp    = ps.header.stamp
+        self._ee_actual_path_msg.header.frame_id = "map"
+        self._ee_actual_path_msg.poses.append(ps)
+        if len(self._ee_actual_path_msg.poses) > self.ee_actual_path_max_len:
+            self._ee_actual_path_msg.poses = (
+                self._ee_actual_path_msg.poses[-self.ee_actual_path_max_len:]
+            )
+
+    # =========================================================================
+    # RViz 机器人 mesh / EE 坐标轴可视化
+    # =========================================================================
+
+    def _build_robot_visual_specs(self) -> None:
+        """解析 URDF 各 link 的 <visual>，缓存 mesh/几何体规格用于 RViz marker。
+
+        每个 spec: {frame_id(pin), origin(pin.SE3), kind, ...}。link 帧位姿由
+        Pinocchio FK 给出，再与 visual origin 复合得到 marker 位姿。
+        """
+        self._robot_visual_specs = []
+        if not self.viz_robot_markers:
+            return
+        try:
+            urdf_path = self.mpc._planner.urdf_path
+            rm = self.mpc.robot_model
+            tree = ET.parse(urdf_path)
+            root = tree.getroot()
+        except Exception as e:
+            rospy.logwarn(f"[viz] URDF 解析失败，跳过机器人 mesh 显示: {e}")
+            return
+
+        def _rpy_xyz_to_se3(origin_el):
+            xyz = [0.0, 0.0, 0.0]
+            rpy = [0.0, 0.0, 0.0]
+            if origin_el is not None:
+                if origin_el.get("xyz"):
+                    xyz = [float(v) for v in origin_el.get("xyz").split()]
+                if origin_el.get("rpy"):
+                    rpy = [float(v) for v in origin_el.get("rpy").split()]
+            R = pin.rpy.rpyToMatrix(rpy[0], rpy[1], rpy[2])
+            return pin.SE3(R, np.asarray(xyz, dtype=float))
+
+        n_mesh = 0
+        for link in root.findall("link"):
+            link_name = link.get("name")
+            if not link_name:
+                continue
+            try:
+                fid = rm.getFrameId(link_name)
+            except Exception:
+                continue
+            if fid < 0 or fid >= len(rm.frames):
+                continue
+            for visual in link.findall("visual"):
+                geom = visual.find("geometry")
+                if geom is None:
+                    continue
+                origin = _rpy_xyz_to_se3(visual.find("origin"))
+                # 颜色（material/color rgba）
+                rgba = [0.8, 0.8, 0.8, 1.0]
+                mat = visual.find("material")
+                if mat is not None and mat.find("color") is not None:
+                    c = mat.find("color").get("rgba")
+                    if c:
+                        rgba = [float(v) for v in c.split()]
+                spec = {"frame_id": int(fid), "origin": origin, "rgba": rgba}
+                mesh = geom.find("mesh")
+                box = geom.find("box")
+                sphere = geom.find("sphere")
+                cylinder = geom.find("cylinder")
+                if mesh is not None and mesh.get("filename"):
+                    uri = mesh.get("filename")
+                    scale = [1.0, 1.0, 1.0]
+                    if mesh.get("scale"):
+                        scale = [float(v) for v in mesh.get("scale").split()]
+                    spec.update({"kind": "mesh", "uri": uri, "scale": scale})
+                    n_mesh += 1
+                elif box is not None and box.get("size"):
+                    spec.update({"kind": "box", "size": [float(v) for v in box.get("size").split()]})
+                elif sphere is not None and sphere.get("radius"):
+                    spec.update({"kind": "sphere", "radius": float(sphere.get("radius"))})
+                elif cylinder is not None:
+                    spec.update({
+                        "kind": "cylinder",
+                        "radius": float(cylinder.get("radius", 0.05)),
+                        "length": float(cylinder.get("length", 0.1)),
+                    })
+                else:
+                    continue
+                self._robot_visual_specs.append(spec)
+        rospy.loginfo(
+            f"[viz] Robot visual specs: {len(self._robot_visual_specs)} 个 "
+            f"({n_mesh} mesh) 用于 RViz 显示"
+        )
+
+    def _publish_robot_markers(self, q: np.ndarray, stamp) -> None:
+        """按当前 q 用 Pinocchio FK 计算各 link 视觉位姿，发布 mesh/几何 marker。"""
+        if not self.viz_robot_markers or not self._robot_visual_specs:
+            return
+        rm = self.mpc.robot_model
+        data = self._viz_fk_data
+        pin.forwardKinematics(rm, data, np.asarray(q, dtype=float))
+        pin.updateFramePlacements(rm, data)
+
+        arr = MarkerArray()
+        for i, spec in enumerate(self._robot_visual_specs):
+            oMf = data.oMf[spec["frame_id"]]
+            oMv = oMf * spec["origin"]
+            quat = pin.Quaternion(oMv.rotation)
+            t = oMv.translation
+
+            m = Marker()
+            m.header.frame_id = self.viz_frame_id
+            m.header.stamp = stamp
+            m.ns = "suite_mpc_robot"
+            m.id = i
+            m.action = Marker.ADD
+            m.pose.position.x = float(t[0])
+            m.pose.position.y = float(t[1])
+            m.pose.position.z = float(t[2])
+            m.pose.orientation.x = float(quat.x)
+            m.pose.orientation.y = float(quat.y)
+            m.pose.orientation.z = float(quat.z)
+            m.pose.orientation.w = float(quat.w)
+            rgba = spec["rgba"]
+            m.color.r, m.color.g, m.color.b, m.color.a = (
+                float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3]),
+            )
+            m.lifetime = rospy.Duration(0)
+            kind = spec["kind"]
+            if kind == "mesh":
+                m.type = Marker.MESH_RESOURCE
+                m.mesh_resource = spec["uri"]
+                m.mesh_use_embedded_materials = spec["uri"].lower().endswith(".dae")
+                sc = spec["scale"]
+                m.scale.x, m.scale.y, m.scale.z = float(sc[0]), float(sc[1]), float(sc[2])
+            elif kind == "box":
+                m.type = Marker.CUBE
+                sz = spec["size"]
+                m.scale.x, m.scale.y, m.scale.z = float(sz[0]), float(sz[1]), float(sz[2])
+            elif kind == "sphere":
+                m.type = Marker.SPHERE
+                d = 2.0 * spec["radius"]
+                m.scale.x = m.scale.y = m.scale.z = d
+            elif kind == "cylinder":
+                m.type = Marker.CYLINDER
+                d = 2.0 * spec["radius"]
+                m.scale.x = m.scale.y = d
+                m.scale.z = spec["length"]
+            arr.markers.append(m)
+        self.robot_markers_pub.publish(arr)
+
+    def _publish_ee_axes(self, q: np.ndarray, stamp) -> None:
+        """发布 EE 坐标轴（X 红 / Y 绿 / Z 蓝 三支箭头），并广播 EE TF。"""
+        if not self.viz_ee_axes or not self.arm_enabled:
+            return
+        if self.mpc.ee_frame_id is None:
+            return
+        rm = self.mpc.robot_model
+        data = self._viz_fk_data
+        pin.forwardKinematics(rm, data, np.asarray(q, dtype=float))
+        pin.updateFramePlacements(rm, data)
+        oMf = data.oMf[self.mpc.ee_frame_id]
+        origin = oMf.translation
+        R = oMf.rotation
+        L = self.viz_ee_axis_len
+
+        from geometry_msgs.msg import Point
+
+        arr = MarkerArray()
+        axis_colors = [
+            (1.0, 0.0, 0.0),  # X red
+            (0.0, 1.0, 0.0),  # Y green
+            (0.0, 0.0, 1.0),  # Z blue
+        ]
+        for ax in range(3):
+            tip = origin + R[:, ax] * L
+            m = Marker()
+            m.header.frame_id = self.viz_frame_id
+            m.header.stamp = stamp
+            m.ns = "suite_mpc_ee_axes"
+            m.id = ax
+            m.type = Marker.ARROW
+            m.action = Marker.ADD
+            m.pose.orientation.w = 1.0  # arrow geometry is point-defined; keep pose valid
+            p0 = Point(); p0.x, p0.y, p0.z = float(origin[0]), float(origin[1]), float(origin[2])
+            p1 = Point(); p1.x, p1.y, p1.z = float(tip[0]), float(tip[1]), float(tip[2])
+            m.points = [p0, p1]
+            m.scale.x = self.viz_ee_axis_diam          # shaft diameter
+            m.scale.y = self.viz_ee_axis_diam * 2.0    # head diameter
+            m.scale.z = self.viz_ee_axis_diam * 2.5    # head length
+            cr, cg, cb = axis_colors[ax]
+            m.color.r, m.color.g, m.color.b, m.color.a = cr, cg, cb, 1.0
+            m.lifetime = rospy.Duration(0)
+            arr.markers.append(m)
+        self.ee_axes_pub.publish(arr)
+
+        # 广播 EE TF（独立 frame，便于使用 RViz TF / Axes 显示）
+        try:
+            quat = pin.Quaternion(R)
+            tf_msg = TransformStamped()
+            tf_msg.header.stamp = stamp
+            tf_msg.header.frame_id = self.viz_frame_id
+            tf_msg.child_frame_id = "suite_mpc_ee"
+            tf_msg.transform.translation.x = float(origin[0])
+            tf_msg.transform.translation.y = float(origin[1])
+            tf_msg.transform.translation.z = float(origin[2])
+            tf_msg.transform.rotation.x = float(quat.x)
+            tf_msg.transform.rotation.y = float(quat.y)
+            tf_msg.transform.rotation.z = float(quat.z)
+            tf_msg.transform.rotation.w = float(quat.w)
+            self._tf_broadcaster.sendTransform(tf_msg)
+        except Exception as e:
+            rospy.logdebug_throttle(5.0, f"[viz] EE TF broadcast failed: {e}")
+
+    def _track_err_sphere_marker(
+        self, mid: int, pos: np.ndarray, color: Tuple[float, float, float, float], stamp
+    ) -> Marker:
+        from geometry_msgs.msg import Point
+
+        m = Marker()
+        m.header.frame_id = self.viz_frame_id
+        m.header.stamp = stamp
+        m.ns = "suite_mpc_track_err"
+        m.id = int(mid)
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x = float(pos[0])
+        m.pose.position.y = float(pos[1])
+        m.pose.position.z = float(pos[2])
+        m.pose.orientation.w = 1.0
+        d = 2.0 * float(self.viz_track_err_sphere_r)
+        m.scale.x = m.scale.y = m.scale.z = d
+        m.color.r, m.color.g, m.color.b, m.color.a = color
+        m.lifetime = rospy.Duration(0)
+        return m
+
+    def _track_err_arrow_marker(
+        self, mid: int, p_from: np.ndarray, p_to: np.ndarray,
+        color: Tuple[float, float, float, float], stamp,
+    ) -> Marker:
+        from geometry_msgs.msg import Point
+
+        p0 = np.asarray(p_from, dtype=float).reshape(3)
+        p1 = np.asarray(p_to, dtype=float).reshape(3)
+        m = Marker()
+        m.header.frame_id = self.viz_frame_id
+        m.header.stamp = stamp
+        m.ns = "suite_mpc_track_err"
+        m.id = int(mid)
+        m.type = Marker.ARROW
+        m.action = Marker.ADD
+        m.pose.orientation.w = 1.0
+        pt0 = Point(x=float(p0[0]), y=float(p0[1]), z=float(p0[2]))
+        pt1 = Point(x=float(p1[0]), y=float(p1[1]), z=float(p1[2]))
+        m.points = [pt0, pt1]
+        shaft = max(0.008, float(self.viz_track_err_sphere_r) * 0.22)
+        m.scale.x = shaft
+        m.scale.y = shaft * 2.2
+        m.scale.z = shaft * 2.8
+        m.color.r, m.color.g, m.color.b, m.color.a = color
+        m.lifetime = rospy.Duration(0)
+        return m
+
+    def _track_err_text_marker(
+        self, mid: int, pos: np.ndarray, text: str,
+        color: Tuple[float, float, float, float], stamp,
+    ) -> Marker:
+        m = Marker()
+        m.header.frame_id = self.viz_frame_id
+        m.header.stamp = stamp
+        m.ns = "suite_mpc_track_err"
+        m.id = int(mid)
+        m.type = Marker.TEXT_VIEW_FACING
+        m.action = Marker.ADD
+        m.pose.position.x = float(pos[0])
+        m.pose.position.y = float(pos[1])
+        m.pose.position.z = float(pos[2])
+        m.pose.orientation.w = 1.0
+        m.text = str(text)
+        m.scale.z = 0.07
+        m.color.r, m.color.g, m.color.b, m.color.a = color
+        m.lifetime = rospy.Duration(0)
+        return m
+
+    def _publish_tracking_error_markers(self, stamp) -> None:
+        """RViz：base / EE 位置参考点、误差箭头与文字标注。"""
+        if not self.viz_tracking_error or self._last_debug_x_ref is None:
+            return
+        try:
+            x_ref = np.asarray(self._last_debug_x_ref, dtype=float).flatten()
+            s = np.asarray(self.state, dtype=float).flatten()
+            p_ref = x_ref[0:3]
+            p_act = s[0:3]
+            err_mm = float(self._track_err_pos) * 1000.0
+            ex, ey, ez = (float(x) * 1000.0 for x in self._track_err_xyz)
+
+            arr = MarkerArray()
+            # base: 绿=参考，箭头 actual→ref，黄字
+            arr.markers.append(
+                self._track_err_sphere_marker(
+                    0, p_ref, (0.2, 0.95, 0.25, 0.85), stamp
+                )
+            )
+            if float(self._track_err_pos) > 1e-4:
+                arr.markers.append(
+                    self._track_err_arrow_marker(
+                        1, p_act, p_ref, (1.0, 0.85, 0.1, 0.95), stamp
+                    )
+                )
+            mid_base = 0.5 * (p_act + p_ref)
+            arr.markers.append(
+                self._track_err_text_marker(
+                    2,
+                    mid_base + np.array([0.0, 0.0, 0.12]),
+                    f"base |e|={err_mm:.1f}mm  ({ex:+.0f},{ey:+.0f},{ez:+.0f})mm",
+                    (1.0, 1.0, 0.85, 1.0),
+                    stamp,
+                )
+            )
+
+            if self.arm_enabled and self.mpc.ee_frame_id is not None:
+                p_ee_act = self._ee_world_from_full_state(s)
+                p_ee_ref = self._ee_world_from_full_state(x_ref)
+                if p_ee_act is not None and p_ee_ref is not None:
+                    ee_mm = float(self._track_err_ee_pos) * 1000.0
+                    eex, eey, eez = (float(x) * 1000.0 for x in self._track_err_ee_xyz)
+                    arr.markers.append(
+                        self._track_err_sphere_marker(
+                            10, p_ee_ref, (0.2, 0.75, 1.0, 0.9), stamp
+                        )
+                    )
+                    if float(self._track_err_ee_pos) > 1e-4:
+                        arr.markers.append(
+                            self._track_err_arrow_marker(
+                                11, p_ee_act, p_ee_ref, (1.0, 0.35, 0.85, 0.95), stamp
+                            )
+                        )
+                    mid_ee = 0.5 * (p_ee_act + p_ee_ref)
+                    arr.markers.append(
+                        self._track_err_text_marker(
+                            12,
+                            mid_ee + np.array([0.0, 0.0, 0.08]),
+                            f"EE |e|={ee_mm:.1f}mm  ({eex:+.0f},{eey:+.0f},{eez:+.0f})mm",
+                            (1.0, 0.85, 1.0, 1.0),
+                            stamp,
+                        )
+                    )
+
+            self.tracking_error_markers_pub.publish(arr)
+        except Exception as e:
+            rospy.logdebug_throttle(5.0, f"[viz] tracking error markers: {e}")
+
+    def _maybe_flush_viz_publishes(self, xs_next: Optional[np.ndarray]) -> None:
+        """
+        限速批量发布所有 RViz 路径话题（默认 15 Hz），避免在高频控制回调中
+        每步序列化大型 Path 消息。同时在此处更新 WholeBody 可视化。
+        """
+        now = time.time()
+        if now - self._last_viz_pub_wall_t < self._viz_path_min_period:
+            return
+        self._last_viz_pub_wall_t = now
+        stamp = rospy.Time.now()
+
+        # 1. 参考轨迹（固定，latch 已处理；每次刷新 stamp 后重发保持活跃）
+        if self._cached_ref_path is not None:
+            self._cached_ref_path.header.stamp = stamp
+            self.ref_traj_path_pub.publish(self._cached_ref_path)
+
+        # 2. MPC horizon 预测路径
+        if self._staged_mpc_path is not None and self._staged_mpc_path.poses:
+            self._staged_mpc_path.header.stamp = stamp
+            self.mpc_planned_path_pub.publish(self._staged_mpc_path)
+
+        # 3. UAV 实际路径
+        if self._uav_actual_path_msg.poses:
+            self._uav_actual_path_msg.header.stamp = stamp
+            self.uav_actual_path_pub.publish(self._uav_actual_path_msg)
+
+        # 4. EE 规划 & 实际路径
+        if self.arm_enabled:
+            if self._cached_ee_plan_path is not None and self._cached_ee_plan_path.poses:
+                self._cached_ee_plan_path.header.stamp = stamp
+                self.ee_planned_path_pub.publish(self._cached_ee_plan_path)
+            if self._ee_actual_path_msg.poses:
+                self._ee_actual_path_msg.header.stamp = stamp
+                self.ee_actual_path_pub.publish(self._ee_actual_path_msg)
+
+        # 4b. 机器人 mesh marker + EE 坐标轴（自包含，不依赖 robot_state_publisher）
+        try:
+            nq_v = self.mpc.nq
+            q_v = np.asarray(self.state[:nq_v], dtype=float)
+            self._publish_robot_markers(q_v, stamp)
+            self._publish_ee_axes(q_v, stamp)
+        except Exception as e:
+            rospy.logdebug_throttle(5.0, f"[viz] robot/EE marker publish error: {e}")
+
+        # 4c. base / EE 跟踪误差（参考球、误差箭头、文字标注）
+        try:
+            self._publish_tracking_error_markers(stamp)
+        except Exception as e:
+            rospy.logdebug_throttle(5.0, f"[viz] tracking error publish error: {e}")
+
+        # 5. WholeBody 可视化（eagle_mpc_viz）
+        if _WHOLEBODY_VIZ_OK and self._wb_current_pub is not None:
+            try:
+                nq  = self.mpc.nq
+                q   = self.state[:nq].tolist()
+                v   = self.state[nq:].tolist()
+                tau = self._u_hold.tolist()
+                self._wb_current_pub.publish(stamp, q, v, tau)
+                if xs_next is not None:
+                    q_ref = xs_next[:nq].tolist()
+                    v_ref = xs_next[nq:].tolist()
+                    self._wb_target_pub.publish(stamp, q_ref, v_ref, tau)
+                if self._staged_mpc_path is not None and self._xs_guess is not None:
+                    ts = [float(i) * self.dt_mpc for i in range(len(self._xs_guess))]
+                    qs = [np.asarray(x[:nq], dtype=float).tolist() for x in self._xs_guess]
+                    vs = [np.asarray(x[nq:], dtype=float).tolist() for x in self._xs_guess]
+                    self._wb_planned_pub.publish(ts, qs, vs)
+            except Exception as e:
+                rospy.logdebug_throttle(5.0, f"WholeBody viz publish error: {e}")
+
+    def _clear_actual_paths(self) -> None:
+        """清空实际路径缓冲（reset 时调用）。"""
+        self._uav_actual_path_msg.poses = []
+        self._ee_actual_path_msg.poses  = []
+        self._last_uav_path_pos_sample  = None
+        self._last_ee_path_pos_sample   = None
+        empty = RosPath()
+        empty.header.stamp    = rospy.Time.now()
+        empty.header.frame_id = "map"
+        self.uav_actual_path_pub.publish(empty)
+        if self.arm_enabled:
+            self.ee_actual_path_pub.publish(empty)
+
+    # =========================================================================
+    # 工具方法
+    # =========================================================================
+
+    def _hover_thrust_cmd(self) -> np.ndarray:
+        """悬停时各转子推力（等推力悬停）。"""
+        mass = float(pin.computeTotalMass(self.mpc.robot_model))
+        T_hover = mass * 9.81 / self._n_rotors
+        nu = self.mpc.nu
+        u = np.zeros(nu, dtype=float)
+        u[: self._n_rotors] = T_hover
+        return u
+
+    def _default_reg_target(self) -> np.ndarray:
+        """
+        未锁定时的 regulation 默认参考：
+        - 未开始 / 未结束 tracking: 轨迹起点 x_plan[0]
+        - tracking 已结束: 轨迹终点 x_plan[-1]
+        Stop tracking 会锁定当前位姿，不会走这条默认策略。
+        """
+        if self.x_plan is None or len(self.x_plan) == 0:
+            return self._match_state_dim(np.asarray(self.state, dtype=float).copy(), zero_vel=True)
+        idx = -1 if bool(self.traj_finished) else 0
+        x_tgt = np.asarray(self.x_plan[idx], dtype=float).copy()
+        return self._match_state_dim(x_tgt, zero_vel=True)
+
+    def _plan_end_hover_target(self) -> np.ndarray:
+        """轨迹终点悬停（速度清零）。"""
+        if self.x_plan is None or len(self.x_plan) == 0:
+            return self._hold_current_pose_target()
+        return self._match_state_dim(
+            np.asarray(self.x_plan[-1], dtype=float).copy(), zero_vel=True
+        )
+
+    def _enter_hover_regulation(self, target, *, reason: str, save: bool = True) -> str:
+        """结束轨迹跟踪，切到 regulation 并在给定目标悬停。"""
+        was_recording = bool(self.recording_enabled) or bool(self.trajectory_started)
+        self.trajectory_started = False
+        self.traj_finished = True
+        self.recording_enabled = False
+        self.controller_start_time = None
+        self._xs_guess = None
+        self._us_guess = None
+        self._reg_xs_guess = None
+        self._reg_us_guess = None
+        self._reg_target = self._match_state_dim(
+            np.asarray(target, dtype=float).copy(), zero_vel=True
+        )
+        self._reg_target_locked = True
+        self._regulating = True
+        tgt = self._reg_target
+        rospy.loginfo(
+            f"{reason} Hover at x={tgt[0]:.2f} y={tgt[1]:.2f} z={tgt[2]:.2f}"
+        )
+        extra = ""
+        if save and was_recording:
+            try:
+                tag = self._active_tracking_tag or self._compose_tracking_file_tag()
+                csv_path, txt_path = self._save_tracking_csv_and_stats(tag)
+                self._active_tracking_tag = None
+                extra = f" Saved: {csv_path.name}, {txt_path.name}"
+            except Exception as e:
+                extra = f" Save failed: {e}"
+                rospy.logwarn(f"[hover] {extra}")
+        return extra
+
+    def _cancel_takeoff_sequence(self) -> None:
+        self._takeoff_seq_active = False
+        self._takeoff_phase = 0
+
+    def _cancel_takeoff_prep(self) -> None:
+        self._takeoff_prep_active = False
+        self._takeoff_prep_stage = "stream"
+        self._takeoff_prep_t0 = 0.0
+        self._last_prep_request_t = 0.0
+
+    def _ensure_mavros_flight_clients(self) -> bool:
+        if self._set_mode_client is not None and self._arming_client is not None:
+            return True
+        try:
+            rospy.wait_for_service("/mavros/set_mode", timeout=3.0)
+            rospy.wait_for_service("/mavros/cmd/arming", timeout=3.0)
+            self._set_mode_client = rospy.ServiceProxy("/mavros/set_mode", SetMode)
+            self._arming_client = rospy.ServiceProxy("/mavros/cmd/arming", CommandBool)
+            return True
+        except Exception as e:
+            rospy.logwarn(f"[take_off] MAVROS flight services unavailable: {e}")
+            return False
+
+    def _ensure_px4_stick_disabled(self) -> None:
+        """仿真：关掉摇杆检查，OFFBOARD / 解锁不再依赖 QGC 虚拟摇杆。"""
+        if self._px4_stick_disabled:
+            return
+        try:
+            from px4_sitl_rc import ensure_px4_offboard_without_stick
+
+            ok, msg = ensure_px4_offboard_without_stick(timeout_s=3.0)
+            rospy.loginfo(f"[take_off] {msg}")
+            if ok:
+                self._px4_stick_disabled = True
+        except Exception as e:
+            rospy.logwarn(f"[take_off] disable stick input: {e}")
+
+    def _request_offboard_mode(self) -> bool:
+        if not self._ensure_mavros_flight_clients():
+            return False
+        self._ensure_px4_stick_disabled()
+        try:
+            req = SetModeRequest()
+            req.custom_mode = "OFFBOARD"
+            resp = self._set_mode_client(req)
+            if resp.mode_sent:
+                rospy.loginfo("[take_off] OFFBOARD mode request sent")
+                return True
+            rospy.logwarn("[take_off] OFFBOARD mode request rejected by MAVROS")
+        except Exception as e:
+            rospy.logwarn(f"[take_off] OFFBOARD request failed: {e}")
+        return False
+
+    def _request_arm(self, arm: bool = True) -> bool:
+        if not self._ensure_mavros_flight_clients():
+            return False
+        if arm:
+            self._ensure_px4_stick_disabled()
+        try:
+            req = CommandBoolRequest()
+            req.value = bool(arm)
+            resp = self._arming_client(req)
+            if resp.success:
+                rospy.loginfo(f"[take_off] {'Arm' if arm else 'Disarm'} request OK")
+                return True
+            rospy.logwarn(f"[take_off] {'Arm' if arm else 'Disarm'} failed: {resp.message}")
+        except Exception as e:
+            rospy.logwarn(f"[take_off] Arm request failed: {e}")
+        return False
+
+    def _hold_current_pose_target(self) -> np.ndarray:
+        """Regulation 目标 = 当前位姿（用于 OFFBOARD 前持续发 setpoint）。"""
+        if self.state is None or not np.all(np.isfinite(np.asarray(self.state))):
+            rospy.logwarn_throttle(2.0, "[take_off] state invalid; using x_plan[0] as hold target")
+            return self._default_reg_target()
+        s = np.asarray(self.state, dtype=float)
+        roll, pitch, yaw = euler_from_quaternion([s[3], s[4], s[5], s[6]])
+        yaw_deg = math.degrees(yaw)
+        nj = self.arm_joint_number
+        j1_deg = math.degrees(s[7]) if nj >= 1 else 0.0
+        j2_deg = math.degrees(s[8]) if nj >= 2 else 0.0
+        return self._make_reg_target(
+            float(s[0]), float(s[1]), float(s[2]), yaw_deg, j1_deg, j2_deg
+        )
+
+    def _start_takeoff_with_prep(self) -> None:
+        """启动起飞：可选自动 stream setpoints -> OFFBOARD -> arm -> 爬升序列。"""
+        if self.x_plan is None or self.mpc is None:
+            raise RuntimeError("Trajectory / MPC not loaded yet.")
+        if self._takeoff_seq_active or self._takeoff_prep_active:
+            raise RuntimeError("Take-off already running")
+
+        self.trajectory_started = False
+        self.traj_finished = False
+        self.controller_start_time = None
+        self.recording_enabled = False
+        self._xs_guess = None
+        self._us_guess = None
+        self.control_output_enabled = True
+        self._regulating = True
+        self._reg_target_locked = True
+        self._reg_target = self._hold_current_pose_target()
+        self._reg_xs_guess = None
+        self._reg_us_guess = None
+        self._u_hold = self._hover_thrust_cmd()
+
+        if not self._takeoff_auto_arm_offboard:
+            if self.px4_state.mode != "OFFBOARD":
+                raise RuntimeError("Must be in OFFBOARD mode (~takeoff_auto_arm_offboard:=false)")
+            if not self.px4_state.armed:
+                raise RuntimeError("Must be armed (~takeoff_auto_arm_offboard:=false)")
+            self._begin_takeoff_sequence()
+            return
+
+        if not bool(getattr(self.px4_state, "connected", False)):
+            raise RuntimeError(
+                "MAVROS not connected to PX4 (check Gazebo/SITL and /mavros/state)"
+            )
+
+        self._takeoff_prep_active = True
+        self._takeoff_prep_stage = "stream"
+        self._takeoff_prep_t0 = time.time()
+        self._last_prep_request_t = 0.0
+        rospy.loginfo(
+            f"[take_off] Prep started: hold pose + stream setpoints for "
+            f"{self._takeoff_stream_s:.1f}s, then OFFBOARD -> arm -> climb"
+        )
+
+    def _update_takeoff_prep(self) -> None:
+        """PX4 前置：持续 setpoint -> OFFBOARD -> 解锁，再进入爬升阶段。"""
+        if not self._takeoff_prep_active:
+            return
+        now = time.time()
+        if now - self._takeoff_prep_t0 > self._takeoff_prep_timeout_s:
+            rospy.logerr("[take_off] Prep timeout (OFFBOARD/arm); aborting.")
+            self._cancel_takeoff_prep()
+            return
+
+        # 准备阶段始终在当前位姿发 regulation setpoint
+        self._reg_target = self._hold_current_pose_target()
+        self._reg_target_locked = True
+        self._regulating = True
+        self.control_output_enabled = True
+
+        if self._takeoff_prep_stage == "stream":
+            if now - self._takeoff_prep_t0 < self._takeoff_stream_s:
+                return
+            self._takeoff_prep_stage = "offboard"
+            self._last_prep_request_t = 0.0
+            rospy.loginfo("[take_off] Prep: requesting OFFBOARD mode")
+
+        if self._takeoff_prep_stage == "offboard":
+            if self.px4_state.mode == "OFFBOARD":
+                self._takeoff_prep_stage = "arm"
+                self._last_prep_request_t = 0.0
+                rospy.loginfo("[take_off] Prep: OFFBOARD OK, requesting arm")
+            elif now - self._last_prep_request_t >= self._takeoff_prep_retry_s:
+                self._request_offboard_mode()
+                self._last_prep_request_t = now
+            return
+
+        if self._takeoff_prep_stage == "arm":
+            if self.px4_state.armed:
+                self._takeoff_prep_stage = "fly"
+            elif now - self._last_prep_request_t >= self._takeoff_prep_retry_s:
+                self._request_arm(True)
+                self._last_prep_request_t = now
+            return
+
+        if self._takeoff_prep_stage == "fly":
+            self._cancel_takeoff_prep()
+            self._begin_takeoff_sequence()
+            rospy.loginfo(
+                "[take_off] OFFBOARD + armed: starting climb to "
+                f"z={self._takeoff_alt_m:.2f} m, then x_plan[0]"
+            )
+
+    def _regulation_reached_target(self) -> bool:
+        if self.mpc is None:
+            return False
+        pos_err = float(np.linalg.norm(self.state[0:3] - self._reg_target[0:3]))
+        nq = self.mpc.nq
+        vel_err = float(np.linalg.norm(self.state[nq : nq + 3]))
+        return pos_err <= self._takeoff_pos_tol and vel_err <= self._takeoff_vel_tol
+
+    def _takeoff_phase0_target(self, alt_m: float) -> np.ndarray:
+        """Vertical take-off at current x/y: climb to alt_m, keep current yaw and arm joints."""
+        s = np.asarray(self.state, dtype=float)
+        roll, pitch, yaw = euler_from_quaternion([s[3], s[4], s[5], s[6]])
+        yaw_deg = math.degrees(yaw)
+        nj = self.arm_joint_number
+        j1_deg = math.degrees(s[7]) if nj >= 1 else 0.0
+        j2_deg = math.degrees(s[8]) if nj >= 2 else 0.0
+        return self._make_reg_target(
+            float(s[0]), float(s[1]), float(alt_m), yaw_deg, j1_deg, j2_deg
+        )
+
+    def _begin_takeoff_sequence(self) -> None:
+        self.trajectory_started = False
+        self.traj_finished = False
+        self.controller_start_time = None
+        self.recording_enabled = False
+        self._xs_guess = None
+        self._us_guess = None
+        self._u_hold = self._hover_thrust_cmd()
+        self._clear_actual_paths()
+
+        self._takeoff_seq_active = True
+        self._takeoff_phase = 0
+        self._regulating = True
+        self._reg_target_locked = True
+        self._reg_target = self._takeoff_phase0_target(self._takeoff_alt_m)
+        self._reg_xs_guess = None
+        self._reg_us_guess = None
+
+    def _update_takeoff_sequence(self) -> None:
+        if self._takeoff_prep_active or not self._takeoff_seq_active:
+            return
+        if not self._regulation_reached_target():
+            return
+        if self._takeoff_phase == 0:
+            self._takeoff_phase = 1
+            self._reg_target = self._match_state_dim(
+                np.asarray(self.x_plan[0], dtype=float).copy(), zero_vel=True
+            )
+            self._reg_target_locked = True
+            self._reg_xs_guess = None
+            self._reg_us_guess = None
+            rospy.loginfo(
+                f"[take_off] Phase 1: reached z={self._takeoff_alt_m:.2f} m, "
+                f"moving to trajectory start x_plan[0]={self._reg_target[:3].tolist()}"
+            )
+            return
+        self._takeoff_seq_active = False
+        self._takeoff_phase = 0
+        rospy.loginfo(
+            "[take_off] Complete: hovering at trajectory start (x_plan[0]). "
+            "Call /start_tracking to begin trajectory tracking."
+        )
+
+    # =========================================================================
+    # 数据录制
+    # =========================================================================
+
+    def _record(self, t: float, u: np.ndarray, xs_next: Optional[np.ndarray], solve_ms: float):
+        s = self.state
+        nq = self.mpc.nq
+        nj = self.arm_joint_number
+        self.recorded_data["time"].append(t)
+        self.recorded_data["position"].append(s[0:3].tolist())
+        self.recorded_data["velocity"].append(s[nq : nq + 3].tolist())
+        self.recorded_data["angular_velocity"].append(s[nq + 3 : nq + 6].tolist())
+        self.recorded_data["orientation"].append(s[3:7].tolist())
+        self.recorded_data["arm_joint_positions"].append(s[7 : 7 + nj].tolist())
+        self.recorded_data["arm_joint_velocities"].append(s[-nj:].tolist() if nj > 0 else [])
+        self.recorded_data["mpc_control"].append(u.tolist())
+        self.recorded_data["mpc_solve_time"].append(solve_ms)
+
+        x_ref = interp_full_state_piecewise(
+            float(self.t_plan[0]) + t, self.t_plan, self.x_plan, self.mpc.robot_model
+        )
+        self.recorded_data["reference_position"].append(x_ref[0:3].tolist())
+        self.recorded_data["reference_orientation"].append(x_ref[3:7].tolist())
+        self.recorded_data["reference_velocity"].append(x_ref[nq : nq + 3].tolist())
+        self.recorded_data["reference_angular_velocity"].append(x_ref[nq + 3 : nq + 6].tolist())
+        self.recorded_data["reference_arm_positions"].append(x_ref[7 : 7 + nj].tolist())
+
+        # ── L1 扰动估计 vs Gazebo 气动阻力真值 ──────────────────────────────
+        mass = max(self._robot_mass(), 1e-6)
+        sigma = np.asarray(self._l1.sigma_hat, dtype=float).reshape(3)
+        thrust_total_N = self._thrust_N_from_u(u)
+        if not (thrust_total_N > 0.0):
+            thrust_total_N = mass * 9.81  # px4 模式下 u 非推力时退回悬停推力
+        # 实际注入的补偿加速度（L1 或真值前馈）
+        a_ac = self._compensation_accel_world(thrust_total_N)
+        self.recorded_data["l1_sigma_world"].append(sigma.tolist())
+        self.recorded_data["l1_force_world"].append((mass * sigma).tolist())
+        self.recorded_data["l1_a_ac_world"].append(a_ac.tolist())
+        if self.aero_drag_record:
+            f_drag = self._compute_true_aero_drag(thrust_total_N)
+        else:
+            f_drag = np.zeros(3, dtype=float)
+        self.recorded_data["aero_drag_force_world"].append(f_drag.tolist())
+        self.recorded_data["aero_drag_accel_world"].append((f_drag / mass).tolist())
+
+    # =========================================================================
+    # ROS 服务
+    # =========================================================================
+
+    def _prime_tracking_warm_start(self, iters: int = 8) -> None:
+        """开始跟踪前预热 MPC warm-start，消除首拍冷启动导致的起步掉高。
+
+        用当前状态在轨迹起点 t_plan[0] 反复求解，使求解器 warm-start 收敛到
+        起点附近的稳定解；不发布任何指令。期间用 _mpc_rebuilding 守卫挡住
+        控制定时器回调（_control_callback 顶部会改为发布 hold），避免与本函数
+        并发调用同一个非可重入求解器。
+        """
+        if self.mpc is None:
+            return
+        x0 = self.state.copy()
+        prev_rebuilding = getattr(self, "_mpc_rebuilding", False)
+        self._mpc_rebuilding = True
+        try:
+            if self.controller_mode == "acados_full_state" and hasattr(self.mpc, "warmup"):
+                self.mpc.warmup(x0, self.t_plan, self.x_plan, iters=iters)
+                self._xs_guess = getattr(self.mpc, "last_xs", None)
+            elif (
+                self.controller_mode == "acados_ee_pose"
+                and hasattr(self.mpc, "warmup")
+                and hasattr(self, "p_ref_ee")
+            ):
+                self.mpc.warmup(
+                    x0,
+                    self.t_ref_ee,
+                    self.p_ref_ee,
+                    self.yaw_ref_ee,
+                    self.roll_ref_ee,
+                    self.pitch_ref_ee,
+                    iters=iters,
+                )
+                self._xs_guess = getattr(self.mpc, "last_xs", None)
+            else:
+                # croc / 其它：用 _solve_mpc 在 t_elapsed=0 反复求解，建立
+                # 控制器级 _xs_guess / _us_guess。
+                for _ in range(max(1, int(iters))):
+                    u_cmd, _ = self._solve_mpc(x0, 0.0)
+                    if u_cmd is not None:
+                        self._u_hold = u_cmd
+            rospy.loginfo(
+                f"[start_tracking] warm-start primed ({iters} iters, "
+                f"mode={self.controller_mode})."
+            )
+        except Exception as e:
+            rospy.logwarn(f"[start_tracking] warm-start priming failed: {e}")
+        finally:
+            self._mpc_rebuilding = prev_rebuilding
+
+    def _svc_start_tracking(self, req) -> TriggerResponse:
+        if self.px4_state.mode != "OFFBOARD":
+            return TriggerResponse(False, "Must be in OFFBOARD mode")
+        if not self.px4_state.armed:
+            return TriggerResponse(False, "Must be armed")
+        if self.trajectory_started:
+            return TriggerResponse(False, "Tracking already started")
+        if self._takeoff_seq_active:
+            return TriggerResponse(False, "Take-off sequence in progress")
+        # 退出 regulation 模式，切换到轨迹跟踪
+        self._regulating = False
+        self._reg_target_locked = False
+        self.traj_finished = False
+        self.trajectory_name = str(rospy.get_param("~trajectory_name", self.trajectory_name))
+        # 丢弃旧 warm-start，并在“正式计时之前”用当前状态在轨迹起点预热求解器，
+        # 否则首拍是冷启动（horizon 猜成 x_now+u_hover），RTI 解质量差 → 起步掉高。
+        self._xs_guess = None
+        self._us_guess = None
+        if hasattr(self.mpc, "reset_warm_start"):
+            self.mpc.reset_warm_start()
+        self._prime_tracking_warm_start()
+        # 预热完成后才置位跟踪并启动计时，使 t_elapsed 从 0 开始且首拍已是热启动。
+        self.trajectory_started = True
+        self.controller_start_time = rospy.Time.now()
+        self._clear_recorded_data()
+        self._active_tracking_tag = self._compose_tracking_file_tag()
+        self.recording_enabled = True
+        self._clear_actual_paths()   # 重置实际路径，使实际轨迹从跟踪起点开始
+        if self.l1_enabled:
+            # 软重置：保留 regulation 期间已收敛的扰动估计/补偿（推力不匹配、
+            # 负载等在切换前后不变），仅对齐预测器速度。硬 reset 会清零补偿，
+            # 导致刚切到 tracking 时系统重新掉落、L1 从头收敛而带偏轨迹。
+            # _l1_last_a_applied 沿用上一拍（regulation）的名义加速度，保持连续。
+            self._l1.reseed_predictor(self._body_to_world_vel())
+        rospy.loginfo("Tracking started! (regulation mode off)")
+        return TriggerResponse(True, "Tracking started")
+
+    def _svc_stop_tracking(self, req) -> TriggerResponse:
+        extra = self._enter_hover_regulation(
+            self._hold_current_pose_target(),
+            reason="Tracking stopped by user; holding current pose.",
+            save=True,
+        )
+        ok = "Save failed" not in extra
+        return TriggerResponse(
+            ok,
+            f"Tracking stopped, hovering at current pose.{extra}",
+        )
+
+    def _svc_save_data(self, req) -> TriggerResponse:
+        try:
+            out_dir = Path(__file__).resolve().parent / "results" / "suite_tracking"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            filepath = out_dir / f"tracking_{self._safe_token(self.controller_mode)}.npz"
+            save_data = {}
+            for k, v in self.recorded_data.items():
+                if v:
+                    save_data[k] = np.array(v)
+                else:
+                    save_data[k] = np.array([])
+            np.savez_compressed(str(filepath), **save_data)
+            tag = self._active_tracking_tag or self._compose_tracking_file_tag()
+            csv_path, txt_path = self._save_tracking_csv_and_stats(tag)
+            rospy.loginfo(f"Data saved: {filepath} | {csv_path} | {txt_path}")
+            return TriggerResponse(True, f"Saved to {filepath}, {csv_path}, {txt_path}")
+        except Exception as e:
+            return TriggerResponse(False, f"Save failed: {e}")
+
+    def _svc_update_trajectory(self, req) -> TriggerResponse:
+        """
+        /update_trajectory 服务：
+        重新加载轨迹与缓存，不重启节点进程。
+        默认不重建 MPC（避免 acados 在线重编译阻塞/与控制环竞态）；需完整重建时设
+        ~rebuild_mpc_on_trajectory_update:=true。
+        """
+        rebuild_mpc = bool(rospy.get_param("~rebuild_mpc_on_trajectory_update", False))
+        try:
+            with self._thread_lock:
+                self._mpc_rebuilding = True
+                try:
+                    if rebuild_mpc:
+                        self.trajectory_name = str(
+                            rospy.get_param("~trajectory_name", self.trajectory_name)
+                        )
+                        self.suite_plan_path = str(
+                            rospy.get_param("~suite_plan_path", self.suite_plan_path)
+                        )
+                        self._load_trajectory()
+                        self._build_mpc()
+                        self.arm_joint_number = self.mpc.robot_model.nq - 7
+                        self._rebuild_cached_viz_paths()
+                        self._u_hold = self._hover_thrust_cmd()
+                        self._xs_guess = None
+                        self._us_guess = None
+                        self._reg_xs_guess = None
+                        self._reg_us_guess = None
+                        self.trajectory_started = False
+                        self.traj_finished = False
+                        self.controller_start_time = None
+                        self._reg_target = self._default_reg_target()
+                        self._reg_target_locked = False
+                        self._regulating = True
+                        self._clear_actual_paths()
+                    else:
+                        self._reload_trajectory_plan_only()
+                finally:
+                    self._mpc_rebuilding = False
+
+            msg = (
+                f"Trajectory reloaded: {len(self.t_plan)} points, "
+                f"mode={self.controller_mode}, suite_plan_path={self.suite_plan_path}, "
+                f"mpc_rebuild={'yes' if rebuild_mpc else 'no (fast)'}, regulation target reset."
+            )
+            rospy.loginfo(f"[update_trajectory] {msg}")
+            return TriggerResponse(True, msg)
+        except Exception as e:
+            self._mpc_rebuilding = False
+            rospy.logerr(f"[update_trajectory] failed: {e}")
+            return TriggerResponse(False, f"Error: {e}")
+
+    # ── take_off ────────────────────────────────────────────────────────────
+
+    def _svc_take_off(self, req) -> TriggerResponse:
+        """
+        /take_off：自动起飞全流程（默认 ~takeoff_auto_arm_offboard:=true）。
+        1) 在当前位姿持续发 setpoint（满足 PX4 OFFBOARD 前置条件）
+        2) 请求 OFFBOARD 模式
+        3) 解锁 (arm)
+        4) 爬升到 ~takeoff_alt_m（默认 1 m）
+        5) 飞到轨迹起点 x_plan[0] 并悬停
+        """
+        if self._takeoff_seq_active or self._takeoff_prep_active:
+            return TriggerResponse(False, "Take-off already running")
+        try:
+            self._takeoff_alt_m = float(rospy.get_param("~takeoff_alt_m", self._takeoff_alt_m))
+            self._takeoff_pos_tol = float(rospy.get_param("~takeoff_pos_tol", self._takeoff_pos_tol))
+            self._takeoff_vel_tol = float(rospy.get_param("~takeoff_vel_tol", self._takeoff_vel_tol))
+            self._takeoff_auto_arm_offboard = bool(
+                rospy.get_param("~takeoff_auto_arm_offboard", self._takeoff_auto_arm_offboard)
+            )
+            self._takeoff_stream_s = float(
+                rospy.get_param("~takeoff_stream_setpoints_s", self._takeoff_stream_s)
+            )
+            self._start_takeoff_with_prep()
+            if self._takeoff_prep_active:
+                msg = (
+                    f"Take-off prep: stream setpoints {self._takeoff_stream_s:.1f}s -> "
+                    f"OFFBOARD -> arm -> climb z={self._takeoff_alt_m:.2f}m -> x_plan[0]"
+                )
+            else:
+                tgt0 = self._reg_target
+                msg = (
+                    f"Take-off started: climb to z={self._takeoff_alt_m:.2f} m at "
+                    f"({tgt0[0]:.2f}, {tgt0[1]:.2f}), then x_plan[0]={self.x_plan[0][:3].tolist()}"
+                )
+            rospy.loginfo(f"[take_off] {msg}")
+            return TriggerResponse(True, msg)
+        except Exception as e:
+            self._cancel_takeoff_prep()
+            self._cancel_takeoff_sequence()
+            return TriggerResponse(False, f"Take-off failed: {e}")
+
+    # ── reset_to_initial ────────────────────────────────────────────────────
+
+    def _svc_reset_to_initial(self, req) -> TriggerResponse:
+        """
+        /reset_to_initial 服务：将 regulation 目标重置为 x_plan[0]，
+        切换到 regulation 模式（MPC 驱动机器人回到轨迹初始状态）。
+        持续保持 regulation 模式直到 /start_tracking 显式调用。
+        """
+        if self.x_plan is None or self.mpc is None:
+            return TriggerResponse(False, "Trajectory / MPC not loaded yet.")
+
+        self._cancel_takeoff_prep()
+        self._cancel_takeoff_sequence()
+
+        # ── 1. 停止轨迹跟踪，重置标志 ───────────────────────────────────────
+        self.trajectory_started = False
+        self.traj_finished = False
+        self.controller_start_time = None
+        self.recording_enabled = False
+        self._xs_guess = None
+        self._us_guess = None
+        self._u_hold = self._hover_thrust_cmd()
+
+        # ── 2. 将 regulation 目标设为 x_plan[0]，切换到 regulation 模式 ──────
+        self._reg_target   = self._default_reg_target()
+        self._reg_target_locked = False
+        self._reg_xs_guess = None
+        self._reg_us_guess = None
+        self._regulating   = True
+        # 丢弃 acados 内部 warm-start，使首帧 regulation 从当前状态冷启动，
+        # 配合有界 look-ahead 参考避免远目标导致 RTI QP 病态（NaN）。
+        try:
+            if hasattr(self.mpc, "reset_warm_start"):
+                self.mpc.reset_warm_start()
+        except Exception:
+            pass
+
+        # ── 3. 清空 RViz 实际路径缓冲 ────────────────────────────────────────
+        self._clear_actual_paths()
+
+        x0 = self._reg_target
+        msg = (
+            f"Reset started: regulation driving to x_plan[0]={x0[:3].tolist()}. "
+            f"Call /start_tracking to begin trajectory tracking."
+        )
+        rospy.loginfo(f"[reset_to_initial] {msg}")
+        return TriggerResponse(True, msg)
+
+    def _svc_set_regulation_target(self, req) -> TriggerResponse:
+        """
+        /set_regulation_target 服务：从 ROS param ~regulation_target_data 读取目标，
+        设置为新的 regulation 目标并切换到 regulation 模式。
+        param 格式：[x, y, z, yaw_deg, j1_deg, j2_deg]（6 个浮点数）
+        """
+        if self.mpc is None:
+            return TriggerResponse(False, "MPC not initialized yet.")
+        try:
+            data = rospy.get_param("~regulation_target_data", None)
+            if data is None:
+                return TriggerResponse(False, "Param ~regulation_target_data not set.")
+            data = [float(v) for v in data]
+            if len(data) < 6:
+                return TriggerResponse(False, f"Expected 6 values, got {len(data)}.")
+            new_target = self._make_reg_target(
+                x=data[0], y=data[1], z=data[2],
+                yaw_deg=data[3], j1_deg=data[4], j2_deg=data[5],
+            )
+            self._reg_target   = new_target
+            self._reg_target_locked = True
+            self._reg_xs_guess = None
+            self._reg_us_guess = None
+            if not self.trajectory_started:
+                self._regulating = True
+            status = "regulation 已激活" if self._regulating else "tracking 中（下次 stop 后生效）"
+            msg = (
+                f"Regulation target set: x={data[0]:.2f} y={data[1]:.2f} z={data[2]:.2f} "
+                f"yaw={data[3]:.1f}° j1={data[4]:.1f}° j2={data[5]:.1f}° | {status}"
+            )
+            rospy.loginfo(f"[set_regulation_target] {msg}")
+            return TriggerResponse(True, msg)
+        except Exception as e:
+            return TriggerResponse(False, f"Error: {e}")
+
+    def _svc_update_controller_params(self, req) -> TriggerResponse:
+        """
+        /update_controller_params 服务：
+        从 ROS param ~controller_update_data 读取控制器参数并在线更新。
+        支持切换 controller_mode 以及更新 MPC / geometric 参数，无需重启节点。
+        """
+        try:
+            cfg = self._read_controller_update_cfg()
+            if not isinstance(cfg, dict):
+                return TriggerResponse(
+                    False,
+                    f"Param {CONTROLLER_UPDATE_PARAM} (or ~controller_update_data) must be a dict.",
+                )
+
+            rospy.loginfo(
+                "[update_controller_params] received: mode=%s w_state_track=%s w_pos=%s",
+                cfg.get("controller_mode", "?"),
+                cfg.get("w_state_track", "?"),
+                cfg.get("w_pos", "?"),
+            )
+
+            prev_sig = self._mpc_structure_signature()
+            prev_rate = float(self.control_rate)
+
+            mpc_detail = ""
+            with self._thread_lock:
+                new_mode = str(cfg.get("controller_mode", self.controller_mode)).strip()
+                allowed = {
+                    "croc_full_state",
+                    "acados_full_state",
+                    "acados_ee_pose",
+                    "croc_ee_pose",
+                    "px4",
+                    "geometric",
+                }
+                if new_mode not in allowed:
+                    return TriggerResponse(False, f"Invalid controller_mode: {new_mode}")
+                self.controller_mode = new_mode
+
+                self.control_rate = float(cfg.get("control_rate", self.control_rate))
+                self.control_rate = max(1.0, self.control_rate)
+                self.dt_control = 1.0 / self.control_rate
+
+                self.dt_mpc = float(cfg.get("dt_mpc", self.dt_mpc))
+                self.horizon = int(cfg.get("horizon", self.horizon))
+                self.mpc_max_iter = int(cfg.get("mpc_max_iter", self.mpc_max_iter))
+                self.dt_mpc = max(1e-3, self.dt_mpc)
+                self.horizon = max(2, self.horizon)
+                self.mpc_max_iter = max(1, self.mpc_max_iter)
+                self.bodyrate_lookahead_ms = float(
+                    cfg.get("bodyrate_lookahead_ms", self.bodyrate_lookahead_ms)
+                )
+                self.bodyrate_lookahead_s = max(0.0, self.bodyrate_lookahead_ms / 1000.0)
+
+                self._apply_cfg_weights_from_dict(cfg)
+
+                self.ee_w_pos = float(cfg.get("ee_w_pos", self.ee_w_pos))
+                self.ee_w_rot_rp = float(cfg.get("ee_w_rot_rp", self.ee_w_rot_rp))
+                self.ee_w_rot_yaw = float(cfg.get("ee_w_rot_yaw", self.ee_w_rot_yaw))
+                self.ee_w_vel_lin = float(cfg.get("ee_w_vel_lin", self.ee_w_vel_lin))
+                self.ee_w_vel_ang_rp = float(
+                    cfg.get("ee_w_vel_ang_rp", self.ee_w_vel_ang_rp)
+                )
+                self.ee_w_vel_ang_yaw = float(
+                    cfg.get("ee_w_vel_ang_yaw", self.ee_w_vel_ang_yaw)
+                )
+                self.ee_w_terminal = float(cfg.get("ee_w_terminal", self.ee_w_terminal))
+                self.ee_override_joints = bool(
+                    cfg.get("ee_override_joints", self.ee_override_joints)
+                )
+                self.ee_joint1 = float(cfg.get("ee_joint1", self.ee_joint1))
+                self.ee_joint2 = float(cfg.get("ee_joint2", self.ee_joint2))
+
+                self.geo_kp_pos = float(cfg.get("geo_kp_pos", self.geo_kp_pos))
+                self.geo_kd_vel = float(cfg.get("geo_kd_vel", self.geo_kd_vel))
+                self.geo_kR = float(cfg.get("geo_kR", self.geo_kR))
+                self.geo_kOmega = float(cfg.get("geo_kOmega", self.geo_kOmega))
+                self.geo_max_tilt_deg = float(
+                    cfg.get("geo_max_tilt_deg", self.geo_max_tilt_deg)
+                )
+
+                self.max_angular_velocity = float(
+                    cfg.get("max_angular_velocity", self.max_angular_velocity)
+                )
+                self.min_thrust_cmd = float(cfg.get("min_thrust_cmd", self.min_thrust_cmd))
+                self.max_thrust_cmd = float(cfg.get("max_thrust_cmd", self.max_thrust_cmd))
+                new_max_thrust = float(cfg.get("max_thrust", self.max_thrust_total))
+                if new_max_thrust > 0:
+                    self.max_thrust_total = new_max_thrust
+
+                self._apply_l1_params_from_dict(cfg)
+
+            mpc_detail = self._maybe_rebuild_mpc_after_cfg(cfg, prev_sig)
+            with self._thread_lock:
+                if self.controller_mode in (
+                    "croc_full_state",
+                    "acados_full_state",
+                    "acados_ee_pose",
+                    "croc_ee_pose",
+                ):
+                    if self._reg_target.shape[0] != self.mpc.nq + self.mpc.nv:
+                        self._reg_target = self._default_reg_target()
+                        self._reg_target_locked = False
+
+            if abs(prev_rate - self.control_rate) > 1e-6:
+                self._restart_control_timer()
+
+            msg = (
+                f"Controller params updated: mode={self.controller_mode}, "
+                f"dt_mpc={self.dt_mpc:.3f}, H={self.horizon}, iter={self.mpc_max_iter}, "
+                f"rate={self.control_rate:.1f}Hz, "
+                f"l1_mode={self.l1_mode}, est={'on' if self.l1_dist_enabled else 'off'}, "
+                f"comp={'on' if self.l1_comp_enabled else 'off'}. "
+                f"{mpc_detail}"
+            )
+            rospy.loginfo(f"[update_controller_params] {msg}")
+            return TriggerResponse(True, msg)
+        except Exception as e:
+            self._mpc_rebuilding = False
+            rospy.logerr(f"[update_controller_params] failed: {e}")
+            return TriggerResponse(False, f"Error: {e}")
+
+    def _publish_initial_joints(self, x0: np.ndarray, nj: int) -> None:
+        """将 x0 中的初始关节角发布到仿真/实机关节控制话题。"""
+        from std_msgs.msg import Float64
+
+        if nj < 1:
+            return
+
+        ref_j = x0[7 : 7 + nj]
+
+        # 实机 desired_joint_states
+        joint_msg = JointState()
+        joint_msg.header.stamp = rospy.Time.now()
+        joint_msg.name = [f"joint_{i+1}" for i in range(nj)]
+        joint_msg.position = list(ref_j)
+        joint_msg.velocity = [0.0] * nj
+        joint_msg.effort = [0.0] * nj
+        self.arm_control_pub.publish(joint_msg)
+
+        # 仿真单关节话题
+        if self.use_simulation:
+            if nj >= 1:
+                self.joint1_pub.publish(Float64(float(ref_j[0])))
+            if nj >= 2:
+                self.joint2_pub.publish(Float64(float(ref_j[1])))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    try:
+        node = SuiteTrackingController()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        rospy.loginfo("SuiteTrackingController terminated.")

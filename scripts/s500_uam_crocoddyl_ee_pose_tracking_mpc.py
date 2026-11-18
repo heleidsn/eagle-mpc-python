@@ -73,6 +73,18 @@ def run_closed_loop_ee_pose_tracking(
     max_iter: int,
     use_thrust_constraints: bool,
     weights: EETrackingWeights = EETrackingWeights(),
+    w_state_track: float = 0.0,
+    w_state_reg: float = 0.0,
+    w_control: float = 1e-3,
+    w_terminal_track: float = 100.0,
+    w_pos: float = 1.0,
+    w_att: float = 1.0,
+    w_joint: float = 1.0,
+    w_vel: float = 1.0,
+    w_omega: float = 1.0,
+    w_joint_vel: float = 1.0,
+    w_u_thrust: float = 1.0,
+    w_u_joint_torque: float = 1.0,
     verbose: bool = True,
     use_actuator_first_order: bool = False,
     tau_thrust: float = 0.06,
@@ -88,6 +100,18 @@ def run_closed_loop_ee_pose_tracking(
         dt_mpc=dt_mpc,
         horizon=horizon,
         u_weights=weights,
+        w_state_track=w_state_track,
+        w_state_reg=w_state_reg,
+        w_control=w_control,
+        w_terminal_track=w_terminal_track,
+        w_pos=w_pos,
+        w_att=w_att,
+        w_joint=w_joint,
+        w_vel=w_vel,
+        w_omega=w_omega,
+        w_joint_vel=w_joint_vel,
+        w_u_thrust=w_u_thrust,
+        w_u_joint_torque=w_u_joint_torque,
         use_thrust_constraints=use_thrust_constraints,
     )
     # MPC uses ideal u; optional first-order lag only on the simulation plant (same as full-state tracker).
@@ -342,10 +366,10 @@ def main():
     parser.add_argument("--w_vel_lin", type=float, default=1.0)
     parser.add_argument("--w_vel_ang_rp", type=float, default=1.0)
     parser.add_argument("--w_vel_ang_yaw", type=float, default=1.0)
-    parser.add_argument("--w_u", type=float, default=0.1)
-    parser.add_argument("--w_state_reg", type=float, default=0.0)
-    parser.add_argument("--w_state_track", type=float, default=0.0)
     parser.add_argument("--w_terminal_scale", type=float, default=3.0)
+    parser.add_argument("--w_state_track", type=float, default=0.0)
+    parser.add_argument("--w_state_reg", type=float, default=0.0)
+    parser.add_argument("--w_control", type=float, default=1e-3)
 
     parser.add_argument("--no_verbose", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
@@ -391,10 +415,7 @@ def main():
         w_vel_lin=float(args.w_vel_lin),
         w_vel_ang_rp=float(args.w_vel_ang_rp),
         w_vel_ang_yaw=float(args.w_vel_ang_yaw),
-        w_u=float(args.w_u),
         w_terminal_scale=float(args.w_terminal_scale),
-        w_state_reg=float(args.w_state_reg),
-        w_state_track=float(args.w_state_track),
     )
 
     out = run_closed_loop_ee_pose_tracking(
@@ -409,6 +430,9 @@ def main():
         max_iter=int(args.max_iter),
         use_thrust_constraints=bool(args.use_thrust_constraints),
         weights=weights,
+        w_state_track=float(args.w_state_track),
+        w_state_reg=float(args.w_state_reg),
+        w_control=float(args.w_control),
         verbose=not bool(args.no_verbose),
     )
 
