@@ -1,0 +1,33 @@
+{
+  "robot": "s500_uam",
+  "trajectory_template": "user_e87adf077b",
+  "trajectory_template_label": "3. Hover",
+  "kind": "full_croc",
+  "updated_at": "2026-06-18T10:50:58+08:00",
+  "id": "__autosave___s500_uam_user_e87adf077b",
+  "name": "3__hover (auto)",
+  "created_at": "2026-06-18T10:19:53+08:00",
+  "velocity_frame": "body",
+  "plan_mixed_wp_rows": [
+    [
+      "Base",
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      "Base",
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ]
+}

@@ -122,6 +122,52 @@ eagle-mpc-python/
 
 ## 🚀 Quick Start
 
+### UAM Flight Studio：跨电脑同步设置和轨迹
+
+`uam_suite_gui.py` 启动时会读取项目根目录的 `.gui_state/`，并恢复
+`saved_trajectories/` 中与当前机器人和模板匹配的轨迹。这两个目录中的配置和
+轨迹文件已纳入 Git，包含规划/跟踪参数、各算法的控制器参数、自定义模板、
+模板名称、控制点、上次选择以及已保存的轨迹。
+
+在另一台已配置好项目依赖的电脑上，在仓库根目录执行：
+
+```bash
+git pull --ff-only origin master
+python uam_suite_gui.py
+```
+
+首次使用可先克隆仓库，再按本文安装依赖：
+
+```bash
+git clone https://github.com/heleidsn/eagle-mpc-python.git
+cd eagle-mpc-python
+python uam_suite_gui.py
+```
+
+如果目标电脑已有自己的配置或轨迹，拉取前先退出 GUI，将 `.gui_state/` 和
+`saved_trajectories/` 复制到仓库外备份。后续每次同步也应先退出 GUI。
+
+修改设置后，分别点击所需页面的 `Save Planning parameters`、
+`Save Tracking parameters`、`Save ROS Tracking parameters`；控制器配置使用
+`Save controller parameters`，模板控制点使用 `Save control points`。
+正常关闭 GUI 会保存机器人和模板选择，成功生成的轨迹会自动保存。
+随后在修改设置的电脑上执行：
+
+```bash
+git add .gui_state/ saved_trajectories/
+git commit -m "Update UAM Flight Studio settings and trajectories"
+git push origin master
+```
+
+其他电脑再次 `git pull --ff-only origin master` 后启动 GUI，即可使用更新。
+这是通过 Git 保存和同步的配置快照，GUI 不会自动提交或推送。
+使用参数另存功能时，要保存到默认的 `.gui_state/uam_suite_gui_params.json`
+才能在下次启动时自动读取。两台电脑都有修改时，需先合并配置再继续同步。
+
+Python/ROS/acados 等依赖和环境变量（如 `UAM_GUI_SCALE`、`UAM_PLOT_SCALE`）
+仍需各电脑自行配置。若使用外部 CSV，需同时提供该文件，优先使用相对于
+项目根目录的路径。
+
 ### 1. S500 UAM GUI (Recommended)
 
 ```bash

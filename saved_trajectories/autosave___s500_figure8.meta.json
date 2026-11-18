@@ -1,0 +1,11 @@
+{
+  "robot": "s500",
+  "trajectory_template": "figure8",
+  "trajectory_template_label": "figure8",
+  "kind": "full_acados",
+  "updated_at": "2026-06-10T11:44:02+08:00",
+  "id": "__autosave___s500_figure8",
+  "name": "figure8 (auto)",
+  "created_at": "2026-06-09T09:56:49+08:00",
+  "velocity_frame": "body"
+}

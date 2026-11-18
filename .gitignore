@@ -64,17 +64,30 @@ s500_uam_ocp.json
 
 # Generated tracking and benchmark outputs
 tracking_results/
-saved_trajectories/
 acados_mpc_quad_bench.json
 
-# GUI local state / template configs (consolidated under .gui_state/)
-.gui_state/
-# legacy root-level files (kept ignored for backward compatibility)
-uam_suite_gui_params.json
-uam_suite_gui_last_session.json
-user_templates.json
-template_display_names.json
-template_control_points.json
+# Share saved trajectories across computers; ignore unrelated local outputs.
+/saved_trajectories/*
+!/saved_trajectories/index.json
+!/saved_trajectories/*.meta.json
+!/saved_trajectories/*.npz
+
+# Share the GUI settings that are restored on startup.
+/.gui_state/*
+!/.gui_state/uam_suite_gui_params.json
+!/.gui_state/uam_suite_gui_last_session.json
+!/.gui_state/user_templates.json
+!/.gui_state/template_display_names.json
+!/.gui_state/template_control_points.json
+!/.gui_state/ros_tracking_controller_profiles.json
+
+# Legacy root-level files are migrated into .gui_state/ by the GUI.
+/uam_suite_gui_params.json
+/uam_suite_gui_last_session.json
+/user_templates.json
+/template_display_names.json
+/template_control_points.json
+/ros_tracking_controller_profiles.json
 
 # Racing trajectory optimization outputs
 racing_traj_opt/results/

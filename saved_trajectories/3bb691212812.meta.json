@@ -1,0 +1,33 @@
+{
+  "robot": "s500_uam",
+  "trajectory_template": "full_state_default",
+  "trajectory_template_label": "1. UAM Two WPs",
+  "kind": "full_croc",
+  "updated_at": "2026-06-13T14:07:42+08:00",
+  "id": "3bb691212812",
+  "name": "full_state_default_1__uam_two_wps",
+  "created_at": "2026-06-13T14:07:42+08:00",
+  "velocity_frame": "body",
+  "plan_mixed_wp_rows": [
+    [
+      "Base",
+      0.0,
+      0.0,
+      1.0,
+      -45.0,
+      -45.0,
+      0.0,
+      0.0
+    ],
+    [
+      "Base",
+      1.0,
+      0.0,
+      1.0,
+      -45.0,
+      -45.0,
+      0.0,
+      2.0
+    ]
+  ]
+}

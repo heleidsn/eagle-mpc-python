@@ -1,0 +1,43 @@
+{
+  "robot": "s500_uam",
+  "trajectory_template": "user_4c667f4381",
+  "trajectory_template_label": "2. Grasp",
+  "kind": "full_croc",
+  "updated_at": "2026-06-03T22:36:28+08:00",
+  "id": "70a4dda74cb8",
+  "name": "2__grasp",
+  "created_at": "2026-06-03T22:36:28+08:00",
+  "velocity_frame": "body",
+  "plan_mixed_wp_rows": [
+    [
+      "Base",
+      -1.5,
+      0.0,
+      1.5,
+      -45.0,
+      -45.0,
+      0.0,
+      0.0
+    ],
+    [
+      "EEp",
+      0.0,
+      0.0,
+      0.8,
+      -17.2,
+      45.0,
+      -45.8,
+      2.0
+    ],
+    [
+      "Base",
+      1.5,
+      0.0,
+      1.5,
+      -45.0,
+      -45.0,
+      0.0,
+      4.0
+    ]
+  ]
+}

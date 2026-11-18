@@ -1,0 +1,43 @@
+{
+  "robot": "s500",
+  "trajectory_template": "minimum_snap",
+  "trajectory_template_label": "minimum_snap",
+  "kind": "ee_snap",
+  "updated_at": "2026-06-09T08:55:24+08:00",
+  "id": "a36507b3a504",
+  "name": "minimum_snap",
+  "created_at": "2026-06-09T08:55:24+08:00",
+  "ee_track_kind": "snap",
+  "waypoints": [
+    [
+      -1.5,
+      0.0,
+      1.5,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      1.5,
+      0.0,
+      1.5,
+      0.0
+    ],
+    [
+      3.0,
+      0.0,
+      1.5,
+      0.0
+    ]
+  ],
+  "t_wp": [
+    1.0000000000000009,
+    3.000000000000001,
+    5.000000000000001,
+    7.000000000000001
+  ]
+}
