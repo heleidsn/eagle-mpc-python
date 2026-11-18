@@ -38,6 +38,7 @@ ENV/
 
 # acados generated code
 c_generated_code/
+/scripts/tube-mpc/c_generated_dtmpc/
 
 # Results and outputs
 results/*.png
